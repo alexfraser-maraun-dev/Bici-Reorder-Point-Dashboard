@@ -1,0 +1,33 @@
+/Users/alesfraser-maraun/Desktop/BICI_replen_level_automation/backend/venv/lib/python3.9/site-packages/google/auth/__init__.py:54: FutureWarning: You are using a Python version 3.9 past its end of life. Google will update google-auth with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade your Python version, and then update google-auth.
+  warnings.warn(eol_message.format("3.9"), FutureWarning)
+/Users/alesfraser-maraun/Desktop/BICI_replen_level_automation/backend/venv/lib/python3.9/site-packages/google/oauth2/__init__.py:40: FutureWarning: You are using a Python version 3.9 past its end of life. Google will update google-auth with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade your Python version, and then update google-auth.
+  warnings.warn(eol_message.format("3.9"), FutureWarning)
+/Users/alesfraser-maraun/Desktop/BICI_replen_level_automation/backend/venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+Traceback (most recent call last):
+  File "/Users/alesfraser-maraun/Desktop/BICI_replen_level_automation/backend/venv/lib/python3.9/site-packages/gspread/client.py", line 168, in open_by_key
+    spreadsheet = Spreadsheet(self.http_client, {"id": key})
+  File "/Users/alesfraser-maraun/Desktop/BICI_replen_level_automation/backend/venv/lib/python3.9/site-packages/gspread/spreadsheet.py", line 29, in __init__
+    metadata = self.fetch_sheet_metadata()
+  File "/Users/alesfraser-maraun/Desktop/BICI_replen_level_automation/backend/venv/lib/python3.9/site-packages/gspread/spreadsheet.py", line 230, in fetch_sheet_metadata
+    return self.client.fetch_sheet_metadata(self.id, params=params)
+  File "/Users/alesfraser-maraun/Desktop/BICI_replen_level_automation/backend/venv/lib/python3.9/site-packages/gspread/http_client.py", line 305, in fetch_sheet_metadata
+    r = self.request("get", url, params=params)
+  File "/Users/alesfraser-maraun/Desktop/BICI_replen_level_automation/backend/venv/lib/python3.9/site-packages/gspread/http_client.py", line 128, in request
+    raise APIError(response)
+gspread.exceptions.APIError: APIError: [403]: Google Sheets API has not been used in project 338555440082 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/sheets.googleapis.com/overview?project=338555440082 then retry. If you enabled this API recently, wait a few minutes for the action to propagate to our systems and retry.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/alesfraser-maraun/Desktop/BICI_replen_level_automation/backend/test_sheets_sync.py", line 18, in test_sync
+    data = google_sheets.fetch_sheet_data(spreadsheet_id)
+  File "/Users/alesfraser-maraun/Desktop/BICI_replen_level_automation/backend/app/services/google_sheets.py", line 27, in fetch_sheet_data
+    spreadsheet = client.open_by_key(spreadsheet_id)
+  File "/Users/alesfraser-maraun/Desktop/BICI_replen_level_automation/backend/venv/lib/python3.9/site-packages/gspread/client.py", line 173, in open_by_key
+    raise PermissionError from ex
+PermissionError
+Using credentials from: /Users/alesfraser-maraun/Downloads/bici-klaviyo-datasync-58dbcac11e40.json
+Service Account Email: afmsbiciserviceaccount@bici-klaviyo-datasync.iam.gserviceaccount.com
+Fetching data from spreadsheet: 1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak...
+Error: 

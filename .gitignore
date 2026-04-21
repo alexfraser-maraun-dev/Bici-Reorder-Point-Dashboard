@@ -1,0 +1,30 @@
+# Dependencies
+backend/venv/
+frontend/node_modules/
+frontend/.next/
+
+# Environment / Credentials
+.env
+backend/.env
+frontend/.env
+*.json
+!package.json
+!tsconfig.json
+!backend/requirements.txt
+# Specifically exclude Google/Lightspeed tokens
+token.json
+client_secret*.json
+
+# Database
+*.db
+*.sqlite
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+backend/logs/
