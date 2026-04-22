@@ -458,21 +458,21 @@ export function SheetsReplenishment() {
                           </div>
                         </div>
                       </TableCell>
-                      <TableCell className="text-right font-mono text-[10px] tabular-nums bg-blue-50/5">
+                      <TableCell className="text-right font-mono text-[11px] tabular-nums bg-blue-50/5">
                         {item.forecast_30d}
                       </TableCell>
-                      <TableCell className="text-right font-mono text-[10px] tabular-nums bg-blue-50/5 border-r">
+                      <TableCell className="text-right font-mono text-[11px] tabular-nums bg-blue-50/5 border-r">
                         {item.forecast_60d}
                       </TableCell>
-                      <TableCell className="text-right font-mono text-xs tabular-nums">
+                      <TableCell className="text-right font-mono text-[11px] tabular-nums">
                         <span className={cn(item.on_hand <= item.recommended_reorder_point && item.recommended_reorder_point > 0 && "text-red-500 font-bold")}>
                           {item.on_hand}
                         </span>
                       </TableCell>
-                      <TableCell className="text-right font-mono text-[10px] tabular-nums text-muted-foreground">
+                      <TableCell className="text-right font-mono text-[11px] tabular-nums text-muted-foreground">
                         {item.on_order}
                       </TableCell>
-                      <TableCell className="text-right font-mono text-[10px] tabular-nums">
+                      <TableCell className="text-right font-mono text-[11px] tabular-nums">
                         <span className={cn(
                           item.days_stock <= 10 && item.daily_sales > 0 ? "text-red-500 font-bold" : "text-muted-foreground"
                         )}>
@@ -493,13 +493,13 @@ export function SheetsReplenishment() {
                       <TableCell className="text-right">
                         <Input 
                           defaultValue={item.recommended_reorder_point}
-                          className="h-5 w-12 ml-auto text-right text-[10px] font-mono tabular-nums bg-white border-blue-100 p-0 px-1"
+                          className="h-5 w-12 ml-auto text-right text-[11px] font-mono tabular-nums bg-white border-blue-100 p-0 px-1"
                         />
                       </TableCell>
                       <TableCell className="text-right">
                         <Input 
                           defaultValue={item.recommended_desired_level}
-                          className="h-5 w-12 ml-auto text-right text-[10px] font-mono tabular-nums bg-white border-purple-100 p-0 px-1"
+                          className="h-5 w-12 ml-auto text-right text-[11px] font-mono tabular-nums bg-white border-purple-100 p-0 px-1"
                         />
                       </TableCell>
                     </TableRow>
