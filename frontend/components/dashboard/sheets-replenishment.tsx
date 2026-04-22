@@ -365,6 +365,23 @@ export function SheetsReplenishment() {
               </Button>
             )}
           </div>
+          
+          {/* Status Legend */}
+          <div className="flex items-center gap-4 px-1 pt-1 border-t border-muted/30">
+            <span className="text-[10px] font-bold uppercase text-muted-foreground/60 mr-1">Status Legend:</span>
+            {[
+              { label: 'Critical', color: 'bg-red-500' },
+              { label: 'Low Stock', color: 'bg-orange-500' },
+              { label: 'Warning', color: 'bg-amber-500' },
+              { label: 'Healthy', color: 'bg-blue-500' },
+              { label: 'Optimal', color: 'bg-emerald-500' }
+            ].map((item) => (
+              <div key={item.label} className="flex items-center gap-1.5">
+                <div className={cn("w-2 h-2 rounded-full", item.color)} />
+                <span className="text-[10px] font-medium text-muted-foreground">{item.label}</span>
+              </div>
+            ))}
+          </div>
         </div>
 
         {/* Table Area */}

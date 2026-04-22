@@ -10,6 +10,7 @@ import {
   Settings,
   Package,
   Menu,
+  HelpCircle,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -24,6 +25,7 @@ const navigation = [
   { name: 'Recommendation Runs', href: '/runs', icon: History },
   { name: 'Writeback Audit', href: '/audit', icon: FileText },
   { name: 'Managed SKUs', href: '/managed-skus', icon: Package },
+  { name: 'How to Use Me', href: '/how-to-use', icon: HelpCircle },
 ]
 
 export function AppShell({ children }: { children: React.ReactNode }) {
