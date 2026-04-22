@@ -1,4 +1,11 @@
-export { default } from "next-auth/middleware"
+import { withAuth } from "next-auth/middleware"
+
+// More explicit export to satisfy the Next.js build checker
+export default withAuth({
+  callbacks: {
+    authorized: ({ token }) => !!token,
+  },
+})
 
 export const config = {
   matcher: [
