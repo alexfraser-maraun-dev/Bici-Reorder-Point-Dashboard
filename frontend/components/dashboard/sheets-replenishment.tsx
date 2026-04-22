@@ -381,6 +381,7 @@ export function SheetsReplenishment() {
                       onChange={toggleSelectAll}
                     />
                   </TableHead>
+                  <TableHead className="w-[60px] text-[9px] font-bold uppercase">Lead Time</TableHead>
                   <TableHead className="w-[70px]">
                     <button onClick={() => requestSort('urgency')} className="flex items-center gap-1 hover:text-foreground text-[9px] font-bold uppercase">
                       Status <ArrowUpDown className="w-2.5 h-2.5" />
@@ -391,21 +392,18 @@ export function SheetsReplenishment() {
                       Product Info <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[80px] text-right bg-blue-50/20 dark:bg-blue-900/10">
-                    <button onClick={() => requestSort('forecast_30d')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
-                      30d Sales <ArrowUpDown className="w-2.5 h-2.5" />
-                    </button>
-                  </TableHead>
+                  <TableHead className="w-[70px] text-right text-[9px] font-bold uppercase bg-blue-50/20">30d Fcst</TableHead>
+                  <TableHead className="w-[70px] text-right text-[9px] font-bold uppercase bg-blue-50/20 border-r">60d Fcst</TableHead>
                   <TableHead className="w-[50px] text-right text-[9px] font-bold uppercase">QOH</TableHead>
                   <TableHead className="w-[50px] text-right text-[9px] font-bold uppercase">QOO</TableHead>
-                  <TableHead className="w-[60px] text-right text-[9px] font-bold uppercase">Days</TableHead>
-                  <TableHead className="w-[80px] text-right bg-emerald-50/30 dark:bg-emerald-900/10 font-bold">
+                  <TableHead className="w-[60px] text-right text-[9px] font-bold uppercase">Cover</TableHead>
+                  <TableHead className="w-[80px] text-right bg-emerald-50/30 dark:bg-emerald-900/10 font-bold border-x">
                     <button onClick={() => requestSort('qty_to_order')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
                       Order <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[60px] text-right text-[9px] font-bold uppercase text-blue-600">Rec ROP</TableHead>
-                  <TableHead className="w-[60px] text-right text-[9px] font-bold uppercase text-purple-600">Rec DL</TableHead>
+                  <TableHead className="w-[60px] text-right text-[9px] font-bold uppercase text-blue-600">Reorder Point</TableHead>
+                  <TableHead className="w-[60px] text-right text-[9px] font-bold uppercase text-purple-600">Desired Level</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -443,6 +441,9 @@ export function SheetsReplenishment() {
                           onChange={() => toggleSelectItem(item.system_id)}
                         />
                       </TableCell>
+                      <TableCell className="text-[10px] font-mono font-medium text-muted-foreground">
+                        {item.lead_time}d
+                      </TableCell>
                       <TableCell>
                         <Badge className={cn("px-1 py-0 text-[7px] uppercase font-bold border-none", getUrgencyColor(item.urgency))}>
                           {getUrgencyLabel(item.urgency)}
@@ -457,12 +458,11 @@ export function SheetsReplenishment() {
                           </div>
                         </div>
                       </TableCell>
-                      <TableCell className="text-right font-mono text-xs tabular-nums bg-blue-50/5">
-                        <div className="flex items-center justify-end gap-1">
-                          {item.momentum === 'increasing' && <TrendingUp className="w-2 h-2 text-emerald-500" />}
-                          {item.momentum === 'decreasing' && <TrendingDown className="w-2 h-2 text-red-500" />}
-                          {item.forecast_30d}
-                        </div>
+                      <TableCell className="text-right font-mono text-[10px] tabular-nums bg-blue-50/5">
+                        {item.forecast_30d}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-[10px] tabular-nums bg-blue-50/5 border-r">
+                        {item.forecast_60d}
                       </TableCell>
                       <TableCell className="text-right font-mono text-xs tabular-nums">
                         <span className={cn(item.on_hand <= item.recommended_reorder_point && item.recommended_reorder_point > 0 && "text-red-500 font-bold")}>
@@ -479,7 +479,7 @@ export function SheetsReplenishment() {
                           {item.days_stock}d
                         </span>
                       </TableCell>
-                      <TableCell className="text-right bg-emerald-50/5">
+                      <TableCell className="text-right bg-emerald-50/5 border-x">
                         <div className="flex items-center justify-end gap-1">
                           <span className={cn(
                             "font-bold font-mono text-xs",
@@ -493,13 +493,13 @@ export function SheetsReplenishment() {
                       <TableCell className="text-right">
                         <Input 
                           defaultValue={item.recommended_reorder_point}
-                          className="h-5 w-10 ml-auto text-right text-[10px] bg-white border-blue-100 p-0"
+                          className="h-5 w-12 ml-auto text-right text-[10px] bg-white border-blue-100 p-0 px-1"
                         />
                       </TableCell>
                       <TableCell className="text-right">
                         <Input 
                           defaultValue={item.recommended_desired_level}
-                          className="h-5 w-10 ml-auto text-right text-[10px] bg-white border-purple-100 p-0"
+                          className="h-5 w-12 ml-auto text-right text-[10px] bg-white border-purple-100 p-0 px-1"
                         />
                       </TableCell>
                     </TableRow>

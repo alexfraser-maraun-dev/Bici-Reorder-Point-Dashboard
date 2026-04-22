@@ -24,7 +24,6 @@ const navigation = [
   { name: 'Recommendation Runs', href: '/runs', icon: History },
   { name: 'Writeback Audit', href: '/audit', icon: FileText },
   { name: 'Managed SKUs', href: '/managed-skus', icon: Package },
-  { name: 'Settings', href: '/settings', icon: Settings },
 ]
 
 export function AppShell({ children }: { children: React.ReactNode }) {
