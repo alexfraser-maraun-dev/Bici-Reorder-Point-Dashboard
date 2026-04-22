@@ -19,16 +19,6 @@ export function DashboardContent() {
             Manual Ingestion Workflow • Live Google Sheets Sync
           </p>
         </div>
-        
-        <div className="flex items-center gap-3">
-          <div className="flex flex-col items-end">
-            <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Lightspeed Status</span>
-            <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="text-sm font-semibold">Connected</span>
-            </div>
-          </div>
-        </div>
       </div>
 
       <Tabs defaultValue="inventory" className="w-full">
