@@ -391,32 +391,32 @@ export function SheetsReplenishment() {
                       Status <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[240px]">
+                  <TableHead className="w-[280px]">
                     <button onClick={() => requestSort('description')} className="flex items-center gap-1 hover:text-foreground text-[9px] font-bold uppercase">
                       Item Description <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[70px] text-right bg-blue-50/20">
+                  <TableHead className="w-[60px] text-right bg-blue-50/20">
                     <button onClick={() => requestSort('forecast_30d')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
                       30d Fcst <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[70px] text-right bg-blue-50/20 border-r">
+                  <TableHead className="w-[60px] text-right bg-blue-50/20 border-r">
                     <button onClick={() => requestSort('forecast_60d')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
                       60d Fcst <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[50px] text-right">
+                  <TableHead className="w-[42px] text-right">
                     <button onClick={() => requestSort('on_hand')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
                       QOH <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[50px] text-right">
+                  <TableHead className="w-[42px] text-right">
                     <button onClick={() => requestSort('on_order')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
                       QOO <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[60px] text-right">
+                  <TableHead className="w-[52px] text-right">
                     <button onClick={() => requestSort('days_stock')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
                       Cover <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
@@ -426,13 +426,13 @@ export function SheetsReplenishment() {
                       Order <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[60px] text-right text-blue-600">
-                    <button onClick={() => requestSort('recommended_reorder_point')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
+                  <TableHead className="w-[52px] text-right text-blue-600">
+                    <button onClick={() => requestSort('recommended_reorder_point')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase text-wrap leading-[1]">
                       Reorder Point <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[60px] text-right text-purple-600">
-                    <button onClick={() => requestSort('recommended_desired_level')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
+                  <TableHead className="w-[52px] text-right text-purple-600">
+                    <button onClick={() => requestSort('recommended_desired_level')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase text-wrap leading-[1]">
                       Desired Level <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
@@ -482,7 +482,7 @@ export function SheetsReplenishment() {
                         </Badge>
                       </TableCell>
                       <TableCell>
-                        <div className="flex flex-col w-[240px]">
+                        <div className="flex flex-col w-[280px]">
                           <a 
                             href={`https://us.merchantos.com/?name=item.views.item.edit&id=${item.system_id}`}
                             target="_blank"
