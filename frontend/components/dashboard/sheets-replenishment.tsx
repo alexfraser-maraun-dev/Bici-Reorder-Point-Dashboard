@@ -369,7 +369,7 @@ export function SheetsReplenishment() {
           
           {/* Status Legend */}
           <div className="flex items-center gap-4 px-1 pt-1 border-t border-muted/30">
-            <span className="text-[10px] font-bold uppercase text-muted-foreground/60 mr-1 flex items-center gap-1">
+            <span className="text-[10px] font-bold uppercase text-foreground/60 mr-1 flex items-center gap-1">
               Status Definitions <Info className="w-2.5 h-2.5 opacity-50" />:
             </span>
             {[
@@ -381,8 +381,8 @@ export function SheetsReplenishment() {
             ].map((item) => (
               <div key={item.label} className="flex items-center gap-1.5" title={item.desc}>
                 <div className={cn("w-2 h-2 rounded-full", item.color)} />
-                <span className="text-[10px] font-medium text-muted-foreground">
-                  {item.label} <span className="text-[9px] text-muted-foreground/50 ml-0.5">({item.desc})</span>
+                <span className="text-[10px] font-bold text-foreground/80">
+                  {item.label} <span className="text-[9px] text-foreground/40 ml-0.5 font-medium">({item.desc})</span>
                 </span>
               </div>
             ))}
