@@ -391,7 +391,7 @@ export function SheetsReplenishment() {
                       Status <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="min-w-[300px]">
+                  <TableHead className="w-[240px]">
                     <button onClick={() => requestSort('description')} className="flex items-center gap-1 hover:text-foreground text-[9px] font-bold uppercase">
                       Item Description <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
@@ -482,18 +482,19 @@ export function SheetsReplenishment() {
                         </Badge>
                       </TableCell>
                       <TableCell>
-                        <div className="flex flex-col min-w-[300px]">
+                        <div className="flex flex-col w-[240px]">
                           <a 
                             href={`https://us.merchantos.com/?name=item.views.item.edit&id=${item.system_id}`}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="font-semibold text-xs leading-tight mb-0.5 hover:text-blue-600 hover:underline transition-all"
+                            className="font-semibold text-xs leading-tight mb-0.5 hover:text-blue-600 hover:underline transition-all truncate"
+                            title={item.description}
                           >
                             {item.description}
                           </a>
                           <div className="flex items-center gap-1.5 text-[8px] text-muted-foreground">
-                            <span className="bg-muted px-1 rounded font-mono">{item.sku}</span>
-                            <span className="font-medium text-foreground/70">{item.brand}</span>
+                            <span className="bg-muted px-1 rounded font-mono truncate">{item.sku}</span>
+                            <span className="font-medium text-foreground/70 truncate">{item.brand}</span>
                           </div>
                         </div>
                       </TableCell>
