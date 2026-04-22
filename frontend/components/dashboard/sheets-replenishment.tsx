@@ -381,7 +381,11 @@ export function SheetsReplenishment() {
                       onChange={toggleSelectAll}
                     />
                   </TableHead>
-                  <TableHead className="w-[60px] text-[9px] font-bold uppercase">Lead Time</TableHead>
+                  <TableHead className="w-[60px]">
+                    <button onClick={() => requestSort('lead_time')} className="flex items-center gap-1 hover:text-foreground text-[9px] font-bold uppercase">
+                      Lead Time <ArrowUpDown className="w-2.5 h-2.5" />
+                    </button>
+                  </TableHead>
                   <TableHead className="w-[70px]">
                     <button onClick={() => requestSort('urgency')} className="flex items-center gap-1 hover:text-foreground text-[9px] font-bold uppercase">
                       Status <ArrowUpDown className="w-2.5 h-2.5" />
@@ -392,18 +396,46 @@ export function SheetsReplenishment() {
                       Product Info <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[70px] text-right text-[9px] font-bold uppercase bg-blue-50/20">30d Fcst</TableHead>
-                  <TableHead className="w-[70px] text-right text-[9px] font-bold uppercase bg-blue-50/20 border-r">60d Fcst</TableHead>
-                  <TableHead className="w-[50px] text-right text-[9px] font-bold uppercase">QOH</TableHead>
-                  <TableHead className="w-[50px] text-right text-[9px] font-bold uppercase">QOO</TableHead>
-                  <TableHead className="w-[60px] text-right text-[9px] font-bold uppercase">Cover</TableHead>
+                  <TableHead className="w-[70px] text-right bg-blue-50/20">
+                    <button onClick={() => requestSort('forecast_30d')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
+                      30d Fcst <ArrowUpDown className="w-2.5 h-2.5" />
+                    </button>
+                  </TableHead>
+                  <TableHead className="w-[70px] text-right bg-blue-50/20 border-r">
+                    <button onClick={() => requestSort('forecast_60d')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
+                      60d Fcst <ArrowUpDown className="w-2.5 h-2.5" />
+                    </button>
+                  </TableHead>
+                  <TableHead className="w-[50px] text-right">
+                    <button onClick={() => requestSort('on_hand')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
+                      QOH <ArrowUpDown className="w-2.5 h-2.5" />
+                    </button>
+                  </TableHead>
+                  <TableHead className="w-[50px] text-right">
+                    <button onClick={() => requestSort('on_order')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
+                      QOO <ArrowUpDown className="w-2.5 h-2.5" />
+                    </button>
+                  </TableHead>
+                  <TableHead className="w-[60px] text-right">
+                    <button onClick={() => requestSort('days_stock')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
+                      Cover <ArrowUpDown className="w-2.5 h-2.5" />
+                    </button>
+                  </TableHead>
                   <TableHead className="w-[80px] text-right bg-emerald-50/30 dark:bg-emerald-900/10 font-bold border-x">
                     <button onClick={() => requestSort('qty_to_order')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
                       Order <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[60px] text-right text-[9px] font-bold uppercase text-blue-600">Reorder Point</TableHead>
-                  <TableHead className="w-[60px] text-right text-[9px] font-bold uppercase text-purple-600">Desired Level</TableHead>
+                  <TableHead className="w-[60px] text-right text-blue-600">
+                    <button onClick={() => requestSort('recommended_reorder_point')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
+                      Reorder Point <ArrowUpDown className="w-2.5 h-2.5" />
+                    </button>
+                  </TableHead>
+                  <TableHead className="w-[60px] text-right text-purple-600">
+                    <button onClick={() => requestSort('recommended_desired_level')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
+                      Desired Level <ArrowUpDown className="w-2.5 h-2.5" />
+                    </button>
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
