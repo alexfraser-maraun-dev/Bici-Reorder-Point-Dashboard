@@ -482,7 +482,7 @@ export function SheetsReplenishment() {
                       <TableCell className="text-right bg-emerald-50/5 border-x">
                         <div className="flex items-center justify-end gap-1">
                           <span className={cn(
-                            "font-bold font-mono text-xs",
+                            "font-bold font-mono text-[11px] tabular-nums",
                             item.qty_to_order > 0 ? "text-emerald-600" : "text-muted-foreground/20"
                           )}>
                             {item.qty_to_order}
@@ -493,13 +493,13 @@ export function SheetsReplenishment() {
                       <TableCell className="text-right">
                         <Input 
                           defaultValue={item.recommended_reorder_point}
-                          className="h-5 w-12 ml-auto text-right text-[10px] bg-white border-blue-100 p-0 px-1"
+                          className="h-5 w-12 ml-auto text-right text-[10px] font-mono tabular-nums bg-white border-blue-100 p-0 px-1"
                         />
                       </TableCell>
                       <TableCell className="text-right">
                         <Input 
                           defaultValue={item.recommended_desired_level}
-                          className="h-5 w-12 ml-auto text-right text-[10px] bg-white border-purple-100 p-0 px-1"
+                          className="h-5 w-12 ml-auto text-right text-[10px] font-mono tabular-nums bg-white border-purple-100 p-0 px-1"
                         />
                       </TableCell>
                     </TableRow>
