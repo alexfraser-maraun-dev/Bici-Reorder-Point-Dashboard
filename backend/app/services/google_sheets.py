@@ -190,15 +190,24 @@ def process_recommendations(parsed_data: List[Dict[str, Any]], safety_days: int 
             margin = row.get(f"{loc}|Sale Line Margin", "0%")
             qty_sold = clean_float(row.get(f"{loc}|Sale Line Quantity Sold"))
 
-            # Calculate Urgency (Gradient rating)
+            # Calculate Urgency (Gradient rating) - PROACTIVE CALIBRATION
             urgency = 0
-            if new_reorder_point > 0:
-                stock_ratio = on_hand / new_reorder_point
-                if stock_ratio <= 0.2: urgency = 5 # Critical
-                elif stock_ratio <= 0.5: urgency = 4 # High
-                elif stock_ratio <= 0.8: urgency = 3 # Medium
-                elif stock_ratio <= 1.0: urgency = 2 # Low
-                else: urgency = 1 # Healthy
+            if new_desired_level > 0 and new_reorder_point > 0:
+                if on_hand >= (new_desired_level * 0.8): 
+                    urgency = 1 # Optimal (Stocked near Desired Level)
+                elif on_hand > (new_reorder_point * 1.15):
+                    urgency = 2 # Healthy (Safe buffer above ROP)
+                elif on_hand > new_reorder_point:
+                    urgency = 3 # Warning (Approaching ROP - Order Soon)
+                elif on_hand > (new_reorder_point * 0.5):
+                    urgency = 4 # Low Stock (Dipping into Safety Stock)
+                else:
+                    urgency = 5 # Critical (Dangerously low)
+            elif new_reorder_point > 0:
+                # Fallback if DL is not set
+                if on_hand > (new_reorder_point * 1.15): urgency = 2
+                elif on_hand > new_reorder_point: urgency = 3
+                else: urgency = 5
             
             # Momentum Indicator
             momentum = "stable"

@@ -372,11 +372,11 @@ export function SheetsReplenishment() {
               Status Definitions <Info className="w-2.5 h-2.5 opacity-50" />:
             </span>
             {[
-              { label: 'Critical', color: 'bg-red-500', desc: '<20% of ROP' },
-              { label: 'Low Stock', color: 'bg-orange-500', desc: '20-50% of ROP' },
-              { label: 'Warning', color: 'bg-amber-500', desc: '50-80% of ROP' },
-              { label: 'Healthy', color: 'bg-blue-500', desc: '80-100% of ROP' },
-              { label: 'Optimal', color: 'bg-emerald-500', desc: '>100% of ROP' }
+              { label: 'Critical', color: 'bg-red-500', desc: '<50% of ROP' },
+              { label: 'Low Stock', color: 'bg-orange-500', desc: '50-100% of ROP' },
+              { label: 'Warning', color: 'bg-amber-500', desc: '100-115% of ROP' },
+              { label: 'Healthy', color: 'bg-blue-500', desc: '>115% of ROP' },
+              { label: 'Optimal', color: 'bg-emerald-500', desc: '>80% of Desired Level' }
             ].map((item) => (
               <div key={item.label} className="flex items-center gap-1.5" title={item.desc}>
                 <div className={cn("w-2 h-2 rounded-full", item.color)} />
