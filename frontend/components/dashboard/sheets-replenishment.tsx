@@ -285,7 +285,7 @@ export function SheetsReplenishment() {
             disabled={isLoading}
           >
             <RefreshCw className={cn("w-3 h-3", isLoading && "animate-spin")} />
-            {isLoading ? "Syncing..." : "Sync Google Sheets"}
+            {isLoading ? "Syncing..." : "Sync Product Data"}
           </Button>
         </div>
       </div>
@@ -452,7 +452,7 @@ export function SheetsReplenishment() {
                     <TableCell colSpan={10} className="h-64 text-center">
                       <div className="flex flex-col items-center gap-2 text-muted-foreground">
                         <AlertCircle className="w-8 h-8 opacity-20" />
-                        <p className="font-semibold">No matches found in Google Sheets.</p>
+                        <p className="font-semibold">No matches found in synced product data.</p>
                       </div>
                     </TableCell>
                   </TableRow>
