@@ -15,4 +15,4 @@ services:
     startCommand: npm start
     envVars:
       - key: NODE_VERSION
-        value: 18.17.0
+        value: 20.9.0
