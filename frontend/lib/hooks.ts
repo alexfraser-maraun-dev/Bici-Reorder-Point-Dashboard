@@ -163,7 +163,8 @@ export function useManagedSkus() {
   const fetchData = useCallback(async () => {
     setIsLoading(true)
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/skus')
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+      const response = await fetch(`${baseUrl}/api/skus`)
       if (!response.ok) {
         throw new Error('Failed to fetch managed SKUs')
       }
@@ -220,7 +221,8 @@ export function useReplenishmentData(forecastPeriod?: number, safetyDays: number
     setIsLoading(true)
     setError(null)
     try {
-      let url = 'http://127.0.0.1:8000/api/replenishment/data?'
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+      let url = `${baseUrl}/api/replenishment/data?`
       if (forecastPeriod) url += `forecast_period=${forecastPeriod}&`
       url += `safety_days=${safetyDays}&`
       url += `growth_multiplier=${growthMultiplier}`
@@ -254,7 +256,8 @@ export function useVendorLeadTimes() {
     setIsLoading(true)
     setError(null)
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/replenishment/vendor-lead-times')
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+      const response = await fetch(`${baseUrl}/api/replenishment/vendor-lead-times`)
       if (!response.ok) {
         throw new Error('Failed to fetch vendor lead times')
       }

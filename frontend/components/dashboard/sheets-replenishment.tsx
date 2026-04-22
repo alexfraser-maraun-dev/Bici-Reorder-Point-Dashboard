@@ -149,7 +149,8 @@ export function SheetsReplenishment() {
 
     setIsPushing(true)
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/replenishment/push', {
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+      const response = await fetch(`${baseUrl}/api/replenishment/push`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(itemsToPush)
