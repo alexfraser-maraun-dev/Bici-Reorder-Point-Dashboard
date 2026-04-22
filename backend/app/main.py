@@ -244,7 +244,33 @@ async def push_replenishment_updates(updates: List[Dict[str, Any]], db: Session 
 async def get_writeback_logs(limit: int = 100, db: Session = Depends(get_db)):
     from app.db.models import WritebackLog
     logs = db.query(WritebackLog).order_by(desc(WritebackLog.created_at)).limit(limit).all()
-    return logs
+    # Format for frontend
+    return [{
+        "id": log.id,
+        "timestamp": log.created_at.isoformat(),
+        "user": log.triggered_by,
+        "sku": log.sku,
+        "location": log.location_id,
+        "field": "reorder_point" if log.new_reorder_point != log.old_reorder_point else "desired_level",
+        "oldValue": log.old_reorder_point if log.new_reorder_point != log.old_reorder_point else log.old_desired_inventory,
+        "newValue": log.new_reorder_point if log.new_reorder_point != log.old_reorder_point else log.new_desired_inventory,
+        "status": log.status,
+        "errorMessage": log.error_message
+    } for log in logs]
+
+@app.get("/api/replenishment/runs")
+async def get_recommendation_runs(limit: int = 50, db: Session = Depends(get_db)):
+    from app.db.models import RecommendationRun
+    runs = db.query(RecommendationRun).order_by(desc(RecommendationRun.started_at)).limit(limit).all()
+    return [{
+        "id": str(run.id),
+        "timestamp": run.started_at.isoformat(),
+        "type": run.run_type,
+        "triggeredBy": run.triggered_by or "System",
+        "status": run.status,
+        "rowCount": run.row_count or 0,
+        "duration": "N/A" # Could calculate if needed
+    } for run in runs]
 
 @app.get("/api/replenishment/vendor-lead-times")
 async def get_vendor_lead_times():

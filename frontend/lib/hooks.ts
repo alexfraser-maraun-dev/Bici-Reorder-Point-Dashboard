@@ -112,22 +112,28 @@ export function useRecommendationRuns() {
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<Error | null>(null)
 
-  useEffect(() => {
-    const fetchData = async () => {
-      setIsLoading(true)
-      try {
-        await simulateDelay(400)
-        setData(generateMockRecommendationRuns())
-      } catch (err) {
-        setError(err as Error)
-      } finally {
-        setIsLoading(false)
+  const fetchData = useCallback(async () => {
+    setIsLoading(true)
+    try {
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+      const response = await fetch(`${baseUrl}/api/replenishment/runs`)
+      if (!response.ok) {
+        throw new Error('Failed to fetch recommendation runs')
       }
+      const json = await response.json()
+      setData(json)
+    } catch (err) {
+      setError(err as Error)
+    } finally {
+      setIsLoading(false)
     }
-    fetchData()
   }, [])
 
-  return { data, isLoading, error }
+  useEffect(() => {
+    fetchData()
+  }, [fetchData])
+
+  return { data, isLoading, error, refetch: fetchData }
 }
 
 // Hook for writeback audit
@@ -136,22 +142,28 @@ export function useWritebackAudit() {
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<Error | null>(null)
 
-  useEffect(() => {
-    const fetchData = async () => {
-      setIsLoading(true)
-      try {
-        await simulateDelay(400)
-        setData(generateMockWritebackAudit())
-      } catch (err) {
-        setError(err as Error)
-      } finally {
-        setIsLoading(false)
+  const fetchData = useCallback(async () => {
+    setIsLoading(true)
+    try {
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+      const response = await fetch(`${baseUrl}/api/replenishment/logs`)
+      if (!response.ok) {
+        throw new Error('Failed to fetch writeback audit')
       }
+      const json = await response.json()
+      setData(json)
+    } catch (err) {
+      setError(err as Error)
+    } finally {
+      setIsLoading(false)
     }
-    fetchData()
   }, [])
 
-  return { data, isLoading, error }
+  useEffect(() => {
+    fetchData()
+  }, [fetchData])
+
+  return { data, isLoading, error, refetch: fetchData }
 }
 
 // Hook for managed SKUs
