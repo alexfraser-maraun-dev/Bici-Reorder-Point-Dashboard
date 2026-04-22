@@ -72,14 +72,22 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </Sheet>
 
           {/* Logo */}
-          <div className="flex items-center gap-2">
-            <div className="bg-primary flex h-8 w-8 items-center justify-center rounded-md">
-              <Package className="text-primary-foreground h-4 w-4" />
+          <div className="flex items-center gap-4">
+            <div className="flex items-center">
+              <svg 
+                viewBox="0 0 160 40" 
+                className="h-8 w-auto fill-primary" 
+                aria-label="Bici Logo"
+              >
+                <path d="M0 0h14.5v30c0 5.5 4.5 10 10 10h10.5v-13h-6c-2.8 0-5-2.2-5-5V0H0zm50.5 0h14.5v40H50.5V0zM85 10c0-5.5 4.5-10 10-10h28.5c5.5 0 10 4.5 10 10v20c0 5.5-4.5 10-10 10H95c-5.5 0-10-4.5-10-10V10zm14.5 2h19v16h-19V12zM150 0h14.5v40H150V0z" />
+                <circle cx="57.75" cy="5" r="5" className="fill-primary" />
+                <circle cx="157.25" cy="5" r="5" className="fill-primary" />
+              </svg>
             </div>
-            <span className="hidden font-semibold sm:inline-block">
-              SKU Reorder Point & Desired Inventory
+            <div className="h-6 w-[1px] bg-muted mx-1 hidden sm:block" />
+            <span className="hidden font-semibold text-foreground/80 tracking-tight sm:inline-block">
+              Inventory Replenishment
             </span>
-            <span className="font-semibold sm:hidden">SKU Automation</span>
           </div>
 
           {/* Desktop navigation */}
