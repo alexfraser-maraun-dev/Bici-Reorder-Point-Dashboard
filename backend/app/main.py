@@ -184,6 +184,7 @@ async def get_replenishment_data(forecast_period: int = None, safety_days: int =
         
         # Update run status
         new_run.status = "completed"
+        new_run.row_count = len(recommendations)
         new_run.completed_at = func.now()
         db.commit()
         

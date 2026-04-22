@@ -39,6 +39,7 @@ class RecommendationRun(Base):
     started_at = Column(DateTime(timezone=True), server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
     status = Column(String) # 'running', 'completed', 'failed'
+    row_count = Column(Integer, nullable=True)
 
 class RecommendationRow(Base):
     __tablename__ = "recommendation_rows"
