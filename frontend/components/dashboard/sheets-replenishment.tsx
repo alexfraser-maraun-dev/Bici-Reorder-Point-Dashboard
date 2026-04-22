@@ -382,7 +382,7 @@ export function SheetsReplenishment() {
               <div key={item.label} className="flex items-center gap-1.5" title={item.desc}>
                 <div className={cn("w-2 h-2 rounded-full", item.color)} />
                 <span className="text-[10px] font-bold text-foreground/80">
-                  {item.label} <span className="text-[9px] text-foreground/40 ml-0.5 font-medium">({item.desc})</span>
+                  {item.label} <span className="text-[9px] text-foreground/60 ml-0.5 font-medium">({item.desc})</span>
                 </span>
               </div>
             ))}
