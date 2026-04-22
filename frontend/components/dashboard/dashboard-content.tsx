@@ -12,8 +12,8 @@ export function DashboardContent() {
       {/* Page header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text">
-            Replenishment Automation
+          <h1 className="text-3xl font-bold tracking-tight">
+            Reorder Point Config Tool
           </h1>
           <p className="text-muted-foreground text-sm font-medium mt-1">
             Manual Ingestion Workflow • Live Google Sheets Sync

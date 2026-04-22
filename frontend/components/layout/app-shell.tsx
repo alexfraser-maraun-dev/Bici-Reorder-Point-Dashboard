@@ -82,7 +82,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </div>
             <div className="h-6 w-[1px] bg-muted mx-1 hidden sm:block" />
             <span className="hidden font-semibold text-foreground/80 tracking-tight sm:inline-block">
-              Inventory Replenishment
+              Reorder Point Config Tool
             </span>
           </div>
 
