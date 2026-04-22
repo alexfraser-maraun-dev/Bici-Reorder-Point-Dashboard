@@ -368,17 +368,21 @@ export function SheetsReplenishment() {
           
           {/* Status Legend */}
           <div className="flex items-center gap-4 px-1 pt-1 border-t border-muted/30">
-            <span className="text-[10px] font-bold uppercase text-muted-foreground/60 mr-1">Status Legend:</span>
+            <span className="text-[10px] font-bold uppercase text-muted-foreground/60 mr-1 flex items-center gap-1">
+              Status Definitions <Info className="w-2.5 h-2.5 opacity-50" />:
+            </span>
             {[
-              { label: 'Critical', color: 'bg-red-500' },
-              { label: 'Low Stock', color: 'bg-orange-500' },
-              { label: 'Warning', color: 'bg-amber-500' },
-              { label: 'Healthy', color: 'bg-blue-500' },
-              { label: 'Optimal', color: 'bg-emerald-500' }
+              { label: 'Critical', color: 'bg-red-500', desc: '<20% of ROP' },
+              { label: 'Low Stock', color: 'bg-orange-500', desc: '20-50% of ROP' },
+              { label: 'Warning', color: 'bg-amber-500', desc: '50-80% of ROP' },
+              { label: 'Healthy', color: 'bg-blue-500', desc: '80-100% of ROP' },
+              { label: 'Optimal', color: 'bg-emerald-500', desc: '>100% of ROP' }
             ].map((item) => (
-              <div key={item.label} className="flex items-center gap-1.5">
+              <div key={item.label} className="flex items-center gap-1.5" title={item.desc}>
                 <div className={cn("w-2 h-2 rounded-full", item.color)} />
-                <span className="text-[10px] font-medium text-muted-foreground">{item.label}</span>
+                <span className="text-[10px] font-medium text-muted-foreground">
+                  {item.label} <span className="text-[9px] text-muted-foreground/50 ml-0.5">({item.desc})</span>
+                </span>
               </div>
             ))}
           </div>
