@@ -18,9 +18,9 @@ export default function HowToUsePage() {
     <AppShell>
       <div className="max-w-4xl mx-auto space-y-8 py-4 animate-in fade-in slide-in-from-bottom-4 duration-700">
         <div className="space-y-2">
-          <h1 className="text-3xl font-bold tracking-tight">How to Use the Reorder Point Config Tool</h1>
+          <h1 className="text-3xl font-bold tracking-tight">How the Config Tool Works</h1>
           <p className="text-muted-foreground text-lg">
-            A comprehensive guide to managing your inventory replenishment and Lightspeed updates.
+            A comprehensive guide to the proactive logic, metrics, and workflows powering your replenishment.
           </p>
         </div>
 
@@ -48,20 +48,21 @@ export default function HowToUsePage() {
           <Card className="shadow-sm border-purple-100 bg-purple-50/10">
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-purple-700">
-                <Zap className="w-5 h-5" /> 2. Analyze & Filter
+                <Zap className="w-5 h-5" /> 2. Proactive Analysis
               </CardTitle>
-              <CardDescription>Finding what needs your attention</CardDescription>
+              <CardDescription>Understanding the Urgency logic</CardDescription>
             </CardHeader>
             <CardContent className="text-sm space-y-3">
               <p>
-                Use the <strong>Filters</strong> to narrow down by Category, Brand, or Vendor. 
-                Pay close attention to the <strong>Status</strong> icons:
+                The tool uses a <strong>proactive buffer</strong> to warn you before you hit your Reorder Point. 
+                Pay attention to the status icons:
               </p>
-              <ul className="grid grid-cols-2 gap-2 mt-2">
-                <li className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-red-500"/> Critical</li>
-                <li className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-orange-500"/> Low Stock</li>
-                <li className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-amber-500"/> Warning</li>
-                <li className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-blue-500"/> Healthy</li>
+              <ul className="grid grid-cols-1 gap-2 mt-2">
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-emerald-500"/> <strong>Optimal:</strong> Stock is &gt; 80% of your Desired Level.</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-blue-500"/> <strong>Healthy:</strong> Stock is safe (&gt; 115% of your Reorder Point).</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-amber-500"/> <strong>Warning:</strong> Order now (Stock is 100-115% of ROP).</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-orange-500"/> <strong>Low Stock:</strong> Dipping into safety stock (50-100% of ROP).</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-red-500"/> <strong>Critical:</strong> Stock-out imminent (&lt; 50% of ROP).</li>
               </ul>
             </CardContent>
           </Card>
