@@ -23,7 +23,6 @@ import {
 } from "@/components/ui/select"
 import { 
   Store, 
-  AlertCircle, 
   MapPin,
   RefreshCw,
   Search,
@@ -37,7 +36,9 @@ import {
   Minus,
   ShoppingCart,
   Zap,
-  CheckCircle2
+  CircleCheck,
+  CircleAlert,
+  Info
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -394,7 +395,7 @@ export function SheetsReplenishment() {
             <Table>
               <TableHeader className="bg-muted/50 sticky top-0 z-10 backdrop-blur-sm">
                 <TableRow className="hover:bg-transparent border-none">
-                  <TableHead className="w-[40px] px-2">
+                  <TableHead className="w-[34px] px-2">
                     <input 
                       type="checkbox" 
                       className="rounded border-muted-foreground/30 accent-blue-600"
@@ -402,59 +403,59 @@ export function SheetsReplenishment() {
                       onChange={toggleSelectAll}
                     />
                   </TableHead>
-                  <TableHead className="w-[60px]">
+                  <TableHead className="w-[54px]">
                     <button onClick={() => requestSort('lead_time')} className="flex items-center gap-1 hover:text-foreground text-[9px] font-bold uppercase">
-                      Lead Time <ArrowUpDown className="w-2.5 h-2.5" />
+                      Lead <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[70px]">
+                  <TableHead className="w-[66px]">
                     <button onClick={() => requestSort('urgency')} className="flex items-center gap-1 hover:text-foreground text-[9px] font-bold uppercase">
                       Status <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[280px]">
+                  <TableHead className="w-[330px]">
                     <button onClick={() => requestSort('description')} className="flex items-center gap-1 hover:text-foreground text-[9px] font-bold uppercase">
                       Item Description <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[60px] text-right bg-blue-50/20">
+                  <TableHead className="w-[56px] text-right bg-blue-50/20">
                     <button onClick={() => requestSort('forecast_30d')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
-                      30d Fcst <ArrowUpDown className="w-2.5 h-2.5" />
+                      30d <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[60px] text-right bg-blue-50/20 border-r">
+                  <TableHead className="w-[56px] text-right bg-blue-50/20 border-r">
                     <button onClick={() => requestSort('forecast_60d')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
-                      60d Fcst <ArrowUpDown className="w-2.5 h-2.5" />
+                      60d <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[42px] text-right">
+                  <TableHead className="w-[38px] text-right">
                     <button onClick={() => requestSort('on_hand')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
                       QOH <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[42px] text-right">
+                  <TableHead className="w-[38px] text-right">
                     <button onClick={() => requestSort('on_order')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
                       QOO <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[52px] text-right">
+                  <TableHead className="w-[48px] text-right">
                     <button onClick={() => requestSort('days_stock')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
                       Cover <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[80px] text-right bg-emerald-50/30 dark:bg-emerald-900/10 font-bold border-x">
+                  <TableHead className="w-[74px] text-right bg-emerald-50/30 dark:bg-emerald-900/10 font-bold border-x">
                     <button onClick={() => requestSort('qty_to_order')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
                       Order <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[52px] text-right text-blue-600">
+                  <TableHead className="w-[48px] text-right text-blue-600">
                     <button onClick={() => requestSort('recommended_reorder_point')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase text-wrap leading-[1]">
-                      Reorder Point <ArrowUpDown className="w-2.5 h-2.5" />
+                      ROP <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[52px] text-right text-purple-600">
+                  <TableHead className="w-[48px] text-right text-purple-600">
                     <button onClick={() => requestSort('recommended_desired_level')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase text-wrap leading-[1]">
-                      Desired Level <ArrowUpDown className="w-2.5 h-2.5" />
+                      DL <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
                 </TableRow>
@@ -472,7 +473,7 @@ export function SheetsReplenishment() {
                   <TableRow>
                     <TableCell colSpan={10} className="h-64 text-center">
                       <div className="flex flex-col items-center gap-2 text-muted-foreground">
-                        <AlertCircle className="w-8 h-8 opacity-20" />
+                        <CircleAlert className="w-8 h-8 opacity-20" />
                         <p className="font-semibold">No matches found in synced product data.</p>
                       </div>
                     </TableCell>
@@ -503,7 +504,7 @@ export function SheetsReplenishment() {
                         </Badge>
                       </TableCell>
                       <TableCell>
-                        <div className="flex flex-col w-[280px]">
+                        <div className="flex flex-col w-[330px]">
                           <a 
                             href={`https://us.merchantos.com/?name=item.views.item.edit&id=${item.system_id}`}
                             target="_blank"
@@ -520,7 +521,11 @@ export function SheetsReplenishment() {
                         </div>
                       </TableCell>
                       <TableCell className="text-right font-mono text-[11px] tabular-nums bg-blue-50/5">
-                        {item.forecast_30d}
+                        <div className="flex items-center justify-end gap-1">
+                          {item.momentum === 'increasing' && <TrendingUp className="w-2.5 h-2.5 text-emerald-500" />}
+                          {item.momentum === 'decreasing' && <TrendingDown className="w-2.5 h-2.5 text-red-500" />}
+                          {item.forecast_30d}
+                        </div>
                       </TableCell>
                       <TableCell className="text-right font-mono text-[11px] tabular-nums bg-blue-50/5 border-r">
                         {item.forecast_60d}
@@ -598,7 +603,7 @@ export function SheetsReplenishment() {
                   </>
                 ) : pushSuccess ? (
                   <>
-                    <CheckCircle2 className="w-3.5 h-3.5 mr-2" />
+                    <CircleCheck className="w-3.5 h-3.5 mr-2" />
                     Pushed Successfully!
                   </>
                 ) : (
