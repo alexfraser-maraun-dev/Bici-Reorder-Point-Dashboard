@@ -260,17 +260,40 @@ async def get_writeback_logs(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/api/replenishment/runs")
 async def get_recommendation_runs(limit: int = 50, db: Session = Depends(get_db)):
-    from app.db.models import RecommendationRun
+    from app.db.models import RecommendationRun, RecommendationRow
+    from sqlalchemy import func
+    
     runs = db.query(RecommendationRun).order_by(desc(RecommendationRun.started_at)).limit(limit).all()
-    return [{
-        "id": str(run.id),
-        "timestamp": run.started_at.isoformat(),
-        "type": run.run_type,
-        "triggeredBy": run.triggered_by or "System",
-        "status": run.status,
-        "rowCount": run.row_count or 0,
-        "duration": "N/A" # Could calculate if needed
-    } for run in runs]
+    
+    results = []
+    for run in runs:
+        # Calculate summaries from recommendation rows
+        summary = db.query(
+            func.count(RecommendationRow.id).label("total"),
+            func.sum(func.cast(RecommendationRow.changed_flag, Integer)).label("changed"),
+            func.sum(func.cast(RecommendationRow.needs_order, Integer)).label("needs_order")
+        ).filter(RecommendationRow.run_id == run.id).first()
+        
+        duration = "N/A"
+        if run.completed_at and run.started_at:
+            delta = run.completed_at - run.started_at
+            duration = f"{delta.total_seconds():.1f}s"
+            
+        results.append({
+            "id": str(run.id),
+            "runDate": run.started_at.isoformat(),
+            "type": run.run_type,
+            "triggeredBy": run.triggered_by or "System",
+            "status": run.status,
+            "totalRows": summary.total if summary and summary.total else (run.row_count or 0),
+            "changedRows": summary.changed if summary and summary.changed else 0,
+            "needsOrderCount": summary.needs_order if summary and summary.needs_order else 0,
+            "duration": duration,
+            "trailingDays": 30, # Defaulting for now as it's not in the run model
+            "forecastDays": 60,
+            "safetyDays": 7
+        })
+    return results
 
 @app.get("/api/replenishment/vendor-lead-times")
 async def get_vendor_lead_times():
