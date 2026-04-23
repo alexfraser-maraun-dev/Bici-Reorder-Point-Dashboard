@@ -19,5 +19,5 @@ COPY . .
 # Expose the port
 EXPOSE 8000
 
-# Start command
-CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "app.main:app", "--bind", "0.0.0.0:8000"]
+# Start command using shell form to expand environment variables
+CMD gunicorn -w 4 -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:${PORT:-8000}
