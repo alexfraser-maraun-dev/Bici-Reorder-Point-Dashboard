@@ -244,19 +244,56 @@ async def push_replenishment_updates(updates: List[Dict[str, Any]], db: Session 
 async def get_writeback_logs(limit: int = 100, db: Session = Depends(get_db)):
     from app.db.models import WritebackLog
     logs = db.query(WritebackLog).order_by(desc(WritebackLog.created_at)).limit(limit).all()
-    # Format for frontend
-    return [{
-        "id": log.id,
-        "timestamp": log.created_at.isoformat(),
-        "user": log.triggered_by,
-        "sku": log.sku,
-        "location": log.location_id,
-        "field": "reorder_point" if log.new_reorder_point != log.old_reorder_point else "desired_level",
-        "oldValue": log.old_reorder_point if log.new_reorder_point != log.old_reorder_point else log.old_desired_inventory,
-        "newValue": log.new_reorder_point if log.new_reorder_point != log.old_reorder_point else log.new_desired_inventory,
-        "status": log.status,
-        "errorMessage": log.error_message
-    } for log in logs]
+    
+    formatted_logs = []
+    for log in logs:
+        rop_changed = log.new_reorder_point != log.old_reorder_point
+        dl_changed = log.new_desired_inventory != log.old_desired_inventory
+        
+        if not rop_changed and not dl_changed:
+            formatted_logs.append({
+                "id": f"{log.id}",
+                "timestamp": log.created_at.isoformat(),
+                "user": log.triggered_by,
+                "sku": log.sku,
+                "location": log.location_id,
+                "field": "reorder_point",
+                "oldValue": log.old_reorder_point,
+                "newValue": log.new_reorder_point,
+                "status": log.status,
+                "errorMessage": log.error_message
+            })
+            continue
+            
+        if rop_changed:
+            formatted_logs.append({
+                "id": f"{log.id}-rop",
+                "timestamp": log.created_at.isoformat(),
+                "user": log.triggered_by,
+                "sku": log.sku,
+                "location": log.location_id,
+                "field": "reorder_point",
+                "oldValue": log.old_reorder_point,
+                "newValue": log.new_reorder_point,
+                "status": log.status,
+                "errorMessage": log.error_message
+            })
+            
+        if dl_changed:
+            formatted_logs.append({
+                "id": f"{log.id}-dl",
+                "timestamp": log.created_at.isoformat(),
+                "user": log.triggered_by,
+                "sku": log.sku,
+                "location": log.location_id,
+                "field": "desired_level",
+                "oldValue": log.old_desired_inventory,
+                "newValue": log.new_desired_inventory,
+                "status": log.status,
+                "errorMessage": log.error_message
+            })
+            
+    return formatted_logs
 
 @app.get("/api/replenishment/runs")
 async def get_recommendation_runs(limit: int = 50, db: Session = Depends(get_db)):

@@ -101,8 +101,10 @@ class LightspeedClient:
     def update_reorder_levels(self, item_shop_id: str, reorder_point: int, reorder_level: int) -> Optional[Dict[str, Any]]:
         url = f"{self.base_url}/ItemShop/{item_shop_id}.json"
         payload = {
-            "reorderPoint": reorder_point,
-            "reorderLevel": reorder_level
+            "ItemShop": {
+                "reorderPoint": reorder_point,
+                "reorderLevel": reorder_level
+            }
         }
         try:
             response = requests.put(url, headers=self._get_headers(), json=payload)
