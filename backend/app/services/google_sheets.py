@@ -31,7 +31,7 @@ def get_gspread_client():
         )
     
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+        if creds and creds.refresh_token:
             creds.refresh(Request())
         else:
             client_id = os.getenv("GOOGLE_CLIENT_ID")
