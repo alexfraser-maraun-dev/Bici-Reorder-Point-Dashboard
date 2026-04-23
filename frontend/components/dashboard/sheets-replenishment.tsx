@@ -47,6 +47,7 @@ export function SheetsReplenishment() {
   const [safetyDays, setSafetyDays] = useState(7)
   const [growthMultiplier, setGrowthMultiplier] = useState(1.0)
   const { data, isLoading, refetch } = useReplenishmentData(forecastPeriod, safetyDays, growthMultiplier)
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
   
   const [isPushing, setIsPushing] = useState(false)
   const [pushResult, setPushResult] = useState<{status: 'success'|'warning'|'error', msg: string} | null>(null)
@@ -65,6 +66,9 @@ export function SheetsReplenishment() {
   
   // Sort State
   const [sortConfig, setSortConfig] = useState<{key: string, direction: 'asc' | 'desc'} | null>(null)
+
+  // Manual Overrides State
+  const [overrides, setOverrides] = useState<Record<string, {rop?: number, dl?: number}>>({})
 
   const allItems = useMemo(() => {
     if (!data || !data.data || !data.data[selectedLocation]) return []
@@ -143,7 +147,18 @@ export function SheetsReplenishment() {
   }
 
   const handlePush = async () => {
-    const itemsToPush = processedData.filter((i: any) => selectedIds.has(i.system_id))
+    const selectedItems = processedData.filter((i: any) => selectedIds.has(i.system_id))
+    
+    // Apply manual overrides to selected items
+    const itemsToPush = selectedItems.map(item => {
+      const override = overrides[item.system_id]
+      return {
+        ...item,
+        recommended_reorder_point: override?.rop ?? item.recommended_reorder_point,
+        recommended_desired_level: override?.dl ?? item.recommended_desired_level
+      }
+    })
+
     if (itemsToPush.length === 0) return alert("Please select at least one SKU to push.")
     
     if (!confirm(`Pushing updates for ${itemsToPush.length} selected SKUs to Lightspeed. Continue?`)) return
@@ -151,7 +166,6 @@ export function SheetsReplenishment() {
     setIsPushing(true)
     setPushResult(null)
     try {
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
       const response = await fetch(`${baseUrl}/api/replenishment/push`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -568,7 +582,7 @@ export function SheetsReplenishment() {
                       <TableCell>
                         <div className="flex flex-col w-[330px]">
                           <a 
-                            href={`https://us.merchantos.com/?name=item.views.item.edit&id=${item.system_id}`}
+                            href={`${baseUrl}/api/replenishment/ls-link/${item.system_id}`}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="font-semibold text-xs leading-tight mb-0.5 hover:text-blue-600 hover:underline transition-all truncate"
@@ -620,14 +634,34 @@ export function SheetsReplenishment() {
                       
                       <TableCell className="text-right">
                         <Input 
-                          defaultValue={item.recommended_reorder_point}
-                          className="h-5 w-12 ml-auto text-right text-[11px] font-mono tabular-nums bg-white border-blue-100 p-0 px-1"
+                          value={overrides[item.system_id]?.rop ?? item.recommended_reorder_point}
+                          onChange={(e) => {
+                            const val = parseInt(e.target.value) || 0
+                            setOverrides(prev => ({
+                              ...prev,
+                              [item.system_id]: { ...prev[item.system_id], rop: val }
+                            }))
+                          }}
+                          className={cn(
+                            "h-5 w-12 ml-auto text-right text-[11px] font-mono tabular-nums bg-white border-blue-100 p-0 px-1",
+                            overrides[item.system_id]?.rop !== undefined && "bg-amber-50 border-amber-400 font-bold"
+                          )}
                         />
                       </TableCell>
                       <TableCell className="text-right">
                         <Input 
-                          defaultValue={item.recommended_desired_level}
-                          className="h-5 w-12 ml-auto text-right text-[11px] font-mono tabular-nums bg-white border-purple-100 p-0 px-1"
+                          value={overrides[item.system_id]?.dl ?? item.recommended_desired_level}
+                          onChange={(e) => {
+                            const val = parseInt(e.target.value) || 0
+                            setOverrides(prev => ({
+                              ...prev,
+                              [item.system_id]: { ...prev[item.system_id], dl: val }
+                            }))
+                          }}
+                          className={cn(
+                            "h-5 w-12 ml-auto text-right text-[11px] font-mono tabular-nums bg-white border-purple-100 p-0 px-1",
+                            overrides[item.system_id]?.dl !== undefined && "bg-amber-50 border-amber-400 font-bold"
+                          )}
                         />
                       </TableCell>
                     </TableRow>

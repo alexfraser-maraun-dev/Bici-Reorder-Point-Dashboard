@@ -250,7 +250,7 @@ export function useReplenishmentData(forecastPeriod?: number, safetyDays: number
     } finally {
       setIsLoading(false)
     }
-  }, [forecastPeriod, safetyDays])
+  }, [forecastPeriod, safetyDays, growthMultiplier])
 
   useEffect(() => {
     fetchData()
