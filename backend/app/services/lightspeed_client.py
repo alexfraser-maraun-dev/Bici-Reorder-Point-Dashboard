@@ -43,6 +43,21 @@ class LightspeedClient:
             "Content-Type": "application/json"
         }
 
+    def check_health(self) -> bool:
+        """
+        Pings the API to check if the credentials and connection are valid.
+        """
+        url = f"{self.base_url}.json"
+        try:
+            response = requests.get(url, headers=self._get_headers())
+            if response.status_code == 401:
+                self._refresh_access_token()
+                response = requests.get(url, headers=self._get_headers())
+            return response.status_code == 200
+        except Exception as e:
+            print(f"Lightspeed health check failed: {e}")
+            return False
+
     def get_item_shops(self, item_id: str) -> Dict[str, str]:
         """
         Fetches the itemShopIDs for an item, mapped by their shopID.

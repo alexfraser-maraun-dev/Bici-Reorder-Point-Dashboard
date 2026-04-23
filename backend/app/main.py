@@ -343,3 +343,14 @@ async def get_vendor_lead_times():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/health/lightspeed")
+async def check_lightspeed_health():
+    from app.services.lightspeed_client import LightspeedClient
+    client = LightspeedClient()
+    is_connected = client.check_health()
+    if is_connected:
+        return {"status": "connected"}
+    else:
+        # Return 503 Service Unavailable so the frontend knows it's an error
+        raise HTTPException(status_code=503, detail="Disconnected from Lightspeed")

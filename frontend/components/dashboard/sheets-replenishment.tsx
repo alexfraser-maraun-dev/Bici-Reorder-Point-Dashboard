@@ -49,7 +49,7 @@ export function SheetsReplenishment() {
   const { data, isLoading, refetch } = useReplenishmentData(forecastPeriod, safetyDays, growthMultiplier)
   
   const [isPushing, setIsPushing] = useState(false)
-  const [pushSuccess, setPushSuccess] = useState(false)
+  const [pushResult, setPushResult] = useState<{status: 'success'|'warning'|'error', msg: string} | null>(null)
   
   const [selectedLocation, setSelectedLocation] = useState('Bici Adanac')
   const [searchQuery, setSearchQuery] = useState('')
@@ -149,6 +149,7 @@ export function SheetsReplenishment() {
     if (!confirm(`Pushing updates for ${itemsToPush.length} selected SKUs to Lightspeed. Continue?`)) return
 
     setIsPushing(true)
+    setPushResult(null)
     try {
       const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
       const response = await fetch(`${baseUrl}/api/replenishment/push`, {
@@ -157,13 +158,30 @@ export function SheetsReplenishment() {
         body: JSON.stringify(itemsToPush)
       })
       if (response.ok) {
-        setPushSuccess(true)
-        setSelectedIds(new Set())
-        setTimeout(() => setPushSuccess(false), 5000)
+        const data = await response.json()
+        const results = data.results || []
+        const failedCount = results.filter((r: any) => !r.success).length
+        const total = itemsToPush.length
+        
+        if (failedCount === 0) {
+          setPushResult({ status: 'success', msg: `Successfully Pushed ${total} SKUs` })
+          setSelectedIds(new Set())
+        } else if (failedCount === total) {
+          setPushResult({ status: 'error', msg: `All ${total} Pushes Failed` })
+        } else {
+          setPushResult({ status: 'warning', msg: `${failedCount} of ${total} Pushes Failed` })
+        }
+        
+        setTimeout(() => setPushResult(null), 6000)
         refetch()
+      } else {
+        setPushResult({ status: 'error', msg: `Server Error: ${response.status}` })
+        setTimeout(() => setPushResult(null), 6000)
       }
     } catch (error) {
       console.error("Push failed:", error)
+      setPushResult({ status: 'error', msg: "Network Error" })
+      setTimeout(() => setPushResult(null), 6000)
     } finally {
       setIsPushing(false)
     }
@@ -401,24 +419,28 @@ export function SheetsReplenishment() {
           </div>
           <Button 
             size="sm" 
-            variant={pushSuccess ? "secondary" : "default"} 
+            variant={pushResult?.status === 'success' ? "secondary" : "default"} 
             className={cn(
               "h-9 text-sm px-6 font-bold shadow-md transition-all rounded-full",
-              pushSuccess ? "bg-emerald-500 text-white" : "bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 hover:shadow-lg",
-              selectedIds.size === 0 && !pushSuccess && "opacity-50 grayscale cursor-not-allowed"
+              pushResult?.status === 'success' && "bg-emerald-500 text-white hover:bg-emerald-600",
+              pushResult?.status === 'warning' && "bg-amber-500 text-white hover:bg-amber-600",
+              pushResult?.status === 'error' && "bg-red-500 text-white hover:bg-red-600",
+              !pushResult && "bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 hover:shadow-lg",
+              selectedIds.size === 0 && !pushResult && "opacity-50 grayscale cursor-not-allowed"
             )}
             onClick={handlePush}
-            disabled={isPushing || pushSuccess || (selectedIds.size === 0 && !pushSuccess)}
+            disabled={isPushing || pushResult?.status === 'success' || (selectedIds.size === 0 && !pushResult)}
           >
             {isPushing ? (
               <>
                 <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
                 Pushing {selectedIds.size} SKUs...
               </>
-            ) : pushSuccess ? (
+            ) : pushResult ? (
               <>
-                <CircleCheck className="w-4 h-4 mr-2" />
-                Successfully Pushed
+                {pushResult.status === 'success' && <CircleCheck className="w-4 h-4 mr-2" />}
+                {pushResult.status !== 'success' && <CircleAlert className="w-4 h-4 mr-2" />}
+                {pushResult.msg}
               </>
             ) : (
               <>
