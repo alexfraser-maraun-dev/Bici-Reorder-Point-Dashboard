@@ -124,7 +124,7 @@ async def upload_skus_csv(file: UploadFile = File(...), db: Session = Depends(ge
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/sync/sheets")
-async def sync_from_google_sheets(db: Session = Depends(get_db)):
+def sync_from_google_sheets(db: Session = Depends(get_db)):
     spreadsheet_id = "1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak"
     try:
         data = google_sheets.fetch_sheet_data(spreadsheet_id)
@@ -147,7 +147,7 @@ async def sync_from_google_sheets(db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to sync from Google Sheets: {str(e)}")
 @app.get("/api/replenishment/data")
-async def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, growth_multiplier: float = 1.0, db: Session = Depends(get_db)):
+def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, growth_multiplier: float = 1.0, db: Session = Depends(get_db)):
     spreadsheet_id = "1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak"
     try:
         # Create a new run record
@@ -210,7 +210,7 @@ async def get_replenishment_data(forecast_period: int = None, safety_days: int =
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/replenishment/push")
-async def push_replenishment_updates(updates: List[Dict[str, Any]], db: Session = Depends(get_db)):
+def push_replenishment_updates(updates: List[Dict[str, Any]], db: Session = Depends(get_db)):
     """
     Pushes a list of SKU recommendations to Lightspeed and logs results.
     """
@@ -241,7 +241,7 @@ async def push_replenishment_updates(updates: List[Dict[str, Any]], db: Session 
     return {"status": "completed", "results": results}
 
 @app.get("/api/replenishment/logs")
-async def get_writeback_logs(limit: int = 100, db: Session = Depends(get_db)):
+def get_writeback_logs(limit: int = 100, db: Session = Depends(get_db)):
     from app.db.models import WritebackLog
     logs = db.query(WritebackLog).order_by(desc(WritebackLog.created_at)).limit(limit).all()
     
@@ -296,7 +296,7 @@ async def get_writeback_logs(limit: int = 100, db: Session = Depends(get_db)):
     return formatted_logs
 
 @app.get("/api/replenishment/runs")
-async def get_recommendation_runs(limit: int = 50, db: Session = Depends(get_db)):
+def get_recommendation_runs(limit: int = 50, db: Session = Depends(get_db)):
     from app.db.models import RecommendationRun, RecommendationRow
     from sqlalchemy import func
     
@@ -333,7 +333,7 @@ async def get_recommendation_runs(limit: int = 50, db: Session = Depends(get_db)
     return results
 
 @app.get("/api/replenishment/vendor-lead-times")
-async def get_vendor_lead_times():
+def get_vendor_lead_times():
     spreadsheet_id = "1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak"
     try:
         data = google_sheets.fetch_vendor_lead_times(spreadsheet_id)
@@ -345,7 +345,7 @@ async def get_vendor_lead_times():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/health/lightspeed")
-async def check_lightspeed_health():
+def check_lightspeed_health():
     from app.services.lightspeed_client import LightspeedClient
     client = LightspeedClient()
     is_connected = client.check_health()
