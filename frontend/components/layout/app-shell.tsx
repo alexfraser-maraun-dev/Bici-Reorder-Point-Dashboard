@@ -11,7 +11,9 @@ import {
   Package,
   Menu,
   CircleHelp,
+  LogOut,
 } from 'lucide-react'
+import { signOut } from 'next-auth/react'
 import { Button } from '@/components/ui/button'
 import {
   Sheet,
@@ -111,11 +113,24 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </nav>
 
           {/* Right side */}
-          <div className="ml-auto flex items-center gap-2">
-            <span className="text-muted-foreground hidden text-xs lg:inline-block">
-              Connected to Lightspeed R-Series
-            </span>
-            <div className="h-2 w-2 rounded-full bg-emerald-500" title="Connected" />
+          <div className="ml-auto flex items-center gap-4">
+            <div className="flex items-center gap-2">
+              <span className="text-muted-foreground hidden text-xs lg:inline-block">
+                Connected to Lightspeed R-Series
+              </span>
+              <div className="h-2 w-2 rounded-full bg-emerald-500" title="Connected" />
+            </div>
+            <div className="h-4 w-[1px] bg-border hidden sm:block" />
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => signOut({ callbackUrl: '/' })}
+              className="text-muted-foreground hover:text-foreground h-8 px-2 flex items-center"
+              title="Sign Out"
+            >
+              <LogOut className="h-4 w-4 sm:mr-2" />
+              <span className="hidden sm:inline-block text-xs font-medium">Sign Out</span>
+            </Button>
           </div>
         </div>
       </header>

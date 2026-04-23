@@ -389,6 +389,46 @@ export function SheetsReplenishment() {
           </div>
         </div>
 
+        {/* Actions Bar */}
+        <div className="flex items-center justify-between bg-card rounded-xl border p-3 shadow-sm mb-3">
+          <div className="flex items-center gap-3">
+            <Badge variant="outline" className="px-3 py-1 text-sm font-semibold border-blue-200 bg-blue-50 text-blue-700">
+              {selectedIds.size} / {processedData.length} Selected
+            </Badge>
+            <span className="text-xs text-muted-foreground font-medium">
+               Ready to push to Lightspeed
+            </span>
+          </div>
+          <Button 
+            size="sm" 
+            variant={pushSuccess ? "secondary" : "default"} 
+            className={cn(
+              "h-9 text-sm px-6 font-bold shadow-md transition-all rounded-full",
+              pushSuccess ? "bg-emerald-500 text-white" : "bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 hover:shadow-lg",
+              selectedIds.size === 0 && !pushSuccess && "opacity-50 grayscale cursor-not-allowed"
+            )}
+            onClick={handlePush}
+            disabled={isPushing || pushSuccess || (selectedIds.size === 0 && !pushSuccess)}
+          >
+            {isPushing ? (
+              <>
+                <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                Pushing {selectedIds.size} SKUs...
+              </>
+            ) : pushSuccess ? (
+              <>
+                <CircleCheck className="w-4 h-4 mr-2" />
+                Successfully Pushed
+              </>
+            ) : (
+              <>
+                <Zap className="w-4 h-4 mr-2 fill-current" />
+                Push to Lightspeed ({selectedIds.size})
+              </>
+            )}
+          </Button>
+        </div>
+
         {/* Table Area */}
         <div className="flex-1 bg-card rounded-xl border shadow-sm overflow-hidden flex flex-col">
           <div className="overflow-auto flex-1">
@@ -583,36 +623,6 @@ export function SheetsReplenishment() {
               <span className="text-[9px] text-muted-foreground/60 italic">
                 {selectedIds.size} Items Selected for Push
               </span>
-            </div>
-            <div className="flex gap-2">
-              <Button 
-                size="sm" 
-                variant={pushSuccess ? "secondary" : "default"} 
-                className={cn(
-                  "h-8 text-xs px-6 font-bold shadow-lg transition-all",
-                  pushSuccess ? "bg-emerald-500 text-white" : "bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700",
-                  selectedIds.size === 0 && !pushSuccess && "opacity-50 grayscale cursor-not-allowed"
-                )}
-                onClick={handlePush}
-                disabled={isPushing || pushSuccess || (selectedIds.size === 0 && !pushSuccess)}
-              >
-                {isPushing ? (
-                  <>
-                    <RefreshCw className="w-3.5 h-3.5 mr-2 animate-spin" />
-                    Pushing {selectedIds.size} SKUs...
-                  </>
-                ) : pushSuccess ? (
-                  <>
-                    <CircleCheck className="w-3.5 h-3.5 mr-2" />
-                    Pushed Successfully!
-                  </>
-                ) : (
-                  <>
-                    <Zap className="w-3.5 h-3.5 mr-2" />
-                    Push {selectedIds.size > 0 ? selectedIds.size : 'Selected'} to Lightspeed
-                  </>
-                )}
-              </Button>
             </div>
           </div>
         </div>
