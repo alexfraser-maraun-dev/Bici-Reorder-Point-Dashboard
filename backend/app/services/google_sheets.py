@@ -19,6 +19,16 @@ def get_gspread_client():
     creds = None
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    elif os.getenv("GOOGLE_REFRESH_TOKEN"):
+        # Headless production authentication
+        creds = Credentials(
+            token=None,
+            refresh_token=os.getenv("GOOGLE_REFRESH_TOKEN"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=os.getenv("GOOGLE_CLIENT_ID"),
+            client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+            scopes=SCOPES
+        )
     
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
