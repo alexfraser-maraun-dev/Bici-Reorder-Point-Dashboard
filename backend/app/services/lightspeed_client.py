@@ -144,13 +144,25 @@ class LightspeedClient:
             print(f"Location {location} not mapped to a Lightspeed shopID")
             return False
             
-        # 2. Get the itemShopIDs for this item
-        item_shop_mapping = self.get_item_shops(system_id)
+        # 1.5 Resolve internal itemID from system_id (systemSku)
+        # The sheet uses Item System ID (systemSku), but the API needs the internal itemID
+        items = self.get_item_by_sku(system_id)
+        if not items:
+            print(f"Item with SKU {system_id} not found in Lightspeed API")
+            return False
+        
+        internal_item_id = items[0].get("itemID")
+        if not internal_item_id:
+            print(f"Could not find itemID for SKU {system_id}")
+            return False
+
+        # 2. Get the itemShopIDs for this item using the internal itemID
+        item_shop_mapping = self.get_item_shops(internal_item_id)
         
         # 3. Find the specific itemShopID for our target shop
         item_shop_id = item_shop_mapping.get(target_shop_id)
         if not item_shop_id:
-            print(f"Item {system_id} does not have an ItemShop entry for shop {target_shop_id}")
+            print(f"Item {system_id} (ID: {internal_item_id}) does not have an ItemShop entry for shop {target_shop_id}")
             return False
             
         # 4. Push the update

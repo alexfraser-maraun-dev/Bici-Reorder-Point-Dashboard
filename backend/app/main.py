@@ -27,7 +27,7 @@ app.add_middleware(
 def read_root():
     return {"status": "ok", "message": "Replenishment API is running"}
 
-from fastapi.responses import Response
+from fastapi.responses import Response, RedirectResponse
 
 @app.get("/api/health")
 def health_check():
@@ -354,3 +354,33 @@ def check_lightspeed_health():
     else:
         # Return 503 Service Unavailable so the frontend knows it's an error
         raise HTTPException(status_code=503, detail="Disconnected from Lightspeed")
+
+@app.get("/api/replenishment/ls-link/{system_id}")
+def get_lightspeed_link(system_id: str):
+    """
+    Resolves a system_id (systemSku) to a Lightspeed itemID and redirects 
+    to the product edit page.
+    """
+    from app.services.lightspeed_client import LightspeedClient
+    client = LightspeedClient()
+    try:
+        items = client.get_item_by_sku(system_id)
+        if not items:
+            # Fallback: maybe it's already an itemID?
+            # But according to user, system_id is NOT itemID.
+            raise HTTPException(status_code=404, detail=f"Item with SKU {system_id} not found in Lightspeed")
+        
+        # Get the first match
+        item = items[0]
+        item_id = item.get("itemID")
+        
+        if not item_id:
+            raise HTTPException(status_code=404, detail="Lightspeed itemID not found in API response")
+            
+        ls_url = f"https://us.merchantos.com/?name=item.views.item.edit&id={item_id}"
+        return RedirectResponse(url=ls_url)
+    except Exception as e:
+        print(f"Error resolving LS link for {system_id}: {e}")
+        # If it fails, maybe redirect to search?
+        search_url = f"https://us.merchantos.com/?name=item.views.item.edit&id={system_id}"
+        return RedirectResponse(url=search_url)
