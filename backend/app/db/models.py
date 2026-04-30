@@ -16,6 +16,17 @@ class ManagedSKU(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
+class Vendor(Base):
+    __tablename__ = "vendors"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)
+    adanac_lead_time = Column(Integer, default=7)
+    langford_lead_time = Column(Integer, default=7)
+    victoria_lead_time = Column(Integer, default=7)
+    contact_email = Column(String, nullable=True)
+    notes = Column(String, nullable=True)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
 class SKULocationPolicy(Base):
     __tablename__ = "sku_location_policy"
     id = Column(Integer, primary_key=True, index=True)
@@ -28,6 +39,7 @@ class SKULocationPolicy(Base):
     locked = Column(Boolean, default=False)
     manual_reorder_point_override = Column(Integer, nullable=True)
     manual_desired_level_override = Column(Integer, nullable=True)
+    override_reason = Column(String, nullable=True) # "Seasonality", "Promotion", etc.
     notes = Column(String, nullable=True)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -52,7 +64,9 @@ class RecommendationRow(Base):
     on_hand_units = Column(Integer)
     on_order_units = Column(Integer)
     trailing_units_sold = Column(Float)
-    daily_sales = Column(Float)
+    days_out_of_stock = Column(Integer, default=0) # Calculated from BigQuery
+    daily_sales = Column(Float) # Raw velocity
+    adjusted_daily_sales = Column(Float) # Velocity corrected for stockouts
     recommended_reorder_point = Column(Integer)
     recommended_desired_inventory = Column(Integer)
     suggested_buy_qty = Column(Integer)
@@ -78,6 +92,7 @@ class WritebackLog(Base):
     response_payload = Column(JSON, nullable=True)
     error_message = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
 class VelocitySnapshot(Base):
     __tablename__ = "velocity_snapshots"
     id = Column(Integer, primary_key=True, index=True)
