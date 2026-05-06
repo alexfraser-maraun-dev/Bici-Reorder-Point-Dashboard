@@ -143,7 +143,7 @@ def fetch_vendor_lead_times(spreadsheet_id: str) -> List[Dict[str, Any]]:
         print(f"Error fetching vendor lead times: {e}")
         return []
 
-def process_recommendations(parsed_data: List[Dict[str, Any]], safety_days: int = 7, override_forecast: int = None, growth_multiplier: float = 1.0, momentum_data: Dict[str, float] = None) -> List[Dict[str, Any]]:
+def process_recommendations(parsed_data: List[Dict[str, Any]], safety_days: int = 7, override_forecast: int = None, growth_multiplier: float = 1.0, momentum_data: Dict[str, float] = None, bq_metrics: Dict[str, Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
     Applies the custom BICI calculation logic to the spreadsheet data.
     """
@@ -233,6 +233,30 @@ def process_recommendations(parsed_data: List[Dict[str, Any]], safety_days: int 
             # Rec. DL - (On Hand + On Order)
             qty_to_order = max(0, int(new_desired_level - (on_hand + on_order)))
 
+            # Stockout Correction (using BQ metrics)
+            days_out_of_stock = 0
+            adjusted_daily_sales = daily_sales
+            if bq_metrics:
+                # Key maps to system_id and location name mapping
+                # Shop ID mapping: 2 -> Adanac, 3 -> Victoria, 20 -> Langford (Assuming these are standard for BICI)
+                shop_map = {"Bici Adanac": 2, "Victoria": 3, "Langford": 20}
+                shop_id = shop_map.get(loc)
+                bq_key = f"{system_id}_{shop_id}"
+                
+                if bq_key in bq_metrics:
+                    days_out_of_stock = bq_metrics[bq_key].get("days_out_of_stock", 0)
+                    total_sold = bq_metrics[bq_key].get("total_units_sold", 0)
+                    active_days = max(1, 60 - days_out_of_stock) # avoid division by 0
+                    
+                    if days_out_of_stock > 0 and total_sold > 0:
+                         # Calculate true velocity based on days it was actually available
+                         adjusted_daily_sales = total_sold / active_days
+                         # Recalculate ROP and DL using adjusted sales
+                         safety_stock = math.ceil(adjusted_daily_sales * safety_days)
+                         new_reorder_point = math.ceil((adjusted_daily_sales * lead_time) + safety_stock)
+                         new_desired_level = math.ceil(adjusted_daily_sales * forecast_period)
+                         qty_to_order = max(0, int(new_desired_level - (on_hand + on_order)))
+
             # We now include ALL rows from the sheet as requested
             recommendations.append({
                 "system_id": system_id,
@@ -243,6 +267,8 @@ def process_recommendations(parsed_data: List[Dict[str, Any]], safety_days: int 
                 "vendor": row.get("Item Default Vendor"),
                 "location": loc,
                 "daily_sales": round(daily_sales, 2),
+                "adjusted_daily_sales": round(adjusted_daily_sales, 2),
+                "days_out_of_stock": days_out_of_stock,
                 "raw_daily_sales": raw_daily_sales,
                 "lead_time": lead_time,
                 "forecast_period": forecast_period,

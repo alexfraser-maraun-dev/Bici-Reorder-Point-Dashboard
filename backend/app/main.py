@@ -158,6 +158,10 @@ def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, gr
         # 1. Fetch data from Google Sheets
         data = google_sheets.fetch_sheet_data(spreadsheet_id)
         
+        # 1.5 Fetch BigQuery Metrics (Cached)
+        from app.services.bigquery_sync import get_cached_bq_metrics
+        bq_metrics = get_cached_bq_metrics()
+        
         # 2. Get previous velocity snapshots
         momentum_data = {}
         prev_snapshots = db.query(VelocitySnapshot).all()
@@ -170,7 +174,8 @@ def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, gr
             safety_days=safety_days, 
             override_forecast=forecast_period,
             growth_multiplier=growth_multiplier,
-            momentum_data=momentum_data
+            momentum_data=momentum_data,
+            bq_metrics=bq_metrics
         )
         
         # 4. Save NEW snapshots
