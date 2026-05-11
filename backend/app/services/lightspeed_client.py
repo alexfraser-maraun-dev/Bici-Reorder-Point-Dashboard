@@ -27,7 +27,7 @@ class LightspeedClient:
             "client_secret": self.client_secret,
             "grant_type": "refresh_token"
         }
-        response = requests.post(url, data=payload)
+        response = requests.post(url, data=payload, timeout=10)
         if response.status_code == 200:
             new_token = response.json().get("access_token")
             self.bearer_token = new_token
@@ -49,10 +49,10 @@ class LightspeedClient:
         """
         url = f"{self.base_url}.json"
         try:
-            response = requests.get(url, headers=self._get_headers())
+            response = requests.get(url, headers=self._get_headers(), timeout=10)
             if response.status_code == 401:
                 self._refresh_access_token()
-                response = requests.get(url, headers=self._get_headers())
+                response = requests.get(url, headers=self._get_headers(), timeout=10)
             return response.status_code == 200
         except Exception as e:
             print(f"Lightspeed health check failed: {e}")
@@ -67,10 +67,10 @@ class LightspeedClient:
         params = {"load_relations": '["ItemShops"]'}
         
         try:
-            response = requests.get(url, headers=self._get_headers(), params=params)
+            response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
             if response.status_code == 401:
                 self._refresh_access_token()
-                response = requests.get(url, headers=self._get_headers(), params=params)
+                response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
                 
             if response.status_code != 200:
                 print(f"Error fetching item {item_id}: {response.text}")
@@ -95,7 +95,7 @@ class LightspeedClient:
     def get_item_by_sku(self, sku: str) -> List[Dict[str, Any]]:
         url = f"{self.base_url}/Item.json"
         params = {"systemSku": sku}
-        response = requests.get(url, headers=self._get_headers(), params=params)
+        response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
         if response.status_code == 200:
             items = response.json().get("Item", [])
             if isinstance(items, dict): return [items]
@@ -105,7 +105,7 @@ class LightspeedClient:
     def get_item_shops_full(self, item_id: str) -> List[Dict[str, Any]]:
         url = f"{self.base_url}/Item/{item_id}.json"
         params = {"load_relations": '["ItemShops"]'}
-        response = requests.get(url, headers=self._get_headers(), params=params)
+        response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
         if response.status_code == 200:
             data = response.json()
             item_shops = data.get("Item", {}).get("ItemShops", {}).get("ItemShop", [])
@@ -122,10 +122,10 @@ class LightspeedClient:
             }
         }
         try:
-            response = requests.put(url, headers=self._get_headers(), json=payload)
+            response = requests.put(url, headers=self._get_headers(), json=payload, timeout=10)
             if response.status_code == 401:
                 self._refresh_access_token()
-                response = requests.put(url, headers=self._get_headers(), json=payload)
+                response = requests.put(url, headers=self._get_headers(), json=payload, timeout=10)
             
             if response.status_code == 200:
                 return response.json().get("ItemShop")
