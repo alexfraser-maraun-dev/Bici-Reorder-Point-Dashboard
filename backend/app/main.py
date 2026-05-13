@@ -17,12 +17,7 @@ from datetime import datetime
 from typing import List, Dict, Any
 from fastapi.responses import Response, RedirectResponse
 
-# Database initialization (Optional for local dev, logs to BQ in prod)
-try:
-    Base.metadata.create_all(bind=engine)
-except Exception as e:
-    print(f"Skipping local DB initialization: {e}")
-
+# App initialization
 app = FastAPI(title="SKU Reorder Point Automation API")
 
 # Setup CORS for frontend
