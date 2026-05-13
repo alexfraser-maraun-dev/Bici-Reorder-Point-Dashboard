@@ -32,13 +32,23 @@ def get_gspread_client():
     
     if not creds or not creds.valid:
         if creds and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                print(f"Failed to refresh Google token: {e}")
+                # Fall back to environment-based credentials check
+        
+        if not creds or not creds.valid:
+            # If we are in production (no TOKEN_FILE and potentially no display), 
+            # we SHOULD NOT run the local server as it will hang the process.
+            if not os.path.exists(TOKEN_FILE) and os.getenv("RENDER"):
+                raise Exception("Google Sheets credentials invalid or missing GOOGLE_REFRESH_TOKEN in production.")
+            
             client_id = os.getenv("GOOGLE_CLIENT_ID")
             client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
             
             if not client_id or not client_secret:
-                raise Exception("GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET not found in .env")
+                raise Exception("GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET not found in environment.")
             
             client_config = {
                 "installed": {
@@ -50,6 +60,7 @@ def get_gspread_client():
                 }
             }
             
+            print("Attempting local Google Auth flow... (This will fail in headless environments)")
             flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
             creds = flow.run_local_server(port=8085, prompt='consent')
             

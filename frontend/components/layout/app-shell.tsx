@@ -35,35 +35,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const { data: session } = useSession()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
 
-  const [lsStatus, setLsStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
-  const [bqStatus, setBqStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
-  const [gsStatus, setGsStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
-
-  useEffect(() => {
-    const checkHealth = async () => {
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-
-      // Check Lightspeed
-      fetch(`${baseUrl}/api/health/lightspeed`)
-        .then(res => setLsStatus(res.ok ? 'connected' : 'disconnected'))
-        .catch(() => setLsStatus('disconnected'))
-
-      // Check BigQuery
-      fetch(`${baseUrl}/api/health/bigquery`)
-        .then(res => setBqStatus(res.ok ? 'connected' : 'disconnected'))
-        .catch(() => setBqStatus('disconnected'))
-
-      // Check Google Sheets
-      fetch(`${baseUrl}/api/health/sheets`)
-        .then(res => setGsStatus(res.ok ? 'connected' : 'disconnected'))
-        .catch(() => setGsStatus('disconnected'))
-    }
-
-    checkHealth()
-    const interval = setInterval(checkHealth, 30000)
-    return () => clearInterval(interval)
-  }, [])
-
   return (
     <div className="bg-background min-h-screen">
       {/* Header */}

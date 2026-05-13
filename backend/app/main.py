@@ -240,8 +240,8 @@ def check_lightspeed_health():
 def check_bigquery_health():
     from app.services.bigquery_sync import client as bq_client
     try:
-        # Simple query to check connectivity
-        bq_client.list_datasets(max_results=1)
+        # Force an actual API call by iterating over the results
+        datasets = list(bq_client.list_datasets(max_results=1))
         return {"status": "connected"}
     except Exception as e:
         print(f"BigQuery health check failed: {e}")
@@ -249,10 +249,16 @@ def check_bigquery_health():
 
 @app.get("/api/health/sheets")
 def check_sheets_health():
+    import concurrent.futures
     try:
         from app.services.google_sheets import get_gspread_client
-        client = get_gspread_client()
-        # Just check if we can initialize the client
+        
+        # Use a thread pool to enforce a timeout on the gspread initialization
+        # which can hang if it tries to refresh tokens on a slow network
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(get_gspread_client)
+            client = future.result(timeout=5) # 5 second timeout
+            
         if client:
             return {"status": "connected"}
         else:
