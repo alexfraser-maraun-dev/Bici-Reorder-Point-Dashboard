@@ -1,10 +1,5 @@
-from fastapi import FastAPI, Depends, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from app.db.database import engine, Base, get_db
-from app.db.models import VelocitySnapshot, RecommendationRun, WritebackLog, ManagedSKU
-from sqlalchemy import desc, func
-from app.services import google_sheets
 from app.services.bigquery_sync import (
     log_recommendation_run, log_velocity_snapshots, log_writeback,
     get_managed_skus, upsert_managed_skus, get_sku_overrides, upsert_sku_override,
@@ -74,6 +69,7 @@ def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, gr
     spreadsheet_id = "1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak"
     try:
         # 1. Fetch Google Sheet Data
+        from app.services import google_sheets
         raw_data = google_sheets.fetch_sheet_data(spreadsheet_id)
         
         # 1.5 Fetch BigQuery Metrics and Overrides
@@ -216,6 +212,7 @@ def save_override(override: Dict[str, Any]):
 def get_vendor_lead_times():
     spreadsheet_id = "1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak"
     try:
+        from app.services import google_sheets
         data = google_sheets.fetch_vendor_lead_times(spreadsheet_id)
         return {"status": "success", "data": data}
     except Exception as e:
