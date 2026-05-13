@@ -4,8 +4,15 @@ import os
 import json
 import time
 
-# Initialize BigQuery client
-client = bigquery.Client()
+# Initialize BigQuery client lazily to avoid startup crashes
+_client = None
+
+def get_bq_client():
+    global _client
+    if _client is None:
+        # This will look for GOOGLE_APPLICATION_CREDENTIALS env var
+        _client = bigquery.Client()
+    return _client
 
 BQ_DATASET = os.getenv("BQ_DATASET", "bici-klaviyo-datasync.BiciReorderPointDashboard")
 CACHE_FILE = "bq_metrics_cache.json"
@@ -15,6 +22,7 @@ def log_recommendation_run(run_data: dict):
     """Streams a run summary to BigQuery."""
     table_id = f"{BQ_DATASET}.replen_recommendation_runs"
     try:
+        client = get_bq_client()
         errors = client.insert_rows_json(table_id, [run_data])
         if errors:
             print(f"BigQuery Run Log Errors: {errors}")
@@ -25,6 +33,7 @@ def log_velocity_snapshots(snapshots: list):
     """Streams velocity snapshots to BigQuery in batches."""
     table_id = f"{BQ_DATASET}.replen_velocity_snapshots"
     try:
+        client = get_bq_client()
         # Batch by 500 rows to avoid request size limits
         for i in range(0, len(snapshots), 500):
             batch = snapshots[i:i+500]
@@ -76,8 +85,11 @@ def get_writeback_logs(limit: int = 100):
 
 def get_managed_skus():
     """Fetches list of managed SKUs from BigQuery."""
-    query = f"SELECT * FROM `{BQ_DATASET}.replen_managed_skus` WHERE active = TRUE"
+    query = f"""
+        SELECT * FROM `{BQ_DATASET}.replen_managed_skus`
+    """
     try:
+        client = get_bq_client()
         return client.query(query).to_dataframe().to_dict('records')
     except Exception as e:
         print(f"Failed to fetch managed SKUs: {e}")
@@ -109,6 +121,7 @@ def get_sku_overrides():
     """Fetches manual overrides from BigQuery."""
     query = f"SELECT * FROM `{BQ_DATASET}.replen_sku_overrides`"
     try:
+        client = get_bq_client()
         df = client.query(query).to_dataframe()
         # Create lookup map: {sku_location: {rop: x, dl: y, locked: z}}
         overrides = {}

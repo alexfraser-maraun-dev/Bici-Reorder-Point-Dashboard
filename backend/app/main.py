@@ -238,10 +238,11 @@ def check_lightspeed_health():
 
 @app.get("/api/health/bigquery")
 def check_bigquery_health():
-    from app.services.bigquery_sync import client as bq_client
+    from app.services.bigquery_sync import get_bq_client
     try:
+        client = get_bq_client()
         # Force an actual API call by iterating over the results
-        datasets = list(bq_client.list_datasets(max_results=1))
+        list(client.list_datasets(max_results=1))
         return {"status": "connected"}
     except Exception as e:
         print(f"BigQuery health check failed: {e}")

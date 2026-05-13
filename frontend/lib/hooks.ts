@@ -297,18 +297,25 @@ export function useConnectionStatus() {
   useEffect(() => {
     const checkHealth = () => {
       const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+      console.log(`[HealthCheck] Pinging backend at: ${baseUrl}`)
+
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 8000) // 8s timeout
+
+      const fetchWithTimeout = (endpoint: string) => {
+        return fetch(`${baseUrl}/api/health/${endpoint}`, { signal: controller.signal })
+          .then(res => res.ok ? 'connected' : 'disconnected')
+          .catch(err => {
+            console.error(`[HealthCheck] ${endpoint} failed:`, err)
+            return 'disconnected'
+          })
+      }
       
-      fetch(`${baseUrl}/api/health/lightspeed`)
-        .then(res => setLsStatus(res.ok ? 'connected' : 'disconnected'))
-        .catch(() => setLsStatus('disconnected'))
-        
-      fetch(`${baseUrl}/api/health/bigquery`)
-        .then(res => setBqStatus(res.ok ? 'connected' : 'disconnected'))
-        .catch(() => setBqStatus('disconnected'))
-        
-      fetch(`${baseUrl}/api/health/sheets`)
-        .then(res => setGsStatus(res.ok ? 'connected' : 'disconnected'))
-        .catch(() => setGsStatus('disconnected'))
+      fetchWithTimeout('lightspeed').then(setLsStatus)
+      fetchWithTimeout('bigquery').then(setBqStatus)
+      fetchWithTimeout('sheets').then(setGsStatus)
+
+      return () => clearTimeout(timeoutId)
     }
     
     checkHealth()
