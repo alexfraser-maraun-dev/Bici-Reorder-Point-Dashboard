@@ -1,3 +1,5 @@
+'use client'
+
 import { AppShell } from '@/components/layout/app-shell'
 import { AuditContent } from '@/components/pages/audit-content'
 import { Toaster } from '@/components/ui/sonner'

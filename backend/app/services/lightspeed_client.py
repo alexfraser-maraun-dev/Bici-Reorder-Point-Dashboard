@@ -135,39 +135,57 @@ class LightspeedClient:
             return None
 
     def sync_recommendation(self, rec: Dict[str, Any]) -> bool:
-        system_id = rec['system_id']
-        location = rec['location'] # e.g. "Bici Adanac"
+        system_id = str(rec.get('system_id', ''))
+        location = rec.get('location')
         
-        # 1. Get the shopID for this location name
+        print(f"[Lightspeed] Attempting sync for SKU: {rec.get('sku')} (ID: {system_id}) at {location}")
+        
+        # 1. Get the shopID
         target_shop_id = self.shop_id_map.get(location)
         if not target_shop_id:
-            print(f"Location {location} not mapped to a Lightspeed shopID")
+            print(f"  [Error] Location {location} not mapped to a shopID")
             return False
             
-        # 1.5 Resolve internal itemID from system_id (systemSku)
-        # The sheet uses Item System ID (systemSku), but the API needs the internal itemID
-        items = self.get_item_by_sku(system_id)
+        # 2. Resolve internal itemID
+        # We try searching by the system_id provided (which might be the internal ID or SystemSKU)
+        items = []
+        
+        # Try as internal ID first if it's numeric
+        if system_id.isdigit():
+            url = f"{self.base_url}/Item/{system_id}.json"
+            resp = requests.get(url, headers=self._get_headers(), timeout=10)
+            if resp.status_code == 200:
+                items = [resp.json().get("Item")]
+        
+        # Fallback to systemSku search
+        if not items or items[0] is None:
+            items = self.get_item_by_sku(system_id)
+            
         if not items:
-            print(f"Item with SKU {system_id} not found in Lightspeed API")
+            print(f"  [Error] Item {system_id} not found in Lightspeed API")
             return False
         
         internal_item_id = items[0].get("itemID")
-        if not internal_item_id:
-            print(f"Could not find itemID for SKU {system_id}")
-            return False
+        print(f"  [Info] Resolved internal itemID: {internal_item_id}")
 
-        # 2. Get the itemShopIDs for this item using the internal itemID
+        # 3. Get itemShopIDs
         item_shop_mapping = self.get_item_shops(internal_item_id)
-        
-        # 3. Find the specific itemShopID for our target shop
         item_shop_id = item_shop_mapping.get(target_shop_id)
+        
         if not item_shop_id:
-            print(f"Item {system_id} (ID: {internal_item_id}) does not have an ItemShop entry for shop {target_shop_id}")
+            print(f"  [Error] No ItemShop entry for shop {target_shop_id}")
             return False
             
-        # 4. Push the update
-        return self.update_reorder_levels(
-            item_shop_id, 
-            rec['recommended_reorder_point'], 
-            rec['recommended_desired_level']
-        )
+        # 4. Push update
+        rop = int(rec.get('recommended_reorder_point', 0))
+        dl = int(rec.get('recommended_desired_level', 0))
+        
+        print(f"  [Action] Updating {location} (Shop {target_shop_id}) -> ROP: {rop}, DL: {dl}")
+        result = self.update_reorder_levels(item_shop_id, rop, dl)
+        
+        if result:
+            print(f"  [Success] Lightspeed confirmed update for itemShopID {item_shop_id}")
+            return True
+        else:
+            print(f"  [Error] Lightspeed rejected the update request")
+            return False
