@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.services.bigquery_sync import (
     log_recommendation_run, log_velocity_snapshots, log_writeback,
     get_managed_skus, upsert_managed_skus, get_sku_overrides, upsert_sku_override,
-    get_recommendation_runs, get_writeback_logs
+    get_recommendation_runs, get_writeback_logs as fetch_writeback_logs
 )
 import pandas as pd
 import io
@@ -184,8 +184,8 @@ def get_recommendation_history(limit: int = 50):
     return runs
 
 @app.get("/api/replenishment/logs")
-def get_writeback_logs(limit: int = 100):
-    logs = get_writeback_logs(limit)
+def get_audit_logs(limit: int = 100):
+    logs = fetch_writeback_logs(limit)
     formatted_logs = []
     for log in logs:
         rop_changed = log.get('new_reorder_point') != log.get('old_reorder_point')

@@ -63,10 +63,12 @@ export function SheetsReplenishment() {
   const [vendorFilter, setVendorFilter] = useState('all')
   const [brandFilter, setBrandFilter] = useState('all')
   const [categoryFilter, setCategoryFilter] = useState('all')
-  const [statusFilter, setStatusFilter] = useState('all')
+  const [statusFilter, setStatusFilter] = useState<string>('all')
   
   // Sort State
-  const [sortConfig, setSortConfig] = useState<{key: string, direction: 'asc' | 'desc'} | null>(null)
+  const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>({ key: 'urgency', direction: 'desc' })
+  const [currentPage, setCurrentPage] = useState(1)
+  const itemsPerPage = 50
 
   // Manual Overrides State
   const [overrides, setOverrides] = useState<Record<string, {rop?: number, dl?: number}>>({})
@@ -131,6 +133,18 @@ export function SheetsReplenishment() {
     
     return items
   }, [allItems, searchQuery, vendorFilter, brandFilter, categoryFilter, statusFilter, sortConfig])
+
+  // Pagination Logic
+  const totalPages = Math.ceil(processedData.length / itemsPerPage)
+  const paginatedData = useMemo(() => {
+    const start = (currentPage - 1) * itemsPerPage
+    return processedData.slice(start, start + itemsPerPage)
+  }, [processedData, currentPage])
+
+  // Reset to page 1 when filters change
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [searchQuery, vendorFilter, brandFilter, categoryFilter, statusFilter, sortConfig])
 
   const toggleSelectAll = () => {
     if (selectedIds.size === processedData.length) {
@@ -612,9 +626,9 @@ export function SheetsReplenishment() {
                       ))}
                     </TableRow>
                   ))
-                ) : processedData.length === 0 ? (
+                ) : paginatedData.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={10} className="h-64 text-center">
+                    <TableCell colSpan={12} className="h-64 text-center">
                       <div className="flex flex-col items-center gap-2 text-muted-foreground">
                         <CircleAlert className="w-8 h-8 opacity-20" />
                         <p className="font-semibold">No matches found in synced product data.</p>
@@ -622,7 +636,7 @@ export function SheetsReplenishment() {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  processedData.map((item: any) => (
+                  paginatedData.map((item: any) => (
                     <TableRow 
                       key={`${item.system_id}-${item.location}`} 
                       className={cn(
@@ -746,6 +760,30 @@ export function SheetsReplenishment() {
               <span className="text-[9px] text-muted-foreground/60 italic">
                 {selectedIds.size} Items Selected for Push
               </span>
+            </div>
+            
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 px-2"
+                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                disabled={currentPage === 1}
+              >
+                Previous
+              </Button>
+              <div className="text-[10px] font-bold text-muted-foreground min-w-[80px] text-center">
+                Page {currentPage} of {totalPages || 1}
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 px-2"
+                onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                disabled={currentPage === totalPages || totalPages === 0}
+              >
+                Next
+              </Button>
             </div>
           </div>
         </div>

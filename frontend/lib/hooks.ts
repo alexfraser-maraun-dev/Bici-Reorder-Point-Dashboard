@@ -106,187 +106,55 @@ export function useKpiSummary(data: SkuLocationRow[]): KpiSummary {
   }, [data])
 }
 
-// Hook for recommendation runs
-export function useRecommendationRuns() {
-  const [data, setData] = useState<RecommendationRun[]>([])
-  const [isLoading, setIsLoading] = useState(true)
-  const [error, setError] = useState<Error | null>(null)
+import useSWR from 'swr'
 
-  const fetchData = useCallback(async () => {
-    setIsLoading(true)
-    try {
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-      const response = await fetch(`${baseUrl}/api/replenishment/runs`)
-      if (!response.ok) {
-        throw new Error('Failed to fetch recommendation runs')
-      }
-      const json = await response.json()
-      setData(json)
-    } catch (err) {
-      setError(err as Error)
-    } finally {
-      setIsLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    fetchData()
-  }, [fetchData])
-
-  return { data, isLoading, error, refetch: fetchData }
+// Generic fetcher for SWR
+const fetcher = async (url: string) => {
+  const res = await fetch(url)
+  if (!res.ok) throw new Error('Failed to fetch data')
+  return res.json()
 }
 
-// Hook for writeback audit
+// Hook for replenishment data (The main dashboard data)
+export function useReplenishmentData(forecastPeriod: number, safetyDays: number, growthMultiplier: number) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const url = `${baseUrl}/api/replenishment/data?forecast_period=${forecastPeriod}&safety_days=${safetyDays}&growth_multiplier=${growthMultiplier}`
+  
+  const { data, error, mutate, isLoading } = useSWR(url, fetcher, {
+    revalidateOnFocus: false,
+    revalidateOnReconnect: false,
+    dedupingInterval: 600000, // Keep in cache for 10 minutes
+  })
+
+  return { data, isLoading, error, refetch: mutate }
+}
+
+// Hook for recommendation runs (History)
+export function useRecommendationRuns() {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/runs`, fetcher)
+  return { data, isLoading, error, refetch: mutate }
+}
+
+// Hook for writeback audit (Audit Logs)
 export function useWritebackAudit() {
-  const [data, setData] = useState<WritebackAuditEntry[]>([])
-  const [isLoading, setIsLoading] = useState(true)
-  const [error, setError] = useState<Error | null>(null)
-
-  const fetchData = useCallback(async () => {
-    setIsLoading(true)
-    try {
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-      const response = await fetch(`${baseUrl}/api/replenishment/logs`)
-      if (!response.ok) {
-        throw new Error('Failed to fetch writeback audit')
-      }
-      const json = await response.json()
-      setData(json)
-    } catch (err) {
-      setError(err as Error)
-    } finally {
-      setIsLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    fetchData()
-  }, [fetchData])
-
-  return { data, isLoading, error, refetch: fetchData }
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/logs`, fetcher)
+  return { data, isLoading, error, refetch: mutate }
 }
 
 // Hook for managed SKUs
 export function useManagedSkus() {
-  const [data, setData] = useState<ManagedSku[]>([])
-  const [isLoading, setIsLoading] = useState(true)
-  const [error, setError] = useState<Error | null>(null)
-
-  const fetchData = useCallback(async () => {
-    setIsLoading(true)
-    try {
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-      const response = await fetch(`${baseUrl}/api/skus`)
-      if (!response.ok) {
-        throw new Error('Failed to fetch managed SKUs')
-      }
-      const json = await response.json()
-      setData(json)
-    } catch (err) {
-      setError(err as Error)
-    } finally {
-      setIsLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    fetchData()
-  }, [fetchData])
-
-  return { data, isLoading, error, refetch: fetchData }
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/skus`, fetcher)
+  return { data, isLoading, error, refetch: mutate }
 }
 
-// Placeholder API functions for future backend integration
-export async function pushToLightspeed(rowIds: string[]): Promise<{ success: boolean; message: string }> {
-  await simulateDelay(1000)
-  // Simulate 95% success rate
-  if (Math.random() < 0.95) {
-    return { success: true, message: `Successfully pushed ${rowIds.length} row(s) to Lightspeed` }
-  }
-  return { success: false, message: 'Lightspeed API error - please try again' }
-}
-
-export async function lockRows(rowIds: string[]): Promise<{ success: boolean }> {
-  await simulateDelay(300)
-  return { success: true }
-}
-
-export async function unlockRows(rowIds: string[]): Promise<{ success: boolean }> {
-  await simulateDelay(300)
-  return { success: true }
-}
-
-export async function updateOverride(
-  rowId: string,
-  reorderPoint?: number,
-  desiredLevel?: number
-): Promise<{ success: boolean }> {
-  await simulateDelay(300)
-  return { success: true }
-}
-export function useReplenishmentData(forecastPeriod?: number, safetyDays: number = 7, growthMultiplier: number = 1.0) {
-  const [data, setData] = useState<any>(null)
-  const [isLoading, setIsLoading] = useState(true)
-  const [error, setError] = useState<Error | null>(null)
-
-  const fetchData = useCallback(async () => {
-    setIsLoading(true)
-    setError(null)
-    try {
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-      let url = `${baseUrl}/api/replenishment/data?`
-      if (forecastPeriod) url += `forecast_period=${forecastPeriod}&`
-      url += `safety_days=${safetyDays}&`
-      url += `growth_multiplier=${growthMultiplier}`
-      
-      const response = await fetch(url)
-      if (!response.ok) {
-        throw new Error('Failed to fetch replenishment data')
-      }
-      const json = await response.json()
-      setData(json)
-    } catch (err) {
-      setError(err as Error)
-    } finally {
-      setIsLoading(false)
-    }
-  }, [forecastPeriod, safetyDays, growthMultiplier])
-
-  useEffect(() => {
-    fetchData()
-  }, [fetchData])
-
-  return { data, isLoading, error, refetch: fetchData }
-}
-
+// Hook for vendor lead times
 export function useVendorLeadTimes() {
-  const [data, setData] = useState<any>(null)
-  const [isLoading, setIsLoading] = useState(true)
-  const [error, setError] = useState<Error | null>(null)
-
-  const fetchData = useCallback(async () => {
-    setIsLoading(true)
-    setError(null)
-    try {
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-      const response = await fetch(`${baseUrl}/api/replenishment/vendor-lead-times`)
-      if (!response.ok) {
-        throw new Error('Failed to fetch vendor lead times')
-      }
-      const json = await response.json()
-      setData(json)
-    } catch (err) {
-      setError(err as Error)
-    } finally {
-      setIsLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    fetchData()
-  }, [fetchData])
-
-  return { data, isLoading, error, refetch: fetchData }
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/vendor-lead-times`, fetcher)
+  return { data, isLoading, error, refetch: mutate }
 }
 
 export function useConnectionStatus() {
