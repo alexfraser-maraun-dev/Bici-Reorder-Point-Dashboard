@@ -13,7 +13,7 @@ import {
   CircleHelp,
   LogOut,
 } from 'lucide-react'
-import { signOut } from 'next-auth/react'
+import { signOut, useSession } from 'next-auth/react'
 import { Button } from '@/components/ui/button'
 import {
   Sheet,
@@ -32,24 +32,33 @@ const navigation = [
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
+  const { data: session } = useSession()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+
   const [lsStatus, setLsStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
+  const [bqStatus, setBqStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
+  const [gsStatus, setGsStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
 
   useEffect(() => {
     const checkHealth = async () => {
-      try {
-        const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-        const response = await fetch(`${baseUrl}/api/health/lightspeed`)
-        if (response.ok) {
-          setLsStatus('connected')
-        } else {
-          setLsStatus('disconnected')
-        }
-      } catch (error) {
-        setLsStatus('disconnected')
-      }
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+
+      // Check Lightspeed
+      fetch(`${baseUrl}/api/health/lightspeed`)
+        .then(res => setLsStatus(res.ok ? 'connected' : 'disconnected'))
+        .catch(() => setLsStatus('disconnected'))
+
+      // Check BigQuery
+      fetch(`${baseUrl}/api/health/bigquery`)
+        .then(res => setBqStatus(res.ok ? 'connected' : 'disconnected'))
+        .catch(() => setBqStatus('disconnected'))
+
+      // Check Google Sheets
+      fetch(`${baseUrl}/api/health/sheets`)
+        .then(res => setGsStatus(res.ok ? 'connected' : 'disconnected'))
+        .catch(() => setGsStatus('disconnected'))
     }
-    
+
     checkHealth()
     const interval = setInterval(checkHealth, 30000)
     return () => clearInterval(interval)
@@ -99,10 +108,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           {/* Logo */}
           <div className="flex items-center gap-4">
             <div className="flex items-center">
-              <img 
-                src="/logo.svg" 
-                alt="Bici Logo" 
-                className="h-5 w-auto" 
+              <img
+                src="/logo.svg"
+                alt="Bici Logo"
+                className="h-5 w-auto"
               />
             </div>
             <div className="h-6 w-[1px] bg-muted mx-1 hidden sm:block" />
@@ -132,40 +141,30 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               )
             })}
           </nav>
-
-          {/* Right side */}
-          <div className="ml-auto flex items-center gap-4">
-            <div className="flex items-center gap-2">
-              <span className={cn(
-                "hidden text-xs lg:inline-block transition-colors font-medium",
-                lsStatus === 'connected' ? "text-muted-foreground" : 
-                lsStatus === 'checking' ? "text-muted-foreground/60" : "text-red-500 font-bold"
-              )}>
-                {lsStatus === 'connected' ? 'Connected to Lightspeed' : 
-                 lsStatus === 'checking' ? 'Checking connection...' : 
-                 'Lightspeed Disconnected'}
-              </span>
-              <div 
-                className={cn(
-                  "h-2.5 w-2.5 rounded-full transition-colors",
-                  lsStatus === 'connected' ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" : 
-                  lsStatus === 'checking' ? "bg-yellow-500 animate-pulse" : 
-                  "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)]"
-                )} 
-                title={lsStatus === 'connected' ? 'Connected' : 'Disconnected'} 
-              />
-            </div>
+          {/* Right side (User Profile) */}
+          <div className="ml-auto flex items-center gap-6">
             <div className="h-4 w-[1px] bg-border hidden sm:block" />
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => signOut({ callbackUrl: '/' })}
-              className="text-muted-foreground hover:text-foreground h-8 px-2 flex items-center"
-              title="Sign Out"
-            >
-              <LogOut className="h-4 w-4 sm:mr-2" />
-              <span className="hidden sm:inline-block text-xs font-medium">Sign Out</span>
-            </Button>
+
+            {/* User Profile */}
+            <div className="flex items-center gap-3">
+              <div className="flex flex-col items-end">
+                <span className="text-xs font-semibold text-foreground/90">
+                  {session?.user?.name || 'Authorized User'}
+                </span>
+                <span className="text-[10px] text-muted-foreground font-medium">
+                  {session?.user?.email || 'not signed in'}
+                </span>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => signOut({ callbackUrl: '/' })}
+                className="text-muted-foreground hover:text-foreground h-8 w-8 p-0"
+                title="Sign Out"
+              >
+                <LogOut className="h-4 w-4" />
+              </Button>
+            </div>
           </div>
         </div>
       </header>

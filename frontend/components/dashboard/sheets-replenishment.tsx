@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useMemo } from 'react'
-import { useReplenishmentData } from '@/lib/hooks'
+import { useReplenishmentData, useConnectionStatus } from '@/lib/hooks'
 import { 
   Table, 
   TableBody, 
@@ -47,6 +47,7 @@ export function SheetsReplenishment() {
   const [safetyDays, setSafetyDays] = useState(7)
   const [growthMultiplier, setGrowthMultiplier] = useState(1.0)
   const { data, isLoading, refetch } = useReplenishmentData(forecastPeriod, safetyDays, growthMultiplier)
+  const { lsStatus, bqStatus, gsStatus } = useConnectionStatus()
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
   
   const [isPushing, setIsPushing] = useState(false)
@@ -320,6 +321,72 @@ export function SheetsReplenishment() {
             <RefreshCw className={cn("w-3 h-3", isLoading && "animate-spin")} />
             {isLoading ? "Syncing..." : "Sync Product Data"}
           </Button>
+
+          {/* Connection Status Indicators */}
+          <div className="mt-4 space-y-3 pt-4 border-t">
+            <div className="flex items-center justify-between">
+              <span className="text-[9px] font-bold text-muted-foreground uppercase tracking-widest">System Connectivity</span>
+            </div>
+            
+            <div className="space-y-2">
+              {/* Lightspeed Indicator */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className={cn(
+                    "h-1.5 w-1.5 rounded-full",
+                    lsStatus === 'connected' ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.3)]" : 
+                    lsStatus === 'checking' ? "bg-yellow-500 animate-pulse" : "bg-red-500"
+                  )} />
+                  <span className="text-[10px] font-medium text-foreground/70">Lightspeed Retail</span>
+                </div>
+                <span className={cn(
+                  "text-[9px] font-bold uppercase tracking-tight",
+                  lsStatus === 'connected' ? "text-emerald-600" : 
+                  lsStatus === 'checking' ? "text-yellow-600" : "text-red-600"
+                )}>
+                  {lsStatus}
+                </span>
+              </div>
+
+              {/* BigQuery Indicator */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className={cn(
+                    "h-1.5 w-1.5 rounded-full",
+                    bqStatus === 'connected' ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.3)]" : 
+                    bqStatus === 'checking' ? "bg-yellow-500 animate-pulse" : "bg-red-500"
+                  )} />
+                  <span className="text-[10px] font-medium text-foreground/70">BigQuery Database</span>
+                </div>
+                <span className={cn(
+                  "text-[9px] font-bold uppercase tracking-tight",
+                  bqStatus === 'connected' ? "text-emerald-600" : 
+                  bqStatus === 'checking' ? "text-yellow-600" : "text-red-600"
+                )}>
+                  {bqStatus}
+                </span>
+              </div>
+
+              {/* Google Sheets Indicator */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className={cn(
+                    "h-1.5 w-1.5 rounded-full",
+                    gsStatus === 'connected' ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.3)]" : 
+                    gsStatus === 'checking' ? "bg-yellow-500 animate-pulse" : "bg-red-500"
+                  )} />
+                  <span className="text-[10px] font-medium text-foreground/70">Google Spreadsheet</span>
+                </div>
+                <span className={cn(
+                  "text-[9px] font-bold uppercase tracking-tight",
+                  gsStatus === 'connected' ? "text-emerald-600" : 
+                  gsStatus === 'checking' ? "text-yellow-600" : "text-red-600"
+                )}>
+                  {gsStatus}
+                </span>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 

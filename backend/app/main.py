@@ -5,12 +5,23 @@ from app.db.database import engine, Base, get_db
 from app.db.models import VelocitySnapshot, RecommendationRun, WritebackLog, ManagedSKU
 from sqlalchemy import desc, func
 from app.services import google_sheets
+from app.services.bigquery_sync import (
+    log_recommendation_run, log_velocity_snapshots, log_writeback,
+    get_managed_skus, upsert_managed_skus, get_sku_overrides, upsert_sku_override,
+    get_recommendation_runs, get_writeback_logs
+)
 import pandas as pd
 import io
+import uuid
+from datetime import datetime
 from typing import List, Dict, Any
+from fastapi.responses import Response, RedirectResponse
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+# Database initialization (Optional for local dev, logs to BQ in prod)
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"Skipping local DB initialization: {e}")
 
 app = FastAPI(title="SKU Reorder Point Automation API")
 
@@ -26,8 +37,6 @@ app.add_middleware(
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "Replenishment API is running"}
-
-from fastapi.responses import Response, RedirectResponse
 
 @app.get("/api/health")
 def health_check():
@@ -45,153 +54,89 @@ def download_sku_template():
     )
 
 @app.get("/api/skus")
-def get_managed_skus(db: Session = Depends(get_db)):
-    skus = db.query(ManagedSKU).all()
-    # Format to match the frontend expectations
-    return [{
-        "id": str(sku.id),
-        "sku": sku.sku,
-        "product": sku.product or "Unknown Product",
-        "brand": sku.brand or "Unknown",
-        "vendor": sku.vendor or "Unknown",
-        "category": sku.category or "Unknown",
-        "active": sku.active,
-        "addedAt": sku.created_at.isoformat() if sku.created_at else None,
-        "addedBy": sku.added_by or "System"
-    } for sku in skus]
+def fetch_managed_skus():
+    skus = get_managed_skus()
+    return skus
 
 @app.post("/api/skus/upload")
-async def upload_skus_csv(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    if not file.filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Only CSV files are allowed")
+async def upload_skus(file: UploadFile = File(...)):
+    contents = await file.read()
+    df = pd.read_csv(io.BytesIO(contents))
     
-    try:
-        contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
+    # Expected columns: sku, item_id
+    if 'sku' not in df.columns or 'item_id' not in df.columns:
+        raise HTTPException(status_code=400, detail="Missing required column: 'sku' or 'item_id'")
+    
+    skus_to_log = df.to_dict('records')
+    for s in skus_to_log:
+        s['added_by'] = "UI_Upload"
         
-        # Check required columns (at minimum we need 'sku' or 'system_sku')
-        sku_col = None
-        for col in ['sku', 'system_sku', 'SKU', 'System SKU']:
-            if col in df.columns:
-                sku_col = col
-                break
-                
-        if not sku_col:
-            raise HTTPException(status_code=400, detail="CSV must contain a 'sku' or 'system_sku' column")
-            
-        added_count = 0
-        updated_count = 0
-        
-        for _, row in df.iterrows():
-            sku_val = str(row[sku_col]).strip()
-            if not sku_val or sku_val == 'nan':
-                continue
-                
-            # Safely get optional fields
-            item_id = str(row.get('item_id', ''))
-            product = str(row.get('product', row.get('description', '')))
-            brand = str(row.get('brand', row.get('manufacturer', '')))
-            vendor = str(row.get('vendor', ''))
-            category = str(row.get('category', ''))
-            
-            existing = db.query(ManagedSKU).filter(ManagedSKU.sku == sku_val).first()
-            if existing:
-                existing.product = product if product and product != 'nan' else existing.product
-                existing.brand = brand if brand and brand != 'nan' else existing.brand
-                existing.vendor = vendor if vendor and vendor != 'nan' else existing.vendor
-                existing.category = category if category and category != 'nan' else existing.category
-                existing.active = True
-                updated_count += 1
-            else:
-                new_sku = ManagedSKU(
-                    sku=sku_val,
-                    item_id=item_id if item_id and item_id != 'nan' else None,
-                    product=product if product and product != 'nan' else None,
-                    brand=brand if brand and brand != 'nan' else None,
-                    vendor=vendor if vendor and vendor != 'nan' else None,
-                    category=category if category and category != 'nan' else None,
-                    active=True,
-                    added_by="CSV Import"
-                )
-                db.add(new_sku)
-                added_count += 1
-                
-        db.commit()
-        return {"status": "success", "added": added_count, "updated": updated_count}
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    upsert_managed_skus(skus_to_log)
+    return {"status": "success", "count": len(skus_to_log)}
 
-@app.post("/api/sync/sheets")
-def sync_from_google_sheets(db: Session = Depends(get_db)):
-    spreadsheet_id = "1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak"
-    try:
-        data = google_sheets.fetch_sheet_data(spreadsheet_id)
-        
-        # Identify locations from headers
-        locations = set()
-        for key in data[0].keys():
-            if "|" in key:
-                locations.add(key.split("|")[0])
-        
-        structured_data = google_sheets.get_location_metrics(data, list(locations))
-        
-        # For now, let's just return the count and first few items to verify
-        return {
-            "status": "success", 
-            "rowCount": len(structured_data),
-            "locationsFound": list(locations),
-            "sample": structured_data[:2]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to sync from Google Sheets: {str(e)}")
 @app.get("/api/replenishment/data")
-def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, growth_multiplier: float = 1.0, db: Session = Depends(get_db)):
+def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, growth_multiplier: float = 1.0):
     spreadsheet_id = "1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak"
     try:
-        # Create a new run record
-        new_run = RecommendationRun(run_type="manual", status="running")
-        db.add(new_run)
-        db.commit()
+        # 1. Fetch Google Sheet Data
+        raw_data = google_sheets.fetch_sheet_data(spreadsheet_id)
         
-        # 1. Fetch data from Google Sheets
-        data = google_sheets.fetch_sheet_data(spreadsheet_id)
-        
-        # 1.5 Fetch BigQuery Metrics (Cached)
+        # 1.5 Fetch BigQuery Metrics and Overrides
         from app.services.bigquery_sync import get_cached_bq_metrics
         bq_metrics = get_cached_bq_metrics()
-        
-        # 2. Get previous velocity snapshots
-        momentum_data = {}
-        prev_snapshots = db.query(VelocitySnapshot).all()
-        for s in prev_snapshots:
-            momentum_data[f"{s.system_id}|{s.location}"] = s.daily_sales
-            
-        # 3. Process recommendations
-        recommendations = google_sheets.process_recommendations(
-            data, 
+        overrides = get_sku_overrides()
+
+        # 2. Process Recommendations
+        from app.services.google_sheets import process_recommendations
+        recommendations = process_recommendations(
+            raw_data, 
             safety_days=safety_days, 
             override_forecast=forecast_period,
             growth_multiplier=growth_multiplier,
-            momentum_data=momentum_data,
             bq_metrics=bq_metrics
         )
-        
-        # 4. Save NEW snapshots
+
+        # 3. Apply Overrides (Locked, Manual ROP/DL)
         for rec in recommendations:
-            new_snap = VelocitySnapshot(
-                system_id=rec['system_id'],
-                location=rec['location'],
-                daily_sales=rec['raw_daily_sales'] if 'raw_daily_sales' in rec else rec['daily_sales']
-            )
-            db.add(new_snap)
+            key = f"{rec['sku']}_{rec['location']}"
+            if key in overrides:
+                ov = overrides[key]
+                if ov.get('locked'):
+                    rec['locked'] = True
+                if ov.get('manual_reorder_point') is not None:
+                    rec['recommended_reorder_point'] = ov['manual_reorder_point']
+                if ov.get('manual_desired_level') is not None:
+                    rec['recommended_desired_level'] = ov['manual_desired_level']
+                
+                # Re-calculate change_needed
+                rec['change_needed'] = (
+                    rec['recommended_reorder_point'] != rec['current_reorder_point'] or 
+                    rec['recommended_desired_level'] != rec['current_desired_level']
+                )
         
-        # Update run status
-        new_run.status = "completed"
-        new_run.row_count = len(recommendations)
-        new_run.completed_at = func.now()
-        db.commit()
+        # 4. Save NEW snapshots and run info to BigQuery
+        run_id = str(uuid.uuid4())
+        run_log = {
+            "run_id": run_id,
+            "run_type": "manual",
+            "triggered_by": "UI_User",
+            "started_at": datetime.utcnow().isoformat(),
+            "completed_at": datetime.utcnow().isoformat(),
+            "status": "completed",
+            "row_count": len(recommendations)
+        }
+        log_recommendation_run(run_log)
+
+        snapshots = []
+        for rec in recommendations:
+            snapshots.append({
+                "system_id": str(rec['system_id']),
+                "sku": str(rec['sku']),
+                "location": rec['location'],
+                "daily_sales": float(rec['raw_daily_sales'] if 'raw_daily_sales' in rec else rec['daily_sales']),
+                "created_at": datetime.utcnow().isoformat()
+            })
+        log_velocity_snapshots(snapshots)
         
         # Organize by location
         by_location = {
@@ -206,146 +151,78 @@ def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, gr
                 
         return {
             "status": "success",
-            "run_id": new_run.id,
+            "run_id": run_id,
             "locations": ["Bici Adanac", "Victoria", "Langford"],
             "data": by_location
         }
     except Exception as e:
-        db.rollback()
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/replenishment/push")
-def push_replenishment_updates(updates: List[Dict[str, Any]], db: Session = Depends(get_db)):
-    """
-    Pushes a list of SKU recommendations to Lightspeed and logs results.
-    """
+def push_replenishment_updates(updates: List[Dict[str, Any]]):
     from app.services.lightspeed_client import LightspeedClient
-    from app.db.models import WritebackLog
-    
     client = LightspeedClient()
     results = []
     
     for update in updates:
         success = client.sync_recommendation(update)
         
-        # Log to database
-        log_entry = WritebackLog(
-            sku=update.get('sku'),
-            location_id=update.get('location'),
-            old_reorder_point=update.get('current_reorder_point'),
-            new_reorder_point=update.get('recommended_reorder_point'),
-            old_desired_inventory=update.get('current_desired_level'),
-            new_desired_inventory=update.get('recommended_desired_level'),
-            status="success" if success else "failed",
-            triggered_by="UI_Manual_Push"
-        )
-        db.add(log_entry)
+        # Log to BigQuery
+        log_data = {
+            "sku": str(update.get('sku')),
+            "location_id": str(update.get('location')),
+            "old_reorder_point": int(update.get('current_reorder_point') or 0),
+            "new_reorder_point": int(update.get('recommended_reorder_point') or 0),
+            "old_desired_inventory": int(update.get('current_desired_level') or 0),
+            "new_desired_inventory": int(update.get('recommended_desired_level') or 0),
+            "triggered_by": "UI_Manual_Push",
+            "status": "success" if success else "failed",
+            "error_message": None if success else "Lightspeed API Write Failure",
+            "created_at": datetime.utcnow().isoformat()
+        }
+        log_writeback(log_data)
         results.append({"sku": update.get('sku'), "success": success})
         
-    db.commit()
     return {"status": "completed", "results": results}
 
+@app.get("/api/replenishment/runs")
+def get_recommendation_history(limit: int = 50):
+    runs = get_recommendation_runs(limit)
+    return runs
+
 @app.get("/api/replenishment/logs")
-def get_writeback_logs(limit: int = 100, db: Session = Depends(get_db)):
-    from app.db.models import WritebackLog
-    logs = db.query(WritebackLog).order_by(desc(WritebackLog.created_at)).limit(limit).all()
-    
+def get_writeback_logs(limit: int = 100):
+    logs = get_writeback_logs(limit)
     formatted_logs = []
     for log in logs:
-        rop_changed = log.new_reorder_point != log.old_reorder_point
-        dl_changed = log.new_desired_inventory != log.old_desired_inventory
-        
-        if not rop_changed and not dl_changed:
-            formatted_logs.append({
-                "id": f"{log.id}",
-                "timestamp": log.created_at.isoformat(),
-                "user": log.triggered_by,
-                "sku": log.sku,
-                "location": log.location_id,
-                "field": "reorder_point",
-                "oldValue": log.old_reorder_point,
-                "newValue": log.new_reorder_point,
-                "status": log.status,
-                "errorMessage": log.error_message
-            })
-            continue
-            
-        if rop_changed:
-            formatted_logs.append({
-                "id": f"{log.id}-rop",
-                "timestamp": log.created_at.isoformat(),
-                "user": log.triggered_by,
-                "sku": log.sku,
-                "location": log.location_id,
-                "field": "reorder_point",
-                "oldValue": log.old_reorder_point,
-                "newValue": log.new_reorder_point,
-                "status": log.status,
-                "errorMessage": log.error_message
-            })
-            
-        if dl_changed:
-            formatted_logs.append({
-                "id": f"{log.id}-dl",
-                "timestamp": log.created_at.isoformat(),
-                "user": log.triggered_by,
-                "sku": log.sku,
-                "location": log.location_id,
-                "field": "desired_level",
-                "oldValue": log.old_desired_inventory,
-                "newValue": log.new_desired_inventory,
-                "status": log.status,
-                "errorMessage": log.error_message
-            })
-            
+        rop_changed = log.get('new_reorder_point') != log.get('old_reorder_point')
+        formatted_logs.append({
+            "id": str(uuid.uuid4()),
+            "timestamp": log.get('created_at').isoformat() if hasattr(log.get('created_at'), 'isoformat') else str(log.get('created_at')),
+            "user": log.get('triggered_by'),
+            "sku": log.get('sku'),
+            "location": log.get('location_id'),
+            "field": "reorder_point" if rop_changed else "desired_level",
+            "oldValue": log.get('old_reorder_point'),
+            "newValue": log.get('new_reorder_point'),
+            "status": log.get('status'),
+            "errorMessage": log.get('error_message')
+        })
     return formatted_logs
 
-@app.get("/api/replenishment/runs")
-def get_recommendation_runs(limit: int = 50, db: Session = Depends(get_db)):
-    from app.db.models import RecommendationRun, RecommendationRow
-    from sqlalchemy import func
-    
-    runs = db.query(RecommendationRun).order_by(desc(RecommendationRun.started_at)).limit(limit).all()
-    
-    results = []
-    for run in runs:
-        # Calculate summaries from recommendation rows
-        summary = db.query(
-            func.count(RecommendationRow.id).label("total"),
-            func.sum(func.cast(RecommendationRow.changed_flag, Integer)).label("changed"),
-            func.sum(func.cast(RecommendationRow.needs_order, Integer)).label("needs_order")
-        ).filter(RecommendationRow.run_id == run.id).first()
-        
-        duration = "N/A"
-        if run.completed_at and run.started_at:
-            delta = run.completed_at - run.started_at
-            duration = f"{delta.total_seconds():.1f}s"
-            
-        results.append({
-            "id": str(run.id),
-            "runDate": run.started_at.isoformat(),
-            "type": run.run_type,
-            "triggeredBy": run.triggered_by or "System",
-            "status": run.status,
-            "totalRows": summary.total if summary and summary.total else (run.row_count or 0),
-            "changedRows": summary.changed if summary and summary.changed else 0,
-            "needsOrderCount": summary.needs_order if summary and summary.needs_order else 0,
-            "duration": duration,
-            "trailingDays": 30, # Defaulting for now as it's not in the run model
-            "forecastDays": 60,
-            "safetyDays": 7
-        })
-    return results
+@app.post("/api/replenishment/override")
+def save_override(override: Dict[str, Any]):
+    upsert_sku_override(override)
+    return {"status": "success"}
 
 @app.get("/api/replenishment/vendor-lead-times")
 def get_vendor_lead_times():
     spreadsheet_id = "1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak"
     try:
         data = google_sheets.fetch_vendor_lead_times(spreadsheet_id)
-        return {
-            "status": "success",
-            "data": data
-        }
+        return {"status": "success", "data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -357,35 +234,44 @@ def check_lightspeed_health():
     if is_connected:
         return {"status": "connected"}
     else:
-        # Return 503 Service Unavailable so the frontend knows it's an error
         raise HTTPException(status_code=503, detail="Disconnected from Lightspeed")
+
+@app.get("/api/health/bigquery")
+def check_bigquery_health():
+    from app.services.bigquery_sync import client as bq_client
+    try:
+        # Simple query to check connectivity
+        bq_client.list_datasets(max_results=1)
+        return {"status": "connected"}
+    except Exception as e:
+        print(f"BigQuery health check failed: {e}")
+        raise HTTPException(status_code=503, detail="Disconnected from BigQuery")
+
+@app.get("/api/health/sheets")
+def check_sheets_health():
+    try:
+        from app.services.google_sheets import get_gspread_client
+        client = get_gspread_client()
+        # Just check if we can initialize the client
+        if client:
+            return {"status": "connected"}
+        else:
+            raise Exception("Failed to initialize gspread client")
+    except Exception as e:
+        print(f"Google Sheets health check failed: {e}")
+        raise HTTPException(status_code=503, detail="Disconnected from Google Sheets")
 
 @app.get("/api/replenishment/ls-link/{system_id}")
 def get_lightspeed_link(system_id: str):
-    """
-    Resolves a system_id (systemSku) to a Lightspeed itemID and redirects 
-    to the product edit page.
-    """
     from app.services.lightspeed_client import LightspeedClient
     client = LightspeedClient()
     try:
         items = client.get_item_by_sku(system_id)
         if not items:
-            # Fallback: maybe it's already an itemID?
-            # But according to user, system_id is NOT itemID.
-            raise HTTPException(status_code=404, detail=f"Item with SKU {system_id} not found in Lightspeed")
-        
-        # Get the first match
-        item = items[0]
-        item_id = item.get("itemID")
-        
-        if not item_id:
-            raise HTTPException(status_code=404, detail="Lightspeed itemID not found in API response")
-            
+            raise HTTPException(status_code=404, detail=f"Item with SKU {system_id} not found")
+        item_id = items[0].get("itemID")
         ls_url = f"https://us.merchantos.com/?name=item.views.item.edit&id={item_id}"
         return RedirectResponse(url=ls_url)
     except Exception as e:
-        print(f"Error resolving LS link for {system_id}: {e}")
-        # If it fails, maybe redirect to search?
         search_url = f"https://us.merchantos.com/?name=item.views.item.edit&id={system_id}"
         return RedirectResponse(url=search_url)

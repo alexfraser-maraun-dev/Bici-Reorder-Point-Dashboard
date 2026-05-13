@@ -7,10 +7,150 @@ import time
 # Initialize BigQuery client
 client = bigquery.Client()
 
-# NOTE: You will need to replace 'YOUR_PROJECT.YOUR_DATASET' with your actual GCP project and dataset name.
-BQ_DATASET = os.getenv("BQ_DATASET", "bici-klaviyo-datasync.light_speed_retailne") # Using assumed default
+BQ_DATASET = os.getenv("BQ_DATASET", "bici-klaviyo-datasync.BiciReorderPointDashboard")
 CACHE_FILE = "bq_metrics_cache.json"
 CACHE_EXPIRY_SECONDS = 86400 # 24 hours
+
+def log_recommendation_run(run_data: dict):
+    """Streams a run summary to BigQuery."""
+    table_id = f"{BQ_DATASET}.replen_recommendation_runs"
+    try:
+        errors = client.insert_rows_json(table_id, [run_data])
+        if errors:
+            print(f"BigQuery Run Log Errors: {errors}")
+    except Exception as e:
+        print(f"Failed to log run to BigQuery: {e}")
+
+def log_velocity_snapshots(snapshots: list):
+    """Streams velocity snapshots to BigQuery in batches."""
+    table_id = f"{BQ_DATASET}.replen_velocity_snapshots"
+    try:
+        # Batch by 500 rows to avoid request size limits
+        for i in range(0, len(snapshots), 500):
+            batch = snapshots[i:i+500]
+            errors = client.insert_rows_json(table_id, batch)
+            if errors:
+                print(f"BigQuery Snapshot Errors: {errors}")
+    except Exception as e:
+        print(f"Failed to log snapshots to BigQuery: {e}")
+
+def log_writeback(log_data: dict):
+    """Streams a writeback event to BigQuery."""
+    table_id = f"{BQ_DATASET}.replen_writeback_logs"
+    try:
+        errors = client.insert_rows_json(table_id, [log_data])
+        if errors:
+            print(f"BigQuery Writeback Log Errors: {errors}")
+    except Exception as e:
+        print(f"Failed to log writeback to BigQuery: {e}")
+
+def get_recommendation_runs(limit: int = 50):
+    """Fetches historical runs from BigQuery."""
+    query = f"""
+        SELECT * FROM `{BQ_DATASET}.replen_recommendation_runs`
+        ORDER BY started_at DESC
+        LIMIT {limit}
+    """
+    try:
+        query_job = client.query(query)
+        rows = query_job.result()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"Failed to fetch runs from BigQuery: {e}")
+        return []
+
+def get_writeback_logs(limit: int = 100):
+    """Fetches writeback logs from BigQuery."""
+    query = f"""
+        SELECT * FROM `{BQ_DATASET}.replen_writeback_logs`
+        ORDER BY created_at DESC
+        LIMIT {limit}
+    """
+    try:
+        query_job = client.query(query)
+        rows = query_job.result()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"Failed to fetch writeback logs from BigQuery: {e}")
+        return []
+
+def get_managed_skus():
+    """Fetches list of managed SKUs from BigQuery."""
+    query = f"SELECT * FROM `{BQ_DATASET}.replen_managed_skus` WHERE active = TRUE"
+    try:
+        return client.query(query).to_dataframe().to_dict('records')
+    except Exception as e:
+        print(f"Failed to fetch managed SKUs: {e}")
+        return []
+
+def upsert_managed_skus(skus: list):
+    """Upserts managed SKUs into BigQuery using MERGE."""
+    table_id = f"{BQ_DATASET}.replen_managed_skus"
+    # Create temp table for merge
+    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+    temp_table_id = f"{table_id}_temp"
+    client.load_table_from_json(skus, temp_table_id, job_config=job_config).result()
+
+    merge_query = f"""
+        MERGE `{table_id}` T
+        USING `{temp_table_id}` S
+        ON T.sku = S.sku
+        WHEN MATCHED THEN
+            UPDATE SET T.product = S.product, T.brand = S.brand, T.vendor = S.vendor, 
+                       T.category = S.category, T.updated_at = CURRENT_TIMESTAMP()
+        WHEN NOT MATCHED THEN
+            INSERT (sku, item_id, product, brand, vendor, category, added_by, created_at, updated_at)
+            VALUES (S.sku, S.item_id, S.product, S.brand, S.vendor, S.category, S.added_by, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+    """
+    client.query(merge_query).result()
+    client.delete_table(temp_table_id)
+
+def get_sku_overrides():
+    """Fetches manual overrides from BigQuery."""
+    query = f"SELECT * FROM `{BQ_DATASET}.replen_sku_overrides`"
+    try:
+        df = client.query(query).to_dataframe()
+        # Create lookup map: {sku_location: {rop: x, dl: y, locked: z}}
+        overrides = {}
+        for _, row in df.iterrows():
+            key = f"{row['sku']}_{row['location_id']}"
+            overrides[key] = {
+                "manual_reorder_point": row['manual_reorder_point'],
+                "manual_desired_level": row['manual_desired_level'],
+                "locked": row['locked']
+            }
+        return overrides
+    except Exception as e:
+        print(f"Failed to fetch overrides: {e}")
+        return {}
+
+def upsert_sku_override(override_data: dict):
+    """Upserts a single override into BigQuery."""
+    table_id = f"{BQ_DATASET}.replen_sku_overrides"
+    merge_query = f"""
+        MERGE `{table_id}` T
+        USING (SELECT @sku as sku, @location_id as location_id) S
+        ON T.sku = S.sku AND T.location_id = S.location_id
+        WHEN MATCHED THEN
+            UPDATE SET 
+                manual_reorder_point = @rop,
+                manual_desired_level = @dl,
+                locked = @locked,
+                updated_at = CURRENT_TIMESTAMP()
+        WHEN NOT MATCHED THEN
+            INSERT (sku, location_id, manual_reorder_point, manual_desired_level, locked, updated_at)
+            VALUES (@sku, @location_id, @rop, @dl, @locked, CURRENT_TIMESTAMP())
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("sku", "STRING", override_data['sku']),
+            bigquery.ScalarQueryParameter("location_id", "STRING", override_data['location_id']),
+            bigquery.ScalarQueryParameter("rop", "INT64", override_data.get('manual_reorder_point')),
+            bigquery.ScalarQueryParameter("dl", "INT64", override_data.get('manual_desired_level')),
+            bigquery.ScalarQueryParameter("locked", "BOOL", override_data.get('locked', False)),
+        ]
+    )
+    client.query(merge_query, job_config=job_config).result()
 
 def get_cached_bq_metrics(trailing_days: int = 60) -> dict:
     """
