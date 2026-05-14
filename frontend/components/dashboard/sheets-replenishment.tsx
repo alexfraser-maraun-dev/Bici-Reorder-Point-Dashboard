@@ -47,7 +47,20 @@ export function SheetsReplenishment() {
   const [forecastPeriod, setForecastPeriod] = useState(60)
   const [safetyDays, setSafetyDays] = useState(7)
   const [growthMultiplier, setGrowthMultiplier] = useState(1.0)
-  const { data, isLoading, refetch } = useReplenishmentData(forecastPeriod, safetyDays, growthMultiplier)
+
+  // Debounce slider values to prevent spamming backend during dragging
+  const [debouncedForecast, setDebouncedForecast] = useState(forecastPeriod)
+  const [debouncedSafety, setDebouncedSafety] = useState(safetyDays)
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedForecast(forecastPeriod)
+      setDebouncedSafety(safetyDays)
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [forecastPeriod, safetyDays])
+
+  const { data, isLoading, refetch } = useReplenishmentData(debouncedForecast, debouncedSafety, growthMultiplier)
   const { lsStatus, bqStatus, gsStatus } = useConnectionStatus()
   const { data: session } = useSession()
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'

@@ -65,12 +65,12 @@ async def upload_skus(file: UploadFile = File(...)):
     return {"status": "success", "count": len(skus_to_log)}
 
 @app.get("/api/replenishment/data")
-def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, growth_multiplier: float = 1.0):
+def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, growth_multiplier: float = 1.0, force_refresh: bool = False):
     spreadsheet_id = "1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak"
     try:
         # 1. Fetch Google Sheet Data
         from app.services import google_sheets
-        raw_data = google_sheets.fetch_sheet_data(spreadsheet_id)
+        raw_data = google_sheets.fetch_sheet_data(spreadsheet_id, force_refresh=force_refresh)
         
         # 1.5 Fetch BigQuery Metrics and Overrides
         from app.services.bigquery_sync import get_cached_bq_metrics

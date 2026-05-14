@@ -79,7 +79,19 @@ def clean_float(val: Any) -> float:
     except:
         return 0.0
 
-def fetch_sheet_data(spreadsheet_id: str) -> List[Dict[str, Any]]:
+import time
+
+_sheet_cache = {}
+CACHE_TTL = 300 # 5 minutes
+
+def fetch_sheet_data(spreadsheet_id: str, force_refresh: bool = False) -> List[Dict[str, Any]]:
+    current_time = time.time()
+    
+    if not force_refresh and spreadsheet_id in _sheet_cache:
+        cached_data, timestamp = _sheet_cache[spreadsheet_id]
+        if current_time - timestamp < CACHE_TTL:
+            return cached_data
+
     client = get_gspread_client()
     spreadsheet = client.open_by_key(spreadsheet_id)
     # The main replenishment sheet is usually the first one (index 0)
@@ -116,6 +128,7 @@ def fetch_sheet_data(spreadsheet_id: str) -> List[Dict[str, Any]]:
             item[headers[i]] = val
         parsed_data.append(item)
         
+    _sheet_cache[spreadsheet_id] = (parsed_data, time.time())
     return parsed_data
 
 def fetch_vendor_lead_times(spreadsheet_id: str) -> List[Dict[str, Any]]:

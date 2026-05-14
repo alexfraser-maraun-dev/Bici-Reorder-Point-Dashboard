@@ -115,7 +115,6 @@ const fetcher = async (url: string) => {
   return res.json()
 }
 
-// Hook for replenishment data (The main dashboard data)
 export function useReplenishmentData(forecastPeriod: number, safetyDays: number, growthMultiplier: number) {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
   const url = `${baseUrl}/api/replenishment/data?forecast_period=${forecastPeriod}&safety_days=${safetyDays}&growth_multiplier=${growthMultiplier}`
@@ -126,7 +125,13 @@ export function useReplenishmentData(forecastPeriod: number, safetyDays: number,
     dedupingInterval: 600000, // Keep in cache for 10 minutes
   })
 
-  return { data, isLoading, error, refetch: mutate }
+  const handleRefetch = async () => {
+    const refreshUrl = `${url}&force_refresh=true`
+    const newData = await fetcher(refreshUrl)
+    mutate(newData, false) // update local data without triggering another fetch
+  }
+
+  return { data, isLoading, error, refetch: handleRefetch }
 }
 
 // Hook for recommendation runs (History)
