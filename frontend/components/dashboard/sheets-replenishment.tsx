@@ -567,8 +567,8 @@ export function SheetsReplenishment() {
         {/* Table Area */}
         <div className="flex-1 bg-card rounded-xl border shadow-sm overflow-hidden flex flex-col">
           <div className="overflow-auto flex-1">
-            <Table>
-              <TableHeader className="bg-muted/50 sticky top-0 z-10 backdrop-blur-sm">
+            <Table wrapperClassName="overflow-visible">
+              <TableHeader className="bg-muted/95 sticky top-0 z-10 backdrop-blur border-b shadow-sm">
                 <TableRow className="hover:bg-transparent border-none">
                   <TableHead className="w-[34px] px-2">
                     <input 
