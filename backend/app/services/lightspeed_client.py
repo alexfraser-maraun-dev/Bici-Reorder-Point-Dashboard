@@ -10,7 +10,7 @@ class LightspeedClient:
         self.client_secret = os.getenv("LIGHTSPEED_CLIENT_SECRET")
         self.refresh_token = os.getenv("LIGHTSPEED_REFRESH_TOKEN")
         self.bearer_token = os.getenv("LIGHTSPEED_BEARER_TOKEN")
-        self.base_url = f"https://api.lightspeedapp.com/API/Account/{self.account_id}"
+        self.base_url = f"https://api.lightspeedapp.com/API/V3/Account/{self.account_id}"
         
         # Mapping from Spreadsheet Names to Lightspeed shopIDs
         self.shop_id_map = {
@@ -115,11 +115,10 @@ class LightspeedClient:
 
     def update_reorder_levels(self, item_shop_id: str, reorder_point: int, reorder_level: int) -> Optional[Dict[str, Any]]:
         url = f"{self.base_url}/ItemShop/{item_shop_id}.json"
+        # Per API docs, fields are sent flat (not nested inside ItemShop wrapper)
         payload = {
-            "ItemShop": {
-                "reorderPoint": reorder_point,
-                "reorderLevel": reorder_level
-            }
+            "reorderPoint": str(reorder_point),
+            "reorderLevel": str(reorder_level)
         }
         try:
             response = requests.put(url, headers=self._get_headers(), json=payload, timeout=10)

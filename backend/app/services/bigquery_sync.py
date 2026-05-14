@@ -47,8 +47,10 @@ def log_writeback(log_data: dict):
     """Streams a writeback event to BigQuery."""
     table_id = f"{BQ_DATASET}.replen_writeback_logs"
     try:
+        client = get_bq_client()
         errors = client.insert_rows_json(table_id, [log_data])
         if errors:
+
             print(f"BigQuery Writeback Log Errors: {errors}")
     except Exception as e:
         print(f"Failed to log writeback to BigQuery: {e}")
@@ -61,6 +63,7 @@ def get_recommendation_runs(limit: int = 50):
         LIMIT {limit}
     """
     try:
+        client = get_bq_client()
         query_job = client.query(query)
         rows = query_job.result()
         return [dict(row) for row in rows]
@@ -76,6 +79,7 @@ def get_writeback_logs(limit: int = 100):
         LIMIT {limit}
     """
     try:
+        client = get_bq_client()
         query_job = client.query(query)
         rows = query_job.result()
         return [dict(row) for row in rows]
@@ -231,6 +235,7 @@ def fetch_sales_history(trailing_days: int) -> pd.DataFrame:
             sl.shop_id
     """
     
+    client = get_bq_client()
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("trailing_days", "INT64", trailing_days),
@@ -296,6 +301,7 @@ def fetch_inventory_snapshot() -> pd.DataFrame:
         LEFT JOIN
             open_pos p ON i.item_id = p.item_id AND i.shop_id = p.shop_id
     """
+    client = get_bq_client()
     return client.query(query).to_dataframe()
 
 def fetch_lead_times(lookback_months: int = 12) -> pd.DataFrame:
@@ -321,6 +327,7 @@ def fetch_lead_times(lookback_months: int = 12) -> pd.DataFrame:
             shop_id
     """
     
+    client = get_bq_client()
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("lookback_months", "INT64", lookback_months),

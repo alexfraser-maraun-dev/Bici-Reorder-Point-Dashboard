@@ -250,7 +250,7 @@ def process_recommendations(parsed_data: List[Dict[str, Any]], safety_days: int 
             if bq_metrics:
                 # Key maps to system_id and location name mapping
                 # Shop ID mapping: 2 -> Adanac, 3 -> Victoria, 20 -> Langford (Assuming these are standard for BICI)
-                shop_map = {"Bici Adanac": 2, "Victoria": 3, "Langford": 20}
+                shop_map = {"Bici Adanac": 3, "Victoria": 2, "Langford": 20}
                 shop_id = shop_map.get(loc)
                 bq_key = f"{system_id}_{shop_id}"
                 
