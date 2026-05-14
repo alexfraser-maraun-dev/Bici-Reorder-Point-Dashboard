@@ -125,13 +125,22 @@ export function useReplenishmentData(forecastPeriod: number, safetyDays: number,
     dedupingInterval: 600000, // Keep in cache for 10 minutes
   })
 
+  const [isRefetching, setIsRefetching] = useState(false)
+
   const handleRefetch = async () => {
-    const refreshUrl = `${url}&force_refresh=true`
-    const newData = await fetcher(refreshUrl)
-    mutate(newData, false) // update local data without triggering another fetch
+    setIsRefetching(true)
+    try {
+      const refreshUrl = `${url}&force_refresh=true`
+      const newData = await fetcher(refreshUrl)
+      mutate(newData, false) // update local data without triggering another fetch
+    } catch (e) {
+      console.error("Failed to refetch", e)
+    } finally {
+      setIsRefetching(false)
+    }
   }
 
-  return { data, isLoading, error, refetch: handleRefetch }
+  return { data, isLoading: isLoading || isRefetching, error, refetch: handleRefetch }
 }
 
 // Hook for recommendation runs (History)

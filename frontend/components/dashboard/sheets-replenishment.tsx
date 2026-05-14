@@ -11,6 +11,7 @@ import {
   TableHeader, 
   TableRow 
 } from '@/components/ui/table'
+import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -39,7 +40,8 @@ import {
   Zap,
   CircleCheck,
   CircleAlert,
-  Info
+  Info,
+  BookmarkPlus
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -231,6 +233,44 @@ export function SheetsReplenishment() {
       setTimeout(() => setPushResult(null), 6000)
     } finally {
       setIsPushing(false)
+    }
+  }
+
+  const [isAddingToManaged, setIsAddingToManaged] = useState(false)
+  const handleAddToManaged = async () => {
+    const selectedItems = processedData.filter((i: any) => selectedIds.has(i.system_id))
+    if (selectedItems.length === 0) return alert("Please select at least one SKU to add to the managed list.")
+    
+    setIsAddingToManaged(true)
+    try {
+      const itemsToAdd = selectedItems.map((item: any) => ({
+        system_id: item.system_id,
+        sku: item.sku,
+        description: item.description,
+        brand: item.brand,
+        vendor: item.vendor,
+        category: item.category,
+        added_by: session?.user?.email ?? session?.user?.name ?? 'Unknown User'
+      }))
+
+      const response = await fetch(`${baseUrl}/api/skus/add-bulk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(itemsToAdd)
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        toast.success(`Added ${data.added} SKUs to Managed List`)
+        setSelectedIds(new Set())
+      } else {
+        toast.error(`Server Error: ${response.status}`)
+      }
+    } catch (error) {
+      console.error("Add to managed failed:", error)
+      toast.error("Network Error")
+    } finally {
+      setIsAddingToManaged(false)
     }
   }
 
@@ -530,38 +570,58 @@ export function SheetsReplenishment() {
                Ready to push to Lightspeed
             </span>
           </div>
-          <Button 
-            size="sm" 
-            variant={pushResult?.status === 'success' ? "secondary" : "default"} 
-            className={cn(
-              "h-9 text-sm px-6 font-bold shadow-md transition-all rounded-full",
-              pushResult?.status === 'success' && "bg-emerald-500 text-white hover:bg-emerald-600",
-              pushResult?.status === 'warning' && "bg-amber-500 text-white hover:bg-amber-600",
-              pushResult?.status === 'error' && "bg-red-500 text-white hover:bg-red-600",
-              !pushResult && "bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 hover:shadow-lg",
-              selectedIds.size === 0 && !pushResult && "opacity-50 grayscale cursor-not-allowed"
-            )}
-            onClick={handlePush}
-            disabled={isPushing || pushResult?.status === 'success' || (selectedIds.size === 0 && !pushResult)}
-          >
-            {isPushing ? (
-              <>
+          <div className="flex items-center gap-3">
+            <Button
+              size="sm"
+              variant="outline"
+              className={cn(
+                "h-9 text-sm px-4 font-semibold transition-all rounded-full",
+                selectedIds.size === 0 && "opacity-50 grayscale cursor-not-allowed"
+              )}
+              onClick={handleAddToManaged}
+              disabled={isAddingToManaged || selectedIds.size === 0}
+            >
+              {isAddingToManaged ? (
                 <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
-                Pushing {selectedIds.size} SKUs...
-              </>
-            ) : pushResult ? (
-              <>
-                {pushResult.status === 'success' && <CircleCheck className="w-4 h-4 mr-2" />}
-                {pushResult.status !== 'success' && <CircleAlert className="w-4 h-4 mr-2" />}
-                {pushResult.msg}
-              </>
-            ) : (
-              <>
-                <Zap className="w-4 h-4 mr-2 fill-current" />
-                Push to Lightspeed ({selectedIds.size})
-              </>
-            )}
-          </Button>
+              ) : (
+                <BookmarkPlus className="w-4 h-4 mr-2 text-indigo-600" />
+              )}
+              Add to Managed
+            </Button>
+            
+            <Button 
+              size="sm" 
+              variant={pushResult?.status === 'success' ? "secondary" : "default"} 
+              className={cn(
+                "h-9 text-sm px-6 font-bold shadow-md transition-all rounded-full",
+                pushResult?.status === 'success' && "bg-emerald-500 text-white hover:bg-emerald-600",
+                pushResult?.status === 'warning' && "bg-amber-500 text-white hover:bg-amber-600",
+                pushResult?.status === 'error' && "bg-red-500 text-white hover:bg-red-600",
+                !pushResult && "bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 hover:shadow-lg",
+                selectedIds.size === 0 && !pushResult && "opacity-50 grayscale cursor-not-allowed"
+              )}
+              onClick={handlePush}
+              disabled={isPushing || pushResult?.status === 'success' || (selectedIds.size === 0 && !pushResult)}
+            >
+              {isPushing ? (
+                <>
+                  <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                  Pushing {selectedIds.size} SKUs...
+                </>
+              ) : pushResult ? (
+                <>
+                  {pushResult.status === 'success' && <CircleCheck className="w-4 h-4 mr-2" />}
+                  {pushResult.status !== 'success' && <CircleAlert className="w-4 h-4 mr-2" />}
+                  {pushResult.msg}
+                </>
+              ) : (
+                <>
+                  <Zap className="w-4 h-4 mr-2 fill-current" />
+                  Push to Lightspeed ({selectedIds.size})
+                </>
+              )}
+            </Button>
+          </div>
         </div>
 
         {/* Table Area */}

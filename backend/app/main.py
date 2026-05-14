@@ -64,6 +64,31 @@ async def upload_skus(file: UploadFile = File(...)):
     upsert_managed_skus(skus_to_log)
     return {"status": "success", "count": len(skus_to_log)}
 
+@app.post("/api/skus/add-bulk")
+def add_managed_skus_bulk(items: List[Dict[str, Any]]):
+    skus_to_log = []
+    for item in items:
+        # system_id is usually item_id in Lightspeed
+        item_id = item.get("system_id") or item.get("item_id") or ""
+        sku = item.get("sku", "")
+        if not sku or not item_id:
+            continue
+            
+        skus_to_log.append({
+            "sku": str(sku),
+            "item_id": str(item_id),
+            "product": str(item.get("description", "")),
+            "brand": str(item.get("brand", "")),
+            "vendor": str(item.get("vendor", "")),
+            "category": str(item.get("category", "")),
+            "added_by": item.get("added_by", "Dashboard_Bulk_Add")
+        })
+        
+    if skus_to_log:
+        upsert_managed_skus(skus_to_log)
+        
+    return {"status": "success", "added": len(skus_to_log)}
+
 @app.get("/api/replenishment/data")
 def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, growth_multiplier: float = 1.0, force_refresh: bool = False):
     spreadsheet_id = "1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak"
