@@ -133,28 +133,28 @@ export function useReplenishmentData(forecastPeriod: number, safetyDays: number,
 export function useRecommendationRuns() {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
   const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/runs`, fetcher)
-  return { data, isLoading, error, refetch: mutate }
+  return { data: data || [], isLoading, error, refetch: mutate }
 }
 
 // Hook for writeback audit (Audit Logs)
 export function useWritebackAudit() {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
   const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/logs`, fetcher)
-  return { data, isLoading, error, refetch: mutate }
+  return { data: data || [], isLoading, error, refetch: mutate }
 }
 
 // Hook for managed SKUs
 export function useManagedSkus() {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
   const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/skus`, fetcher)
-  return { data, isLoading, error, refetch: mutate }
+  return { data: data || [], isLoading, error, refetch: mutate }
 }
 
 // Hook for vendor lead times
 export function useVendorLeadTimes() {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
   const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/vendor-lead-times`, fetcher)
-  return { data, isLoading, error, refetch: mutate }
+  return { data: data || null, isLoading, error, refetch: mutate }
 }
 
 export function useConnectionStatus() {
