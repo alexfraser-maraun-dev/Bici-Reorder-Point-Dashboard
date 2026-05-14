@@ -161,6 +161,7 @@ def push_replenishment_updates(updates: List[Dict[str, Any]]):
         success = client.sync_recommendation(update)
         
         # Log to BigQuery
+        triggered_by = update.get('pushed_by') or "UI_Manual_Push"
         log_data = {
             "sku": str(update.get('sku')),
             "location_id": str(update.get('location')),
@@ -168,7 +169,7 @@ def push_replenishment_updates(updates: List[Dict[str, Any]]):
             "new_reorder_point": int(update.get('recommended_reorder_point') or 0),
             "old_desired_inventory": int(update.get('current_desired_level') or 0),
             "new_desired_inventory": int(update.get('recommended_desired_level') or 0),
-            "triggered_by": "UI_Manual_Push",
+            "triggered_by": triggered_by,
             "status": "success" if success else "failed",
             "error_message": None if success else "Lightspeed API Write Failure",
             "created_at": datetime.utcnow().isoformat()

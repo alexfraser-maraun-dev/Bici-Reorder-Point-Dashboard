@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useMemo, useEffect } from 'react'
+import { useSession } from 'next-auth/react'
 import { useReplenishmentData, useConnectionStatus } from '@/lib/hooks'
 import { 
   Table, 
@@ -48,6 +49,7 @@ export function SheetsReplenishment() {
   const [growthMultiplier, setGrowthMultiplier] = useState(1.0)
   const { data, isLoading, refetch } = useReplenishmentData(forecastPeriod, safetyDays, growthMultiplier)
   const { lsStatus, bqStatus, gsStatus } = useConnectionStatus()
+  const { data: session } = useSession()
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
   
   const [isPushing, setIsPushing] = useState(false)
@@ -184,7 +186,10 @@ export function SheetsReplenishment() {
       const response = await fetch(`${baseUrl}/api/replenishment/push`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(itemsToPush)
+        body: JSON.stringify(itemsToPush.map(item => ({
+          ...item,
+          pushed_by: session?.user?.email ?? session?.user?.name ?? 'Unknown User'
+        })))
       })
       if (response.ok) {
         const data = await response.json()
