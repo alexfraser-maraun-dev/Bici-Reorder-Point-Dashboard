@@ -16,6 +16,7 @@ def get_bq_client():
 
 APP_DATASET = os.getenv("APP_DATASET", "bici-klaviyo-datasync.BiciReorderPointDashboard")
 LS_DATASET = os.getenv("LS_DATASET", "bici-klaviyo-datasync.light_speed_retailne")
+QUALIFIED_ITEMS_VIEW = os.getenv("QUALIFIED_ITEMS_VIEW", f"{APP_DATASET}.replen_qualified_items")
 CACHE_FILE = "bq_metrics_cache.json"
 CACHE_EXPIRY_SECONDS = 86400 # 24 hours
 
@@ -438,7 +439,7 @@ CACHE_TTL = 300 # 5 minutes
 def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: bool = False) -> pd.DataFrame:
     """
     Fetches inventory, sales totals (30d and 60d), stockout counts (30d and 60d),
-    and metadata for items matching the given tag.
+    and metadata for items from the curated qualifying-items view.
     """
     current_time = time.time()
     
@@ -455,14 +456,12 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
         date_spine_30 AS (
           SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY), CURRENT_DATE())) AS day
         ),
-        latest_item_tag AS (
-            SELECT item_id FROM `{LS_DATASET}.item_tag_history`
-            WHERE LOWER(tag) LIKE CONCAT('%', LOWER(@tag_name), '%')
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY item_id ORDER BY item_updated_time DESC) = 1
+        qualified_items AS (
+            SELECT item_id FROM `{QUALIFIED_ITEMS_VIEW}`
         ),
         latest_item AS (
             SELECT * FROM `{LS_DATASET}.item_history`
-            WHERE id IN (SELECT item_id FROM latest_item_tag)
+            WHERE id IN (SELECT item_id FROM qualified_items)
             QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
         ),
         latest_item_shop AS (
@@ -569,13 +568,6 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
         LEFT JOIN categories c ON ih.category_id = c.category_id
     """
     client = get_bq_client()
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("tag_name", "STRING", tag_name),
-        ]
-    )
-    df = client.query(query, job_config=job_config).to_dataframe()
+    df = client.query(query).to_dataframe()
     _bq_tag_cache[tag_name] = (df, time.time())
     return df
-
-
