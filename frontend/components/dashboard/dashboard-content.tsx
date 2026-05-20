@@ -16,7 +16,7 @@ export function DashboardContent() {
             Reorder Point Config Tool
           </h1>
           <p className="text-muted-foreground text-sm font-medium mt-1">
-            Manual Ingestion Workflow • Live Google Sheets Sync
+            Manual Ingestion Workflow • Live BigQuery Sync
           </p>
         </div>
       </div>

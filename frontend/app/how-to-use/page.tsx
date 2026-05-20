@@ -31,15 +31,15 @@ export default function HowToUsePage() {
               <CardTitle className="flex items-center gap-2 text-blue-700">
                 <RefreshCw className="w-5 h-5" /> 1. Sync Product Data
               </CardTitle>
-              <CardDescription>Refreshing your data from Google Sheets</CardDescription>
+              <CardDescription>Refreshing your data directly from BigQuery</CardDescription>
             </CardHeader>
             <CardContent className="text-sm space-y-3">
               <p>
-                Click the <strong>"Sync Product Data"</strong> button in the sidebar to fetch the latest sales velocity, 
-                current stock levels, and vendor lead times.
+                Click the <strong>"Sync Product Data"</strong> button in the sidebar to pull the latest sales velocity, 
+                current stock levels, and vendor lead times directly from BigQuery — bypassing the cache for a fresh snapshot.
               </p>
               <p className="text-muted-foreground italic">
-                Tip: Do this every time you start a session to ensure your recommendations are based on the latest snapshots.
+                Tip: Data is cached for 5 minutes automatically. Use this button to force an immediate refresh at the start of your session.
               </p>
             </CardContent>
           </Card>

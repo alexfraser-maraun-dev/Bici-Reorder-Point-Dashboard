@@ -174,7 +174,6 @@ export function useVendorLeadTimes() {
 export function useConnectionStatus() {
   const [lsStatus, setLsStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
   const [bqStatus, setBqStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
-  const [gsStatus, setGsStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
 
   useEffect(() => {
     const checkHealth = () => {
@@ -195,7 +194,6 @@ export function useConnectionStatus() {
       
       fetchWithTimeout('lightspeed').then(setLsStatus)
       fetchWithTimeout('bigquery').then(setBqStatus)
-      fetchWithTimeout('sheets').then(setGsStatus)
 
       return () => clearTimeout(timeoutId)
     }
@@ -205,5 +203,5 @@ export function useConnectionStatus() {
     return () => clearInterval(interval)
   }, [])
 
-  return { lsStatus, bqStatus, gsStatus }
+  return { lsStatus, bqStatus }
 }
