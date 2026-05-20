@@ -215,18 +215,36 @@ def get_audit_logs(limit: int = 100):
     formatted_logs = []
     for log in logs:
         rop_changed = log.get('new_reorder_point') != log.get('old_reorder_point')
-        formatted_logs.append({
-            "id": str(uuid.uuid4()),
-            "timestamp": log.get('created_at').isoformat() if hasattr(log.get('created_at'), 'isoformat') else str(log.get('created_at')),
-            "user": log.get('triggered_by'),
-            "sku": log.get('sku'),
-            "location": log.get('location_id'),
-            "field": "reorder_point" if rop_changed else "desired_level",
-            "oldValue": log.get('old_reorder_point'),
-            "newValue": log.get('new_reorder_point'),
-            "status": log.get('status'),
-            "errorMessage": log.get('error_message')
-        })
+        dl_changed = log.get('new_desired_inventory') != log.get('old_desired_inventory')
+        
+        # If ROP changed, or if neither changed (e.g. baseline or failed attempt fallback)
+        if rop_changed or (not rop_changed and not dl_changed):
+            formatted_logs.append({
+                "id": str(uuid.uuid4()),
+                "timestamp": log.get('created_at').isoformat() if hasattr(log.get('created_at'), 'isoformat') else str(log.get('created_at')),
+                "user": log.get('triggered_by'),
+                "sku": log.get('sku'),
+                "location": log.get('location_id'),
+                "field": "reorder_point",
+                "oldValue": log.get('old_reorder_point'),
+                "newValue": log.get('new_reorder_point'),
+                "status": log.get('status'),
+                "errorMessage": log.get('error_message')
+            })
+            
+        if dl_changed:
+            formatted_logs.append({
+                "id": str(uuid.uuid4()),
+                "timestamp": log.get('created_at').isoformat() if hasattr(log.get('created_at'), 'isoformat') else str(log.get('created_at')),
+                "user": log.get('triggered_by'),
+                "sku": log.get('sku'),
+                "location": log.get('location_id'),
+                "field": "desired_level",
+                "oldValue": log.get('old_desired_inventory'),
+                "newValue": log.get('new_desired_inventory'),
+                "status": log.get('status'),
+                "errorMessage": log.get('error_message')
+            })
     return formatted_logs
 
 @app.post("/api/replenishment/override")
