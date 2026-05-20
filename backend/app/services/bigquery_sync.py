@@ -14,13 +14,14 @@ def get_bq_client():
         _client = bigquery.Client()
     return _client
 
-BQ_DATASET = os.getenv("BQ_DATASET", "bici-klaviyo-datasync.BiciReorderPointDashboard")
+APP_DATASET = os.getenv("APP_DATASET", "bici-klaviyo-datasync.BiciReorderPointDashboard")
+LS_DATASET = os.getenv("LS_DATASET", "bici-klaviyo-datasync.light_speed_retailne")
 CACHE_FILE = "bq_metrics_cache.json"
 CACHE_EXPIRY_SECONDS = 86400 # 24 hours
 
 def log_recommendation_run(run_data: dict):
     """Streams a run summary to BigQuery."""
-    table_id = f"{BQ_DATASET}.replen_recommendation_runs"
+    table_id = f"{APP_DATASET}.replen_recommendation_runs"
     try:
         client = get_bq_client()
         errors = client.insert_rows_json(table_id, [run_data])
@@ -31,7 +32,7 @@ def log_recommendation_run(run_data: dict):
 
 def log_velocity_snapshots(snapshots: list):
     """Streams velocity snapshots to BigQuery in batches."""
-    table_id = f"{BQ_DATASET}.replen_velocity_snapshots"
+    table_id = f"{APP_DATASET}.replen_velocity_snapshots"
     try:
         client = get_bq_client()
         # Batch by 500 rows to avoid request size limits
@@ -45,7 +46,7 @@ def log_velocity_snapshots(snapshots: list):
 
 def log_writeback(log_data: dict):
     """Streams a writeback event to BigQuery."""
-    table_id = f"{BQ_DATASET}.replen_writeback_logs"
+    table_id = f"{APP_DATASET}.replen_writeback_logs"
     try:
         client = get_bq_client()
         errors = client.insert_rows_json(table_id, [log_data])
@@ -58,7 +59,7 @@ def log_writeback(log_data: dict):
 def get_recommendation_runs(limit: int = 50):
     """Fetches historical runs from BigQuery."""
     query = f"""
-        SELECT * FROM `{BQ_DATASET}.replen_recommendation_runs`
+        SELECT * FROM `{LS_DATASET}.replen_recommendation_runs`
         ORDER BY started_at DESC
         LIMIT {limit}
     """
@@ -74,7 +75,7 @@ def get_recommendation_runs(limit: int = 50):
 def get_writeback_logs(limit: int = 100):
     """Fetches writeback logs from BigQuery."""
     query = f"""
-        SELECT * FROM `{BQ_DATASET}.replen_writeback_logs`
+        SELECT * FROM `{APP_DATASET}.replen_writeback_logs`
         ORDER BY created_at DESC
         LIMIT {limit}
     """
@@ -90,7 +91,7 @@ def get_writeback_logs(limit: int = 100):
 def get_managed_skus():
     """Fetches list of managed SKUs from BigQuery."""
     query = f"""
-        SELECT * FROM `{BQ_DATASET}.replen_managed_skus`
+        SELECT * FROM `{APP_DATASET}.replen_managed_skus`
     """
     try:
         client = get_bq_client()
@@ -101,7 +102,7 @@ def get_managed_skus():
 
 def upsert_managed_skus(skus: list):
     """Upserts managed SKUs into BigQuery using MERGE."""
-    table_id = f"{BQ_DATASET}.replen_managed_skus"
+    table_id = f"{APP_DATASET}.replen_managed_skus"
     # Create temp table for merge
     job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
     temp_table_id = f"{table_id}_temp"
@@ -123,7 +124,7 @@ def upsert_managed_skus(skus: list):
 
 def get_sku_overrides():
     """Fetches manual overrides from BigQuery."""
-    query = f"SELECT * FROM `{BQ_DATASET}.replen_sku_overrides`"
+    query = f"SELECT * FROM `{APP_DATASET}.replen_sku_overrides`"
     try:
         client = get_bq_client()
         df = client.query(query).to_dataframe()
@@ -143,7 +144,7 @@ def get_sku_overrides():
 
 def upsert_sku_override(override_data: dict):
     """Upserts a single override into BigQuery."""
-    table_id = f"{BQ_DATASET}.replen_sku_overrides"
+    table_id = f"{APP_DATASET}.replen_sku_overrides"
     merge_query = f"""
         MERGE `{table_id}` T
         USING (SELECT @sku as sku, @location_id as location_id) S
@@ -223,9 +224,9 @@ def fetch_sales_history(trailing_days: int) -> pd.DataFrame:
             sl.shop_id AS location_id,
             SUM(sl.unit_quantity) AS trailing_units_sold
         FROM
-            `{BQ_DATASET}.sale_line_history` sl
+            `{LS_DATASET}.sale_line_history` sl
         JOIN
-            `{BQ_DATASET}.sale_history` s ON sl.sale_id = s.id
+            `{LS_DATASET}.sale_history` s ON sl.sale_id = s.id
         WHERE
             s.completed = TRUE
             AND s.voided = FALSE
@@ -250,11 +251,11 @@ def fetch_inventory_snapshot() -> pd.DataFrame:
     """
     query = f"""
         WITH latest_item_shop AS (
-            SELECT * FROM `{BQ_DATASET}.item_shop_history`
+            SELECT * FROM `{LS_DATASET}.item_shop_history`
             QUALIFY ROW_NUMBER() OVER(PARTITION BY item_id, shop_id ORDER BY updated_time DESC) = 1
         ),
         latest_item AS (
-            SELECT * FROM `{BQ_DATASET}.item_history`
+            SELECT * FROM `{LS_DATASET}.item_history`
             QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
         ),
         latest_inventory AS (
@@ -277,9 +278,9 @@ def fetch_inventory_snapshot() -> pd.DataFrame:
                 o.shop_id,
                 SUM(ol.quantity - COALESCE(ol.num_received, 0)) AS on_order_units
             FROM
-                `{BQ_DATASET}.order_line_history` ol
+                `{LS_DATASET}.order_line_history` ol
             JOIN
-                `{BQ_DATASET}.order_history` o ON ol.order_id = o.id
+                `{LS_DATASET}.order_history` o ON ol.order_id = o.id
             WHERE
                 o.complete = FALSE 
                 AND o.archived = FALSE
@@ -304,10 +305,19 @@ def fetch_inventory_snapshot() -> pd.DataFrame:
     client = get_bq_client()
     return client.query(query).to_dataframe()
 
-def fetch_lead_times(lookback_months: int = 12) -> pd.DataFrame:
+_bq_lead_time_cache = {}
+
+def fetch_lead_times(lookback_months: int = 12, force_refresh: bool = False) -> pd.DataFrame:
     """
     Fetches average vendor lead times per location from the po_report table.
     """
+    current_time = time.time()
+    
+    if not force_refresh and lookback_months in _bq_lead_time_cache:
+        cached_data, timestamp = _bq_lead_time_cache[lookback_months]
+        if current_time - timestamp < CACHE_TTL:
+            return cached_data
+
     query = f"""
         SELECT
             vendor_id,
@@ -315,7 +325,7 @@ def fetch_lead_times(lookback_months: int = 12) -> pd.DataFrame:
             CEIL(AVG(TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY))) AS lead_time_days,
             COUNT(order_id) AS po_count
         FROM
-            `{BQ_DATASET}.po_report`
+            `{LS_DATASET}.po_report`
         WHERE
             po_ordered_at IS NOT NULL
             AND first_received_at IS NOT NULL
@@ -333,7 +343,9 @@ def fetch_lead_times(lookback_months: int = 12) -> pd.DataFrame:
             bigquery.ScalarQueryParameter("lookback_months", "INT64", lookback_months),
         ]
     )
-    return client.query(query, job_config=job_config).to_dataframe()
+    df = client.query(query, job_config=job_config).to_dataframe()
+    _bq_lead_time_cache[lookback_months] = (df, time.time())
+    return df
 
 
 def fetch_unified_metrics(trailing_days: int = 60) -> pd.DataFrame:
@@ -354,7 +366,7 @@ def fetch_unified_metrics(trailing_days: int = 60) -> pd.DataFrame:
             shopID as location_id, 
             qoh, 
             DATE(timeStamp) as change_date
-          FROM `{BQ_DATASET}.LS_itemshop_history`
+          FROM `{LS_DATASET}.LS_itemshop_history`
           WHERE shopID > 0
         ),
         daily_qoh_mapped AS (
@@ -389,8 +401,8 @@ def fetch_unified_metrics(trailing_days: int = 60) -> pd.DataFrame:
             sl.item_id, 
             sl.shop_id as location_id, 
             SUM(sl.unit_quantity) as total_units_sold
-          FROM `{BQ_DATASET}.sale_line_history` sl
-          JOIN `{BQ_DATASET}.sale_history` s ON sl.sale_id = s.id
+          FROM `{LS_DATASET}.sale_line_history` sl
+          JOIN `{LS_DATASET}.sale_history` s ON sl.sale_id = s.id
           WHERE s.completed = TRUE
             AND s.voided = FALSE
             AND DATE(s.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL @trailing_days DAY)
@@ -406,18 +418,164 @@ def fetch_unified_metrics(trailing_days: int = 60) -> pd.DataFrame:
           current_ish.qoh as current_qoh,
           current_ish.reorderPoint as current_reorder_point,
           current_ish.reorderLevel as current_desired_level
-        FROM `{BQ_DATASET}.item_history` ih
-        JOIN `{BQ_DATASET}.LS_itemshop_history` current_ish ON ih.id = current_ish.itemID
+        FROM `{LS_DATASET}.item_history` ih
+        JOIN `{LS_DATASET}.LS_itemshop_history` current_ish ON ih.id = current_ish.itemID
         LEFT JOIN sales_totals st ON ih.id = st.item_id AND current_ish.shopID = st.location_id
         LEFT JOIN stockout_counts sc ON ih.id = sc.item_id AND current_ish.shopID = sc.location_id
         WHERE current_ish.shopID > 0
         QUALIFY ROW_NUMBER() OVER(PARTITION BY ih.id, current_ish.shopID ORDER BY current_ish.timeStamp DESC) = 1
     """
-    
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("trailing_days", "INT64", trailing_days),
         ]
     )
     return client.query(query, job_config=job_config).to_dataframe()
+
+_bq_tag_cache = {}
+CACHE_TTL = 300 # 5 minutes
+
+def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: bool = False) -> pd.DataFrame:
+    """
+    Fetches inventory, sales totals (30d and 60d), stockout counts (30d and 60d),
+    and metadata for items matching the given tag.
+    """
+    current_time = time.time()
+    
+    if not force_refresh and tag_name in _bq_tag_cache:
+        cached_data, timestamp = _bq_tag_cache[tag_name]
+        if current_time - timestamp < CACHE_TTL:
+            return cached_data
+
+    query = f"""
+        WITH 
+        date_spine_60 AS (
+          SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY), CURRENT_DATE())) AS day
+        ),
+        date_spine_30 AS (
+          SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY), CURRENT_DATE())) AS day
+        ),
+        latest_item_tag AS (
+            SELECT item_id FROM `{LS_DATASET}.item_tag_history`
+            WHERE LOWER(tag) LIKE CONCAT('%', LOWER(@tag_name), '%')
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY item_id ORDER BY item_updated_time DESC) = 1
+        ),
+        latest_item AS (
+            SELECT * FROM `{LS_DATASET}.item_history`
+            WHERE id IN (SELECT item_id FROM latest_item_tag)
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        latest_item_shop AS (
+            SELECT * FROM `{LS_DATASET}.item_shop_history`
+            WHERE item_id IN (SELECT id FROM latest_item)
+            AND shop_id > 0
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY item_id, shop_id ORDER BY updated_time DESC) = 1
+        ),
+        item_shop_history_all AS (
+          SELECT 
+            item_id, 
+            shop_id as location_id, 
+            qoh, 
+            DATE(updated_time) as change_date
+          FROM `{LS_DATASET}.item_shop_history`
+          WHERE item_id IN (SELECT id FROM latest_item)
+          AND shop_id > 0
+        ),
+        daily_qoh_mapped_60 AS (
+          SELECT 
+            d.day,
+            ish.item_id,
+            ish.location_id,
+            LAST_VALUE(item_shop_history_all.qoh IGNORE NULLS) OVER (
+              PARTITION BY ish.item_id, ish.location_id 
+              ORDER BY d.day 
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) as daily_qoh
+          FROM date_spine_60 d
+          CROSS JOIN (SELECT DISTINCT item_id, location_id FROM item_shop_history_all) ish
+          LEFT JOIN item_shop_history_all ON item_shop_history_all.change_date = d.day 
+            AND item_shop_history_all.item_id = ish.item_id 
+            AND item_shop_history_all.location_id = ish.location_id
+        ),
+        stockouts AS (
+          SELECT 
+            item_id, 
+            location_id, 
+            COUNTIF(daily_qoh <= 0) as days_out_of_stock_60,
+            COUNTIF(daily_qoh <= 0 AND day >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)) as days_out_of_stock_30
+          FROM daily_qoh_mapped_60
+          GROUP BY 1, 2
+        ),
+        sales_totals AS (
+          SELECT 
+            sl.item_id, 
+            sl.shop_id as location_id, 
+            SUM(CASE WHEN DATE(s.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY) THEN sl.unit_quantity ELSE 0 END) as total_units_sold_30,
+            SUM(sl.unit_quantity) as total_units_sold_60
+          FROM `{LS_DATASET}.sale_line_history` sl
+          JOIN `{LS_DATASET}.sale_history` s ON sl.sale_id = s.id
+          WHERE sl.item_id IN (SELECT id FROM latest_item)
+            AND s.completed = TRUE
+            AND s.voided = FALSE
+            AND DATE(s.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
+          GROUP BY 1, 2
+        ),
+        open_pos AS (
+            SELECT
+                ol.item_id,
+                o.shop_id AS location_id,
+                SUM(ol.quantity - COALESCE(ol.num_received, 0)) AS on_order_units
+            FROM `{LS_DATASET}.order_line_history` ol
+            JOIN `{LS_DATASET}.order_history` o ON ol.order_id = o.id
+            WHERE ol.item_id IN (SELECT id FROM latest_item)
+              AND o.complete = FALSE 
+              AND o.archived = FALSE
+            GROUP BY 1, 2
+        ),
+        vendors AS (
+            SELECT id as vendor_id, name as vendor_name FROM `{LS_DATASET}.vendor_history` QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        brands AS (
+            SELECT id as manufacturer_id, name as brand_name FROM `{LS_DATASET}.manufacturer_history` QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        categories AS (
+            SELECT id as category_id, full_path_name as category_name FROM `{LS_DATASET}.category_history` QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        )
+        
+        SELECT 
+          ih.system_sku as sku,
+          ih.id as item_id,
+          ih.description,
+          ih.default_vendor_id as vendor_id,
+          v.vendor_name as vendor,
+          b.brand_name as brand,
+          c.category_name as category,
+          current_ish.shop_id as location_id,
+          COALESCE(st.total_units_sold_30, 0) as total_units_sold_30,
+          COALESCE(st.total_units_sold_60, 0) as total_units_sold_60,
+          COALESCE(sc.days_out_of_stock_30, 0) as days_out_of_stock_30,
+          COALESCE(sc.days_out_of_stock_60, 0) as days_out_of_stock_60,
+          current_ish.qoh as current_qoh,
+          COALESCE(p.on_order_units, 0) as on_order,
+          current_ish.reorder_point as current_reorder_point,
+          current_ish.reorder_level as current_desired_level
+        FROM latest_item ih
+        JOIN latest_item_shop current_ish ON ih.id = current_ish.item_id
+        LEFT JOIN sales_totals st ON ih.id = st.item_id AND current_ish.shop_id = st.location_id
+        LEFT JOIN stockouts sc ON ih.id = sc.item_id AND current_ish.shop_id = sc.location_id
+        LEFT JOIN open_pos p ON ih.id = p.item_id AND current_ish.shop_id = p.location_id
+        LEFT JOIN vendors v ON ih.default_vendor_id = v.vendor_id
+        LEFT JOIN brands b ON ih.manufacturer_id = b.manufacturer_id
+        LEFT JOIN categories c ON ih.category_id = c.category_id
+    """
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("tag_name", "STRING", tag_name),
+        ]
+    )
+    df = client.query(query, job_config=job_config).to_dataframe()
+    _bq_tag_cache[tag_name] = (df, time.time())
+    return df
+
 
