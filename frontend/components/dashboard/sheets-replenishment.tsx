@@ -64,7 +64,7 @@ export function SheetsReplenishment() {
   }, [forecastPeriod, safetyDays])
 
   const { data, isLoading, refetch } = useReplenishmentData(debouncedForecast, debouncedSafety, growthMultiplier)
-  const { lsStatus, bqStatus, gsStatus } = useConnectionStatus()
+  const { lsStatus, bqStatus } = useConnectionStatus()
   const { data: session } = useSession()
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
   
@@ -440,24 +440,6 @@ export function SheetsReplenishment() {
                 </span>
               </div>
 
-              {/* Google Sheets Indicator */}
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className={cn(
-                    "h-1.5 w-1.5 rounded-full",
-                    gsStatus === 'connected' ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.3)]" : 
-                    gsStatus === 'checking' ? "bg-yellow-500 animate-pulse" : "bg-red-500"
-                  )} />
-                  <span className="text-[10px] font-medium text-foreground/70">Google Spreadsheet</span>
-                </div>
-                <span className={cn(
-                  "text-[9px] font-bold uppercase tracking-tight",
-                  gsStatus === 'connected' ? "text-emerald-600" : 
-                  gsStatus === 'checking' ? "text-yellow-600" : "text-red-600"
-                )}>
-                  {gsStatus}
-                </span>
-              </div>
             </div>
           </div>
         </div>
