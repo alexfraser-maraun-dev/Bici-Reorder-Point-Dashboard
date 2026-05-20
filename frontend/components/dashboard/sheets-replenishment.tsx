@@ -41,7 +41,8 @@ import {
   CircleCheck,
   CircleAlert,
   Info,
-  BookmarkPlus
+  BookmarkPlus,
+  AlertTriangle
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -780,11 +781,25 @@ export function SheetsReplenishment() {
                           {item.days_stock}d
                         </span>
                       </TableCell>
-                      <TableCell className="text-right bg-emerald-50/5 border-x">
-                        <div className="flex items-center justify-end gap-1">
+                      <TableCell className={cn(
+                        "text-right border-x transition-colors duration-200",
+                        item.qty_to_order > 0 && (item.on_hand + item.on_order) > item.recommended_reorder_point 
+                          ? "bg-orange-50/20" 
+                          : "bg-emerald-50/5"
+                      )}>
+                        <div className="flex items-center justify-end gap-1 relative group">
+                          {item.qty_to_order > 0 && (item.on_hand + item.on_order) > item.recommended_reorder_point && (
+                            <div title="Pipeline Alert: On-hand + On-order is greater than the Reorder Point, so Lightspeed will not automatically reorder this item. However, there is a deficit against your Desired Level.">
+                              <AlertTriangle className="w-3.5 h-3.5 text-orange-500 animate-pulse" />
+                            </div>
+                          )}
                           <span className={cn(
                             "font-bold font-mono text-[11px] tabular-nums",
-                            item.qty_to_order > 0 ? "text-emerald-600" : "text-muted-foreground/20"
+                            item.qty_to_order > 0 && (item.on_hand + item.on_order) > item.recommended_reorder_point 
+                              ? "text-orange-600" 
+                              : item.qty_to_order > 0 
+                                ? "text-emerald-600" 
+                                : "text-muted-foreground/20"
                           )}>
                             {item.qty_to_order}
                           </span>
