@@ -342,13 +342,15 @@ def check_sheets_health():
 def get_lightspeed_link(system_id: str):
     from app.services.lightspeed_client import LightspeedClient
     client = LightspeedClient()
+    def build_item_url(item_id: str) -> str:
+        return f"https://us.merchantos.com/?name=item.views.item&form_name=view&id={item_id}&tab=details"
+
     try:
         items = client.get_item_by_sku(system_id)
         if not items:
             raise HTTPException(status_code=404, detail=f"Item with SKU {system_id} not found")
         item_id = items[0].get("itemID")
-        ls_url = f"https://us.merchantos.com/?name=item.views.item.edit&id={item_id}"
-        return RedirectResponse(url=ls_url)
-    except Exception as e:
-        search_url = f"https://us.merchantos.com/?name=item.views.item.edit&id={system_id}"
+        return RedirectResponse(url=build_item_url(item_id))
+    except Exception:
+        search_url = build_item_url(system_id)
         return RedirectResponse(url=search_url)
