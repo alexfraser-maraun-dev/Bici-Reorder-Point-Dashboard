@@ -117,9 +117,9 @@ min-days mode    = 1
 cap mode         = 2
 ```
 
-The weighted velocity below is used as the base daily velocity for replenishment math.
+The historical weighting below is used as the base daily velocity for replenishment math.
 
-### Weighted Velocity
+### Historical Weighting
 
 The replenishment math uses a weighted blend of the most recent 30 days and days 31-60:
 
@@ -128,7 +128,7 @@ weighted velocity = (adjusted 30d daily velocity * recent 30d weight)
                   + (adjusted days 31-60 daily velocity * prior 30d weight)
 ```
 
-The dashboard defaults to a balanced `70% / 30%` split, with UI presets for stable, balanced, reactive, and custom weighting.
+The dashboard control is labeled `Historical Weighting` and defaults to a balanced `70% / 30%` split, with UI presets for stable, balanced, reactive, and custom weighting.
 
 ### ROP
 

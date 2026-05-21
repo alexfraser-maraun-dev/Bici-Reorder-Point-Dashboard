@@ -141,6 +141,10 @@ export default function HowToUsePage() {
               <p className="text-sm">Raw sales are adjusted for active in-stock days, then passed through the selected stockout adjustment guardrail.</p>
             </div>
             <div className="space-y-1">
+              <h4 className="font-bold text-xs uppercase text-muted-foreground">Historical Weighting</h4>
+              <p className="text-sm">Blends adjusted recent 30-day velocity with adjusted days 31-60 velocity before calculating recommendations.</p>
+            </div>
+            <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Shrink Adjustment</h4>
               <p className="text-sm">Default mode. Blends raw velocity toward stockout-adjusted velocity as evidence improves, fully trusting the adjustment at 7 active days.</p>
             </div>

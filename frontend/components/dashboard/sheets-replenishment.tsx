@@ -55,6 +55,13 @@ const VELOCITY_PRESETS: Record<Exclude<VelocityMode, 'custom'>, number> = {
   reactive: 0.85,
 }
 
+const ADJUSTMENT_MODE_LABELS: Record<AdjustmentMode, string> = {
+  shrink: 'Shrink',
+  min_days: 'Min days',
+  cap: '2x cap',
+  raw: 'Raw',
+}
+
 export function SheetsReplenishment() {
   const [forecastPeriod, setForecastPeriod] = useState(60)
   const [safetyDays, setSafetyDays] = useState(7)
@@ -372,15 +379,18 @@ export function SheetsReplenishment() {
           ))}
         </div>
 
-        <div className="space-y-4 pt-4 border-t">
+        <div className="space-y-3 pt-4 border-t">
           <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2">
             <Settings2 className="w-3 h-3" /> Controls
           </h3>
           
-          <div className="space-y-2">
-            <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
-              <Calendar className="w-3 h-3" /> Forecast Period
-            </label>
+          <div className="rounded-lg border bg-card/60 p-3 space-y-2.5">
+            <div className="flex items-start justify-between gap-3">
+              <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
+                <Calendar className="w-3 h-3" /> Forecast Period
+              </label>
+              <span className="text-xs font-mono font-semibold">{forecastPeriod}d</span>
+            </div>
             <div className="flex items-center gap-3">
               <input 
                 type="range" min="7" max="180" step="1"
@@ -388,14 +398,19 @@ export function SheetsReplenishment() {
                 onChange={(e) => setForecastPeriod(parseInt(e.target.value))}
                 className="flex-1 accent-blue-600"
               />
-              <span className="text-xs font-mono w-8">{forecastPeriod}d</span>
             </div>
+            <p className="text-[10px] leading-snug text-muted-foreground">
+              Target days of inventory for desired level.
+            </p>
           </div>
 
-          <div className="space-y-2">
-            <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
-              <ShieldCheck className="w-3 h-3" /> Safety Days
-            </label>
+          <div className="rounded-lg border bg-card/60 p-3 space-y-2.5">
+            <div className="flex items-start justify-between gap-3">
+              <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
+                <ShieldCheck className="w-3 h-3" /> Safety Days
+              </label>
+              <span className="text-xs font-mono font-semibold">{safetyDays}d</span>
+            </div>
             <div className="flex items-center gap-3">
               <input 
                 type="range" min="0" max="30" step="1"
@@ -403,29 +418,39 @@ export function SheetsReplenishment() {
                 onChange={(e) => setSafetyDays(parseInt(e.target.value))}
                 className="flex-1 accent-blue-600"
               />
-              <span className="text-xs font-mono w-8">{safetyDays}d</span>
             </div>
+            <p className="text-[10px] leading-snug text-muted-foreground">
+              Extra demand buffer added to reorder point.
+            </p>
           </div>
 
-          <div className="space-y-2">
-            <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
-              <TrendingUp className="w-3 h-3" /> Growth Multiplier
-            </label>
-            <div className="flex items-center gap-3">
+          <div className="rounded-lg border bg-card/60 p-3 space-y-2.5">
+            <div className="flex items-start justify-between gap-3">
+              <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
+                <TrendingUp className="w-3 h-3" /> Growth Multiplier
+              </label>
+              <span className="text-xs font-mono font-semibold">{growthMultiplier.toFixed(2)}x</span>
+            </div>
+            <div className="flex items-center gap-2">
               <Input 
                 type="number" step="0.05"
                 value={growthMultiplier} 
                 onChange={(e) => setGrowthMultiplier(parseFloat(e.target.value) || 1.0)}
                 className="h-8 bg-background border-muted text-xs"
               />
-              <span className="text-[10px] font-medium text-muted-foreground">x</span>
             </div>
+            <p className="text-[10px] leading-snug text-muted-foreground">
+              Scales forward-looking ROP, DL, and order quantity.
+            </p>
           </div>
 
-          <div className="space-y-2">
-            <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
-              <TrendingUp className="w-3 h-3" /> Velocity Weighting
-            </label>
+          <div className="rounded-lg border bg-card/60 p-3 space-y-2.5">
+            <div className="flex items-start justify-between gap-3">
+              <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
+                <TrendingUp className="w-3 h-3" /> Historical Weighting
+              </label>
+              <span className="text-xs font-mono font-semibold">{recentWeightPercent}/{priorWeightPercent}</span>
+            </div>
             <Select
               value={velocityMode}
               onValueChange={(value) => setVelocityMode(value as VelocityMode)}
@@ -466,12 +491,18 @@ export function SheetsReplenishment() {
                 <span className="text-xs font-mono w-9">{customRecentWeight}%</span>
               </div>
             )}
+            <p className="text-[10px] leading-snug text-muted-foreground">
+              Blends recent demand with days 31-60 for recommendation velocity.
+            </p>
           </div>
 
-          <div className="space-y-2">
-            <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
-              <Info className="w-3 h-3" /> Stockout Adjustment
-            </label>
+          <div className="rounded-lg border bg-card/60 p-3 space-y-2.5">
+            <div className="flex items-start justify-between gap-3">
+              <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
+                <Info className="w-3 h-3" /> Stockout Adjustment
+              </label>
+              <span className="text-xs font-mono font-semibold">{ADJUSTMENT_MODE_LABELS[adjustmentMode]}</span>
+            </div>
             <Select
               value={adjustmentMode}
               onValueChange={(value) => setAdjustmentMode(value as AdjustmentMode)}
