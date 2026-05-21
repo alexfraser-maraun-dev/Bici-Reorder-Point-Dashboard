@@ -88,6 +88,17 @@ export function SheetsReplenishment() {
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 50
 
+  const locations = useMemo(() => {
+    return data?.locations?.length ? data.locations : ['Bici Adanac', 'Victoria', 'Langford']
+  }, [data])
+
+  useEffect(() => {
+    if (locations.length > 0 && !locations.includes(selectedLocation)) {
+      setSelectedLocation(locations[0])
+      setSelectedIds(new Set())
+    }
+  }, [locations, selectedLocation])
+
   // Manual Overrides State
   const [overrides, setOverrides] = useState<Record<string, {rop?: number, dl?: number}>>({})
 
@@ -122,9 +133,9 @@ export function SheetsReplenishment() {
     if (searchQuery) {
       const lower = searchQuery.toLowerCase()
       items = items.filter((item: any) => 
-        item.description.toLowerCase().includes(lower) || 
-        item.sku.toLowerCase().includes(lower) ||
-        item.system_id.toLowerCase().includes(lower)
+        String(item.description ?? '').toLowerCase().includes(lower) ||
+        String(item.sku ?? '').toLowerCase().includes(lower) ||
+        String(item.system_id ?? '').toLowerCase().includes(lower)
       )
     }
     
@@ -311,7 +322,7 @@ export function SheetsReplenishment() {
           <MapPin className="w-3 h-3" /> Locations
         </h3>
         <div className="space-y-1 mb-6">
-          {['Bici Adanac', 'Victoria', 'Langford'].map((loc) => (
+          {locations.map((loc: string) => (
             <Button
               key={loc}
               variant={selectedLocation === loc ? "default" : "ghost"}

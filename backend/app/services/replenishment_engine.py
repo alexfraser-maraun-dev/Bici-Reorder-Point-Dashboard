@@ -13,13 +13,21 @@ def process_recommendations(
     Applies the custom BICI calculation logic to the BigQuery data.
     """
     shop_map = {3: "Bici Adanac", 2: "Victoria", 20: "Langford"}
+
+    def normalize_id(value):
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
     
     # Build Lead Time dictionary: (vendor_id, location_id) -> lead_time_days
     # Fallback to a default if not found
     lead_time_dict = {}
     for row in lead_times_df_dict:
-        vid = row.get("vendor_id")
-        lid = row.get("location_id")
+        vid = normalize_id(row.get("vendor_id"))
+        lid = normalize_id(row.get("location_id"))
         lt = row.get("lead_time_days")
         if vid is not None and lid is not None and lt is not None:
             lead_time_dict[(vid, lid)] = lt
@@ -31,9 +39,9 @@ def process_recommendations(
         if not system_id:
             continue
             
-        location_id = row.get("location_id")
+        location_id = normalize_id(row.get("location_id"))
         loc_name = shop_map.get(location_id, f"Shop {location_id}")
-        vendor_id = row.get("vendor_id")
+        vendor_id = normalize_id(row.get("vendor_id"))
         
         # Determine lead time
         lead_time = lead_time_dict.get((vendor_id, location_id), 14.0) # default to 14 days if no history

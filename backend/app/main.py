@@ -172,13 +172,12 @@ def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, gr
         }
         
         for rec in recommendations:
-            if rec['location'] in by_location:
-                by_location[rec['location']].append(rec)
+            by_location.setdefault(rec['location'], []).append(rec)
                 
         return {
             "status": "success",
             "run_id": run_id,
-            "locations": ["Bici Adanac", "Victoria", "Langford"],
+            "locations": list(by_location.keys()),
             "data": by_location
         }
     except Exception as e:
