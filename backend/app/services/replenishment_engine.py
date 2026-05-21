@@ -8,6 +8,7 @@ def process_recommendations(
     override_forecast: int = None, 
     growth_multiplier: float = 1.0, 
     recent_30d_weight: float = 0.70,
+    adjustment_mode: str = "shrink",
     momentum_data: Dict[str, float] = None
 ) -> List[Dict[str, Any]]:
     """
@@ -25,6 +26,23 @@ def process_recommendations(
 
     def normalize_name(value):
         return str(value).strip().lower() if value is not None else None
+
+    def guarded_daily_sales(units_sold, period_days, active_days):
+        raw_daily = units_sold / period_days if period_days > 0 else 0
+        unbounded_adjusted_daily = units_sold / max(1, active_days)
+
+        if adjustment_mode == "raw":
+            return unbounded_adjusted_daily
+
+        if adjustment_mode == "min_days":
+            return unbounded_adjusted_daily if active_days >= 7 else raw_daily
+
+        if adjustment_mode == "cap":
+            capped_period_demand = min(unbounded_adjusted_daily * period_days, units_sold * 2)
+            return capped_period_demand / period_days if period_days > 0 else 0
+
+        confidence = min(1.0, max(0.0, active_days / 7))
+        return raw_daily + ((unbounded_adjusted_daily - raw_daily) * confidence)
     
     # Build Lead Time dictionary: (vendor_id, location_id) -> lead_time_days
     # Fallback to a default if not found
@@ -42,6 +60,8 @@ def process_recommendations(
     recommendations = []
     recent_30d_weight = min(1.0, max(0.0, recent_30d_weight))
     prior_30d_weight = 1.0 - recent_30d_weight
+    if adjustment_mode not in {"shrink", "min_days", "cap", "raw"}:
+        adjustment_mode = "shrink"
     
     for row in items_df_dict:
         system_id = row.get("item_id")
@@ -64,17 +84,16 @@ def process_recommendations(
         days_out_of_stock_30 = row.get("days_out_of_stock_30", 0)
         days_out_of_stock_60 = row.get("days_out_of_stock_60", 0)
         
-        # Calculate unadjusted historical daily sales
         active_days_30 = max(1, 30 - days_out_of_stock_30)
-        adjusted_daily_sales_30d = total_units_sold_30 / active_days_30
+        adjusted_daily_sales_30d = guarded_daily_sales(total_units_sold_30, 30, active_days_30)
         
         active_days_60 = max(1, 60 - days_out_of_stock_60)
-        adjusted_daily_sales_60d = total_units_sold_60 / active_days_60
+        adjusted_daily_sales_60d = guarded_daily_sales(total_units_sold_60, 60, active_days_60)
 
         prior_units_sold_30 = max(0, total_units_sold_60 - total_units_sold_30)
         prior_days_out_of_stock_30 = min(30, max(0, days_out_of_stock_60 - days_out_of_stock_30))
         prior_active_days_30 = max(1, 30 - prior_days_out_of_stock_30)
-        adjusted_daily_sales_prior_30d = prior_units_sold_30 / prior_active_days_30
+        adjusted_daily_sales_prior_30d = guarded_daily_sales(prior_units_sold_30, 30, prior_active_days_30)
         
         # Blend recent and prior 30-day velocities for stability plus reactivity.
         base_daily_sales = (
@@ -152,6 +171,7 @@ def process_recommendations(
             "adjusted_daily_sales_60d": round(adjusted_daily_sales_60d, 3),
             "recent_30d_weight": round(recent_30d_weight, 2),
             "prior_30d_weight": round(prior_30d_weight, 2),
+            "adjustment_mode": adjustment_mode,
             "lead_time": lead_time,
             "forecast_period": forecast_period,
             "safety_days": safety_days,

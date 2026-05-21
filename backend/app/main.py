@@ -118,6 +118,7 @@ def get_replenishment_data(
     safety_days: int = 7,
     growth_multiplier: float = 1.0,
     recent_30d_weight: float = 0.70,
+    adjustment_mode: str = "shrink",
     force_refresh: bool = False
 ):
     try:
@@ -142,6 +143,7 @@ def get_replenishment_data(
             override_forecast=forecast_period,
             growth_multiplier=growth_multiplier,
             recent_30d_weight=recent_30d_weight,
+            adjustment_mode=adjustment_mode,
             momentum_data={}
         )
 

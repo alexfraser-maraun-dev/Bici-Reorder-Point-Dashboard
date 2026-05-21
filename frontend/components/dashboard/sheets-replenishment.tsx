@@ -47,6 +47,7 @@ import {
 import { cn } from '@/lib/utils'
 
 type VelocityMode = 'stable' | 'balanced' | 'reactive' | 'custom'
+type AdjustmentMode = 'shrink' | 'min_days' | 'cap' | 'raw'
 
 const VELOCITY_PRESETS: Record<Exclude<VelocityMode, 'custom'>, number> = {
   stable: 0.5,
@@ -60,6 +61,7 @@ export function SheetsReplenishment() {
   const [growthMultiplier, setGrowthMultiplier] = useState(1.0)
   const [velocityMode, setVelocityMode] = useState<VelocityMode>('balanced')
   const [customRecentWeight, setCustomRecentWeight] = useState(70)
+  const [adjustmentMode, setAdjustmentMode] = useState<AdjustmentMode>('shrink')
 
   const recent30dWeight = velocityMode === 'custom'
     ? customRecentWeight / 100
@@ -85,7 +87,8 @@ export function SheetsReplenishment() {
     debouncedForecast,
     debouncedSafety,
     growthMultiplier,
-    debouncedRecent30dWeight
+    debouncedRecent30dWeight,
+    adjustmentMode
   )
   const { lsStatus, bqStatus } = useConnectionStatus()
   const { data: session } = useSession()
@@ -464,6 +467,29 @@ export function SheetsReplenishment() {
               </div>
             )}
           </div>
+
+          <div className="space-y-2">
+            <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
+              <Info className="w-3 h-3" /> Stockout Adjustment
+            </label>
+            <Select
+              value={adjustmentMode}
+              onValueChange={(value) => setAdjustmentMode(value as AdjustmentMode)}
+            >
+              <SelectTrigger className="h-8 text-xs bg-background border-muted">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="shrink">Shrink adjustment</SelectItem>
+                <SelectItem value="min_days">Minimum days rule</SelectItem>
+                <SelectItem value="cap">Hard cap multiplier</SelectItem>
+                <SelectItem value="raw">Raw adjustment</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[10px] leading-snug text-muted-foreground">
+              Controls the smaller adjusted demand value and the recommendation math.
+            </p>
+          </div>
         </div>
       </div>
 
@@ -712,18 +738,18 @@ export function SheetsReplenishment() {
                     <button
                       onClick={() => requestSort('raw_units_sold_30d')}
                       className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase"
-                      title="Primary number is raw units sold in the last 30 days. Smaller number below is stockout-adjusted demand for the same period."
+                      title="Primary number is raw units sold in the last 30 days. Smaller number below is adjusted demand using the sidebar stockout adjustment mode."
                     >
-                      30d <ArrowUpDown className="w-2.5 h-2.5" />
+                      30d <Info className="w-2.5 h-2.5 text-blue-500" /> <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
                   <TableHead className="w-[62px] text-right bg-blue-50/20 border-r">
                     <button
                       onClick={() => requestSort('raw_units_sold_60d')}
                       className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase"
-                      title="Primary number is raw units sold in the last 60 days. Smaller number below is stockout-adjusted demand for the same period."
+                      title="Primary number is raw units sold in the last 60 days. Smaller number below is adjusted demand using the sidebar stockout adjustment mode."
                     >
-                      60d <ArrowUpDown className="w-2.5 h-2.5" />
+                      60d <Info className="w-2.5 h-2.5 text-blue-500" /> <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
                   <TableHead className="w-[38px] text-right">

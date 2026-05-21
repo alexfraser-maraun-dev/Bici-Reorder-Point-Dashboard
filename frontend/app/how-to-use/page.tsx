@@ -104,7 +104,7 @@ export default function HowToUsePage() {
           <CardContent className="grid gap-6 md:grid-cols-3">
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">30d / 60d</h4>
-              <p className="text-sm">The main value is raw units sold. The smaller value underneath is stockout-adjusted demand.</p>
+              <p className="text-sm">The main value is raw units sold. The smaller value underneath is adjusted demand using the selected stockout adjustment mode.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">QOH / QOO</h4>
@@ -112,7 +112,7 @@ export default function HowToUsePage() {
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Cover</h4>
-              <p className="text-sm">How many days current QOH will last based on the stockout-adjusted 60-day demand rate.</p>
+              <p className="text-sm">How many days current QOH will last based on the guarded 60-day demand rate.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Lead</h4>
@@ -138,7 +138,23 @@ export default function HowToUsePage() {
           <CardContent className="grid gap-6 md:grid-cols-3">
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Adjusted Demand</h4>
-              <p className="text-sm">Raw sales are divided by in-stock days, then scaled back to 30 or 60 days.</p>
+              <p className="text-sm">Raw sales are adjusted for active in-stock days, then passed through the selected stockout adjustment guardrail.</p>
+            </div>
+            <div className="space-y-1">
+              <h4 className="font-bold text-xs uppercase text-muted-foreground">Shrink Adjustment</h4>
+              <p className="text-sm">Default mode. Blends raw velocity toward stockout-adjusted velocity as evidence improves, fully trusting the adjustment at 7 active days.</p>
+            </div>
+            <div className="space-y-1">
+              <h4 className="font-bold text-xs uppercase text-muted-foreground">Minimum Days Rule</h4>
+              <p className="text-sm">Uses raw sales until a product has at least 7 active in-stock days, then uses the stockout-adjusted value.</p>
+            </div>
+            <div className="space-y-1">
+              <h4 className="font-bold text-xs uppercase text-muted-foreground">Hard Cap Multiplier</h4>
+              <p className="text-sm">Allows stockout adjustment, but caps adjusted period demand at 2x the raw units sold.</p>
+            </div>
+            <div className="space-y-1">
+              <h4 className="font-bold text-xs uppercase text-muted-foreground">Raw Adjustment</h4>
+              <p className="text-sm">Uses the original unprotected stockout adjustment with no shrinkage, minimum-day fallback, or cap.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Safety Days</h4>

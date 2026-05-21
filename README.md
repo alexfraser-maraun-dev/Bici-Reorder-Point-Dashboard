@@ -13,7 +13,7 @@ Internal control panel for reviewing and pushing location-specific reorder point
 2. **FastAPI backend calculates recommendations.**
    - Reads qualified `auto-replen` items from BigQuery.
    - Limits rows to shop IDs `2`, `3`, and `20`: Victoria, Bici Adanac, and Langford.
-   - Calculates stockout-adjusted weighted velocity, safety stock, reorder points, desired levels, and suggested order quantity.
+   - Calculates guarded stockout-adjusted weighted velocity, safety stock, reorder points, desired levels, and suggested order quantity.
    - Pushes approved values back to Lightspeed using the `ItemShop` API.
 
 3. **Next.js frontend is the review surface.**
@@ -74,7 +74,7 @@ Earlier versions calculated QOO manually from `order_line_history` and `order_hi
 Each dashboard cell shows two numbers:
 
 - Main number: raw units sold from the snapshot view.
-- Smaller number underneath: stockout-adjusted demand.
+- Smaller number underneath: adjusted demand using the selected stockout adjustment mode.
 
 Raw sales fields:
 
@@ -83,17 +83,38 @@ v_master_snapshot_latest.sales_units_l30d
 v_master_snapshot_latest.sales_units_l60d
 ```
 
-Adjusted demand is calculated as:
+The dashboard sends the selected stockout adjustment mode to the API as:
 
 ```text
-raw units sold / in-stock days * period length
+adjustment_mode=shrink|min_days|cap|raw
 ```
 
-For example:
+The default mode is `shrink`.
+
+### Stockout Adjustment Modes
+
+Each mode starts from the same two daily velocities:
 
 ```text
-30d adjusted demand = sales_units_l30d / max(1, 30 - days_out_of_stock_30) * 30
-60d adjusted demand = sales_units_l60d / max(1, 60 - days_out_of_stock_60) * 60
+raw daily velocity       = raw units sold / period days
+adjusted daily velocity  = raw units sold / active in-stock days
+```
+
+The selected guardrail determines which daily velocity is used for the smaller adjusted 30d/60d values and for recommendation math:
+
+- `shrink`: default. Blends raw velocity toward stockout-adjusted velocity based on evidence. Confidence is `min(1, active in-stock days / 7)`.
+- `min_days`: requires at least 7 active in-stock days. If there are fewer than 7, uses raw velocity.
+- `cap`: allows stockout adjustment, but caps adjusted period demand at `2x` raw sales.
+- `raw`: uses the unprotected stockout-adjusted velocity directly.
+
+For example, with 1 unit sold and only 1 active in-stock day in a 30-day period:
+
+```text
+raw demand       = 1
+raw adjustment   = 30
+shrink mode      = about 5.1
+min-days mode    = 1
+cap mode         = 2
 ```
 
 The weighted velocity below is used as the base daily velocity for replenishment math.

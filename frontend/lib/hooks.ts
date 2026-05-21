@@ -119,10 +119,11 @@ export function useReplenishmentData(
   forecastPeriod: number,
   safetyDays: number,
   growthMultiplier: number,
-  recent30dWeight: number
+  recent30dWeight: number,
+  adjustmentMode: string
 ) {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-  const url = `${baseUrl}/api/replenishment/data?forecast_period=${forecastPeriod}&safety_days=${safetyDays}&growth_multiplier=${growthMultiplier}&recent_30d_weight=${recent30dWeight}`
+  const url = `${baseUrl}/api/replenishment/data?forecast_period=${forecastPeriod}&safety_days=${safetyDays}&growth_multiplier=${growthMultiplier}&recent_30d_weight=${recent30dWeight}&adjustment_mode=${adjustmentMode}`
   
   const { data, error, mutate, isLoading } = useSWR(url, fetcher, {
     revalidateOnFocus: false,
