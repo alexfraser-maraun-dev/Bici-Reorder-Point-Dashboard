@@ -130,8 +130,10 @@ def process_recommendations(
             "lead_time": lead_time,
             "forecast_period": forecast_period,
             "safety_days": safety_days,
-            "forecast_30d": round(raw_daily_sales_30d * 30, 1), # True 30d raw fact
-            "forecast_60d": round(raw_daily_sales_60d * 60, 1), # True 60d raw fact
+            "raw_units_sold_30d": total_units_sold_30,
+            "raw_units_sold_60d": total_units_sold_60,
+            "forecast_30d": round(raw_daily_sales_30d * 30, 1), # Stockout-adjusted 30d demand
+            "forecast_60d": round(raw_daily_sales_60d * 60, 1), # Stockout-adjusted 60d demand
             "on_hand": on_hand,
             "on_order": on_order,
             "qty_to_order": qty_to_order,

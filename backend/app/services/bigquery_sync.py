@@ -524,15 +524,25 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
             AND DATE(s.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
           GROUP BY 1, 2
         ),
+        latest_order_lines AS (
+            SELECT *
+            FROM `{LS_DATASET}.order_line_history`
+            WHERE item_id IN (SELECT id FROM latest_item)
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        latest_orders AS (
+            SELECT *
+            FROM `{LS_DATASET}.order_history`
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
         open_pos AS (
             SELECT
                 ol.item_id,
                 o.shop_id AS location_id,
                 SUM(ol.quantity - COALESCE(ol.num_received, 0)) AS on_order_units
-            FROM `{LS_DATASET}.order_line_history` ol
-            JOIN `{LS_DATASET}.order_history` o ON ol.order_id = o.id
-            WHERE ol.item_id IN (SELECT id FROM latest_item)
-              AND o.shop_id IN {TARGET_SHOP_IDS}
+            FROM latest_order_lines ol
+            JOIN latest_orders o ON ol.order_id = o.id
+            WHERE o.shop_id IN {TARGET_SHOP_IDS}
               AND o.complete = FALSE 
               AND o.archived = FALSE
             GROUP BY 1, 2
