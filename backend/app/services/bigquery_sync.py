@@ -17,6 +17,7 @@ def get_bq_client():
 APP_DATASET = os.getenv("APP_DATASET", "bici-klaviyo-datasync.BiciReorderPointDashboard")
 LS_DATASET = os.getenv("LS_DATASET", "bici-klaviyo-datasync.light_speed_retailne")
 QUALIFIED_ITEMS_VIEW = os.getenv("QUALIFIED_ITEMS_VIEW", f"{APP_DATASET}.replen_qualified_items")
+TARGET_SHOP_IDS = (2, 3, 20)
 CACHE_FILE = "bq_metrics_cache.json"
 CACHE_EXPIRY_SECONDS = 86400 # 24 hours
 
@@ -470,7 +471,7 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
         latest_item_shop AS (
             SELECT * FROM `{LS_DATASET}.item_shop_history`
             WHERE item_id IN (SELECT id FROM latest_item)
-            AND shop_id > 0
+            AND shop_id IN {TARGET_SHOP_IDS}
             QUALIFY ROW_NUMBER() OVER(PARTITION BY item_id, shop_id ORDER BY updated_time DESC) = 1
         ),
         item_shop_history_all AS (
@@ -481,7 +482,7 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
             DATE(updated_time) as change_date
           FROM `{LS_DATASET}.item_shop_history`
           WHERE item_id IN (SELECT id FROM latest_item)
-          AND shop_id > 0
+          AND shop_id IN {TARGET_SHOP_IDS}
         ),
         daily_qoh_mapped_60 AS (
           SELECT 
@@ -517,6 +518,7 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
           FROM `{LS_DATASET}.sale_line_history` sl
           JOIN `{LS_DATASET}.sale_history` s ON sl.sale_id = s.id
           WHERE sl.item_id IN (SELECT id FROM latest_item)
+            AND sl.shop_id IN {TARGET_SHOP_IDS}
             AND s.completed = TRUE
             AND s.voided = FALSE
             AND DATE(s.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
@@ -530,6 +532,7 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
             FROM `{LS_DATASET}.order_line_history` ol
             JOIN `{LS_DATASET}.order_history` o ON ol.order_id = o.id
             WHERE ol.item_id IN (SELECT id FROM latest_item)
+              AND o.shop_id IN {TARGET_SHOP_IDS}
               AND o.complete = FALSE 
               AND o.archived = FALSE
             GROUP BY 1, 2
@@ -574,3 +577,83 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
     df = client.query(query).to_dataframe()
     _bq_tag_cache[tag_name] = (df, time.time())
     return df
+
+
+def get_replenishment_debug_counts() -> dict:
+    """Returns production-safe counts showing where qualifying items drop out."""
+    def to_plain_json(value):
+        if isinstance(value, list):
+            return [to_plain_json(item) for item in value]
+        if hasattr(value, "items"):
+            return {key: to_plain_json(val) for key, val in value.items()}
+        return value
+
+    query = f"""
+        WITH
+        examples AS (
+          SELECT * FROM UNNEST([
+            STRUCT(32856 AS item_id, 'should qualify' AS expected),
+            STRUCT(98993 AS item_id, 'should qualify' AS expected),
+            STRUCT(112947 AS item_id, 'should qualify' AS expected),
+            STRUCT(49232 AS item_id, 'should not qualify' AS expected),
+            STRUCT(12406 AS item_id, 'should not qualify' AS expected),
+            STRUCT(106555 AS item_id, 'should not qualify' AS expected)
+          ])
+        ),
+        qualified_items AS (
+          SELECT item_id FROM `{QUALIFIED_ITEMS_VIEW}`
+        ),
+        latest_item AS (
+          SELECT *
+          FROM `{LS_DATASET}.item_history`
+          WHERE id IN (SELECT item_id FROM qualified_items)
+          QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        latest_target_item_shop AS (
+          SELECT *
+          FROM `{LS_DATASET}.item_shop_history`
+          WHERE item_id IN (SELECT id FROM latest_item)
+            AND shop_id IN {TARGET_SHOP_IDS}
+          QUALIFY ROW_NUMBER() OVER(PARTITION BY item_id, shop_id ORDER BY updated_time DESC) = 1
+        ),
+        target_rows_by_shop AS (
+          SELECT
+            shop_id AS location_id,
+            COUNT(*) AS row_count
+          FROM latest_target_item_shop
+          GROUP BY shop_id
+        ),
+        example_status AS (
+          SELECT
+            e.item_id,
+            e.expected,
+            q.item_id IS NOT NULL AS in_qualified_view,
+            li.id IS NOT NULL AS in_latest_item,
+            ARRAY_AGG(DISTINCT lis.shop_id IGNORE NULLS ORDER BY lis.shop_id) AS target_shop_ids
+          FROM examples e
+          LEFT JOIN qualified_items q ON e.item_id = q.item_id
+          LEFT JOIN latest_item li ON e.item_id = li.id
+          LEFT JOIN latest_target_item_shop lis ON e.item_id = lis.item_id
+          GROUP BY e.item_id, e.expected, q.item_id, li.id
+        )
+        SELECT
+          '{APP_DATASET}' AS app_dataset,
+          '{LS_DATASET}' AS lightspeed_dataset,
+          '{QUALIFIED_ITEMS_VIEW}' AS qualified_items_view,
+          (SELECT COUNT(*) FROM qualified_items) AS qualified_item_count,
+          (SELECT COUNT(*) FROM latest_item) AS latest_item_count,
+          (SELECT COUNT(*) FROM latest_target_item_shop) AS target_item_shop_row_count,
+          ARRAY(
+            SELECT AS STRUCT location_id, row_count
+            FROM target_rows_by_shop
+            ORDER BY location_id
+          ) AS target_rows_by_shop,
+          ARRAY(
+            SELECT AS STRUCT item_id, expected, in_qualified_view, in_latest_item, target_shop_ids
+            FROM example_status
+            ORDER BY item_id
+          ) AS example_status
+    """
+    client = get_bq_client()
+    row = dict(next(iter(client.query(query).result())))
+    return to_plain_json(row)

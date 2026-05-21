@@ -35,6 +35,16 @@ def read_root():
 def health_check():
     return {"status": "healthy"}
 
+@app.get("/api/replenishment/debug")
+def get_replenishment_debug():
+    try:
+        from app.services.bigquery_sync import get_replenishment_debug_counts
+        return {"status": "success", "debug": get_replenishment_debug_counts()}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/skus/template")
 def download_sku_template():
     csv_content = "sku,item_id,product,brand,vendor,category\n"
