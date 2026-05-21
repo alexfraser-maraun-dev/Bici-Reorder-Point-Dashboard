@@ -115,9 +115,14 @@ const fetcher = async (url: string) => {
   return res.json()
 }
 
-export function useReplenishmentData(forecastPeriod: number, safetyDays: number, growthMultiplier: number) {
+export function useReplenishmentData(
+  forecastPeriod: number,
+  safetyDays: number,
+  growthMultiplier: number,
+  recent30dWeight: number
+) {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-  const url = `${baseUrl}/api/replenishment/data?forecast_period=${forecastPeriod}&safety_days=${safetyDays}&growth_multiplier=${growthMultiplier}`
+  const url = `${baseUrl}/api/replenishment/data?forecast_period=${forecastPeriod}&safety_days=${safetyDays}&growth_multiplier=${growthMultiplier}&recent_30d_weight=${recent30dWeight}`
   
   const { data, error, mutate, isLoading } = useSWR(url, fetcher, {
     revalidateOnFocus: false,
@@ -172,8 +177,10 @@ export function useVendorLeadTimes() {
 }
 
 export function useConnectionStatus() {
-  const [lsStatus, setLsStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
-  const [bqStatus, setBqStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
+  type ConnectionState = 'checking' | 'connected' | 'disconnected'
+
+  const [lsStatus, setLsStatus] = useState<ConnectionState>('checking')
+  const [bqStatus, setBqStatus] = useState<ConnectionState>('checking')
 
   useEffect(() => {
     const checkHealth = () => {
@@ -183,7 +190,7 @@ export function useConnectionStatus() {
       const controller = new AbortController()
       const timeoutId = setTimeout(() => controller.abort(), 8000) // 8s timeout
 
-      const fetchWithTimeout = (endpoint: string) => {
+      const fetchWithTimeout = (endpoint: string): Promise<ConnectionState> => {
         return fetch(`${baseUrl}/api/health/${endpoint}`, { signal: controller.signal })
           .then(res => res.ok ? 'connected' : 'disconnected')
           .catch(err => {

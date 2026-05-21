@@ -46,24 +46,47 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
+type VelocityMode = 'stable' | 'balanced' | 'reactive' | 'custom'
+
+const VELOCITY_PRESETS: Record<Exclude<VelocityMode, 'custom'>, number> = {
+  stable: 0.5,
+  balanced: 0.7,
+  reactive: 0.85,
+}
+
 export function SheetsReplenishment() {
   const [forecastPeriod, setForecastPeriod] = useState(60)
   const [safetyDays, setSafetyDays] = useState(7)
   const [growthMultiplier, setGrowthMultiplier] = useState(1.0)
+  const [velocityMode, setVelocityMode] = useState<VelocityMode>('balanced')
+  const [customRecentWeight, setCustomRecentWeight] = useState(70)
+
+  const recent30dWeight = velocityMode === 'custom'
+    ? customRecentWeight / 100
+    : VELOCITY_PRESETS[velocityMode]
+  const recentWeightPercent = Math.round(recent30dWeight * 100)
+  const priorWeightPercent = 100 - recentWeightPercent
 
   // Debounce slider values to prevent spamming backend during dragging
   const [debouncedForecast, setDebouncedForecast] = useState(forecastPeriod)
   const [debouncedSafety, setDebouncedSafety] = useState(safetyDays)
+  const [debouncedRecent30dWeight, setDebouncedRecent30dWeight] = useState(recent30dWeight)
 
   useEffect(() => {
     const timer = setTimeout(() => {
       setDebouncedForecast(forecastPeriod)
       setDebouncedSafety(safetyDays)
+      setDebouncedRecent30dWeight(recent30dWeight)
     }, 300)
     return () => clearTimeout(timer)
-  }, [forecastPeriod, safetyDays])
+  }, [forecastPeriod, safetyDays, recent30dWeight])
 
-  const { data, isLoading, refetch } = useReplenishmentData(debouncedForecast, debouncedSafety, growthMultiplier)
+  const { data, isLoading, refetch } = useReplenishmentData(
+    debouncedForecast,
+    debouncedSafety,
+    growthMultiplier,
+    debouncedRecent30dWeight
+  )
   const { lsStatus, bqStatus } = useConnectionStatus()
   const { data: session } = useSession()
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
@@ -396,68 +419,106 @@ export function SheetsReplenishment() {
             </div>
           </div>
 
-          <Button 
-            variant="secondary" 
-            className="w-full gap-2 text-xs font-semibold border mt-2" 
-            onClick={() => refetch()}
-            disabled={isLoading}
-          >
-            <RefreshCw className={cn("w-3 h-3", isLoading && "animate-spin")} />
-            {isLoading ? "Syncing..." : "Sync Product Data"}
-          </Button>
+          <div className="space-y-2">
+            <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
+              <TrendingUp className="w-3 h-3" /> Velocity Weighting
+            </label>
+            <Select
+              value={velocityMode}
+              onValueChange={(value) => setVelocityMode(value as VelocityMode)}
+            >
+              <SelectTrigger className="h-8 text-xs bg-background border-muted">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="stable">Stable</SelectItem>
+                <SelectItem value="balanced">Balanced</SelectItem>
+                <SelectItem value="reactive">Reactive</SelectItem>
+                <SelectItem value="custom">Custom</SelectItem>
+              </SelectContent>
+            </Select>
 
-          {/* Connection Status Indicators */}
-          <div className="mt-4 space-y-3 pt-4 border-t">
-            <div className="flex items-center justify-between">
-              <span className="text-[9px] font-bold text-muted-foreground uppercase tracking-widest">System Connectivity</span>
-            </div>
-            
-            <div className="space-y-2">
-              {/* Lightspeed Indicator */}
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className={cn(
-                    "h-1.5 w-1.5 rounded-full",
-                    lsStatus === 'connected' ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.3)]" : 
-                    lsStatus === 'checking' ? "bg-yellow-500 animate-pulse" : "bg-red-500"
-                  )} />
-                  <span className="text-[10px] font-medium text-foreground/70">Lightspeed Retail</span>
-                </div>
-                <span className={cn(
-                  "text-[9px] font-bold uppercase tracking-tight",
-                  lsStatus === 'connected' ? "text-emerald-600" : 
-                  lsStatus === 'checking' ? "text-yellow-600" : "text-red-600"
-                )}>
-                  {lsStatus}
-                </span>
+            <div className="rounded-md bg-muted/40 px-2.5 py-2">
+              <div className="flex items-center justify-between text-[10px] font-medium">
+                <span>Recent 30d</span>
+                <span className="font-mono">{recentWeightPercent}%</span>
               </div>
-
-              {/* BigQuery Indicator */}
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className={cn(
-                    "h-1.5 w-1.5 rounded-full",
-                    bqStatus === 'connected' ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.3)]" : 
-                    bqStatus === 'checking' ? "bg-yellow-500 animate-pulse" : "bg-red-500"
-                  )} />
-                  <span className="text-[10px] font-medium text-foreground/70">BigQuery Database</span>
-                </div>
-                <span className={cn(
-                  "text-[9px] font-bold uppercase tracking-tight",
-                  bqStatus === 'connected' ? "text-emerald-600" : 
-                  bqStatus === 'checking' ? "text-yellow-600" : "text-red-600"
-                )}>
-                  {bqStatus}
-                </span>
+              <div className="mt-1 flex items-center justify-between text-[10px] font-medium text-muted-foreground">
+                <span>Days 31-60</span>
+                <span className="font-mono">{priorWeightPercent}%</span>
               </div>
-
             </div>
+
+            {velocityMode === 'custom' && (
+              <div className="flex items-center gap-3">
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="5"
+                  value={customRecentWeight}
+                  onChange={(e) => setCustomRecentWeight(parseInt(e.target.value))}
+                  className="flex-1 accent-blue-600"
+                />
+                <span className="text-xs font-mono w-9">{customRecentWeight}%</span>
+              </div>
+            )}
           </div>
         </div>
       </div>
 
       {/* Main Content */}
       <div className="flex-1 flex flex-col gap-4 min-w-0">
+        <div className="flex justify-end">
+          <div className="flex flex-wrap items-center justify-end gap-3 rounded-xl border bg-card px-3 py-2 shadow-sm">
+            <Button
+              variant="secondary"
+              className="h-8 gap-2 text-xs font-semibold border"
+              onClick={() => refetch()}
+              disabled={isLoading}
+            >
+              <RefreshCw className={cn("w-3 h-3", isLoading && "animate-spin")} />
+              {isLoading ? "Syncing..." : "Sync Product Data"}
+            </Button>
+
+            <div className="hidden h-5 w-px bg-border sm:block" />
+
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2">
+                <div className={cn(
+                  "h-1.5 w-1.5 rounded-full",
+                  lsStatus === 'connected' ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.3)]" :
+                  lsStatus === 'checking' ? "bg-yellow-500 animate-pulse" : "bg-red-500"
+                )} />
+                <span className="text-[10px] font-medium text-foreground/70">Lightspeed</span>
+                <span className={cn(
+                  "text-[9px] font-bold uppercase tracking-tight",
+                  lsStatus === 'connected' ? "text-emerald-600" :
+                  lsStatus === 'checking' ? "text-yellow-600" : "text-red-600"
+                )}>
+                  {lsStatus}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <div className={cn(
+                  "h-1.5 w-1.5 rounded-full",
+                  bqStatus === 'connected' ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.3)]" :
+                  bqStatus === 'checking' ? "bg-yellow-500 animate-pulse" : "bg-red-500"
+                )} />
+                <span className="text-[10px] font-medium text-foreground/70">BigQuery</span>
+                <span className={cn(
+                  "text-[9px] font-bold uppercase tracking-tight",
+                  bqStatus === 'connected' ? "text-emerald-600" :
+                  bqStatus === 'checking' ? "text-yellow-600" : "text-red-600"
+                )}>
+                  {bqStatus}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
         {/* Filter Bar */}
         <div className="flex flex-col gap-3 bg-card p-3 rounded-xl border shadow-sm">
           <div className="flex items-center justify-between gap-4">

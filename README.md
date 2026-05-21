@@ -13,7 +13,7 @@ Internal control panel for reviewing and pushing location-specific reorder point
 2. **FastAPI backend calculates recommendations.**
    - Reads qualified `auto-replen` items from BigQuery.
    - Limits rows to shop IDs `2`, `3`, and `20`: Victoria, Bici Adanac, and Langford.
-   - Calculates stockout-adjusted demand, safety stock, reorder points, desired levels, and suggested order quantity.
+   - Calculates stockout-adjusted weighted velocity, safety stock, reorder points, desired levels, and suggested order quantity.
    - Pushes approved values back to Lightspeed using the `ItemShop` API.
 
 3. **Next.js frontend is the review surface.**
@@ -96,14 +96,25 @@ For example:
 60d adjusted demand = sales_units_l60d / max(1, 60 - days_out_of_stock_60) * 60
 ```
 
-The 60d adjusted demand rate is used as the base daily velocity for replenishment math.
+The weighted velocity below is used as the base daily velocity for replenishment math.
+
+### Weighted Velocity
+
+The replenishment math uses a weighted blend of the most recent 30 days and days 31-60:
+
+```text
+weighted velocity = (adjusted 30d daily velocity * recent 30d weight)
+                  + (adjusted days 31-60 daily velocity * prior 30d weight)
+```
+
+The dashboard defaults to a balanced `70% / 30%` split, with UI presets for stable, balanced, reactive, and custom weighting.
 
 ### ROP
 
 Recommended reorder point:
 
 ```text
-(adjusted daily sales * lead time days) + safety stock
+(weighted velocity * growth multiplier * lead time days) + safety stock
 ```
 
 ### DL
@@ -111,7 +122,7 @@ Recommended reorder point:
 Recommended desired level:
 
 ```text
-adjusted daily sales * forecast period
+weighted velocity * growth multiplier * forecast period
 ```
 
 ### Suggested Order Quantity

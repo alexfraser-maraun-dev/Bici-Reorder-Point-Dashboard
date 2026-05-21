@@ -113,7 +113,13 @@ def add_managed_skus_bulk(items: List[Dict[str, Any]]):
     return {"status": "success", "added": len(skus_to_log)}
 
 @app.get("/api/replenishment/data")
-def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, growth_multiplier: float = 1.0, force_refresh: bool = False):
+def get_replenishment_data(
+    forecast_period: int = None,
+    safety_days: int = 7,
+    growth_multiplier: float = 1.0,
+    recent_30d_weight: float = 0.70,
+    force_refresh: bool = False
+):
     try:
         # 1. Fetch BigQuery Data & Lead Times
         from app.services.bigquery_sync import fetch_tagged_items_metrics, fetch_lead_times
@@ -135,6 +141,7 @@ def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, gr
             safety_days=safety_days, 
             override_forecast=forecast_period,
             growth_multiplier=growth_multiplier,
+            recent_30d_weight=recent_30d_weight,
             momentum_data={}
         )
 

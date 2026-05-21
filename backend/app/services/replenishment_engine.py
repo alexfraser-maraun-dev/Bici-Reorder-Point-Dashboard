@@ -7,6 +7,7 @@ def process_recommendations(
     safety_days: int = 7, 
     override_forecast: int = None, 
     growth_multiplier: float = 1.0, 
+    recent_30d_weight: float = 0.70,
     momentum_data: Dict[str, float] = None
 ) -> List[Dict[str, Any]]:
     """
@@ -39,6 +40,8 @@ def process_recommendations(
             lead_time_dict[(vendor_name, lid)] = lt
             
     recommendations = []
+    recent_30d_weight = min(1.0, max(0.0, recent_30d_weight))
+    prior_30d_weight = 1.0 - recent_30d_weight
     
     for row in items_df_dict:
         system_id = row.get("item_id")
@@ -63,13 +66,21 @@ def process_recommendations(
         
         # Calculate unadjusted historical daily sales
         active_days_30 = max(1, 30 - days_out_of_stock_30)
-        raw_daily_sales_30d = total_units_sold_30 / active_days_30
+        adjusted_daily_sales_30d = total_units_sold_30 / active_days_30
         
         active_days_60 = max(1, 60 - days_out_of_stock_60)
-        raw_daily_sales_60d = total_units_sold_60 / active_days_60
+        adjusted_daily_sales_60d = total_units_sold_60 / active_days_60
+
+        prior_units_sold_30 = max(0, total_units_sold_60 - total_units_sold_30)
+        prior_days_out_of_stock_30 = min(30, max(0, days_out_of_stock_60 - days_out_of_stock_30))
+        prior_active_days_30 = max(1, 30 - prior_days_out_of_stock_30)
+        adjusted_daily_sales_prior_30d = prior_units_sold_30 / prior_active_days_30
         
-        # Use 60d as the base velocity for calculations (more stable)
-        base_daily_sales = raw_daily_sales_60d
+        # Blend recent and prior 30-day velocities for stability plus reactivity.
+        base_daily_sales = (
+            adjusted_daily_sales_30d * recent_30d_weight
+            + adjusted_daily_sales_prior_30d * prior_30d_weight
+        )
         
         # Apply Growth Multiplier (only affects forward-looking calcs)
         adjusted_daily_sales = base_daily_sales * growth_multiplier
@@ -132,17 +143,23 @@ def process_recommendations(
             "category": row.get("category"),
             "vendor": row.get("vendor"),
             "location": loc_name,
-            "daily_sales": round(base_daily_sales, 2), # Base (60d) velocity
+            "daily_sales": round(base_daily_sales, 2), # Weighted base velocity
             "adjusted_daily_sales": round(adjusted_daily_sales, 2), # Velocity w/ multiplier
             "days_out_of_stock": days_out_of_stock_60,
-            "raw_daily_sales": raw_daily_sales_60d, # Same as base_daily_sales
+            "raw_daily_sales": base_daily_sales,
+            "adjusted_daily_sales_30d": round(adjusted_daily_sales_30d, 3),
+            "adjusted_daily_sales_prior_30d": round(adjusted_daily_sales_prior_30d, 3),
+            "adjusted_daily_sales_60d": round(adjusted_daily_sales_60d, 3),
+            "recent_30d_weight": round(recent_30d_weight, 2),
+            "prior_30d_weight": round(prior_30d_weight, 2),
             "lead_time": lead_time,
             "forecast_period": forecast_period,
             "safety_days": safety_days,
             "raw_units_sold_30d": total_units_sold_30,
             "raw_units_sold_60d": total_units_sold_60,
-            "forecast_30d": round(raw_daily_sales_30d * 30, 1), # Stockout-adjusted 30d demand
-            "forecast_60d": round(raw_daily_sales_60d * 60, 1), # Stockout-adjusted 60d demand
+            "forecast_30d": round(adjusted_daily_sales_30d * 30, 1), # Stockout-adjusted 30d demand
+            "forecast_prior_30d": round(adjusted_daily_sales_prior_30d * 30, 1),
+            "forecast_60d": round(adjusted_daily_sales_60d * 60, 1), # Stockout-adjusted 60d demand
             "on_hand": on_hand,
             "on_order": on_order,
             "qty_to_order": qty_to_order,
