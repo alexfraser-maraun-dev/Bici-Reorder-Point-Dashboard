@@ -107,6 +107,7 @@ def upsert_managed_skus(skus: list):
     # Create temp table for merge
     job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
     temp_table_id = f"{table_id}_temp"
+    client = get_bq_client()
     client.load_table_from_json(skus, temp_table_id, job_config=job_config).result()
 
     merge_query = f"""
@@ -169,6 +170,7 @@ def upsert_sku_override(override_data: dict):
             bigquery.ScalarQueryParameter("locked", "BOOL", override_data.get('locked', False)),
         ]
     )
+    client = get_bq_client()
     client.query(merge_query, job_config=job_config).result()
 
 def get_cached_bq_metrics(trailing_days: int = 60) -> dict:
@@ -431,6 +433,7 @@ def fetch_unified_metrics(trailing_days: int = 60) -> pd.DataFrame:
             bigquery.ScalarQueryParameter("trailing_days", "INT64", trailing_days),
         ]
     )
+    client = get_bq_client()
     return client.query(query, job_config=job_config).to_dataframe()
 
 _bq_tag_cache = {}
