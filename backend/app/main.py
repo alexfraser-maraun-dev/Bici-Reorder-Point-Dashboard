@@ -106,25 +106,18 @@ def add_managed_skus_bulk(items: List[Dict[str, Any]]):
 def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, growth_multiplier: float = 1.0, force_refresh: bool = False):
     try:
         # 1. Fetch BigQuery Data & Lead Times
-        from app.services.bigquery_sync import fetch_tagged_items_metrics, fetch_lead_times, get_cached_bq_metrics
+        from app.services.bigquery_sync import fetch_tagged_items_metrics, fetch_lead_times
         # We handle caching via BigQuery functions or use simple manual cache dict if needed.
         # For now, fetch_tagged_items_metrics will hit BQ directly on every call unless we add caching.
         # In a real production scenario, caching this result is recommended.
         raw_data = fetch_tagged_items_metrics("auto-replen", force_refresh=force_refresh).to_dict(orient="records")
         lead_times = fetch_lead_times().to_dict(orient="records")
         
-        # 1.5 Fetch Overrides and Momentum
+        # 1.5 Fetch Overrides
         overrides = get_sku_overrides()
-        bq_metrics = get_cached_bq_metrics() # Still useful for momentum if we want to extract prev velocity
 
         # 2. Process Recommendations
         from app.services.replenishment_engine import process_recommendations
-        
-        # Calculate momentum data from the old snapshots
-        momentum_data = {}
-        for key, val in bq_metrics.items():
-            if "prev_velocity" in val:
-                momentum_data[key] = val["prev_velocity"]
                 
         recommendations = process_recommendations(
             raw_data, 
@@ -132,7 +125,7 @@ def get_replenishment_data(forecast_period: int = None, safety_days: int = 7, gr
             safety_days=safety_days, 
             override_forecast=forecast_period,
             growth_multiplier=growth_multiplier,
-            momentum_data=momentum_data
+            momentum_data={}
         )
 
         # 3. Apply Overrides (Locked, Manual ROP/DL)
