@@ -462,16 +462,18 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
         qualified_items AS (
           SELECT item_id FROM `{QUALIFIED_ITEMS_VIEW}`
         ),
-        snapshot AS (
-          SELECT *
+        latest_snapshot_date AS (
+          SELECT MAX(snapshot_date_local) AS snapshot_date_local
           FROM `{LS_DATASET}.v_master_snapshot_latest`
-          WHERE item_id IN (SELECT item_id FROM qualified_items)
-            AND shop_id IN {TARGET_SHOP_IDS}
-            AND snapshot_date_local = (
-              SELECT MAX(snapshot_date_local)
-              FROM `{LS_DATASET}.v_master_snapshot_latest`
-            )
-            AND COALESCE(item_archived, FALSE) = FALSE
+        ),
+        snapshot AS (
+          SELECT s.*
+          FROM `{LS_DATASET}.v_master_snapshot_latest` s
+          CROSS JOIN latest_snapshot_date lsd
+          WHERE s.item_id IN (SELECT item_id FROM qualified_items)
+            AND s.shop_id IN {TARGET_SHOP_IDS}
+            AND s.snapshot_date_local = lsd.snapshot_date_local
+            AND COALESCE(s.item_archived, FALSE) = FALSE
         ),
         item_shop_history_all AS (
           SELECT 
