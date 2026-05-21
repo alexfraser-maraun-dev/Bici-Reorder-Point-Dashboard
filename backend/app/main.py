@@ -45,6 +45,16 @@ def get_replenishment_debug():
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/replenishment/debug/item/{item_id}")
+def get_replenishment_item_debug(item_id: int):
+    try:
+        from app.services.bigquery_sync import get_item_replenishment_debug
+        return {"status": "success", "debug": get_item_replenishment_debug(item_id)}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/skus/template")
 def download_sku_template():
     csv_content = "sku,item_id,product,brand,vendor,category\n"

@@ -442,8 +442,10 @@ CACHE_TTL = 300 # 5 minutes
 
 def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: bool = False) -> pd.DataFrame:
     """
-    Fetches inventory, sales totals (30d and 60d), stockout counts (30d and 60d),
-    and metadata for items from the curated qualifying-items view.
+    Fetches product, inventory, sales, and PO metrics from the trusted latest
+    master snapshot view for qualified replenishment items. Stockout counts are
+    still calculated from item_shop_history because the snapshot view does not
+    expose trailing stockout days.
     """
     current_time = time.time()
     
@@ -457,32 +459,29 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
         date_spine_60 AS (
           SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY), CURRENT_DATE())) AS day
         ),
-        date_spine_30 AS (
-          SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY), CURRENT_DATE())) AS day
-        ),
         qualified_items AS (
-            SELECT item_id FROM `{QUALIFIED_ITEMS_VIEW}`
+          SELECT item_id FROM `{QUALIFIED_ITEMS_VIEW}`
         ),
-        latest_item AS (
-            SELECT * FROM `{LS_DATASET}.item_history`
-            WHERE id IN (SELECT item_id FROM qualified_items)
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
-        ),
-        latest_item_shop AS (
-            SELECT * FROM `{LS_DATASET}.item_shop_history`
-            WHERE item_id IN (SELECT id FROM latest_item)
+        snapshot AS (
+          SELECT *
+          FROM `{LS_DATASET}.v_master_snapshot_latest`
+          WHERE item_id IN (SELECT item_id FROM qualified_items)
             AND shop_id IN {TARGET_SHOP_IDS}
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY item_id, shop_id ORDER BY updated_time DESC) = 1
+            AND snapshot_date_local = (
+              SELECT MAX(snapshot_date_local)
+              FROM `{LS_DATASET}.v_master_snapshot_latest`
+            )
+            AND COALESCE(item_archived, FALSE) = FALSE
         ),
         item_shop_history_all AS (
           SELECT 
-            item_id, 
-            shop_id as location_id, 
-            qoh, 
-            DATE(updated_time) as change_date
+            item_id,
+            shop_id AS location_id,
+            qoh,
+            DATE(updated_time) AS change_date
           FROM `{LS_DATASET}.item_shop_history`
-          WHERE item_id IN (SELECT id FROM latest_item)
-          AND shop_id IN {TARGET_SHOP_IDS}
+          WHERE item_id IN (SELECT item_id FROM qualified_items)
+            AND shop_id IN {TARGET_SHOP_IDS}
         ),
         daily_qoh_mapped_60 AS (
           SELECT 
@@ -490,98 +489,44 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
             ish.item_id,
             ish.location_id,
             LAST_VALUE(item_shop_history_all.qoh IGNORE NULLS) OVER (
-              PARTITION BY ish.item_id, ish.location_id 
-              ORDER BY d.day 
+              PARTITION BY ish.item_id, ish.location_id
+              ORDER BY d.day
               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            ) as daily_qoh
+            ) AS daily_qoh
           FROM date_spine_60 d
           CROSS JOIN (SELECT DISTINCT item_id, location_id FROM item_shop_history_all) ish
-          LEFT JOIN item_shop_history_all ON item_shop_history_all.change_date = d.day 
-            AND item_shop_history_all.item_id = ish.item_id 
+          LEFT JOIN item_shop_history_all ON item_shop_history_all.change_date = d.day
+            AND item_shop_history_all.item_id = ish.item_id
             AND item_shop_history_all.location_id = ish.location_id
         ),
         stockouts AS (
-          SELECT 
-            item_id, 
-            location_id, 
-            COUNTIF(daily_qoh <= 0) as days_out_of_stock_60,
-            COUNTIF(daily_qoh <= 0 AND day >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)) as days_out_of_stock_30
+          SELECT
+            item_id,
+            location_id,
+            COUNTIF(daily_qoh <= 0) AS days_out_of_stock_60,
+            COUNTIF(daily_qoh <= 0 AND day >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)) AS days_out_of_stock_30
           FROM daily_qoh_mapped_60
           GROUP BY 1, 2
-        ),
-        sales_totals AS (
-          SELECT 
-            sl.item_id, 
-            sl.shop_id as location_id, 
-            SUM(CASE WHEN DATE(s.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY) THEN sl.unit_quantity ELSE 0 END) as total_units_sold_30,
-            SUM(sl.unit_quantity) as total_units_sold_60
-          FROM `{LS_DATASET}.sale_line_history` sl
-          JOIN `{LS_DATASET}.sale_history` s ON sl.sale_id = s.id
-          WHERE sl.item_id IN (SELECT id FROM latest_item)
-            AND sl.shop_id IN {TARGET_SHOP_IDS}
-            AND s.completed = TRUE
-            AND s.voided = FALSE
-            AND DATE(s.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
-          GROUP BY 1, 2
-        ),
-        latest_order_lines AS (
-            SELECT *
-            FROM `{LS_DATASET}.order_line_history`
-            WHERE item_id IN (SELECT id FROM latest_item)
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
-        ),
-        latest_orders AS (
-            SELECT *
-            FROM `{LS_DATASET}.order_history`
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
-        ),
-        open_pos AS (
-            SELECT
-                ol.item_id,
-                o.shop_id AS location_id,
-                SUM(ol.quantity - COALESCE(ol.num_received, 0)) AS on_order_units
-            FROM latest_order_lines ol
-            JOIN latest_orders o ON ol.order_id = o.id
-            WHERE o.shop_id IN {TARGET_SHOP_IDS}
-              AND o.complete = FALSE 
-              AND o.archived = FALSE
-            GROUP BY 1, 2
-        ),
-        vendors AS (
-            SELECT id as vendor_id, name as vendor_name FROM `{LS_DATASET}.vendor_history` QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
-        ),
-        brands AS (
-            SELECT id as manufacturer_id, name as brand_name FROM `{LS_DATASET}.manufacturer_history` QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
-        ),
-        categories AS (
-            SELECT id as category_id, full_path_name as category_name FROM `{LS_DATASET}.category_history` QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
         )
-        
-        SELECT 
-          ih.system_sku as sku,
-          ih.id as item_id,
-          ih.description,
-          ih.default_vendor_id as vendor_id,
-          v.vendor_name as vendor,
-          b.brand_name as brand,
-          c.category_name as category,
-          current_ish.shop_id as location_id,
-          COALESCE(st.total_units_sold_30, 0) as total_units_sold_30,
-          COALESCE(st.total_units_sold_60, 0) as total_units_sold_60,
-          COALESCE(sc.days_out_of_stock_30, 0) as days_out_of_stock_30,
-          COALESCE(sc.days_out_of_stock_60, 0) as days_out_of_stock_60,
-          current_ish.qoh as current_qoh,
-          COALESCE(p.on_order_units, 0) as on_order,
-          current_ish.reorder_point as current_reorder_point,
-          current_ish.reorder_level as current_desired_level
-        FROM latest_item ih
-        JOIN latest_item_shop current_ish ON ih.id = current_ish.item_id
-        LEFT JOIN sales_totals st ON ih.id = st.item_id AND current_ish.shop_id = st.location_id
-        LEFT JOIN stockouts sc ON ih.id = sc.item_id AND current_ish.shop_id = sc.location_id
-        LEFT JOIN open_pos p ON ih.id = p.item_id AND current_ish.shop_id = p.location_id
-        LEFT JOIN vendors v ON ih.default_vendor_id = v.vendor_id
-        LEFT JOIN brands b ON ih.manufacturer_id = b.manufacturer_id
-        LEFT JOIN categories c ON ih.category_id = c.category_id
+        SELECT
+          CAST(s.system_sku AS STRING) AS sku,
+          s.item_id,
+          s.item_description AS description,
+          s.po_vendor_id_any AS vendor_id,
+          COALESCE(s.po_vendor_name_any, s.default_vendor) AS vendor,
+          s.brand_name AS brand,
+          s.category_name AS category,
+          s.shop_id AS location_id,
+          COALESCE(s.sales_units_l30d, 0) AS total_units_sold_30,
+          COALESCE(s.sales_units_l60d, 0) AS total_units_sold_60,
+          COALESCE(sc.days_out_of_stock_30, 0) AS days_out_of_stock_30,
+          COALESCE(sc.days_out_of_stock_60, 0) AS days_out_of_stock_60,
+          COALESCE(s.qoh, 0) AS current_qoh,
+          COALESCE(s.po_units_remaining, 0) AS on_order,
+          COALESCE(s.reorderPoint, 0) AS current_reorder_point,
+          COALESCE(s.reorderLevel, 0) AS current_desired_level
+        FROM snapshot s
+        LEFT JOIN stockouts sc ON s.item_id = sc.item_id AND s.shop_id = sc.location_id
     """
     client = get_bq_client()
     df = client.query(query).to_dataframe()
@@ -666,4 +611,137 @@ def get_replenishment_debug_counts() -> dict:
     """
     client = get_bq_client()
     row = dict(next(iter(client.query(query).result())))
+    return to_plain_json(row)
+
+
+def get_item_replenishment_debug(item_id: int) -> dict:
+    """Returns raw vs deduped sales and PO counts for a single item."""
+    def to_plain_json(value):
+        if isinstance(value, list):
+            return [to_plain_json(item) for item in value]
+        if hasattr(value, "items"):
+            return {key: to_plain_json(val) for key, val in value.items()}
+        return value
+
+    query = f"""
+        WITH
+        latest_sale_lines AS (
+          SELECT *
+          FROM `{LS_DATASET}.sale_line_history`
+          WHERE item_id = @item_id
+            AND shop_id IN {TARGET_SHOP_IDS}
+          QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        latest_sales AS (
+          SELECT *
+          FROM `{LS_DATASET}.sale_history`
+          QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        raw_sales AS (
+          SELECT
+            sl.shop_id AS location_id,
+            COUNT(*) AS raw_history_rows,
+            COUNT(DISTINCT sl.id) AS distinct_sale_line_ids,
+            SUM(CASE WHEN DATE(s.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY) THEN sl.unit_quantity ELSE 0 END) AS raw_units_30d,
+            SUM(sl.unit_quantity) AS raw_units_60d
+          FROM `{LS_DATASET}.sale_line_history` sl
+          JOIN `{LS_DATASET}.sale_history` s ON sl.sale_id = s.id
+          WHERE sl.item_id = @item_id
+            AND sl.shop_id IN {TARGET_SHOP_IDS}
+            AND s.completed = TRUE
+            AND s.voided = FALSE
+            AND DATE(s.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
+          GROUP BY sl.shop_id
+        ),
+        deduped_sales AS (
+          SELECT
+            sl.shop_id AS location_id,
+            COUNT(*) AS deduped_rows,
+            SUM(CASE WHEN DATE(s.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY) THEN sl.unit_quantity ELSE 0 END) AS deduped_units_30d,
+            SUM(sl.unit_quantity) AS deduped_units_60d
+          FROM latest_sale_lines sl
+          JOIN latest_sales s ON sl.sale_id = s.id
+          WHERE s.completed = TRUE
+            AND s.voided = FALSE
+            AND DATE(s.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
+          GROUP BY sl.shop_id
+        ),
+        latest_order_lines AS (
+          SELECT *
+          FROM `{LS_DATASET}.order_line_history`
+          WHERE item_id = @item_id
+          QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        latest_orders AS (
+          SELECT *
+          FROM `{LS_DATASET}.order_history`
+          QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        raw_open_pos AS (
+          SELECT
+            o.shop_id AS location_id,
+            COUNT(*) AS raw_history_rows,
+            COUNT(DISTINCT ol.id) AS distinct_order_line_ids,
+            SUM(ol.quantity - COALESCE(ol.num_received, 0)) AS raw_on_order
+          FROM `{LS_DATASET}.order_line_history` ol
+          JOIN `{LS_DATASET}.order_history` o ON ol.order_id = o.id
+          WHERE ol.item_id = @item_id
+            AND o.shop_id IN {TARGET_SHOP_IDS}
+            AND o.complete = FALSE
+            AND o.archived = FALSE
+          GROUP BY o.shop_id
+        ),
+        deduped_open_pos AS (
+          SELECT
+            o.shop_id AS location_id,
+            COUNT(*) AS deduped_rows,
+            SUM(ol.quantity - COALESCE(ol.num_received, 0)) AS deduped_on_order
+          FROM latest_order_lines ol
+          JOIN latest_orders o ON ol.order_id = o.id
+          WHERE o.shop_id IN {TARGET_SHOP_IDS}
+            AND o.complete = FALSE
+            AND o.archived = FALSE
+          GROUP BY o.shop_id
+        ),
+        locations AS (
+          SELECT * FROM UNNEST([2, 3, 20]) AS location_id
+        )
+        SELECT
+          @item_id AS item_id,
+          ARRAY(
+            SELECT AS STRUCT
+              l.location_id,
+              COALESCE(rs.raw_history_rows, 0) AS raw_sales_history_rows,
+              COALESCE(rs.distinct_sale_line_ids, 0) AS distinct_sale_line_ids,
+              COALESCE(rs.raw_units_30d, 0) AS raw_history_units_30d,
+              COALESCE(ds.deduped_rows, 0) AS deduped_sales_rows,
+              COALESCE(ds.deduped_units_30d, 0) AS deduped_units_30d,
+              COALESCE(rs.raw_units_60d, 0) AS raw_history_units_60d,
+              COALESCE(ds.deduped_units_60d, 0) AS deduped_units_60d
+            FROM locations l
+            LEFT JOIN raw_sales rs USING (location_id)
+            LEFT JOIN deduped_sales ds USING (location_id)
+            ORDER BY l.location_id
+          ) AS sales_by_location,
+          ARRAY(
+            SELECT AS STRUCT
+              l.location_id,
+              COALESCE(rp.raw_history_rows, 0) AS raw_po_history_rows,
+              COALESCE(rp.distinct_order_line_ids, 0) AS distinct_order_line_ids,
+              COALESCE(rp.raw_on_order, 0) AS raw_history_on_order,
+              COALESCE(dp.deduped_rows, 0) AS deduped_po_rows,
+              COALESCE(dp.deduped_on_order, 0) AS deduped_on_order
+            FROM locations l
+            LEFT JOIN raw_open_pos rp USING (location_id)
+            LEFT JOIN deduped_open_pos dp USING (location_id)
+            ORDER BY l.location_id
+          ) AS po_by_location
+    """
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("item_id", "INT64", item_id),
+        ]
+    )
+    row = dict(next(iter(client.query(query, job_config=job_config).result())))
     return to_plain_json(row)

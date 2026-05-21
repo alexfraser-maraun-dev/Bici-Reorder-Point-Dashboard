@@ -647,24 +647,22 @@ export function SheetsReplenishment() {
                       Item Description <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[52px] text-right">
-                    <button onClick={() => requestSort('raw_units_sold_30d')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
-                      30d Raw <ArrowUpDown className="w-2.5 h-2.5" />
+                  <TableHead className="w-[62px] text-right bg-blue-50/20">
+                    <button
+                      onClick={() => requestSort('raw_units_sold_30d')}
+                      className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase"
+                      title="Primary number is raw units sold in the last 30 days. Smaller number below is stockout-adjusted demand for the same period."
+                    >
+                      30d <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
-                  <TableHead className="w-[56px] text-right bg-blue-50/20">
-                    <button onClick={() => requestSort('forecast_30d')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
-                      30d Adj <ArrowUpDown className="w-2.5 h-2.5" />
-                    </button>
-                  </TableHead>
-                  <TableHead className="w-[52px] text-right">
-                    <button onClick={() => requestSort('raw_units_sold_60d')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
-                      60d Raw <ArrowUpDown className="w-2.5 h-2.5" />
-                    </button>
-                  </TableHead>
-                  <TableHead className="w-[56px] text-right bg-blue-50/20 border-r">
-                    <button onClick={() => requestSort('forecast_60d')} className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase">
-                      60d Adj <ArrowUpDown className="w-2.5 h-2.5" />
+                  <TableHead className="w-[62px] text-right bg-blue-50/20 border-r">
+                    <button
+                      onClick={() => requestSort('raw_units_sold_60d')}
+                      className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase"
+                      title="Primary number is raw units sold in the last 60 days. Smaller number below is stockout-adjusted demand for the same period."
+                    >
+                      60d <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
                   <TableHead className="w-[38px] text-right">
@@ -703,14 +701,14 @@ export function SheetsReplenishment() {
                 {isLoading ? (
                   Array.from({ length: 15 }).map((_, i) => (
                     <TableRow key={i}>
-                      {Array.from({ length: 14 }).map((_, j) => (
+                      {Array.from({ length: 12 }).map((_, j) => (
                         <TableCell key={j}><Skeleton className="h-4 w-full" /></TableCell>
                       ))}
                     </TableRow>
                   ))
                 ) : paginatedData.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={14} className="h-64 text-center">
+                    <TableCell colSpan={12} className="h-64 text-center">
                       <div className="flex flex-col items-center gap-2 text-muted-foreground">
                         <CircleAlert className="w-8 h-8 opacity-20" />
                         <p className="font-semibold">No matches found in synced product data.</p>
@@ -759,21 +757,21 @@ export function SheetsReplenishment() {
                           </div>
                         </div>
                       </TableCell>
-                      <TableCell className="text-right font-mono text-[11px] tabular-nums bg-blue-50/5">
-                        {item.raw_units_sold_30d}
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-[11px] tabular-nums bg-blue-50/5">
-                        <div className="flex items-center justify-end gap-1">
-                          {item.momentum === 'increasing' && <TrendingUp className="w-2.5 h-2.5 text-emerald-500" />}
-                          {item.momentum === 'decreasing' && <TrendingDown className="w-2.5 h-2.5 text-red-500" />}
-                          {item.forecast_30d}
+                      <TableCell className="text-right font-mono tabular-nums bg-blue-50/5">
+                        <div className="flex flex-col items-end leading-tight">
+                          <div className="flex items-center justify-end gap-1 text-[11px]">
+                            {item.momentum === 'increasing' && <TrendingUp className="w-2.5 h-2.5 text-emerald-500" />}
+                            {item.momentum === 'decreasing' && <TrendingDown className="w-2.5 h-2.5 text-red-500" />}
+                            <span>{item.raw_units_sold_30d}</span>
+                          </div>
+                          <span className="text-[9px] text-blue-500">{item.forecast_30d} adj</span>
                         </div>
                       </TableCell>
-                      <TableCell className="text-right font-mono text-[11px] tabular-nums bg-blue-50/5">
-                        {item.raw_units_sold_60d}
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-[11px] tabular-nums bg-blue-50/5 border-r">
-                        {item.forecast_60d}
+                      <TableCell className="text-right font-mono tabular-nums bg-blue-50/5 border-r">
+                        <div className="flex flex-col items-end leading-tight">
+                          <span className="text-[11px]">{item.raw_units_sold_60d}</span>
+                          <span className="text-[9px] text-blue-500">{item.forecast_60d} adj</span>
+                        </div>
                       </TableCell>
                       <TableCell className="text-right font-mono text-[11px] tabular-nums">
                         <span className={cn(item.on_hand <= item.recommended_reorder_point && item.recommended_reorder_point > 0 && "text-red-500 font-bold")}>

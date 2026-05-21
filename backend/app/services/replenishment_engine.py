@@ -21,16 +21,22 @@ def process_recommendations(
             return int(value)
         except (TypeError, ValueError):
             return value
+
+    def normalize_name(value):
+        return str(value).strip().lower() if value is not None else None
     
     # Build Lead Time dictionary: (vendor_id, location_id) -> lead_time_days
     # Fallback to a default if not found
     lead_time_dict = {}
     for row in lead_times_df_dict:
         vid = normalize_id(row.get("vendor_id"))
+        vendor_name = normalize_name(row.get("vendor_name"))
         lid = normalize_id(row.get("location_id"))
         lt = row.get("lead_time_days")
         if vid is not None and lid is not None and lt is not None:
             lead_time_dict[(vid, lid)] = lt
+        if vendor_name and lid is not None and lt is not None:
+            lead_time_dict[(vendor_name, lid)] = lt
             
     recommendations = []
     
@@ -42,9 +48,12 @@ def process_recommendations(
         location_id = normalize_id(row.get("location_id"))
         loc_name = shop_map.get(location_id, f"Shop {location_id}")
         vendor_id = normalize_id(row.get("vendor_id"))
+        vendor_name = normalize_name(row.get("vendor"))
         
         # Determine lead time
-        lead_time = lead_time_dict.get((vendor_id, location_id), 14.0) # default to 14 days if no history
+        lead_time = lead_time_dict.get((vendor_id, location_id))
+        if lead_time is None:
+            lead_time = lead_time_dict.get((vendor_name, location_id), 14.0) # default to 14 days if no history
         
         # Raw Sales Data
         total_units_sold_30 = row.get("total_units_sold_30", 0)
