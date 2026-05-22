@@ -267,6 +267,8 @@ function DemandCell({
   const activeDays = item[activeKey]
   const oosDays = item[oosKey]
   const distinctSaleDays = item[distinctSaleDaysKey]
+  const periodDays = period === '14d' ? 14 : period === '30d' ? 30 : 60
+  const qohInStockDays = oosDays === undefined ? undefined : Math.max(0, periodDays - oosDays)
 
   return (
     <Tooltip>
@@ -280,8 +282,8 @@ function DemandCell({
         <div className="font-bold">{period} demand context</div>
         <div>Raw sales: <span className="font-mono">{rawValue}</span></div>
         <div>Adjusted demand: <span className="font-mono">{adjustedValue}</span></div>
-        {activeDays !== undefined && (
-          <div>Effective active days: <span className="font-mono">{activeDays}</span></div>
+        {qohInStockDays !== undefined && (
+          <div>QOH in-stock days: <span className="font-mono">{qohInStockDays}</span></div>
         )}
         {oosDays !== undefined && (
           <div>QOH OOS days: <span className="font-mono">{oosDays}</span></div>
@@ -289,8 +291,11 @@ function DemandCell({
         {distinctSaleDays !== undefined && (
           <div>Distinct sale days: <span className="font-mono">{distinctSaleDays}</span></div>
         )}
+        {activeDays !== undefined && (
+          <div>Adjustment active days: <span className="font-mono">{activeDays}</span></div>
+        )}
         <div className="border-t border-background/20 pt-1 text-background/80">
-          Effective active days are capped by in-stock days, distinct sale days, and a 3-day minimum so negative inventory does not overinflate adjusted demand.
+          Adjustment active days use the larger of QOH in-stock days, distinct sale days, and a 3-day minimum. Shrink mode now trusts thin active-day windows more slowly.
         </div>
       </TooltipContent>
     </Tooltip>

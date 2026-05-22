@@ -237,7 +237,33 @@ class IdentityFieldsTest(unittest.TestCase):
         self.assertEqual(rows[0]["active_days_14"], 4)
         self.assertEqual(rows[0]["days_out_of_stock_14"], 11)
         self.assertEqual(rows[0]["distinct_sale_days_14"], 4)
-        self.assertEqual(rows[0]["forecast_14d"], 14.6)
+        self.assertEqual(rows[0]["forecast_14d"], 12.0)
+
+    def test_min_days_uses_raw_velocity_until_seven_adjustment_active_days(self):
+        row = item_row(29070, "MIN-DAYS", 55)
+        row["total_units_sold_14"] = 6
+        row["total_units_sold_30"] = 6
+        row["total_units_sold_60"] = 6
+        row["days_out_of_stock_14"] = 11
+        row["days_out_of_stock_30"] = 11
+        row["days_out_of_stock_60"] = 11
+        row["distinct_sale_days_14"] = 5
+        row["distinct_sale_days_30"] = 5
+        row["distinct_sale_days_60"] = 5
+
+        rows = process_recommendations(
+            [row],
+            [{"vendor_id": 55, "location_id": 3, "lead_time_days": 8}],
+            safety_days=0,
+            override_forecast=60,
+            weight_14d=1,
+            weight_15_30d=0,
+            weight_31_60d=0,
+            adjustment_mode="min_days",
+        )
+
+        self.assertEqual(rows[0]["active_days_14"], 5)
+        self.assertEqual(rows[0]["forecast_14d"], 6.0)
 
     def test_rising_requires_stronger_multi_window_evidence(self):
         row = item_row(1001, "WEAK-RISE", 55)

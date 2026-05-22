@@ -142,7 +142,7 @@ export default function HowToUsePage() {
           <CardContent className="grid gap-6 md:grid-cols-3">
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Adjusted Demand</h4>
-              <p className="text-sm">Raw sales are adjusted for active in-stock days, then passed through the selected stockout adjustment guardrail. Negative QOH remains visible, but effective active days never fall below distinct sale days or a 3-day minimum.</p>
+              <p className="text-sm">Raw sales are adjusted using adjustment active days, then passed through the selected stockout adjustment guardrail. Negative QOH remains visible, but adjustment active days never fall below distinct sale days or a 3-day minimum.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Demand Weighting</h4>
@@ -154,11 +154,11 @@ export default function HowToUsePage() {
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Shrink Adjustment</h4>
-              <p className="text-sm">Default mode. Blends raw velocity toward stockout-adjusted velocity as evidence improves, fully trusting the adjustment at 7 active days.</p>
+              <p className="text-sm">Default mode. Blends raw velocity toward stockout-adjusted velocity as evidence improves, fully trusting the adjustment at 10 active days.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Minimum Days Rule</h4>
-              <p className="text-sm">Uses raw sales until a product has at least 7 active in-stock days, then uses the stockout-adjusted value.</p>
+              <p className="text-sm">Uses raw sales until a product has at least 7 adjustment active days, then uses the stockout-adjusted value.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Hard Cap Multiplier</h4>

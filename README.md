@@ -103,8 +103,8 @@ adjusted daily velocity  = raw units sold / active in-stock days
 
 The selected guardrail determines which daily velocity is used for the smaller adjusted 14d/30d/60d values and for recommendation math:
 
-- `shrink`: default. Blends raw velocity toward stockout-adjusted velocity based on evidence. Confidence is `min(1, active in-stock days / 7)`.
-- `min_days`: requires at least 7 active in-stock days. If there are fewer than 7, uses raw velocity.
+- `shrink`: default. Blends raw velocity toward stockout-adjusted velocity based on evidence. Confidence is `min(1, adjustment active days / 10)`.
+- `min_days`: requires at least 7 adjustment active days. If there are fewer than 7, uses raw velocity.
 - `cap`: allows stockout adjustment, but caps adjusted period demand at `2x` raw sales.
 - `raw`: uses the unprotected stockout-adjusted velocity directly.
 
@@ -121,7 +121,7 @@ cap mode         = 2
 The demand weighting below is used as the base daily velocity for replenishment math.
 
 When QOH is zero or negative, that day still counts as an out-of-stock day.
-For adjusted-demand math, however, effective active days are guarded so they
+For adjusted-demand math, however, adjustment active days are guarded so they
 never fall below the number of distinct sale days in the window or a 3-day
 minimum. This keeps negative-inventory sales from creating unrealistically high
 adjusted demand.

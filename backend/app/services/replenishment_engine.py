@@ -244,7 +244,7 @@ def process_recommendations(
             capped_period_demand = min(unbounded_adjusted_daily * period_days, units_sold * 2)
             return capped_period_demand / period_days if period_days > 0 else 0
 
-        confidence = min(1.0, max(0.0, active_days / 7))
+        confidence = min(1.0, max(0.0, active_days / 10))
         return raw_daily + ((unbounded_adjusted_daily - raw_daily) * confidence)
 
     def effective_active_days(period_days, qoh_oos_days, distinct_sale_days):
