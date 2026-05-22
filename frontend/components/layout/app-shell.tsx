@@ -127,15 +127,10 @@ export function AppShell({ children, headerActions, mainClassName }: AppShellPro
             <div className="h-4 w-[1px] bg-border hidden sm:block" />
 
             {/* User Profile */}
-            <div className="flex items-center gap-3">
-              <div className="flex flex-col items-end">
-                <span className="text-xs font-semibold text-foreground/90">
-                  {session?.user?.name || 'Authorized User'}
-                </span>
-                <span className="text-[10px] text-muted-foreground font-medium">
-                  {session?.user?.email || 'not signed in'}
-                </span>
-              </div>
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="hidden max-w-[180px] truncate text-[10px] font-medium text-muted-foreground md:inline">
+                {session?.user?.email || 'not signed in'}
+              </span>
               <Button
                 variant="ghost"
                 size="sm"
