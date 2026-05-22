@@ -357,7 +357,7 @@ def get_vendor_lead_times():
 def get_active_vendor_lead_times(force_refresh: bool = False):
     try:
         from app.services.bigquery_sync import fetch_active_vendor_lead_times
-        result = fetch_active_vendor_lead_times(active_days=120, force_refresh=force_refresh)
+        result = fetch_active_vendor_lead_times(active_days=90, force_refresh=force_refresh)
         return {
             "status": "success",
             "data": to_json_safe(result["data"]),

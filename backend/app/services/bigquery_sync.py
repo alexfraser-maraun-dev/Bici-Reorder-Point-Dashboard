@@ -319,10 +319,10 @@ def fetch_vendor_name_map(vendor_ids: list) -> dict:
             vendor_names[str(row_dict["vendor_id"])] = row_dict["vendor_name"]
     return vendor_names
 
-def fetch_active_vendor_lead_times(active_days: int = 120, force_refresh: bool = False) -> dict:
+def fetch_active_vendor_lead_times(active_days: int = 90, force_refresh: bool = False) -> dict:
     """
-    Returns vendors with at least one PO placed in the active window, plus median
-    received lead times and configured brand mappings.
+    Returns vendors with at least one usable received lead-time sample in the
+    active window, plus median received lead times and configured brand mappings.
     """
     cache_key = active_days
     if not force_refresh:
@@ -331,29 +331,27 @@ def fetch_active_vendor_lead_times(active_days: int = 120, force_refresh: bool =
             return cached
 
     query = f"""
-        WITH active_vendors AS (
-            SELECT
-                CAST(vendor_id AS STRING) AS vendor_id,
-                COUNT(DISTINCT order_id) AS active_po_count,
-                MAX(po_ordered_at) AS last_po_ordered_at
-            FROM `{LS_DATASET}.po_report`
-            WHERE vendor_id IS NOT NULL
-                AND po_ordered_at IS NOT NULL
-                AND DATE(po_ordered_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @active_days DAY)
-            GROUP BY vendor_id
-        ),
-        lead_time_samples AS (
+        WITH lead_time_samples AS (
             SELECT
                 CAST(vendor_id AS STRING) AS vendor_id,
                 shop_id AS location_id,
                 TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY) AS lead_time_day,
-                order_id
+                order_id,
+                po_ordered_at
             FROM `{LS_DATASET}.po_report`
             WHERE vendor_id IS NOT NULL
                 AND po_ordered_at IS NOT NULL
                 AND first_received_at IS NOT NULL
                 AND DATE(po_ordered_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @active_days DAY)
                 AND TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY) BETWEEN 0 AND 40
+        ),
+        active_vendors AS (
+            SELECT
+                vendor_id,
+                COUNT(DISTINCT order_id) AS active_po_count,
+                MAX(po_ordered_at) AS last_po_ordered_at
+            FROM lead_time_samples
+            GROUP BY vendor_id
         ),
         lead_times AS (
             SELECT
@@ -458,25 +456,42 @@ def fetch_brand_sourcing_rules(force_refresh: bool = False) -> list:
         if cached is not None:
             return cached
 
-    ensure_brand_sourcing_rules_table()
-    query = f"""
+    brands_query = f"""
         WITH latest_snapshot_date AS (
             SELECT MAX(snapshot_date_local) AS snapshot_date_local
             FROM `{LS_DATASET}.v_master_snapshot_latest`
-        ),
-        brands AS (
-            SELECT
-                brand_name,
-                COUNT(DISTINCT item_id) AS item_count
-            FROM `{LS_DATASET}.v_master_snapshot_latest` s
-            CROSS JOIN latest_snapshot_date lsd
-            WHERE s.snapshot_date_local = lsd.snapshot_date_local
-                AND COALESCE(s.item_archived, FALSE) = FALSE
-                AND brand_name IS NOT NULL
-                AND TRIM(brand_name) != ''
-            GROUP BY brand_name
-        ),
-        rules AS (
+        )
+        SELECT
+            brand_name,
+            COUNT(DISTINCT item_id) AS item_count
+        FROM `{LS_DATASET}.v_master_snapshot_latest` s
+        CROSS JOIN latest_snapshot_date lsd
+        WHERE s.snapshot_date_local = lsd.snapshot_date_local
+            AND COALESCE(s.item_archived, FALSE) = FALSE
+            AND brand_name IS NOT NULL
+            AND TRIM(brand_name) != ''
+        GROUP BY brand_name
+        ORDER BY brand_name
+    """
+    client = get_bq_client()
+    rows = client.query(brands_query).result()
+    data = []
+    for row in rows:
+        brand = dict(row)
+        brand.update({
+            "preferred_vendor_id": None,
+            "preferred_vendor_name": None,
+            "active": False,
+            "notes": None,
+            "created_at": None,
+            "updated_at": None,
+            "updated_by": None,
+        })
+        data.append(brand)
+
+    try:
+        ensure_brand_sourcing_rules_table()
+        rules_query = f"""
             SELECT
                 brand_name,
                 preferred_vendor_id,
@@ -487,24 +502,16 @@ def fetch_brand_sourcing_rules(force_refresh: bool = False) -> list:
                 updated_at,
                 updated_by
             FROM `{APP_DATASET}.replen_brand_sourcing_rules`
-        )
-        SELECT
-            b.brand_name,
-            b.item_count,
-            r.preferred_vendor_id,
-            r.preferred_vendor_name,
-            COALESCE(r.active, FALSE) AS active,
-            r.notes,
-            r.created_at,
-            r.updated_at,
-            r.updated_by
-        FROM brands b
-        LEFT JOIN rules r ON b.brand_name = r.brand_name
-        ORDER BY b.brand_name
-    """
-    client = get_bq_client()
-    rows = client.query(query).result()
-    data = [dict(row) for row in rows]
+        """
+        rules = {row["brand_name"]: dict(row) for row in client.query(rules_query).result()}
+        for brand in data:
+            rule = rules.get(brand["brand_name"])
+            if rule:
+                brand.update(rule)
+                brand["active"] = bool(rule.get("active"))
+    except Exception as e:
+        print(f"Failed to attach brand sourcing rules: {e}")
+
     _cache_set(_brand_sourcing_rules_cache, cache_key, data)
     return data
 

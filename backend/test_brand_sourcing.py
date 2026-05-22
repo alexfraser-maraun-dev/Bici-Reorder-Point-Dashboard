@@ -35,7 +35,7 @@ class BrandSourcingTest(unittest.TestCase):
         bigquery_sync._brand_sourcing_rules_cache.clear()
         bigquery_sync._brand_sourcing_rules_map_cache.clear()
 
-    def test_active_vendor_query_uses_120_day_active_po_window(self):
+    def test_active_vendor_query_uses_90_day_received_lead_time_window(self):
         client = FakeClient(rows=[
             {
                 "vendor_id": "55",
@@ -52,7 +52,7 @@ class BrandSourcingTest(unittest.TestCase):
              patch("app.services.bigquery_sync.get_brand_sourcing_rules_map", return_value={
                  "Shimano": {"brand_name": "Shimano", "preferred_vendor_id": "55"}
              }):
-            result = bigquery_sync.fetch_active_vendor_lead_times(active_days=120)
+            result = bigquery_sync.fetch_active_vendor_lead_times(active_days=90)
 
         rows = result["data"]
         self.assertEqual(rows[0]["vendor_id"], "55")
@@ -61,6 +61,7 @@ class BrandSourcingTest(unittest.TestCase):
         query_text = client.calls[-1]["query"]
         self.assertIn("DATE_SUB(CURRENT_DATE(), INTERVAL @active_days DAY)", query_text)
         self.assertIn("PERCENTILE_CONT(lead_time_day, 0.5)", query_text)
+        self.assertIn("first_received_at IS NOT NULL", query_text)
         self.assertNotIn("ANY_VALUE(vendor_name)", query_text)
         self.assertNotIn("v_master_snapshot_latest", query_text)
         self.assertEqual(result["meta"]["active_vendor_count"], 1)
@@ -68,7 +69,7 @@ class BrandSourcingTest(unittest.TestCase):
         self.assertEqual(result["meta"]["warnings"], [])
         params = client.calls[-1]["job_config"].query_parameters
         self.assertEqual(params[0].name, "active_days")
-        self.assertEqual(params[0].value, 120)
+        self.assertEqual(params[0].value, 90)
 
     def test_active_vendor_query_does_not_require_brand_rules_table(self):
         client = FakeClient(rows=[
@@ -83,7 +84,7 @@ class BrandSourcingTest(unittest.TestCase):
         with patch("app.services.bigquery_sync.get_bq_client", return_value=client), \
              patch("app.services.bigquery_sync.fetch_vendor_name_map", side_effect=Exception("no names")), \
              patch("app.services.bigquery_sync.get_brand_sourcing_rules_map", side_effect=Exception("no rules")):
-            result = bigquery_sync.fetch_active_vendor_lead_times(active_days=120)
+            result = bigquery_sync.fetch_active_vendor_lead_times(active_days=90)
 
         rows = result["data"]
         self.assertEqual(rows[0]["vendor_id"], "99")
@@ -106,8 +107,8 @@ class BrandSourcingTest(unittest.TestCase):
         with patch("app.services.bigquery_sync.get_bq_client", return_value=client), \
              patch("app.services.bigquery_sync.fetch_vendor_name_map", return_value={}), \
              patch("app.services.bigquery_sync.get_brand_sourcing_rules_map", return_value={}):
-            first = bigquery_sync.fetch_active_vendor_lead_times(active_days=120)
-            second = bigquery_sync.fetch_active_vendor_lead_times(active_days=120)
+            first = bigquery_sync.fetch_active_vendor_lead_times(active_days=90)
+            second = bigquery_sync.fetch_active_vendor_lead_times(active_days=90)
 
         self.assertEqual(first, second)
         self.assertEqual(len(client.calls), 1)
@@ -136,27 +137,22 @@ class BrandSourcingTest(unittest.TestCase):
         self.assertFalse(params["active"])
         self.assertEqual(bigquery_sync._brand_sourcing_rules_cache, {})
 
-    def test_brand_configuration_query_returns_unmapped_brands(self):
+    def test_brand_configuration_query_returns_unmapped_brands_when_rules_are_unavailable(self):
         client = FakeClient(rows=[
             {
                 "brand_name": "Unmapped Brand",
                 "item_count": 12,
-                "preferred_vendor_id": None,
-                "preferred_vendor_name": None,
-                "active": False,
-                "notes": None,
-                "created_at": None,
-                "updated_at": None,
-                "updated_by": None,
             }
         ])
 
-        with patch("app.services.bigquery_sync.get_bq_client", return_value=client):
+        with patch("app.services.bigquery_sync.get_bq_client", return_value=client), \
+             patch("app.services.bigquery_sync.ensure_brand_sourcing_rules_table", side_effect=Exception("no rules")):
             rows = bigquery_sync.fetch_brand_sourcing_rules()
 
         self.assertEqual(rows[0]["brand_name"], "Unmapped Brand")
         self.assertFalse(rows[0]["active"])
-        self.assertIn("LEFT JOIN rules", client.calls[-1]["query"])
+        self.assertIsNone(rows[0]["preferred_vendor_id"])
+        self.assertNotIn("replen_brand_sourcing_rules", client.calls[0]["query"])
 
     def test_json_safe_serializes_nested_timestamps(self):
         class TimestampLike:

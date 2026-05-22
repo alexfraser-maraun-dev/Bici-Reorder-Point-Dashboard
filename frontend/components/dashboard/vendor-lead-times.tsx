@@ -60,7 +60,7 @@ export function VendorLeadTimes() {
           <div>
             <h2 className="font-semibold text-lg">Active Vendor Lead Times</h2>
             <p className="text-xs text-muted-foreground">
-              Vendors with at least one PO placed in the past 120 days
+              Vendors with a received lead-time sample in the past 90 days
             </p>
           </div>
         </div>
@@ -136,7 +136,7 @@ export function VendorLeadTimes() {
                     <AlertCircle className="w-8 h-8 opacity-20" />
                     <p>
                       {leadTimes.length === 0
-                        ? 'No vendors with POs placed in the past 120 days.'
+                        ? 'No vendors with received lead-time samples in the past 90 days.'
                         : 'No vendors match the current search.'}
                     </p>
                   </div>
