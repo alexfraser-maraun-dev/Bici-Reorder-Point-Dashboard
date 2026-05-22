@@ -112,11 +112,11 @@ export default function HowToUsePage() {
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">QOH / QOO</h4>
-              <p className="text-sm">QOH is quantity on hand. QOO is open PO quantity remaining from the trusted snapshot view.</p>
+              <p className="text-sm">QOH is quantity on hand. QOO is open PO quantity remaining from the trusted snapshot view. Negative QOH is displayed, but treated as zero for planning math.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Cover</h4>
-              <p className="text-sm">How many days current QOH will last based on the guarded 60-day demand rate.</p>
+              <p className="text-sm">How many days current QOH will last based on the guarded 60-day demand rate, with negative QOH floored to zero.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Lead</h4>
@@ -170,7 +170,7 @@ export default function HowToUsePage() {
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Order Qty</h4>
-              <p className="text-sm">Suggested order is desired level minus QOH and QOO, floored at zero.</p>
+              <p className="text-sm">Suggested order is desired level minus QOH and QOO, floored at zero. Negative QOH is treated as zero so it does not inflate the order.</p>
             </div>
           </CardContent>
         </Card>

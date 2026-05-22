@@ -44,7 +44,9 @@ def calculate_inventory_status(
     reorder_point: float,
     desired_level: float,
 ) -> Dict[str, Any]:
-    inventory_position = on_hand + on_order
+    effective_on_hand = max(0, on_hand)
+    qoh_adjusted_for_math = on_hand < 0
+    inventory_position = effective_on_hand + on_order
 
     if reorder_point <= 0 and desired_level <= 0:
         status = "no_demand"
@@ -55,9 +57,9 @@ def calculate_inventory_status(
     elif desired_level > 0 and inventory_position >= desired_level * 1.2:
         status = "high"
         reason = f"Inventory position is at least 120% of desired level ({inventory_position:g} vs {desired_level:g})."
-    elif desired_level > 0 and inventory_position >= desired_level * 0.8 and reorder_point > 0 and on_hand <= reorder_point:
+    elif desired_level > 0 and inventory_position >= desired_level * 0.8 and reorder_point > 0 and effective_on_hand <= reorder_point:
         status = "incoming"
-        reason = f"Pipeline covers target, but on-hand is at or below ROP ({on_hand:g} vs {reorder_point:g})."
+        reason = f"Pipeline covers target, but on-hand is at or below ROP ({effective_on_hand:g} vs {reorder_point:g})."
     elif desired_level > 0 and inventory_position >= desired_level * 0.8:
         status = "on_target"
         reason = f"Inventory position is within the target band for desired level ({inventory_position:g} vs {desired_level:g})."
@@ -74,7 +76,12 @@ def calculate_inventory_status(
         status = "critical"
         reason = f"Inventory position is at or below 50% of ROP ({inventory_position:g} vs {reorder_point:g})."
 
+    if qoh_adjusted_for_math:
+        reason = f"QOH is negative ({on_hand:g}), so replenishment math uses 0 on hand. {reason}"
+
     return {
+        "effective_on_hand": effective_on_hand,
+        "qoh_adjusted_for_math": qoh_adjusted_for_math,
         "inventory_position": inventory_position,
         "inventory_status": status,
         "inventory_status_label": STATUS_LABELS[status],
@@ -249,6 +256,8 @@ def process_recommendations(
             "forecast_prior_30d": round(adjusted_daily_sales_prior_30d * 30, 1),
             "forecast_60d": round(adjusted_daily_sales_60d * 60, 1), # Stockout-adjusted 60d demand
             "on_hand": on_hand,
+            "effective_on_hand": inventory_status["effective_on_hand"],
+            "qoh_adjusted_for_math": inventory_status["qoh_adjusted_for_math"],
             "on_order": on_order,
             "inventory_position": inventory_status["inventory_position"],
             "inventory_status": inventory_status["inventory_status"],
@@ -256,7 +265,7 @@ def process_recommendations(
             "inventory_status_rank": inventory_status["inventory_status_rank"],
             "inventory_status_reason": inventory_status["inventory_status_reason"],
             "qty_to_order": qty_to_order,
-            "days_stock": round(on_hand / base_daily_sales, 1) if base_daily_sales > 0 else 0,
+            "days_stock": round(inventory_status["effective_on_hand"] / base_daily_sales, 1) if base_daily_sales > 0 else 0,
             "qty_sold": total_units_sold_60,
             "margin": margin,
             "urgency": inventory_status["urgency"],

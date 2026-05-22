@@ -149,8 +149,11 @@ weighted velocity * growth multiplier * forecast period
 ### Suggested Order Quantity
 
 ```text
-max(0, recommended desired level - (QOH + QOO))
+max(0, recommended desired level - (max(0, QOH) + QOO))
 ```
+
+Negative QOH remains visible in the dashboard, but replenishment math treats it
+as zero on hand so inventory corrections do not inflate the suggested order.
 
 ## Backend Endpoints
 

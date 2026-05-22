@@ -36,6 +36,23 @@ class InventoryStatusTest(unittest.TestCase):
     def test_no_demand(self):
         self.assert_status("no_demand", 0, 0, 0, 0)
 
+    def test_negative_qoh_is_floored_for_inventory_position(self):
+        result = calculate_inventory_status(-5, 0, 10, 60)
+
+        self.assertEqual(result["effective_on_hand"], 0)
+        self.assertTrue(result["qoh_adjusted_for_math"])
+        self.assertEqual(result["inventory_position"], 0)
+        self.assertEqual(result["inventory_status"], "critical")
+        self.assertIn("QOH is negative (-5)", result["inventory_status_reason"])
+
+    def test_negative_qoh_with_on_order_uses_on_order_only(self):
+        result = calculate_inventory_status(-5, 60, 10, 60)
+
+        self.assertEqual(result["effective_on_hand"], 0)
+        self.assertTrue(result["qoh_adjusted_for_math"])
+        self.assertEqual(result["inventory_position"], 60)
+        self.assertEqual(result["inventory_status"], "incoming")
+
 
 if __name__ == "__main__":
     unittest.main()

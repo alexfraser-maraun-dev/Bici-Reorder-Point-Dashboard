@@ -1,10 +1,11 @@
 import unittest
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from app.main import build_lightspeed_item_url
+from app.main import build_lightspeed_item_url, get_replenishment_data
 from app.services.replenishment_engine import process_recommendations
 
 
@@ -88,6 +89,47 @@ class IdentityFieldsTest(unittest.TestCase):
             build_lightspeed_item_url("79637"),
             "https://us.merchantos.com/?name=item.views.item&form_name=view&id=79637&tab=details",
         )
+
+    def test_negative_qoh_is_visible_but_not_used_as_deficit(self):
+        row = item_row(1001, "NEG-QOH", 55)
+        row["current_qoh"] = -5
+        rows = self.process([row], [{"vendor_id": 55, "location_id": 3, "lead_time_days": 14}])
+
+        self.assertEqual(rows[0]["on_hand"], -5)
+        self.assertEqual(rows[0]["effective_on_hand"], 0)
+        self.assertTrue(rows[0]["qoh_adjusted_for_math"])
+        self.assertEqual(rows[0]["inventory_position"], 0)
+        self.assertEqual(rows[0]["recommended_desired_level"], 60)
+        self.assertEqual(rows[0]["qty_to_order"], 60)
+        self.assertEqual(rows[0]["days_stock"], 0)
+
+    def test_override_recalculation_uses_effective_qoh(self):
+        class FakeFrame:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def to_dict(self, orient):
+                if orient != "records":
+                    raise ValueError(f"Unexpected orient: {orient}")
+                return self.rows
+
+        row = item_row(1001, "NEG-QOH", 55)
+        row["current_qoh"] = -5
+
+        with patch("app.services.bigquery_sync.fetch_tagged_items_metrics", return_value=FakeFrame([row])), \
+             patch("app.services.bigquery_sync.fetch_lead_times", return_value=FakeFrame([{"vendor_id": 55, "location_id": 3, "lead_time_days": 14}])), \
+             patch("app.main.get_sku_overrides", return_value={"NEG-QOH_Bici Adanac": {"manual_desired_level": 40}}), \
+             patch("app.main.log_recommendation_run"), \
+             patch("app.main.log_velocity_snapshots"):
+            response = get_replenishment_data(forecast_period=60, safety_days=0)
+
+        rec = response["data"]["Bici Adanac"][0]
+        self.assertEqual(rec["on_hand"], -5)
+        self.assertEqual(rec["effective_on_hand"], 0)
+        self.assertTrue(rec["qoh_adjusted_for_math"])
+        self.assertEqual(rec["inventory_position"], 0)
+        self.assertEqual(rec["recommended_desired_level"], 40)
+        self.assertEqual(rec["qty_to_order"], 40)
 
 
 if __name__ == "__main__":
