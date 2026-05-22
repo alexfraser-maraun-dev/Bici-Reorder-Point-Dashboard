@@ -37,14 +37,16 @@ class BrandSourcingTest(unittest.TestCase):
                 "vendor_name": "Shimano Canada",
                 "active_po_count": 3,
                 "last_po_ordered_at": "2026-05-01T12:00:00",
-                "configured_brands": ["Shimano"],
                 "location_lead_times": [
                     {"location_id": 3, "lead_time_days": 8, "po_count": 2},
                 ],
             }
         ])
 
-        with patch("app.services.bigquery_sync.get_bq_client", return_value=client):
+        with patch("app.services.bigquery_sync.get_bq_client", return_value=client), \
+             patch("app.services.bigquery_sync.get_brand_sourcing_rules_map", return_value={
+                 "Shimano": {"brand_name": "Shimano", "preferred_vendor_id": "55"}
+             }):
             rows = bigquery_sync.fetch_active_vendor_lead_times(active_days=120)
 
         self.assertEqual(rows[0]["vendor_id"], "55")
@@ -52,9 +54,33 @@ class BrandSourcingTest(unittest.TestCase):
         query_text = client.calls[-1]["query"]
         self.assertIn("DATE_SUB(CURRENT_DATE(), INTERVAL @active_days DAY)", query_text)
         self.assertIn("PERCENTILE_CONT(lead_time_day, 0.5)", query_text)
+        self.assertNotIn("ANY_VALUE(vendor_name)", query_text)
+        self.assertIn("v_master_snapshot_latest", query_text)
         params = client.calls[-1]["job_config"].query_parameters
         self.assertEqual(params[0].name, "active_days")
         self.assertEqual(params[0].value, 120)
+
+    def test_active_vendor_query_does_not_require_brand_rules_table(self):
+        client = FakeClient(rows=[
+            {
+                "vendor_id": "99",
+                "vendor_name": "Vendor 99",
+                "active_po_count": 1,
+                "last_po_ordered_at": None,
+                "location_lead_times": [],
+            }
+        ])
+
+        with patch("app.services.bigquery_sync.get_bq_client", return_value=client), \
+             patch("app.services.bigquery_sync.get_brand_sourcing_rules_map", side_effect=Exception("no rules")):
+            rows = bigquery_sync.fetch_active_vendor_lead_times(active_days=120)
+
+        self.assertEqual(rows[0]["vendor_id"], "99")
+        self.assertEqual(rows[0]["configured_brands"], [])
+
+    def test_brand_rule_map_returns_empty_when_table_is_unavailable(self):
+        with patch("app.services.bigquery_sync.ensure_brand_sourcing_rules_table", side_effect=Exception("no create permission")):
+            self.assertEqual(bigquery_sync.get_brand_sourcing_rules_map(), {})
 
     def test_brand_rule_upsert_clears_vendor_when_no_vendor_id_is_supplied(self):
         client = FakeClient()

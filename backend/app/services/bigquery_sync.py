@@ -193,21 +193,21 @@ def ensure_brand_sourcing_rules_table():
 
 def get_brand_sourcing_rules_map() -> dict:
     """Fetches active brand sourcing rules keyed by brand name."""
-    ensure_brand_sourcing_rules_table()
-    query = f"""
-        SELECT
-            brand_name,
-            preferred_vendor_id,
-            preferred_vendor_name,
-            active,
-            notes,
-            created_at,
-            updated_at,
-            updated_by
-        FROM `{APP_DATASET}.replen_brand_sourcing_rules`
-        WHERE active = TRUE
-    """
     try:
+        ensure_brand_sourcing_rules_table()
+        query = f"""
+            SELECT
+                brand_name,
+                preferred_vendor_id,
+                preferred_vendor_name,
+                active,
+                notes,
+                created_at,
+                updated_at,
+                updated_by
+            FROM `{APP_DATASET}.replen_brand_sourcing_rules`
+            WHERE active = TRUE
+        """
         client = get_bq_client()
         rows = client.query(query).result()
         return {row["brand_name"]: dict(row) for row in rows}
@@ -280,12 +280,10 @@ def fetch_active_vendor_lead_times(active_days: int = 120) -> list:
     Returns vendors with at least one PO placed in the active window, plus median
     received lead times and configured brand mappings.
     """
-    ensure_brand_sourcing_rules_table()
     query = f"""
         WITH active_vendors AS (
             SELECT
                 CAST(vendor_id AS STRING) AS vendor_id,
-                ANY_VALUE(vendor_name) AS vendor_name,
                 COUNT(DISTINCT order_id) AS active_po_count,
                 MAX(po_ordered_at) AS last_po_ordered_at
             FROM `{LS_DATASET}.po_report`
@@ -323,21 +321,30 @@ def fetch_active_vendor_lead_times(active_days: int = 120) -> list:
                 ORDER BY vendor_id
             ) = 1
         ),
-        brand_mappings AS (
+        latest_snapshot_date AS (
             SELECT
-                preferred_vendor_id AS vendor_id,
-                ARRAY_AGG(brand_name ORDER BY brand_name) AS configured_brands
-            FROM `{APP_DATASET}.replen_brand_sourcing_rules`
-            WHERE active = TRUE
-                AND preferred_vendor_id IS NOT NULL
-            GROUP BY preferred_vendor_id
+                MAX(snapshot_date_local) AS snapshot_date_local
+            FROM `{LS_DATASET}.v_master_snapshot_latest`
+        ),
+        vendor_names AS (
+            SELECT
+                CAST(po_vendor_id_any AS STRING) AS vendor_id,
+                ARRAY_AGG(
+                    COALESCE(po_vendor_name_any, default_vendor) IGNORE NULLS
+                    ORDER BY COALESCE(po_vendor_name_any, default_vendor)
+                    LIMIT 1
+                )[SAFE_OFFSET(0)] AS vendor_name
+            FROM `{LS_DATASET}.v_master_snapshot_latest` s
+            CROSS JOIN latest_snapshot_date lsd
+            WHERE s.snapshot_date_local = lsd.snapshot_date_local
+                AND po_vendor_id_any IS NOT NULL
+            GROUP BY po_vendor_id_any
         )
         SELECT
             av.vendor_id,
-            COALESCE(av.vendor_name, CONCAT('Vendor ', av.vendor_id)) AS vendor_name,
+            COALESCE(vn.vendor_name, CONCAT('Vendor ', av.vendor_id)) AS vendor_name,
             av.active_po_count,
             av.last_po_ordered_at,
-            COALESCE(bm.configured_brands, []) AS configured_brands,
             ARRAY(
                 SELECT AS STRUCT
                     lt.location_id AS location_id,
@@ -348,7 +355,7 @@ def fetch_active_vendor_lead_times(active_days: int = 120) -> list:
                 ORDER BY lt.location_id
             ) AS location_lead_times
         FROM active_vendors av
-        LEFT JOIN brand_mappings bm ON av.vendor_id = bm.vendor_id
+        LEFT JOIN vendor_names vn ON av.vendor_id = vn.vendor_id
         ORDER BY vendor_name
     """
     client = get_bq_client()
@@ -358,7 +365,25 @@ def fetch_active_vendor_lead_times(active_days: int = 120) -> list:
         ]
     )
     rows = client.query(query, job_config=job_config).result()
-    return [dict(row) for row in rows]
+    try:
+        brand_rules = get_brand_sourcing_rules_map()
+    except Exception as e:
+        print(f"Failed to attach configured brands to active vendors: {e}")
+        brand_rules = {}
+
+    configured_brands_by_vendor = {}
+    for rule in brand_rules.values():
+        vendor_id = rule.get("preferred_vendor_id")
+        brand_name = rule.get("brand_name")
+        if vendor_id and brand_name:
+            configured_brands_by_vendor.setdefault(str(vendor_id), []).append(brand_name)
+
+    data = []
+    for row in rows:
+        vendor = dict(row)
+        vendor["configured_brands"] = sorted(configured_brands_by_vendor.get(str(vendor["vendor_id"]), []))
+        data.append(vendor)
+    return data
 
 def fetch_brand_sourcing_rules() -> list:
     """Returns all current brands with any configured preferred vendor mapping."""
