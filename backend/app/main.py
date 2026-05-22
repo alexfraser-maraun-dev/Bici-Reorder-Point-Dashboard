@@ -15,6 +15,9 @@ from datetime import datetime
 from typing import List, Dict, Any
 from fastapi.responses import Response, RedirectResponse
 
+def build_lightspeed_item_url(item_id: str) -> str:
+    return f"https://us.merchantos.com/?name=item.views.item&form_name=view&id={item_id}&tab=details"
+
 # App initialization
 app = FastAPI(title="SKU Reorder Point Automation API")
 
@@ -350,19 +353,6 @@ def check_sheets_health():
         print(f"Google Sheets health check failed: {e}")
         raise HTTPException(status_code=503, detail="Disconnected from Google Sheets")
 
-@app.get("/api/replenishment/ls-link/{system_id}")
-def get_lightspeed_link(system_id: str):
-    from app.services.lightspeed_client import LightspeedClient
-    client = LightspeedClient()
-    def build_item_url(item_id: str) -> str:
-        return f"https://us.merchantos.com/?name=item.views.item&form_name=view&id={item_id}&tab=details"
-
-    try:
-        items = client.get_item_by_sku(system_id)
-        if not items:
-            raise HTTPException(status_code=404, detail=f"Item with SKU {system_id} not found")
-        item_id = items[0].get("itemID")
-        return RedirectResponse(url=build_item_url(item_id))
-    except Exception:
-        search_url = build_item_url(system_id)
-        return RedirectResponse(url=search_url)
+@app.get("/api/replenishment/ls-link/{item_id}")
+def get_lightspeed_link(item_id: str):
+    return RedirectResponse(url=build_lightspeed_item_url(item_id))

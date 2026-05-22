@@ -888,7 +888,7 @@ export function SheetsReplenishment({
                       <TableCell>
                         <div className="flex flex-col w-[330px]">
                           <a 
-                            href={`${baseUrl}/api/replenishment/ls-link/${item.system_id}`}
+                            href={`${baseUrl}/api/replenishment/ls-link/${item.lightspeed_item_id ?? item.system_id}`}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="font-semibold text-xs leading-tight mb-0.5 hover:text-blue-600 hover:underline transition-all truncate"
@@ -898,7 +898,7 @@ export function SheetsReplenishment({
                           </a>
                           <div className="flex items-center gap-1.5 text-[8px] text-muted-foreground">
                             <span className="bg-muted px-1 rounded font-mono truncate">{item.sku}</span>
-                            <span className="font-medium text-foreground/70 truncate">{item.brand}</span>
+                            <span className="font-medium text-foreground/70 truncate">{item.vendor}</span>
                           </div>
                         </div>
                       </TableCell>

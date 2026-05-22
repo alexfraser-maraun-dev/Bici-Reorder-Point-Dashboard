@@ -134,7 +134,8 @@ class LightspeedClient:
             return None
 
     def sync_recommendation(self, rec: Dict[str, Any]) -> bool:
-        system_id = str(rec.get('system_id', ''))
+        item_identity = rec.get('lightspeed_item_id') or rec.get('system_id') or rec.get('sku') or ''
+        system_id = str(item_identity)
         location = rec.get('location')
         
         print(f"[Lightspeed] Attempting sync for SKU: {rec.get('sku')} (ID: {system_id}) at {location}")
@@ -145,8 +146,8 @@ class LightspeedClient:
             print(f"  [Error] Location {location} not mapped to a shopID")
             return False
             
-        # 2. Resolve internal itemID
-        # We try searching by the system_id provided (which might be the internal ID or SystemSKU)
+        # 2. Resolve internal itemID. New payloads send lightspeed_item_id;
+        # SKU lookup remains only as a compatibility fallback for older payloads.
         items = []
         
         # Try as internal ID first if it's numeric

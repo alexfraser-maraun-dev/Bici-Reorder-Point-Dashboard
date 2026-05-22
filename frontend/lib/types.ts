@@ -1,7 +1,9 @@
 // SKU × Location row type
 export interface SkuLocationRow {
   id: string
+  lightspeedItemId?: string
   sku: string
+  vendorId?: string | number
   product: string
   brand: string
   vendor: string

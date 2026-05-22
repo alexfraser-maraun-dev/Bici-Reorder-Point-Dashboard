@@ -132,13 +132,10 @@ def process_recommendations(
     lead_time_dict = {}
     for row in lead_times_df_dict:
         vid = normalize_id(row.get("vendor_id"))
-        vendor_name = normalize_name(row.get("vendor_name"))
         lid = normalize_id(row.get("location_id"))
         lt = row.get("lead_time_days")
         if vid is not None and lid is not None and lt is not None:
             lead_time_dict[(vid, lid)] = lt
-        if vendor_name and lid is not None and lt is not None:
-            lead_time_dict[(vendor_name, lid)] = lt
             
     recommendations = []
     recent_30d_weight = min(1.0, max(0.0, recent_30d_weight))
@@ -147,19 +144,17 @@ def process_recommendations(
         adjustment_mode = "shrink"
     
     for row in items_df_dict:
-        system_id = row.get("item_id")
-        if not system_id:
+        lightspeed_item_id = row.get("item_id")
+        if not lightspeed_item_id:
             continue
+        system_id = lightspeed_item_id
             
         location_id = normalize_id(row.get("location_id"))
         loc_name = shop_map.get(location_id, f"Shop {location_id}")
         vendor_id = normalize_id(row.get("vendor_id"))
-        vendor_name = normalize_name(row.get("vendor"))
         
         # Determine lead time
-        lead_time = lead_time_dict.get((vendor_id, location_id))
-        if lead_time is None:
-            lead_time = lead_time_dict.get((vendor_name, location_id), 14.0) # default to 14 days if no history
+        lead_time = lead_time_dict.get((vendor_id, location_id), 14.0)
         
         # Raw Sales Data
         total_units_sold_30 = row.get("total_units_sold_30", 0)
@@ -227,11 +222,13 @@ def process_recommendations(
 
         recommendations.append({
             "system_id": system_id,
+            "lightspeed_item_id": lightspeed_item_id,
             "sku": row.get("sku"),
             "brand": row.get("brand"),
             "description": row.get("description"),
             "category": row.get("category"),
             "vendor": row.get("vendor"),
+            "vendor_id": row.get("vendor_id"),
             "location": loc_name,
             "daily_sales": round(base_daily_sales, 2), # Weighted base velocity
             "adjusted_daily_sales": round(adjusted_daily_sales, 2), # Velocity w/ multiplier
