@@ -54,6 +54,77 @@ class IdentityFieldsTest(unittest.TestCase):
         )
 
         self.assertEqual([row["lead_time"] for row in rows], [9, 9])
+        self.assertEqual([row["lead_time_source"] for row in rows], ["item_vendor", "item_vendor"])
+        self.assertEqual([row["lead_time_vendor_id"] for row in rows], [55, 55])
+
+    def test_brand_preferred_vendor_takes_precedence_for_lead_time(self):
+        rows = process_recommendations(
+            [item_row(1001, "210000030636", 55, vendor="Occasional Vendor", brand="Shimano")],
+            [
+                {"vendor_id": 55, "location_id": 3, "lead_time_days": 7, "po_count": 4},
+                {"vendor_id": 99, "location_id": 3, "lead_time_days": 18, "po_count": 12},
+            ],
+            brand_sourcing_rules={
+                "Shimano": {
+                    "brand_name": "Shimano",
+                    "preferred_vendor_id": "99",
+                    "preferred_vendor_name": "Preferred Vendor",
+                }
+            },
+            safety_days=0,
+            override_forecast=60,
+            recent_30d_weight=0.5,
+            adjustment_mode="shrink",
+        )
+
+        self.assertEqual(rows[0]["lead_time"], 18)
+        self.assertEqual(rows[0]["lead_time_source"], "preferred_vendor")
+        self.assertEqual(rows[0]["lead_time_vendor_id"], 99)
+        self.assertEqual(rows[0]["lead_time_vendor"], "Preferred Vendor")
+        self.assertEqual(rows[0]["lead_time_po_count"], 12)
+
+    def test_missing_preferred_vendor_lead_time_falls_back_to_item_vendor(self):
+        rows = process_recommendations(
+            [item_row(1001, "210000030636", 55, vendor="Item Vendor", brand="Shimano")],
+            [{"vendor_id": 55, "location_id": 3, "lead_time_days": 7, "po_count": 4}],
+            brand_sourcing_rules={
+                "Shimano": {
+                    "brand_name": "Shimano",
+                    "preferred_vendor_id": "99",
+                    "preferred_vendor_name": "Preferred Vendor",
+                }
+            },
+            safety_days=0,
+            override_forecast=60,
+            recent_30d_weight=0.5,
+            adjustment_mode="shrink",
+        )
+
+        self.assertEqual(rows[0]["lead_time"], 7)
+        self.assertEqual(rows[0]["lead_time_source"], "item_vendor")
+        self.assertEqual(rows[0]["lead_time_vendor_id"], 55)
+        self.assertEqual(rows[0]["lead_time_vendor"], "Item Vendor")
+
+    def test_missing_preferred_and_item_vendor_lead_times_default_to_14(self):
+        rows = process_recommendations(
+            [item_row(1001, "210000030636", 55, brand="Shimano")],
+            [{"vendor_id": 99, "location_id": 20, "lead_time_days": 18}],
+            brand_sourcing_rules={
+                "Shimano": {
+                    "brand_name": "Shimano",
+                    "preferred_vendor_id": "99",
+                    "preferred_vendor_name": "Preferred Vendor",
+                }
+            },
+            safety_days=0,
+            override_forecast=60,
+            recent_30d_weight=0.5,
+            adjustment_mode="shrink",
+        )
+
+        self.assertEqual(rows[0]["lead_time"], 14.0)
+        self.assertEqual(rows[0]["lead_time_source"], "default")
+        self.assertIsNone(rows[0]["lead_time_vendor_id"])
 
     def test_same_brand_with_different_vendor_ids_can_have_different_lead_times(self):
         rows = self.process(
@@ -123,6 +194,7 @@ class IdentityFieldsTest(unittest.TestCase):
 
         with patch("app.services.bigquery_sync.fetch_tagged_items_metrics", return_value=FakeFrame([row])), \
              patch("app.services.bigquery_sync.fetch_lead_times", return_value=FakeFrame([{"vendor_id": 55, "location_id": 3, "lead_time_days": 14}])), \
+             patch("app.services.bigquery_sync.get_brand_sourcing_rules_map", return_value={}), \
              patch("app.main.get_sku_overrides", return_value={"NEG-QOH_Bici Adanac": {"manual_desired_level": 40}}), \
              patch("app.main.log_recommendation_run"), \
              patch("app.main.log_velocity_snapshots"):
@@ -153,6 +225,7 @@ class IdentityFieldsTest(unittest.TestCase):
 
         with patch("app.services.bigquery_sync.fetch_tagged_items_metrics", return_value=FakeFrame([row])), \
              patch("app.services.bigquery_sync.fetch_lead_times", return_value=FakeFrame([{"vendor_id": 55, "location_id": 3, "lead_time_days": 14}])), \
+             patch("app.services.bigquery_sync.get_brand_sourcing_rules_map", return_value={}), \
              patch("app.main.get_sku_overrides", return_value={}), \
              patch("app.main.log_recommendation_run"), \
              patch("app.main.log_velocity_snapshots"):

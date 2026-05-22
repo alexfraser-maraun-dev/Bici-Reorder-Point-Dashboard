@@ -212,7 +212,8 @@ def process_recommendations(
     weight_15_30d: float = None,
     weight_31_60d: float = None,
     adjustment_mode: str = "shrink",
-    momentum_data: Dict[str, float] = None
+    momentum_data: Dict[str, float] = None,
+    brand_sourcing_rules: Dict[str, Any] = None,
 ) -> List[Dict[str, Any]]:
     """
     Applies the custom BICI calculation logic to the BigQuery data.
@@ -253,12 +254,24 @@ def process_recommendations(
     # Build Lead Time dictionary: (vendor_id, location_id) -> lead_time_days
     # Fallback to a default if not found
     lead_time_dict = {}
+    lead_time_po_count_dict = {}
     for row in lead_times_df_dict:
         vid = normalize_id(row.get("vendor_id"))
         lid = normalize_id(row.get("location_id"))
         lt = row.get("lead_time_days")
         if vid is not None and lid is not None and lt is not None:
             lead_time_dict[(vid, lid)] = lt
+            lead_time_po_count_dict[(vid, lid)] = row.get("po_count")
+
+    brand_rule_dict = {}
+    for brand_name, rule in (brand_sourcing_rules or {}).items():
+        normalized_brand = normalize_name(brand_name)
+        preferred_vendor_id = normalize_id(rule.get("preferred_vendor_id")) if rule else None
+        if normalized_brand and preferred_vendor_id is not None:
+            brand_rule_dict[normalized_brand] = {
+                "preferred_vendor_id": preferred_vendor_id,
+                "preferred_vendor_name": rule.get("preferred_vendor_name"),
+            }
             
     recommendations = []
     if weight_14d is None and weight_15_30d is None and weight_31_60d is None:
@@ -290,9 +303,32 @@ def process_recommendations(
         location_id = normalize_id(row.get("location_id"))
         loc_name = shop_map.get(location_id, f"Shop {location_id}")
         vendor_id = normalize_id(row.get("vendor_id"))
+        brand_rule = brand_rule_dict.get(normalize_name(row.get("brand")))
         
         # Determine lead time
-        lead_time = lead_time_dict.get((vendor_id, location_id), 14.0)
+        lead_time = 14.0
+        lead_time_source = "default"
+        lead_time_vendor_id = None
+        lead_time_vendor = None
+        lead_time_po_count = None
+
+        if brand_rule:
+            preferred_vendor_id = brand_rule["preferred_vendor_id"]
+            preferred_key = (preferred_vendor_id, location_id)
+            if preferred_key in lead_time_dict:
+                lead_time = lead_time_dict[preferred_key]
+                lead_time_source = "preferred_vendor"
+                lead_time_vendor_id = preferred_vendor_id
+                lead_time_vendor = brand_rule.get("preferred_vendor_name")
+                lead_time_po_count = lead_time_po_count_dict.get(preferred_key)
+
+        item_vendor_key = (vendor_id, location_id)
+        if lead_time_source == "default" and item_vendor_key in lead_time_dict:
+            lead_time = lead_time_dict[item_vendor_key]
+            lead_time_source = "item_vendor"
+            lead_time_vendor_id = vendor_id
+            lead_time_vendor = row.get("vendor")
+            lead_time_po_count = lead_time_po_count_dict.get(item_vendor_key)
         
         # Raw Sales Data
         total_units_sold_14 = row.get("total_units_sold_14", 0)
@@ -402,6 +438,10 @@ def process_recommendations(
             "prior_30d_weight": round(prior_30d_weight, 2),
             "adjustment_mode": adjustment_mode,
             "lead_time": lead_time,
+            "lead_time_source": lead_time_source,
+            "lead_time_vendor_id": lead_time_vendor_id,
+            "lead_time_vendor": lead_time_vendor,
+            "lead_time_po_count": lead_time_po_count,
             "forecast_period": forecast_period,
             "safety_days": safety_days,
             "raw_units_sold_14d": total_units_sold_14,

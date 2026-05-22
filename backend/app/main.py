@@ -153,12 +153,21 @@ def get_replenishment_data(
             weight_31_60d = 0.2
 
         # 1. Fetch BigQuery Data & Lead Times
-        from app.services.bigquery_sync import fetch_tagged_items_metrics, fetch_lead_times
+        from app.services.bigquery_sync import (
+            fetch_tagged_items_metrics,
+            fetch_lead_times,
+            get_brand_sourcing_rules_map,
+        )
         # We handle caching via BigQuery functions or use simple manual cache dict if needed.
         # For now, fetch_tagged_items_metrics will hit BQ directly on every call unless we add caching.
         # In a real production scenario, caching this result is recommended.
         raw_data = fetch_tagged_items_metrics("auto-replen", force_refresh=force_refresh).to_dict(orient="records")
         lead_times = fetch_lead_times().to_dict(orient="records")
+        try:
+            brand_sourcing_rules = get_brand_sourcing_rules_map()
+        except Exception as e:
+            print(f"Failed to fetch brand sourcing rules for replenishment data: {e}")
+            brand_sourcing_rules = {}
         
         # 1.5 Fetch Overrides
         overrides = get_sku_overrides()
@@ -169,6 +178,7 @@ def get_replenishment_data(
         recommendations = process_recommendations(
             raw_data, 
             lead_times,
+            brand_sourcing_rules=brand_sourcing_rules,
             safety_days=safety_days, 
             override_forecast=forecast_period,
             growth_multiplier=growth_multiplier,
