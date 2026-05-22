@@ -313,7 +313,7 @@ _bq_lead_time_cache = {}
 
 def fetch_lead_times(lookback_months: int = 12, force_refresh: bool = False) -> pd.DataFrame:
     """
-    Fetches average vendor lead times per location from the po_report table.
+    Fetches median vendor lead times per location from the po_report table.
     """
     current_time = time.time()
     
@@ -323,21 +323,38 @@ def fetch_lead_times(lookback_months: int = 12, force_refresh: bool = False) -> 
             return cached_data
 
     query = f"""
+        WITH lead_time_samples AS (
+            SELECT
+                vendor_id,
+                shop_id,
+                order_id,
+                TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY) AS lead_time_day
+            FROM
+                `{LS_DATASET}.po_report`
+            WHERE
+                po_ordered_at IS NOT NULL
+                AND first_received_at IS NOT NULL
+                AND DATE(po_ordered_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_months MONTH)
+                -- Filter out obvious data entry errors and pre-booked POs (limit to replenishment POs)
+                AND TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY) BETWEEN 0 AND 50
+        )
         SELECT
             vendor_id,
             shop_id AS location_id,
-            CEIL(AVG(TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY))) AS lead_time_days,
-            COUNT(order_id) AS po_count
+            CEIL(PERCENTILE_CONT(lead_time_day, 0.5) OVER (
+                PARTITION BY vendor_id, shop_id
+            )) AS lead_time_days,
+            COUNT(order_id) OVER (
+                PARTITION BY vendor_id, shop_id
+            ) AS po_count
         FROM
-            `{LS_DATASET}.po_report`
-        WHERE
-            po_ordered_at IS NOT NULL
-            AND first_received_at IS NOT NULL
-            AND DATE(po_ordered_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_months MONTH)
-            -- Filter out obvious data entry errors and pre-booked POs (limit to replenishment POs)
-            AND TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY) BETWEEN 0 AND 50
-        GROUP BY
-            vendor_id, 
+            lead_time_samples
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY vendor_id, shop_id
+            ORDER BY vendor_id
+        ) = 1
+        ORDER BY
+            vendor_id,
             shop_id
     """
     
