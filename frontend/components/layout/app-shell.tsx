@@ -7,7 +7,6 @@ import {
   LayoutDashboard,
   History,
   FileText,
-  Settings,
   Package,
   Menu,
   CircleHelp,
@@ -20,7 +19,7 @@ import {
   SheetContent,
   SheetTrigger,
 } from '@/components/ui/sheet'
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
@@ -30,7 +29,13 @@ const navigation = [
   { name: 'How it Works', href: '/how-to-use', icon: CircleHelp },
 ]
 
-export function AppShell({ children }: { children: React.ReactNode }) {
+interface AppShellProps {
+  children: React.ReactNode
+  headerActions?: React.ReactNode
+  mainClassName?: string
+}
+
+export function AppShell({ children, headerActions, mainClassName }: AppShellProps) {
   const pathname = usePathname()
   const { data: session } = useSession()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
@@ -113,7 +118,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             })}
           </nav>
           {/* Right side (User Profile) */}
-          <div className="ml-auto flex items-center gap-6">
+          <div className="ml-auto flex min-w-0 items-center gap-3">
+            {headerActions && (
+              <div className="hidden min-w-0 items-center justify-end gap-3 lg:flex">
+                {headerActions}
+              </div>
+            )}
             <div className="h-4 w-[1px] bg-border hidden sm:block" />
 
             {/* User Profile */}
@@ -138,10 +148,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </div>
           </div>
         </div>
+        {headerActions && (
+          <div className="flex flex-wrap items-center gap-3 border-t px-4 py-2 lg:hidden">
+            {headerActions}
+          </div>
+        )}
       </header>
 
       {/* Main content */}
-      <main className="p-4 lg:p-6">{children}</main>
+      <main className={cn("p-4 lg:p-6", mainClassName)}>{children}</main>
     </div>
   )
 }

@@ -1,12 +1,5 @@
-import { AppShell } from '@/components/layout/app-shell'
-import { DashboardContent } from '@/components/dashboard/dashboard-content'
-import { Toaster } from '@/components/ui/sonner'
+import { DashboardPageClient } from '@/components/dashboard/dashboard-page-client'
 
 export default function DashboardPage() {
-  return (
-    <AppShell>
-      <DashboardContent />
-      <Toaster position="bottom-right" />
-    </AppShell>
-  )
+  return <DashboardPageClient />
 }
