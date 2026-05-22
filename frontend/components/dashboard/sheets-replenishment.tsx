@@ -38,7 +38,6 @@ import {
   ArrowUpDown,
   Filter,
   TrendingUp,
-  TrendingDown,
   Zap,
   CircleCheck,
   CircleAlert,
@@ -48,8 +47,12 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-export type VelocityMode = 'stable' | 'balanced' | 'reactive' | 'custom'
 export type AdjustmentMode = 'shrink' | 'min_days' | 'cap' | 'raw'
+export type DemandWeights = {
+  weight14d: number
+  weight15To30d: number
+  weight31To60d: number
+}
 type InventoryStatus =
   | 'critical'
   | 'low'
@@ -60,11 +63,12 @@ type InventoryStatus =
   | 'high'
   | 'overstock'
   | 'no_demand'
+type MomentumStatus = 'surging' | 'rising' | 'spiky' | 'flat' | 'cooling' | 'insufficient_data'
 
-const VELOCITY_PRESETS: Record<Exclude<VelocityMode, 'custom'>, number> = {
-  stable: 0.5,
-  balanced: 0.7,
-  reactive: 0.85,
+const DEMAND_WEIGHT_PRESETS: Record<'Stable' | 'Balanced' | 'Reactive', DemandWeights> = {
+  Stable: { weight14d: 20, weight15To30d: 40, weight31To60d: 40 },
+  Balanced: { weight14d: 40, weight15To30d: 40, weight31To60d: 20 },
+  Reactive: { weight14d: 60, weight15To30d: 30, weight31To60d: 10 },
 }
 
 const ADJUSTMENT_MODE_LABELS: Record<AdjustmentMode, string> = {
@@ -134,6 +138,39 @@ const STATUS_FILTERS: InventoryStatus[] = [
   'no_demand',
 ]
 
+const MOMENTUM_DEFINITIONS: Record<MomentumStatus, { label: string; className: string; definition: string }> = {
+  surging: {
+    label: 'Surging',
+    className: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+    definition: '14d adjusted velocity is sharply higher than both older windows.',
+  },
+  rising: {
+    label: 'Rising',
+    className: 'border-blue-200 bg-blue-50 text-blue-700',
+    definition: 'Recent adjusted velocity is meaningfully higher than older demand.',
+  },
+  spiky: {
+    label: 'Spiky',
+    className: 'border-amber-200 bg-amber-50 text-amber-700',
+    definition: 'A small number of recent units is creating a large short-term velocity jump.',
+  },
+  flat: {
+    label: 'Flat',
+    className: 'border-slate-200 bg-slate-50 text-slate-700',
+    definition: 'Adjusted velocity is broadly steady across demand windows.',
+  },
+  cooling: {
+    label: 'Cooling',
+    className: 'border-cyan-200 bg-cyan-50 text-cyan-700',
+    definition: 'Recent adjusted velocity is meaningfully lower than older demand.',
+  },
+  insufficient_data: {
+    label: 'Limited',
+    className: 'border-zinc-200 bg-zinc-50 text-zinc-600',
+    definition: 'There is not enough sales or in-stock evidence to classify momentum confidently.',
+  },
+}
+
 function InventoryStatusBadge({ item }: { item: any }) {
   const status = (item.inventory_status || 'no_demand') as InventoryStatus
   const config = INVENTORY_STATUS_DEFINITIONS[status] || INVENTORY_STATUS_DEFINITIONS.no_demand
@@ -159,7 +196,32 @@ function InventoryStatusBadge({ item }: { item: any }) {
   )
 }
 
-function AdjustedDemandTooltip({ period }: { period: '30d' | '60d' }) {
+function MomentumBadge({ item }: { item: any }) {
+  const status = (item.momentum_status || item.momentum || 'insufficient_data') as MomentumStatus
+  const config = MOMENTUM_DEFINITIONS[status] || MOMENTUM_DEFINITIONS.insufficient_data
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge variant="outline" className={cn('h-4 px-1.5 text-[7px] uppercase font-bold cursor-help', config.className)}>
+          {item.momentum_label || config.label}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent side="right" className="max-w-72 space-y-1.5 p-3 text-left">
+        <div className="font-bold">{item.momentum_label || config.label}</div>
+        <div>{config.definition}</div>
+        {item.momentum_reason && (
+          <div className="text-background/80">{item.momentum_reason}</div>
+        )}
+        <div className="border-t border-background/20 pt-1 font-mono text-[10px]">
+          Compares adjusted daily velocity across 14d, 15-30d, and 31-60d.
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function AdjustedDemandTooltip({ period }: { period: '14d' | '30d' | '60d' }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -176,7 +238,7 @@ function AdjustedDemandTooltip({ period }: { period: '30d' | '60d' }) {
           The main value is raw units sold in the last {period}. The smaller blue value is the same demand adjusted for days the item was out of stock.
         </div>
         <div className="text-background/80">
-          The sidebar stockout adjustment mode controls how much the app trusts that adjustment before it feeds reorder point, desired level, and order quantity.
+          The stockout adjustment mode controls each window before the demand weights feed reorder point, desired level, and order quantity.
         </div>
       </TooltipContent>
     </Tooltip>
@@ -193,10 +255,10 @@ interface SheetsReplenishmentProps {
   setSafetyDays: (value: number) => void
   growthMultiplier: number
   setGrowthMultiplier: (value: number) => void
-  velocityMode: VelocityMode
-  setVelocityMode: (value: VelocityMode) => void
-  customRecentWeight: number
-  setCustomRecentWeight: (value: number) => void
+  demandWeights: DemandWeights
+  setDemandWeights: (value: DemandWeights | ((previous: DemandWeights) => DemandWeights)) => void
+  demandWeightTotal: number
+  isDemandWeightValid: boolean
   adjustmentMode: AdjustmentMode
   setAdjustmentMode: (value: AdjustmentMode) => void
 }
@@ -211,19 +273,13 @@ export function SheetsReplenishment({
   setSafetyDays,
   growthMultiplier,
   setGrowthMultiplier,
-  velocityMode,
-  setVelocityMode,
-  customRecentWeight,
-  setCustomRecentWeight,
+  demandWeights,
+  setDemandWeights,
+  demandWeightTotal,
+  isDemandWeightValid,
   adjustmentMode,
   setAdjustmentMode,
 }: SheetsReplenishmentProps) {
-
-  const recent30dWeight = velocityMode === 'custom'
-    ? customRecentWeight / 100
-    : VELOCITY_PRESETS[velocityMode]
-  const recentWeightPercent = Math.round(recent30dWeight * 100)
-  const priorWeightPercent = 100 - recentWeightPercent
 
   const { data: session } = useSession()
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
@@ -554,52 +610,81 @@ export function SheetsReplenishment({
           <div className="rounded-lg border bg-card/60 p-3 space-y-2.5">
             <div className="flex items-start justify-between gap-3">
               <label className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1.5">
-                <TrendingUp className="w-3 h-3" /> Historical Weighting
+                <TrendingUp className="w-3 h-3" /> Demand Weighting
               </label>
-              <span className="text-xs font-mono font-semibold">{recentWeightPercent}/{priorWeightPercent}</span>
+              <span className={cn(
+                "text-xs font-mono font-semibold",
+                !isDemandWeightValid && "text-red-600"
+              )}>
+                {demandWeightTotal}%
+              </span>
             </div>
-            <Select
-              value={velocityMode}
-              onValueChange={(value) => setVelocityMode(value as VelocityMode)}
-            >
-              <SelectTrigger className="h-8 text-xs bg-background border-muted">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="stable">Stable</SelectItem>
-                <SelectItem value="balanced">Balanced</SelectItem>
-                <SelectItem value="reactive">Reactive</SelectItem>
-                <SelectItem value="custom">Custom</SelectItem>
-              </SelectContent>
-            </Select>
-
-            <div className="rounded-md bg-muted/40 px-2.5 py-2">
-              <div className="flex items-center justify-between text-[10px] font-medium">
-                <span>Recent 30d</span>
-                <span className="font-mono">{recentWeightPercent}%</span>
-              </div>
-              <div className="mt-1 flex items-center justify-between text-[10px] font-medium text-muted-foreground">
-                <span>Days 31-60</span>
-                <span className="font-mono">{priorWeightPercent}%</span>
-              </div>
+            <div className="grid grid-cols-3 gap-1">
+              {Object.entries(DEMAND_WEIGHT_PRESETS).map(([label, weights]) => (
+                <Button
+                  key={label}
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-1 text-[9px]"
+                  onClick={() => setDemandWeights(weights)}
+                >
+                  {label}
+                </Button>
+              ))}
             </div>
 
-            {velocityMode === 'custom' && (
-              <div className="flex items-center gap-3">
-                <input
-                  type="range"
-                  min="0"
-                  max="100"
-                  step="5"
-                  value={customRecentWeight}
-                  onChange={(e) => setCustomRecentWeight(parseInt(e.target.value))}
-                  className="flex-1 accent-blue-600"
-                />
-                <span className="text-xs font-mono w-9">{customRecentWeight}%</span>
+            <div className="space-y-2">
+              {[
+                ['weight14d', 'Last 14d', demandWeights.weight14d],
+                ['weight15To30d', 'Days 15-30', demandWeights.weight15To30d],
+                ['weight31To60d', 'Days 31-60', demandWeights.weight31To60d],
+              ].map(([key, label, value]) => (
+                <div key={key as string} className="space-y-1">
+                  <div className="flex items-center justify-between gap-2 text-[10px] font-medium">
+                    <span>{label}</span>
+                    <Input
+                      type="number"
+                      min="0"
+                      max="100"
+                      step="5"
+                      value={value as number}
+                      onChange={(event) => {
+                        const nextValue = Math.max(0, Math.min(100, parseInt(event.target.value) || 0))
+                        setDemandWeights((previous) => ({
+                          ...previous,
+                          [key as keyof DemandWeights]: nextValue,
+                        }))
+                      }}
+                      className="h-6 w-14 px-1 text-right text-[10px] font-mono"
+                    />
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="5"
+                    value={value as number}
+                    onChange={(event) => {
+                      const nextValue = parseInt(event.target.value)
+                      setDemandWeights((previous) => ({
+                        ...previous,
+                        [key as keyof DemandWeights]: nextValue,
+                      }))
+                    }}
+                    className="w-full accent-blue-600"
+                  />
+                </div>
+              ))}
+            </div>
+
+            {!isDemandWeightValid && (
+              <div className="rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-[10px] font-medium text-red-700">
+                Weights must total 100% before recommendations refresh.
               </div>
             )}
             <p className="text-[10px] leading-snug text-muted-foreground">
-              Blends recent demand with days 31-60 for recommendation velocity.
+              Blends adjusted 14d, 15-30d, and 31-60d velocity.
             </p>
           </div>
 
@@ -798,6 +883,14 @@ export function SheetsReplenishment({
                   </TableHead>
                   <TableHead className="w-[62px] text-right bg-blue-50/20">
                     <button
+                      onClick={() => requestSort('raw_units_sold_14d')}
+                      className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase"
+                    >
+                      14d <AdjustedDemandTooltip period="14d" /> <ArrowUpDown className="w-2.5 h-2.5" />
+                    </button>
+                  </TableHead>
+                  <TableHead className="w-[62px] text-right bg-blue-50/20">
+                    <button
                       onClick={() => requestSort('raw_units_sold_30d')}
                       className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase"
                     >
@@ -848,14 +941,14 @@ export function SheetsReplenishment({
                 {isLoading ? (
                   Array.from({ length: 15 }).map((_, i) => (
                     <TableRow key={i}>
-                      {Array.from({ length: 12 }).map((_, j) => (
+                      {Array.from({ length: 13 }).map((_, j) => (
                         <TableCell key={j}><Skeleton className="h-4 w-full" /></TableCell>
                       ))}
                     </TableRow>
                   ))
                 ) : paginatedData.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={12} className="h-64 text-center">
+                    <TableCell colSpan={13} className="h-64 text-center">
                       <div className="flex flex-col items-center gap-2 text-muted-foreground">
                         <CircleAlert className="w-8 h-8 opacity-20" />
                         <p className="font-semibold">No matches found in synced product data.</p>
@@ -899,16 +992,19 @@ export function SheetsReplenishment({
                           <div className="flex items-center gap-1.5 text-[8px] text-muted-foreground">
                             <span className="bg-muted px-1 rounded font-mono truncate">{item.sku}</span>
                             <span className="font-medium text-foreground/70 truncate">{item.vendor}</span>
+                            <MomentumBadge item={item} />
                           </div>
                         </div>
                       </TableCell>
                       <TableCell className="text-right font-mono tabular-nums bg-blue-50/5">
                         <div className="flex flex-col items-end leading-tight">
-                          <div className="flex items-center justify-end gap-1 text-[11px]">
-                            {item.momentum === 'increasing' && <TrendingUp className="w-2.5 h-2.5 text-emerald-500" />}
-                            {item.momentum === 'decreasing' && <TrendingDown className="w-2.5 h-2.5 text-red-500" />}
-                            <span>{item.raw_units_sold_30d}</span>
-                          </div>
+                          <span className="text-[11px]">{item.raw_units_sold_14d}</span>
+                          <span className="text-[9px] text-blue-500">{item.forecast_14d} adj</span>
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-right font-mono tabular-nums bg-blue-50/5">
+                        <div className="flex flex-col items-end leading-tight">
+                          <span className="text-[11px]">{item.raw_units_sold_30d}</span>
                           <span className="text-[9px] text-blue-500">{item.forecast_30d} adj</span>
                         </div>
                       </TableCell>

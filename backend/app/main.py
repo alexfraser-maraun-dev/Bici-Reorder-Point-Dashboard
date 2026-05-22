@@ -120,11 +120,27 @@ def get_replenishment_data(
     forecast_period: int = None,
     safety_days: int = 7,
     growth_multiplier: float = 1.0,
-    recent_30d_weight: float = 0.70,
+    recent_30d_weight: float = None,
+    weight_14d: float = None,
+    weight_15_30d: float = None,
+    weight_31_60d: float = None,
     adjustment_mode: str = "shrink",
     force_refresh: bool = False
 ):
     try:
+        new_weights = (weight_14d, weight_15_30d, weight_31_60d)
+        if any(weight is not None for weight in new_weights):
+            if any(weight is None for weight in new_weights):
+                raise HTTPException(status_code=400, detail="All demand weights must be provided together.")
+            if any(weight < 0 or weight > 1 for weight in new_weights):
+                raise HTTPException(status_code=400, detail="Demand weights must be between 0 and 1.")
+            if abs(sum(new_weights) - 1.0) > 0.001:
+                raise HTTPException(status_code=400, detail="Demand weights must total 1.0.")
+        elif recent_30d_weight is None:
+            weight_14d = 0.4
+            weight_15_30d = 0.4
+            weight_31_60d = 0.2
+
         # 1. Fetch BigQuery Data & Lead Times
         from app.services.bigquery_sync import fetch_tagged_items_metrics, fetch_lead_times
         # We handle caching via BigQuery functions or use simple manual cache dict if needed.
@@ -146,6 +162,9 @@ def get_replenishment_data(
             override_forecast=forecast_period,
             growth_multiplier=growth_multiplier,
             recent_30d_weight=recent_30d_weight,
+            weight_14d=weight_14d,
+            weight_15_30d=weight_15_30d,
+            weight_31_60d=weight_31_60d,
             adjustment_mode=adjustment_mode,
             momentum_data={}
         )
@@ -220,6 +239,8 @@ def get_replenishment_data(
             "locations": list(by_location.keys()),
             "data": by_location
         }
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()

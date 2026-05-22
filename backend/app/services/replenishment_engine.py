@@ -37,6 +37,39 @@ STATUS_URGENCY = {
     "no_demand": 0,
 }
 
+MOMENTUM_DEFINITIONS = {
+    "surging": {
+        "label": "Surging",
+        "rank": 1,
+        "definition": "14d adjusted velocity is sharply higher than both older windows.",
+    },
+    "rising": {
+        "label": "Rising",
+        "rank": 2,
+        "definition": "Recent adjusted velocity is meaningfully higher than older demand.",
+    },
+    "spiky": {
+        "label": "Spiky",
+        "rank": 3,
+        "definition": "A small number of recent units creates a large short-term velocity jump.",
+    },
+    "flat": {
+        "label": "Flat",
+        "rank": 4,
+        "definition": "Adjusted velocity is broadly steady across demand windows.",
+    },
+    "cooling": {
+        "label": "Cooling",
+        "rank": 5,
+        "definition": "Recent adjusted velocity is meaningfully lower than older demand.",
+    },
+    "insufficient_data": {
+        "label": "Insufficient Data",
+        "rank": 6,
+        "definition": "There is not enough sales or in-stock evidence to classify momentum.",
+    },
+}
+
 
 def calculate_inventory_status(
     on_hand: float,
@@ -90,6 +123,71 @@ def calculate_inventory_status(
         "urgency": STATUS_URGENCY[status],
     }
 
+def calculate_momentum_status(
+    adjusted_daily_sales_14d: float,
+    adjusted_daily_sales_15_30d: float,
+    adjusted_daily_sales_31_60d: float,
+    raw_units_sold_14d: float,
+    raw_units_sold_60d: float,
+    active_days_14d: int,
+    active_days_15_30d: int,
+    active_days_31_60d: int,
+) -> Dict[str, Any]:
+    def pct_higher(new_value, old_value, threshold):
+        if old_value <= 0:
+            return new_value > 0
+        return new_value >= old_value * (1 + threshold)
+
+    def pct_lower(new_value, old_value, threshold):
+        if old_value <= 0:
+            return False
+        return new_value <= old_value * (1 - threshold)
+
+    if raw_units_sold_60d <= 0 or active_days_14d < 3 or active_days_15_30d < 3 or active_days_31_60d < 7:
+        status = "insufficient_data"
+        reason = "Not enough sales or active in-stock days across the 14d, 15-30d, and 31-60d windows."
+    elif (
+        raw_units_sold_14d < 3
+        and adjusted_daily_sales_14d > 0
+        and pct_higher(adjusted_daily_sales_14d, adjusted_daily_sales_15_30d, 1.0)
+        and pct_higher(adjusted_daily_sales_14d, adjusted_daily_sales_31_60d, 1.0)
+    ):
+        status = "spiky"
+        reason = "The last 14 days are at least 2x both older windows, but fewer than 3 units sold recently."
+    elif (
+        pct_higher(adjusted_daily_sales_14d, adjusted_daily_sales_31_60d, 0.75)
+        and pct_higher(adjusted_daily_sales_14d, adjusted_daily_sales_15_30d, 0.35)
+    ):
+        status = "surging"
+        reason = "14d velocity is at least 75% above days 31-60 and at least 35% above days 15-30."
+    elif (
+        pct_higher(adjusted_daily_sales_14d, adjusted_daily_sales_15_30d, 0.25)
+        or pct_higher(adjusted_daily_sales_15_30d, adjusted_daily_sales_31_60d, 0.25)
+    ):
+        status = "rising"
+        reason = "Recent velocity is at least 25% above an older comparison window."
+    elif (
+        pct_lower(adjusted_daily_sales_14d, adjusted_daily_sales_15_30d, 0.25)
+        or pct_lower(adjusted_daily_sales_15_30d, adjusted_daily_sales_31_60d, 0.25)
+    ):
+        status = "cooling"
+        reason = "Recent velocity is at least 25% below an older comparison window."
+    else:
+        status = "flat"
+        reason = "Adjusted velocity is within the 25% movement threshold across the comparison windows."
+
+    definition = MOMENTUM_DEFINITIONS[status]
+    return {
+        "momentum_status": status,
+        "momentum_label": definition["label"],
+        "momentum_rank": definition["rank"],
+        "momentum_reason": reason,
+    }
+
+
+def replenishment_ceil(value: float) -> int:
+    return math.ceil(value - 1e-9)
+
 
 def process_recommendations(
     items_df_dict: List[Dict[str, Any]], 
@@ -98,6 +196,9 @@ def process_recommendations(
     override_forecast: int = None, 
     growth_multiplier: float = 1.0, 
     recent_30d_weight: float = 0.70,
+    weight_14d: float = None,
+    weight_15_30d: float = None,
+    weight_31_60d: float = None,
     adjustment_mode: str = "shrink",
     momentum_data: Dict[str, float] = None
 ) -> List[Dict[str, Any]]:
@@ -145,8 +246,23 @@ def process_recommendations(
             lead_time_dict[(vid, lid)] = lt
             
     recommendations = []
-    recent_30d_weight = min(1.0, max(0.0, recent_30d_weight))
-    prior_30d_weight = 1.0 - recent_30d_weight
+    if weight_14d is None and weight_15_30d is None and weight_31_60d is None:
+        recent_30d_weight = min(1.0, max(0.0, recent_30d_weight))
+        weight_14d = 0.0
+        weight_15_30d = recent_30d_weight
+        weight_31_60d = 1.0 - recent_30d_weight
+    else:
+        if None in (weight_14d, weight_15_30d, weight_31_60d):
+            raise ValueError("All demand weights must be provided together.")
+        weight_14d = float(weight_14d)
+        weight_15_30d = float(weight_15_30d)
+        weight_31_60d = float(weight_31_60d)
+        if any(weight < 0 or weight > 1 for weight in (weight_14d, weight_15_30d, weight_31_60d)):
+            raise ValueError("Demand weights must be between 0 and 1.")
+        if abs((weight_14d + weight_15_30d + weight_31_60d) - 1.0) > 0.001:
+            raise ValueError("Demand weights must total 1.0.")
+    recent_30d_weight = weight_14d + weight_15_30d
+    prior_30d_weight = weight_31_60d
     if adjustment_mode not in {"shrink", "min_days", "cap", "raw"}:
         adjustment_mode = "shrink"
     
@@ -164,11 +280,21 @@ def process_recommendations(
         lead_time = lead_time_dict.get((vendor_id, location_id), 14.0)
         
         # Raw Sales Data
+        total_units_sold_14 = row.get("total_units_sold_14", 0)
         total_units_sold_30 = row.get("total_units_sold_30", 0)
         total_units_sold_60 = row.get("total_units_sold_60", 0)
+        days_out_of_stock_14 = row.get("days_out_of_stock_14", 0)
         days_out_of_stock_30 = row.get("days_out_of_stock_30", 0)
         days_out_of_stock_60 = row.get("days_out_of_stock_60", 0)
         
+        active_days_14 = max(1, 14 - days_out_of_stock_14)
+        adjusted_daily_sales_14d = guarded_daily_sales(total_units_sold_14, 14, active_days_14)
+
+        mid_units_sold_16 = max(0, total_units_sold_30 - total_units_sold_14)
+        mid_days_out_of_stock_16 = min(16, max(0, days_out_of_stock_30 - days_out_of_stock_14))
+        mid_active_days_16 = max(1, 16 - mid_days_out_of_stock_16)
+        adjusted_daily_sales_15_30d = guarded_daily_sales(mid_units_sold_16, 16, mid_active_days_16)
+
         active_days_30 = max(1, 30 - days_out_of_stock_30)
         adjusted_daily_sales_30d = guarded_daily_sales(total_units_sold_30, 30, active_days_30)
         
@@ -178,12 +304,13 @@ def process_recommendations(
         prior_units_sold_30 = max(0, total_units_sold_60 - total_units_sold_30)
         prior_days_out_of_stock_30 = min(30, max(0, days_out_of_stock_60 - days_out_of_stock_30))
         prior_active_days_30 = max(1, 30 - prior_days_out_of_stock_30)
-        adjusted_daily_sales_prior_30d = guarded_daily_sales(prior_units_sold_30, 30, prior_active_days_30)
+        adjusted_daily_sales_31_60d = guarded_daily_sales(prior_units_sold_30, 30, prior_active_days_30)
         
-        # Blend recent and prior 30-day velocities for stability plus reactivity.
+        # Blend 14d, 15-30d, and 31-60d velocities for sensitivity plus stability.
         base_daily_sales = (
-            adjusted_daily_sales_30d * recent_30d_weight
-            + adjusted_daily_sales_prior_30d * prior_30d_weight
+            adjusted_daily_sales_14d * weight_14d
+            + adjusted_daily_sales_15_30d * weight_15_30d
+            + adjusted_daily_sales_31_60d * weight_31_60d
         )
         
         # Apply Growth Multiplier (only affects forward-looking calcs)
@@ -200,11 +327,11 @@ def process_recommendations(
         
         # CALCULATION
         # New Reorder Point = (Sales * Lead Time) + Safety Stock
-        safety_stock = math.ceil(adjusted_daily_sales * safety_days)
-        new_reorder_point = math.ceil((adjusted_daily_sales * lead_time) + safety_stock)
+        safety_stock = replenishment_ceil(adjusted_daily_sales * safety_days)
+        new_reorder_point = replenishment_ceil((adjusted_daily_sales * lead_time) + safety_stock)
         
         # New Desired Level = Sales * Forecast Period
-        new_desired_level = math.ceil(adjusted_daily_sales * forecast_period)
+        new_desired_level = replenishment_ceil(adjusted_daily_sales * forecast_period)
         
         # QTY to Order Calculation
         inventory_status = calculate_inventory_status(
@@ -215,15 +342,16 @@ def process_recommendations(
         )
         qty_to_order = max(0, int(new_desired_level - inventory_status["inventory_position"]))
             
-        # Momentum Indicator
-        momentum = "stable"
-        if momentum_data:
-            key = f"{system_id}|{loc_name}"
-            prev_velocity = momentum_data.get(key)
-            if prev_velocity is not None and prev_velocity > 0:
-                diff = (base_daily_sales - prev_velocity) / prev_velocity
-                if diff > 0.05: momentum = "increasing"
-                elif diff < -0.05: momentum = "decreasing"
+        momentum_status = calculate_momentum_status(
+            adjusted_daily_sales_14d,
+            adjusted_daily_sales_15_30d,
+            adjusted_daily_sales_31_60d,
+            total_units_sold_14,
+            total_units_sold_60,
+            active_days_14,
+            mid_active_days_16,
+            prior_active_days_30,
+        )
                 
         margin = "0%"
 
@@ -241,19 +369,31 @@ def process_recommendations(
             "adjusted_daily_sales": round(adjusted_daily_sales, 2), # Velocity w/ multiplier
             "days_out_of_stock": days_out_of_stock_60,
             "raw_daily_sales": base_daily_sales,
+            "adjusted_daily_sales_14d": round(adjusted_daily_sales_14d, 3),
             "adjusted_daily_sales_30d": round(adjusted_daily_sales_30d, 3),
-            "adjusted_daily_sales_prior_30d": round(adjusted_daily_sales_prior_30d, 3),
+            "adjusted_daily_sales_15_30d": round(adjusted_daily_sales_15_30d, 3),
+            "adjusted_daily_sales_prior_30d": round(adjusted_daily_sales_31_60d, 3),
+            "adjusted_daily_sales_31_60d": round(adjusted_daily_sales_31_60d, 3),
             "adjusted_daily_sales_60d": round(adjusted_daily_sales_60d, 3),
+            "weight_14d": round(weight_14d, 2),
+            "weight_15_30d": round(weight_15_30d, 2),
+            "weight_31_60d": round(weight_31_60d, 2),
             "recent_30d_weight": round(recent_30d_weight, 2),
             "prior_30d_weight": round(prior_30d_weight, 2),
             "adjustment_mode": adjustment_mode,
             "lead_time": lead_time,
             "forecast_period": forecast_period,
             "safety_days": safety_days,
+            "raw_units_sold_14d": total_units_sold_14,
             "raw_units_sold_30d": total_units_sold_30,
             "raw_units_sold_60d": total_units_sold_60,
+            "raw_units_sold_15_30d": mid_units_sold_16,
+            "raw_units_sold_31_60d": prior_units_sold_30,
+            "forecast_14d": round(adjusted_daily_sales_14d * 14, 1),
             "forecast_30d": round(adjusted_daily_sales_30d * 30, 1), # Stockout-adjusted 30d demand
-            "forecast_prior_30d": round(adjusted_daily_sales_prior_30d * 30, 1),
+            "forecast_15_30d": round(adjusted_daily_sales_15_30d * 16, 1),
+            "forecast_prior_30d": round(adjusted_daily_sales_31_60d * 30, 1),
+            "forecast_31_60d": round(adjusted_daily_sales_31_60d * 30, 1),
             "forecast_60d": round(adjusted_daily_sales_60d * 60, 1), # Stockout-adjusted 60d demand
             "on_hand": on_hand,
             "effective_on_hand": inventory_status["effective_on_hand"],
@@ -269,7 +409,11 @@ def process_recommendations(
             "qty_sold": total_units_sold_60,
             "margin": margin,
             "urgency": inventory_status["urgency"],
-            "momentum": momentum,
+            "momentum": momentum_status["momentum_status"],
+            "momentum_status": momentum_status["momentum_status"],
+            "momentum_label": momentum_status["momentum_label"],
+            "momentum_rank": momentum_status["momentum_rank"],
+            "momentum_reason": momentum_status["momentum_reason"],
             "current_reorder_point": int(current_rp) if current_rp else 0,
             "current_desired_level": int(current_dl) if current_dl else 0,
             "recommended_reorder_point": int(new_reorder_point),

@@ -12,6 +12,12 @@ export interface SkuLocationRow {
   trailingUnitsSold: number
   daysOutOfStock: number
   avgDailySales: number
+  rawUnitsSold14d?: number
+  adjustedDailySales14d?: number
+  momentumStatus?: 'surging' | 'rising' | 'spiky' | 'flat' | 'cooling' | 'insufficient_data'
+  momentumLabel?: string
+  momentumRank?: number
+  momentumReason?: string
   leadTimeDays: number
   onHand: number
   onOrder: number

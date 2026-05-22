@@ -523,8 +523,33 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
             item_id,
             location_id,
             COUNTIF(daily_qoh <= 0) AS days_out_of_stock_60,
-            COUNTIF(daily_qoh <= 0 AND day >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)) AS days_out_of_stock_30
+            COUNTIF(daily_qoh <= 0 AND day >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)) AS days_out_of_stock_30,
+            COUNTIF(daily_qoh <= 0 AND day >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)) AS days_out_of_stock_14
           FROM daily_qoh_mapped_60
+          GROUP BY 1, 2
+        ),
+        latest_sale_lines AS (
+          SELECT *
+          FROM `{LS_DATASET}.sale_line_history`
+          WHERE item_id IN (SELECT item_id FROM qualified_items)
+            AND shop_id IN {TARGET_SHOP_IDS}
+          QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        latest_sales AS (
+          SELECT *
+          FROM `{LS_DATASET}.sale_history`
+          QUALIFY ROW_NUMBER() OVER(PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        sales_14 AS (
+          SELECT
+            sl.item_id,
+            sl.shop_id AS location_id,
+            SUM(sl.unit_quantity) AS total_units_sold_14
+          FROM latest_sale_lines sl
+          JOIN latest_sales sale ON sl.sale_id = sale.id
+          WHERE sale.completed = TRUE
+            AND sale.voided = FALSE
+            AND DATE(sale.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
           GROUP BY 1, 2
         )
         SELECT
@@ -536,8 +561,10 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
           s.brand_name AS brand,
           s.category_name AS category,
           s.shop_id AS location_id,
+          COALESCE(s14.total_units_sold_14, 0) AS total_units_sold_14,
           COALESCE(s.sales_units_l30d, 0) AS total_units_sold_30,
           COALESCE(s.sales_units_l60d, 0) AS total_units_sold_60,
+          COALESCE(sc.days_out_of_stock_14, 0) AS days_out_of_stock_14,
           COALESCE(sc.days_out_of_stock_30, 0) AS days_out_of_stock_30,
           COALESCE(sc.days_out_of_stock_60, 0) AS days_out_of_stock_60,
           COALESCE(s.qoh, 0) AS current_qoh,
@@ -546,6 +573,7 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
           COALESCE(s.reorderLevel, 0) AS current_desired_level
         FROM snapshot s
         LEFT JOIN stockouts sc ON s.item_id = sc.item_id AND s.shop_id = sc.location_id
+        LEFT JOIN sales_14 s14 ON s.item_id = s14.item_id AND s.shop_id = s14.location_id
     """
     client = get_bq_client()
     df = client.query(query).to_dataframe()

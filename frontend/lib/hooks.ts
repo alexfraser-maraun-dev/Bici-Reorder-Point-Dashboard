@@ -119,11 +119,21 @@ export function useReplenishmentData(
   forecastPeriod: number,
   safetyDays: number,
   growthMultiplier: number,
-  recent30dWeight: number,
-  adjustmentMode: string
+  demandWeights: { weight14d: number; weight15To30d: number; weight31To60d: number },
+  adjustmentMode: string,
+  enabled: boolean = true
 ) {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-  const url = `${baseUrl}/api/replenishment/data?forecast_period=${forecastPeriod}&safety_days=${safetyDays}&growth_multiplier=${growthMultiplier}&recent_30d_weight=${recent30dWeight}&adjustment_mode=${adjustmentMode}`
+  const query = [
+    `forecast_period=${forecastPeriod}`,
+    `safety_days=${safetyDays}`,
+    `growth_multiplier=${growthMultiplier}`,
+    `weight_14d=${demandWeights.weight14d / 100}`,
+    `weight_15_30d=${demandWeights.weight15To30d / 100}`,
+    `weight_31_60d=${demandWeights.weight31To60d / 100}`,
+    `adjustment_mode=${adjustmentMode}`,
+  ].join('&')
+  const url = enabled ? `${baseUrl}/api/replenishment/data?${query}` : null
   
   const { data, error, mutate, isLoading } = useSWR(url, fetcher, {
     revalidateOnFocus: false,
@@ -134,6 +144,7 @@ export function useReplenishmentData(
   const [isRefetching, setIsRefetching] = useState(false)
 
   const handleRefetch = async () => {
+    if (!url) return
     setIsRefetching(true)
     try {
       const refreshUrl = `${url}&force_refresh=true`

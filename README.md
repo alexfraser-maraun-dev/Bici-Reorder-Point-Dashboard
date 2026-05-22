@@ -17,7 +17,7 @@ Internal control panel for reviewing and pushing location-specific reorder point
    - Pushes approved values back to Lightspeed using the `ItemShop` API.
 
 3. **Next.js frontend is the review surface.**
-   - Displays raw and adjusted 30d/60d demand in the same columns.
+   - Displays raw and adjusted 14d/30d/60d demand in the same columns.
    - Shows QOH, QOO, cover, recommended ROP, recommended DL, and order quantity by location.
    - Allows manual review before pushing to Lightspeed.
 
@@ -69,7 +69,7 @@ v_master_snapshot_latest.po_units_remaining
 
 Earlier versions calculated QOO manually from `order_line_history` and `order_history`, but history snapshots caused inflated values. The app now relies on the trusted master snapshot view.
 
-### 30d / 60d
+### 14d / 30d / 60d
 
 Each dashboard cell shows two numbers:
 
@@ -79,6 +79,7 @@ Each dashboard cell shows two numbers:
 Raw sales fields:
 
 ```text
+14d is derived from deduped sale history
 v_master_snapshot_latest.sales_units_l30d
 v_master_snapshot_latest.sales_units_l60d
 ```
@@ -100,7 +101,7 @@ raw daily velocity       = raw units sold / period days
 adjusted daily velocity  = raw units sold / active in-stock days
 ```
 
-The selected guardrail determines which daily velocity is used for the smaller adjusted 30d/60d values and for recommendation math:
+The selected guardrail determines which daily velocity is used for the smaller adjusted 14d/30d/60d values and for recommendation math:
 
 - `shrink`: default. Blends raw velocity toward stockout-adjusted velocity based on evidence. Confidence is `min(1, active in-stock days / 7)`.
 - `min_days`: requires at least 7 active in-stock days. If there are fewer than 7, uses raw velocity.
@@ -117,18 +118,31 @@ min-days mode    = 1
 cap mode         = 2
 ```
 
-The historical weighting below is used as the base daily velocity for replenishment math.
+The demand weighting below is used as the base daily velocity for replenishment math.
 
-### Historical Weighting
+### Demand Weighting
 
-The replenishment math uses a weighted blend of the most recent 30 days and days 31-60:
+The replenishment math uses a weighted blend of the last 14 days, days 15-30, and days 31-60:
 
 ```text
-weighted velocity = (adjusted 30d daily velocity * recent 30d weight)
-                  + (adjusted days 31-60 daily velocity * prior 30d weight)
+weighted velocity = (adjusted 14d daily velocity * 14d weight)
+                  + (adjusted days 15-30 daily velocity * 15-30d weight)
+                  + (adjusted days 31-60 daily velocity * 31-60d weight)
 ```
 
-The dashboard control is labeled `Historical Weighting` and defaults to a balanced `70% / 30%` split, with UI presets for stable, balanced, reactive, and custom weighting.
+The dashboard control is labeled `Demand Weighting` and defaults to `40% / 40% / 20%`.
+Preset buttons provide stable, balanced, and reactive starting points, and the custom weights must total `100%`.
+
+### Momentum
+
+Momentum is an informational demand-shape flag, separate from inventory status.
+It compares stockout-adjusted daily velocities across 14d, 15-30d, and 31-60d:
+
+```text
+surging / rising / spiky / flat / cooling / insufficient data
+```
+
+Momentum does not directly change ROP or DL. It only explains whether recent demand is accelerating, cooling, or too thin to classify confidently.
 
 ### ROP
 

@@ -19,8 +19,10 @@ def item_row(item_id, sku, vendor_id, vendor="Shimano", brand="Shimano", locatio
         "vendor": vendor,
         "vendor_id": vendor_id,
         "location_id": location_id,
+        "total_units_sold_14": 14,
         "total_units_sold_30": 30,
         "total_units_sold_60": 60,
+        "days_out_of_stock_14": 0,
         "days_out_of_stock_30": 0,
         "days_out_of_stock_60": 0,
         "current_qoh": 0,
@@ -130,6 +132,91 @@ class IdentityFieldsTest(unittest.TestCase):
         self.assertEqual(rec["inventory_position"], 0)
         self.assertEqual(rec["recommended_desired_level"], 40)
         self.assertEqual(rec["qty_to_order"], 40)
+
+    def test_default_api_uses_40_40_20_demand_weighting(self):
+        class FakeFrame:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def to_dict(self, orient):
+                if orient != "records":
+                    raise ValueError(f"Unexpected orient: {orient}")
+                return self.rows
+
+        row = item_row(1001, "WEIGHTED", 55)
+        row["total_units_sold_14"] = 28
+        row["total_units_sold_30"] = 44
+        row["total_units_sold_60"] = 74
+
+        with patch("app.services.bigquery_sync.fetch_tagged_items_metrics", return_value=FakeFrame([row])), \
+             patch("app.services.bigquery_sync.fetch_lead_times", return_value=FakeFrame([{"vendor_id": 55, "location_id": 3, "lead_time_days": 14}])), \
+             patch("app.main.get_sku_overrides", return_value={}), \
+             patch("app.main.log_recommendation_run"), \
+             patch("app.main.log_velocity_snapshots"):
+            response = get_replenishment_data(forecast_period=60, safety_days=0)
+
+        rec = response["data"]["Bici Adanac"][0]
+        self.assertEqual(rec["weight_14d"], 0.4)
+        self.assertEqual(rec["weight_15_30d"], 0.4)
+        self.assertEqual(rec["weight_31_60d"], 0.2)
+        self.assertAlmostEqual(rec["raw_daily_sales"], 1.4)
+        self.assertEqual(rec["recommended_desired_level"], 84)
+
+    def test_legacy_recent_30d_weight_still_uses_old_two_window_behavior(self):
+        rows = process_recommendations(
+            [item_row(1001, "LEGACY", 55)],
+            [{"vendor_id": 55, "location_id": 3, "lead_time_days": 8}],
+            safety_days=0,
+            override_forecast=60,
+            recent_30d_weight=0.25,
+            adjustment_mode="shrink",
+        )
+
+        self.assertEqual(rows[0]["weight_14d"], 0)
+        self.assertEqual(rows[0]["weight_15_30d"], 0.25)
+        self.assertEqual(rows[0]["weight_31_60d"], 0.75)
+        self.assertEqual(rows[0]["recommended_desired_level"], 60)
+
+    def test_momentum_statuses_are_classified(self):
+        cases = [
+            ("surging", 28, 36, 42),
+            ("rising", 12, 28, 44),
+            ("spiky", 2, 3, 4),
+            ("cooling", 7, 31, 91),
+            ("flat", 14, 30, 60),
+            ("insufficient_data", 0, 0, 0),
+        ]
+
+        for expected_status, units_14, units_30, units_60 in cases:
+            with self.subTest(expected_status=expected_status):
+                row = item_row(1001, expected_status, 55)
+                row["total_units_sold_14"] = units_14
+                row["total_units_sold_30"] = units_30
+                row["total_units_sold_60"] = units_60
+                rows = process_recommendations(
+                    [row],
+                    [{"vendor_id": 55, "location_id": 3, "lead_time_days": 8}],
+                    safety_days=0,
+                    override_forecast=60,
+                    weight_14d=0.4,
+                    weight_15_30d=0.4,
+                    weight_31_60d=0.2,
+                    adjustment_mode="shrink",
+                )
+
+                self.assertEqual(rows[0]["momentum_status"], expected_status)
+                self.assertIn("momentum_label", rows[0])
+                self.assertIn("momentum_reason", rows[0])
+
+    def test_invalid_demand_weights_are_rejected(self):
+        with self.assertRaises(ValueError):
+            process_recommendations(
+                [item_row(1001, "BAD-WEIGHTS", 55)],
+                [{"vendor_id": 55, "location_id": 3, "lead_time_days": 8}],
+                weight_14d=0.5,
+                weight_15_30d=0.5,
+                weight_31_60d=0.5,
+            )
 
 
 if __name__ == "__main__":

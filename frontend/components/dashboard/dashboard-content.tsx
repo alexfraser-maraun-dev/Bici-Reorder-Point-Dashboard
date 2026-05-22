@@ -4,7 +4,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { SheetsReplenishment } from './sheets-replenishment'
 import { VendorLeadTimes } from './vendor-lead-times'
 import { LayoutDashboard, Truck } from 'lucide-react'
-import type { AdjustmentMode, VelocityMode } from './sheets-replenishment'
+import type { AdjustmentMode, DemandWeights } from './sheets-replenishment'
 
 interface DashboardContentProps {
   data: any
@@ -16,10 +16,10 @@ interface DashboardContentProps {
   setSafetyDays: (value: number) => void
   growthMultiplier: number
   setGrowthMultiplier: (value: number) => void
-  velocityMode: VelocityMode
-  setVelocityMode: (value: VelocityMode) => void
-  customRecentWeight: number
-  setCustomRecentWeight: (value: number) => void
+  demandWeights: DemandWeights
+  setDemandWeights: (value: DemandWeights | ((previous: DemandWeights) => DemandWeights)) => void
+  demandWeightTotal: number
+  isDemandWeightValid: boolean
   adjustmentMode: AdjustmentMode
   setAdjustmentMode: (value: AdjustmentMode) => void
 }

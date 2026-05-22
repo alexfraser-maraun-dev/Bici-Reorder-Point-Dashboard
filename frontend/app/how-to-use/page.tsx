@@ -107,7 +107,7 @@ export default function HowToUsePage() {
           </CardHeader>
           <CardContent className="grid gap-6 md:grid-cols-3">
             <div className="space-y-1">
-              <h4 className="font-bold text-xs uppercase text-muted-foreground">30d / 60d</h4>
+              <h4 className="font-bold text-xs uppercase text-muted-foreground">14d / 30d / 60d</h4>
               <p className="text-sm">The main value is raw units sold. The smaller value underneath is adjusted demand using the selected stockout adjustment mode.</p>
             </div>
             <div className="space-y-1">
@@ -116,7 +116,7 @@ export default function HowToUsePage() {
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Cover</h4>
-              <p className="text-sm">How many days current QOH will last based on the guarded 60-day demand rate, with negative QOH floored to zero.</p>
+              <p className="text-sm">How many days current QOH will last based on the weighted demand rate, with negative QOH floored to zero.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Lead</h4>
@@ -145,8 +145,12 @@ export default function HowToUsePage() {
               <p className="text-sm">Raw sales are adjusted for active in-stock days, then passed through the selected stockout adjustment guardrail.</p>
             </div>
             <div className="space-y-1">
-              <h4 className="font-bold text-xs uppercase text-muted-foreground">Historical Weighting</h4>
-              <p className="text-sm">Blends adjusted recent 30-day velocity with adjusted days 31-60 velocity before calculating recommendations.</p>
+              <h4 className="font-bold text-xs uppercase text-muted-foreground">Demand Weighting</h4>
+              <p className="text-sm">Blends adjusted 14d, days 15-30, and days 31-60 velocity. Default weighting is 40% / 40% / 20%.</p>
+            </div>
+            <div className="space-y-1">
+              <h4 className="font-bold text-xs uppercase text-muted-foreground">Momentum</h4>
+              <p className="text-sm">Flags short-term demand shape as surging, rising, spiky, flat, cooling, or limited data. It explains demand behavior but does not replace inventory status.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Shrink Adjustment</h4>
