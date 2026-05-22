@@ -159,6 +159,30 @@ function InventoryStatusBadge({ item }: { item: any }) {
   )
 }
 
+function AdjustedDemandTooltip({ period }: { period: '30d' | '60d' }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          className="inline-flex cursor-help items-center"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <Info className="w-2.5 h-2.5 text-blue-500" />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-80 space-y-1.5 p-3 text-left">
+        <div className="font-bold">{period} adjusted demand</div>
+        <div>
+          The main value is raw units sold in the last {period}. The smaller blue value is the same demand adjusted for days the item was out of stock.
+        </div>
+        <div className="text-background/80">
+          The sidebar stockout adjustment mode controls how much the app trusts that adjustment before it feeds reorder point, desired level, and order quantity.
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 interface SheetsReplenishmentProps {
   data: any
   isLoading: boolean
@@ -776,18 +800,16 @@ export function SheetsReplenishment({
                     <button
                       onClick={() => requestSort('raw_units_sold_30d')}
                       className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase"
-                      title="Primary number is raw units sold in the last 30 days. Smaller number below is adjusted demand using the sidebar stockout adjustment mode."
                     >
-                      30d <Info className="w-2.5 h-2.5 text-blue-500" /> <ArrowUpDown className="w-2.5 h-2.5" />
+                      30d <AdjustedDemandTooltip period="30d" /> <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
                   <TableHead className="w-[62px] text-right bg-blue-50/20 border-r">
                     <button
                       onClick={() => requestSort('raw_units_sold_60d')}
                       className="flex items-center gap-1 ml-auto hover:text-foreground text-[9px] font-bold uppercase"
-                      title="Primary number is raw units sold in the last 60 days. Smaller number below is adjusted demand using the sidebar stockout adjustment mode."
                     >
-                      60d <Info className="w-2.5 h-2.5 text-blue-500" /> <ArrowUpDown className="w-2.5 h-2.5" />
+                      60d <AdjustedDemandTooltip period="60d" /> <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
                   <TableHead className="w-[38px] text-right">
