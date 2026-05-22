@@ -52,19 +52,23 @@ export default function HowToUsePage() {
               <CardTitle className="flex items-center gap-2 text-purple-700">
                 <Zap className="w-5 h-5" /> 2. Proactive Analysis
               </CardTitle>
-              <CardDescription>Understanding the Urgency logic</CardDescription>
+              <CardDescription>Understanding the inventory status logic</CardDescription>
             </CardHeader>
             <CardContent className="text-sm space-y-3">
               <p>
-                The tool compares each location's QOH against the recommended Reorder Point and Desired Level. Status
-                badges help prioritize review before pushing updates:
+                The tool compares each location's inventory position against the recommended Reorder Point and Desired
+                Level. Inventory position means <strong>QOH + QOO</strong>, so open purchase orders are part of the status.
               </p>
               <ul className="grid grid-cols-1 gap-2 mt-2">
-                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-emerald-500"/> <strong>Optimal:</strong> Stock is &gt; 80% of your Desired Level.</li>
-                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-blue-500"/> <strong>Healthy:</strong> Stock is safe (&gt; 115% of your Reorder Point).</li>
-                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-amber-500"/> <strong>Warning:</strong> Order now (Stock is 100-115% of ROP).</li>
-                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-orange-500"/> <strong>Low Stock:</strong> Dipping into safety stock (50-100% of ROP).</li>
-                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-red-500"/> <strong>Critical:</strong> Stock-out imminent (&lt; 50% of ROP).</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-red-500"/> <strong>Critical:</strong> Inventory position is at or below 50% of ROP.</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-orange-500"/> <strong>Low:</strong> Inventory position is 50-100% of ROP.</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-amber-500"/> <strong>Warning:</strong> Inventory position is 100-115% of ROP.</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-blue-500"/> <strong>Healthy:</strong> Inventory position is above 115% of ROP, below the desired-level target band.</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-emerald-500"/> <strong>On Target:</strong> Inventory position is 80-120% of Desired Level.</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-cyan-500"/> <strong>Incoming:</strong> Pipeline covers the target band, but QOH is at or below ROP.</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-violet-500"/> <strong>High:</strong> Inventory position is 120-150% of Desired Level.</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-fuchsia-600"/> <strong>Overstock:</strong> Inventory position is at least 150% of Desired Level.</li>
+                <li className="flex items-center gap-2 text-[11px]"><div className="w-2 h-2 rounded-full bg-slate-500"/> <strong>No Demand:</strong> Recommended ROP and Desired Level are both zero.</li>
               </ul>
             </CardContent>
           </Card>

@@ -14,6 +14,10 @@ export interface SkuLocationRow {
   onHand: number
   onOrder: number
   inventoryPosition: number
+  inventoryStatus?: InventoryStatus
+  inventoryStatusLabel?: string
+  inventoryStatusRank?: number
+  inventoryStatusReason?: string
   currentReorderPoint: number
   recommendedReorderPoint: number
   currentDesiredLevel: number
@@ -29,6 +33,16 @@ export interface SkuLocationRow {
 }
 
 export type WritebackStatus = 'pending' | 'success' | 'failed' | 'not_pushed'
+export type InventoryStatus =
+  | 'critical'
+  | 'low'
+  | 'warning'
+  | 'healthy'
+  | 'incoming'
+  | 'on_target'
+  | 'high'
+  | 'overstock'
+  | 'no_demand'
 
 // Recommendation Run
 export interface RecommendationRun {

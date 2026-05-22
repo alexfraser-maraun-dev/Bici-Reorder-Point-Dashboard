@@ -134,7 +134,7 @@ def get_replenishment_data(
         overrides = get_sku_overrides()
 
         # 2. Process Recommendations
-        from app.services.replenishment_engine import process_recommendations
+        from app.services.replenishment_engine import process_recommendations, calculate_inventory_status
                 
         recommendations = process_recommendations(
             raw_data, 
@@ -158,6 +158,18 @@ def get_replenishment_data(
                     rec['recommended_reorder_point'] = ov['manual_reorder_point']
                 if ov.get('manual_desired_level') is not None:
                     rec['recommended_desired_level'] = ov['manual_desired_level']
+
+                inventory_status = calculate_inventory_status(
+                    float(rec.get('on_hand') or 0),
+                    float(rec.get('on_order') or 0),
+                    float(rec.get('recommended_reorder_point') or 0),
+                    float(rec.get('recommended_desired_level') or 0),
+                )
+                rec.update(inventory_status)
+                rec['qty_to_order'] = max(
+                    0,
+                    int(float(rec.get('recommended_desired_level') or 0) - inventory_status['inventory_position'])
+                )
                 
                 # Re-calculate change_needed
                 rec['change_needed'] = (

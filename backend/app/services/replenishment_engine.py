@@ -1,6 +1,89 @@
 import math
 from typing import List, Dict, Any
 
+STATUS_RANKS = {
+    "critical": 1,
+    "low": 2,
+    "warning": 3,
+    "healthy": 4,
+    "incoming": 5,
+    "on_target": 6,
+    "high": 7,
+    "overstock": 8,
+    "no_demand": 9,
+}
+
+STATUS_LABELS = {
+    "critical": "Critical",
+    "low": "Low",
+    "warning": "Warning",
+    "healthy": "Healthy",
+    "incoming": "Incoming",
+    "on_target": "On Target",
+    "high": "High",
+    "overstock": "Overstock",
+    "no_demand": "No Demand",
+}
+
+STATUS_URGENCY = {
+    "critical": 5,
+    "low": 4,
+    "warning": 3,
+    "healthy": 2,
+    "incoming": 2,
+    "on_target": 1,
+    "high": 1,
+    "overstock": 1,
+    "no_demand": 0,
+}
+
+
+def calculate_inventory_status(
+    on_hand: float,
+    on_order: float,
+    reorder_point: float,
+    desired_level: float,
+) -> Dict[str, Any]:
+    inventory_position = on_hand + on_order
+
+    if reorder_point <= 0 and desired_level <= 0:
+        status = "no_demand"
+        reason = "No recommended reorder point or desired level is set for this item."
+    elif desired_level > 0 and inventory_position >= desired_level * 1.5:
+        status = "overstock"
+        reason = f"Inventory position is at least 150% of desired level ({inventory_position:g} vs {desired_level:g})."
+    elif desired_level > 0 and inventory_position >= desired_level * 1.2:
+        status = "high"
+        reason = f"Inventory position is at least 120% of desired level ({inventory_position:g} vs {desired_level:g})."
+    elif desired_level > 0 and inventory_position >= desired_level * 0.8 and reorder_point > 0 and on_hand <= reorder_point:
+        status = "incoming"
+        reason = f"Pipeline covers target, but on-hand is at or below ROP ({on_hand:g} vs {reorder_point:g})."
+    elif desired_level > 0 and inventory_position >= desired_level * 0.8:
+        status = "on_target"
+        reason = f"Inventory position is within the target band for desired level ({inventory_position:g} vs {desired_level:g})."
+    elif reorder_point > 0 and inventory_position > reorder_point * 1.15:
+        status = "healthy"
+        reason = f"Inventory position is more than 115% of ROP ({inventory_position:g} vs {reorder_point:g})."
+    elif reorder_point > 0 and inventory_position > reorder_point:
+        status = "warning"
+        reason = f"Inventory position is between 100% and 115% of ROP ({inventory_position:g} vs {reorder_point:g})."
+    elif reorder_point > 0 and inventory_position > reorder_point * 0.5:
+        status = "low"
+        reason = f"Inventory position is between 50% and 100% of ROP ({inventory_position:g} vs {reorder_point:g})."
+    else:
+        status = "critical"
+        reason = f"Inventory position is at or below 50% of ROP ({inventory_position:g} vs {reorder_point:g})."
+
+    return {
+        "inventory_position": inventory_position,
+        "inventory_status": status,
+        "inventory_status_label": STATUS_LABELS[status],
+        "inventory_status_rank": STATUS_RANKS[status],
+        "inventory_status_reason": reason,
+        "urgency": STATUS_URGENCY[status],
+    }
+
+
 def process_recommendations(
     items_df_dict: List[Dict[str, Any]], 
     lead_times_df_dict: List[Dict[str, Any]], 
@@ -122,25 +205,13 @@ def process_recommendations(
         new_desired_level = math.ceil(adjusted_daily_sales * forecast_period)
         
         # QTY to Order Calculation
-        qty_to_order = max(0, int(new_desired_level - (on_hand + on_order)))
-        
-        # Calculate Urgency
-        urgency = 0
-        if new_desired_level > 0 and new_reorder_point > 0:
-            if on_hand >= (new_desired_level * 0.8): 
-                urgency = 1
-            elif on_hand > (new_reorder_point * 1.15):
-                urgency = 2
-            elif on_hand > new_reorder_point:
-                urgency = 3
-            elif on_hand > (new_reorder_point * 0.5):
-                urgency = 4
-            else:
-                urgency = 5
-        elif new_reorder_point > 0:
-            if on_hand > (new_reorder_point * 1.15): urgency = 2
-            elif on_hand > new_reorder_point: urgency = 3
-            else: urgency = 5
+        inventory_status = calculate_inventory_status(
+            on_hand,
+            on_order,
+            new_reorder_point,
+            new_desired_level,
+        )
+        qty_to_order = max(0, int(new_desired_level - inventory_status["inventory_position"]))
             
         # Momentum Indicator
         momentum = "stable"
@@ -182,11 +253,16 @@ def process_recommendations(
             "forecast_60d": round(adjusted_daily_sales_60d * 60, 1), # Stockout-adjusted 60d demand
             "on_hand": on_hand,
             "on_order": on_order,
+            "inventory_position": inventory_status["inventory_position"],
+            "inventory_status": inventory_status["inventory_status"],
+            "inventory_status_label": inventory_status["inventory_status_label"],
+            "inventory_status_rank": inventory_status["inventory_status_rank"],
+            "inventory_status_reason": inventory_status["inventory_status_reason"],
             "qty_to_order": qty_to_order,
             "days_stock": round(on_hand / base_daily_sales, 1) if base_daily_sales > 0 else 0,
             "qty_sold": total_units_sold_60,
             "margin": margin,
-            "urgency": urgency,
+            "urgency": inventory_status["urgency"],
             "momentum": momentum,
             "current_reorder_point": int(current_rp) if current_rp else 0,
             "current_desired_level": int(current_dl) if current_dl else 0,

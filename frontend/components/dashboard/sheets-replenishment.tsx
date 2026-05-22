@@ -16,6 +16,11 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { 
   Select,
   SelectContent,
@@ -35,8 +40,6 @@ import {
   Filter,
   TrendingUp,
   TrendingDown,
-  Minus,
-  ShoppingCart,
   Zap,
   CircleCheck,
   CircleAlert,
@@ -48,6 +51,16 @@ import { cn } from '@/lib/utils'
 
 type VelocityMode = 'stable' | 'balanced' | 'reactive' | 'custom'
 type AdjustmentMode = 'shrink' | 'min_days' | 'cap' | 'raw'
+type InventoryStatus =
+  | 'critical'
+  | 'low'
+  | 'warning'
+  | 'healthy'
+  | 'incoming'
+  | 'on_target'
+  | 'high'
+  | 'overstock'
+  | 'no_demand'
 
 const VELOCITY_PRESETS: Record<Exclude<VelocityMode, 'custom'>, number> = {
   stable: 0.5,
@@ -60,6 +73,91 @@ const ADJUSTMENT_MODE_LABELS: Record<AdjustmentMode, string> = {
   min_days: 'Min days',
   cap: '2x cap',
   raw: 'Raw',
+}
+
+const INVENTORY_STATUS_DEFINITIONS: Record<InventoryStatus, { label: string; className: string; definition: string }> = {
+  critical: {
+    label: 'Critical',
+    className: 'bg-red-500 text-white',
+    definition: 'Inventory position is at or below 50% of the recommended reorder point.',
+  },
+  low: {
+    label: 'Low',
+    className: 'bg-orange-500 text-white',
+    definition: 'Inventory position is between 50% and 100% of the recommended reorder point.',
+  },
+  warning: {
+    label: 'Warning',
+    className: 'bg-amber-500 text-white',
+    definition: 'Inventory position is above reorder point, but no more than 115% of it.',
+  },
+  healthy: {
+    label: 'Healthy',
+    className: 'bg-blue-500 text-white',
+    definition: 'Inventory position is more than 115% of reorder point, but below the target desired-level band.',
+  },
+  incoming: {
+    label: 'Incoming',
+    className: 'bg-cyan-500 text-white',
+    definition: 'On hand is at or below reorder point, but on hand plus on order covers the target band.',
+  },
+  on_target: {
+    label: 'On Target',
+    className: 'bg-emerald-500 text-white',
+    definition: 'Inventory position is between 80% and 120% of the recommended desired level.',
+  },
+  high: {
+    label: 'High',
+    className: 'bg-violet-500 text-white',
+    definition: 'Inventory position is at least 120% of desired level, but below 150%.',
+  },
+  overstock: {
+    label: 'Overstock',
+    className: 'bg-fuchsia-600 text-white',
+    definition: 'Inventory position is at least 150% of the recommended desired level.',
+  },
+  no_demand: {
+    label: 'No Demand',
+    className: 'bg-slate-500 text-white',
+    definition: 'Recommended reorder point and desired level are both zero.',
+  },
+}
+
+const STATUS_FILTERS: InventoryStatus[] = [
+  'critical',
+  'low',
+  'warning',
+  'healthy',
+  'on_target',
+  'incoming',
+  'high',
+  'overstock',
+  'no_demand',
+]
+
+function InventoryStatusBadge({ item }: { item: any }) {
+  const status = (item.inventory_status || 'no_demand') as InventoryStatus
+  const config = INVENTORY_STATUS_DEFINITIONS[status] || INVENTORY_STATUS_DEFINITIONS.no_demand
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge className={cn('px-1 py-0 text-[7px] uppercase font-bold border-none cursor-help', config.className)}>
+          {item.inventory_status_label || config.label}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent side="right" className="max-w-72 space-y-1.5 p-3 text-left">
+        <div className="font-bold">{item.inventory_status_label || config.label}</div>
+        <div>{config.definition}</div>
+        {item.inventory_status_reason && (
+          <div className="text-background/80">{item.inventory_status_reason}</div>
+        )}
+        <div className="border-t border-background/20 pt-1 font-mono text-[10px]">
+          On hand + on order = inventory position
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
 }
 
 export function SheetsReplenishment() {
@@ -117,7 +215,7 @@ export function SheetsReplenishment() {
   const [statusFilter, setStatusFilter] = useState<string>('all')
   
   // Sort State
-  const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>({ key: 'urgency', direction: 'desc' })
+  const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>({ key: 'inventory_status_rank', direction: 'asc' })
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 50
 
@@ -176,7 +274,7 @@ export function SheetsReplenishment() {
     if (vendorFilter !== 'all') items = items.filter((i: any) => i.vendor === vendorFilter)
     if (brandFilter !== 'all') items = items.filter((i: any) => i.brand === brandFilter)
     if (categoryFilter !== 'all') items = items.filter((i: any) => i.category === categoryFilter)
-    if (statusFilter !== 'all') items = items.filter((i: any) => String(i.urgency) === statusFilter)
+    if (statusFilter !== 'all') items = items.filter((i: any) => i.inventory_status === statusFilter)
     
     // Sorting
     if (sortConfig) {
@@ -325,26 +423,6 @@ export function SheetsReplenishment() {
       direction = 'desc'
     }
     setSortConfig({ key, direction })
-  }
-
-  const getUrgencyColor = (urgency: number) => {
-    switch (urgency) {
-      case 5: return 'bg-red-500 text-white'
-      case 4: return 'bg-orange-500 text-white'
-      case 3: return 'bg-amber-500 text-white'
-      case 2: return 'bg-blue-500 text-white'
-      default: return 'bg-emerald-500 text-white'
-    }
-  }
-
-  const getUrgencyLabel = (urgency: number) => {
-    switch (urgency) {
-      case 5: return 'Critical'
-      case 4: return 'Low Stock'
-      case 3: return 'Warning'
-      case 2: return 'Healthy'
-      default: return 'Optimal'
-    }
   }
 
   return (
@@ -594,15 +672,16 @@ export function SheetsReplenishment() {
             <Filter className="w-3.5 h-3.5 text-muted-foreground mr-1" />
             
             <Select value={statusFilter} onValueChange={setStatusFilter}>
-              <SelectTrigger className="h-8 w-[120px] text-[10px] bg-muted/30">
+              <SelectTrigger className="h-8 w-[140px] text-[10px] bg-muted/30">
                 <SelectValue placeholder="Status" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All Statuses</SelectItem>
-                <SelectItem value="5">Critical Only</SelectItem>
-                <SelectItem value="4">Low Stock</SelectItem>
-                <SelectItem value="3">Warning</SelectItem>
-                <SelectItem value="2">Healthy</SelectItem>
+                {STATUS_FILTERS.map((status) => (
+                  <SelectItem key={status} value={status}>
+                    {INVENTORY_STATUS_DEFINITIONS[status].label}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
 
@@ -651,24 +730,21 @@ export function SheetsReplenishment() {
           </div>
           
           {/* Status Legend */}
-          <div className="flex items-center gap-4 px-1 pt-1 border-t border-muted/30">
+          <div className="flex items-center gap-3 px-1 pt-1 border-t border-muted/30 flex-wrap">
             <span className="text-[10px] font-bold uppercase text-foreground/60 mr-1 flex items-center gap-1">
               Status Definitions <Info className="w-2.5 h-2.5 opacity-50" />:
             </span>
-            {[
-              { label: 'Critical', color: 'bg-red-500', desc: '<50% of ROP' },
-              { label: 'Low Stock', color: 'bg-orange-500', desc: '50-100% of ROP' },
-              { label: 'Warning', color: 'bg-amber-500', desc: '100-115% of ROP' },
-              { label: 'Healthy', color: 'bg-blue-500', desc: '>115% of ROP' },
-              { label: 'Optimal', color: 'bg-emerald-500', desc: '>80% of Desired Level' }
-            ].map((item) => (
-              <div key={item.label} className="flex items-center gap-1.5" title={item.desc}>
-                <div className={cn("w-2 h-2 rounded-full", item.color)} />
-                <span className="text-[10px] font-bold text-foreground/80">
-                  {item.label} <span className="text-[9px] text-foreground/60 ml-0.5 font-medium">({item.desc})</span>
-                </span>
-              </div>
-            ))}
+            {STATUS_FILTERS.map((status) => {
+              const item = INVENTORY_STATUS_DEFINITIONS[status]
+              return (
+                <div key={status} className="flex items-center gap-1.5" title={item.definition}>
+                  <div className={cn("w-2 h-2 rounded-full", item.className)} />
+                  <span className="text-[10px] font-bold text-foreground/80">
+                    {item.label}
+                  </span>
+                </div>
+              )
+            })}
           </div>
         </div>
 
@@ -756,7 +832,7 @@ export function SheetsReplenishment() {
                     </button>
                   </TableHead>
                   <TableHead className="w-[66px]">
-                    <button onClick={() => requestSort('urgency')} className="flex items-center gap-1 hover:text-foreground text-[9px] font-bold uppercase">
+                    <button onClick={() => requestSort('inventory_status_rank')} className="flex items-center gap-1 hover:text-foreground text-[9px] font-bold uppercase">
                       Status <ArrowUpDown className="w-2.5 h-2.5" />
                     </button>
                   </TableHead>
@@ -854,9 +930,7 @@ export function SheetsReplenishment() {
                         {item.lead_time}d
                       </TableCell>
                       <TableCell>
-                        <Badge className={cn("px-1 py-0 text-[7px] uppercase font-bold border-none", getUrgencyColor(item.urgency))}>
-                          {getUrgencyLabel(item.urgency)}
-                        </Badge>
+                        <InventoryStatusBadge item={item} />
                       </TableCell>
                       <TableCell>
                         <div className="flex flex-col w-[330px]">
