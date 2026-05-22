@@ -12,8 +12,9 @@ import {
 } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Truck, AlertCircle, Search } from 'lucide-react'
+import { Truck, AlertCircle, Search, RefreshCw } from 'lucide-react'
 
 const LOCATION_COLUMNS = [
   { id: 3, key: 'adanac', label: 'Adanac' },
@@ -33,10 +34,11 @@ function getLocationLead(vendor: any, locationId: number) {
 }
 
 export function VendorLeadTimes() {
-  const { data, isLoading } = useActiveVendorLeadTimes()
+  const { data, isLoading, error, refetch } = useActiveVendorLeadTimes()
   const [search, setSearch] = useState('')
 
   const leadTimes = data?.data || []
+  const meta = data?.meta
   const filteredLeadTimes = useMemo(() => {
     const searchLower = search.trim().toLowerCase()
     if (!searchLower) return leadTimes
@@ -71,7 +73,16 @@ export function VendorLeadTimes() {
             className="h-9 pl-9"
           />
         </div>
+        <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading}>
+          <RefreshCw className="mr-2 h-4 w-4" />
+          Refresh
+        </Button>
       </div>
+      {meta?.warnings?.length > 0 && (
+        <div className="border-b bg-amber-50 px-4 py-2 text-xs text-amber-800">
+          Vendor data loaded with {meta.warnings.length} warning{meta.warnings.length === 1 ? '' : 's'}.
+        </div>
+      )}
       
       <div className="overflow-auto flex-1">
         <Table>
@@ -102,12 +113,32 @@ export function VendorLeadTimes() {
                   ))}
                 </TableRow>
               ))
+            ) : error ? (
+              <TableRow>
+                <TableCell colSpan={12} className="h-64 text-center text-muted-foreground">
+                  <div className="flex flex-col items-center gap-3">
+                    <AlertCircle className="w-8 h-8 opacity-20" />
+                    <div>
+                      <p className="font-medium text-foreground">Unable to load active vendors.</p>
+                      <p className="text-sm">Try refreshing the dashboard.</p>
+                    </div>
+                    <Button variant="outline" size="sm" onClick={() => refetch()}>
+                      <RefreshCw className="mr-2 h-4 w-4" />
+                      Retry
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
             ) : filteredLeadTimes.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={12} className="h-64 text-center text-muted-foreground">
                   <div className="flex flex-col items-center gap-2">
                     <AlertCircle className="w-8 h-8 opacity-20" />
-                    <p>No active vendors found.</p>
+                    <p>
+                      {leadTimes.length === 0
+                        ? 'No vendors with POs placed in the past 120 days.'
+                        : 'No vendors match the current search.'}
+                    </p>
                   </div>
                 </TableCell>
               </TableRow>

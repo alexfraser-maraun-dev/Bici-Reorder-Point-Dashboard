@@ -354,21 +354,25 @@ def get_vendor_lead_times():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/replenishment/active-vendor-lead-times")
-def get_active_vendor_lead_times():
+def get_active_vendor_lead_times(force_refresh: bool = False):
     try:
         from app.services.bigquery_sync import fetch_active_vendor_lead_times
-        data = fetch_active_vendor_lead_times(active_days=120)
-        return {"status": "success", "data": to_json_safe(data)}
+        result = fetch_active_vendor_lead_times(active_days=120, force_refresh=force_refresh)
+        return {
+            "status": "success",
+            "data": to_json_safe(result["data"]),
+            "meta": to_json_safe(result["meta"]),
+        }
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/replenishment/brand-sourcing-rules")
-def get_brand_sourcing_rules():
+def get_brand_sourcing_rules(force_refresh: bool = False):
     try:
         from app.services.bigquery_sync import fetch_brand_sourcing_rules
-        data = fetch_brand_sourcing_rules()
+        data = fetch_brand_sourcing_rules(force_refresh=force_refresh)
         return {"status": "success", "data": to_json_safe(data)}
     except Exception as e:
         import traceback

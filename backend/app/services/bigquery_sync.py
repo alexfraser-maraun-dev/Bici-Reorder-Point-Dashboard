@@ -193,6 +193,10 @@ def ensure_brand_sourcing_rules_table():
 
 def get_brand_sourcing_rules_map() -> dict:
     """Fetches active brand sourcing rules keyed by brand name."""
+    cached = _cache_get(_brand_sourcing_rules_map_cache, "active")
+    if cached is not None:
+        return cached
+
     try:
         ensure_brand_sourcing_rules_table()
         query = f"""
@@ -210,7 +214,9 @@ def get_brand_sourcing_rules_map() -> dict:
         """
         client = get_bq_client()
         rows = client.query(query).result()
-        return {row["brand_name"]: dict(row) for row in rows}
+        rules = {row["brand_name"]: dict(row) for row in rows}
+        _cache_set(_brand_sourcing_rules_map_cache, "active", rules)
+        return rules
     except Exception as e:
         print(f"Failed to fetch brand sourcing rules: {e}")
         return {}
@@ -274,12 +280,56 @@ def upsert_brand_sourcing_rule(rule_data: dict):
     )
     client = get_bq_client()
     client.query(merge_query, job_config=job_config).result()
+    invalidate_brand_sourcing_cache()
 
-def fetch_active_vendor_lead_times(active_days: int = 120) -> list:
+def fetch_vendor_name_map(vendor_ids: list) -> dict:
+    if not vendor_ids:
+        return {}
+
+    query = f"""
+        WITH latest_snapshot_date AS (
+            SELECT MAX(snapshot_date_local) AS snapshot_date_local
+            FROM `{LS_DATASET}.v_master_snapshot_latest`
+        )
+        SELECT
+            CAST(po_vendor_id_any AS STRING) AS vendor_id,
+            ARRAY_AGG(
+                COALESCE(po_vendor_name_any, default_vendor) IGNORE NULLS
+                ORDER BY COALESCE(po_vendor_name_any, default_vendor)
+                LIMIT 1
+            )[SAFE_OFFSET(0)] AS vendor_name
+        FROM `{LS_DATASET}.v_master_snapshot_latest` s
+        CROSS JOIN latest_snapshot_date lsd
+        WHERE s.snapshot_date_local = lsd.snapshot_date_local
+            AND CAST(po_vendor_id_any AS STRING) IN UNNEST(@vendor_ids)
+            AND po_vendor_id_any IS NOT NULL
+        GROUP BY po_vendor_id_any
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("vendor_ids", "STRING", [str(vendor_id) for vendor_id in vendor_ids]),
+        ]
+    )
+    client = get_bq_client()
+    rows = client.query(query, job_config=job_config).result()
+    vendor_names = {}
+    for row in rows:
+        row_dict = dict(row)
+        if row_dict.get("vendor_name"):
+            vendor_names[str(row_dict["vendor_id"])] = row_dict["vendor_name"]
+    return vendor_names
+
+def fetch_active_vendor_lead_times(active_days: int = 120, force_refresh: bool = False) -> dict:
     """
     Returns vendors with at least one PO placed in the active window, plus median
     received lead times and configured brand mappings.
     """
+    cache_key = active_days
+    if not force_refresh:
+        cached = _cache_get(_active_vendor_lead_time_cache, cache_key)
+        if cached is not None:
+            return cached
+
     query = f"""
         WITH active_vendors AS (
             SELECT
@@ -320,29 +370,9 @@ def fetch_active_vendor_lead_times(active_days: int = 120) -> list:
                 PARTITION BY vendor_id, location_id
                 ORDER BY vendor_id
             ) = 1
-        ),
-        latest_snapshot_date AS (
-            SELECT
-                MAX(snapshot_date_local) AS snapshot_date_local
-            FROM `{LS_DATASET}.v_master_snapshot_latest`
-        ),
-        vendor_names AS (
-            SELECT
-                CAST(po_vendor_id_any AS STRING) AS vendor_id,
-                ARRAY_AGG(
-                    COALESCE(po_vendor_name_any, default_vendor) IGNORE NULLS
-                    ORDER BY COALESCE(po_vendor_name_any, default_vendor)
-                    LIMIT 1
-                )[SAFE_OFFSET(0)] AS vendor_name
-            FROM `{LS_DATASET}.v_master_snapshot_latest` s
-            CROSS JOIN latest_snapshot_date lsd
-            WHERE s.snapshot_date_local = lsd.snapshot_date_local
-                AND po_vendor_id_any IS NOT NULL
-            GROUP BY po_vendor_id_any
         )
         SELECT
             av.vendor_id,
-            COALESCE(vn.vendor_name, CONCAT('Vendor ', av.vendor_id)) AS vendor_name,
             av.active_po_count,
             av.last_po_ordered_at,
             ARRAY(
@@ -355,8 +385,7 @@ def fetch_active_vendor_lead_times(active_days: int = 120) -> list:
                 ORDER BY lt.location_id
             ) AS location_lead_times
         FROM active_vendors av
-        LEFT JOIN vendor_names vn ON av.vendor_id = vn.vendor_id
-        ORDER BY vendor_name
+        ORDER BY av.vendor_id
     """
     client = get_bq_client()
     job_config = bigquery.QueryJobConfig(
@@ -365,10 +394,34 @@ def fetch_active_vendor_lead_times(active_days: int = 120) -> list:
         ]
     )
     rows = client.query(query, job_config=job_config).result()
+
+    warnings = []
+    data = []
+    for row in rows:
+        vendor = dict(row)
+        vendor["vendor_id"] = str(vendor["vendor_id"])
+        vendor["vendor_name"] = f"Vendor {vendor['vendor_id']}"
+        vendor["configured_brands"] = []
+        data.append(vendor)
+
+    vendor_ids = [vendor["vendor_id"] for vendor in data]
+
+    try:
+        vendor_names = fetch_vendor_name_map(vendor_ids)
+        for vendor in data:
+            if vendor_names.get(vendor["vendor_id"]):
+                vendor["vendor_name"] = vendor_names[vendor["vendor_id"]]
+    except Exception as e:
+        warning = f"Vendor names could not be loaded: {e}"
+        print(warning)
+        warnings.append(warning)
+
     try:
         brand_rules = get_brand_sourcing_rules_map()
     except Exception as e:
-        print(f"Failed to attach configured brands to active vendors: {e}")
+        warning = f"Configured brand mappings could not be loaded: {e}"
+        print(warning)
+        warnings.append(warning)
         brand_rules = {}
 
     configured_brands_by_vendor = {}
@@ -378,15 +431,33 @@ def fetch_active_vendor_lead_times(active_days: int = 120) -> list:
         if vendor_id and brand_name:
             configured_brands_by_vendor.setdefault(str(vendor_id), []).append(brand_name)
 
-    data = []
-    for row in rows:
-        vendor = dict(row)
+    lead_time_vendor_count = 0
+    for vendor in data:
         vendor["configured_brands"] = sorted(configured_brands_by_vendor.get(str(vendor["vendor_id"]), []))
-        data.append(vendor)
-    return data
+        if vendor.get("location_lead_times"):
+            lead_time_vendor_count += 1
 
-def fetch_brand_sourcing_rules() -> list:
+    result = {
+        "data": sorted(data, key=lambda vendor: (vendor.get("vendor_name") or "", vendor.get("vendor_id") or "")),
+        "meta": {
+            "active_days": active_days,
+            "active_vendor_count": len(data),
+            "lead_time_vendor_count": lead_time_vendor_count,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "warnings": warnings,
+        },
+    }
+    _cache_set(_active_vendor_lead_time_cache, cache_key, result)
+    return result
+
+def fetch_brand_sourcing_rules(force_refresh: bool = False) -> list:
     """Returns all current brands with any configured preferred vendor mapping."""
+    cache_key = "all"
+    if not force_refresh:
+        cached = _cache_get(_brand_sourcing_rules_cache, cache_key)
+        if cached is not None:
+            return cached
+
     ensure_brand_sourcing_rules_table()
     query = f"""
         WITH latest_snapshot_date AS (
@@ -433,7 +504,9 @@ def fetch_brand_sourcing_rules() -> list:
     """
     client = get_bq_client()
     rows = client.query(query).result()
-    return [dict(row) for row in rows]
+    data = [dict(row) for row in rows]
+    _cache_set(_brand_sourcing_rules_cache, cache_key, data)
+    return data
 
 def get_cached_bq_metrics(trailing_days: int = 60) -> dict:
     """
@@ -571,6 +644,27 @@ def fetch_inventory_snapshot() -> pd.DataFrame:
     return client.query(query).to_dataframe()
 
 _bq_lead_time_cache = {}
+ADMIN_CACHE_TTL_SECONDS = 900
+_active_vendor_lead_time_cache = {}
+_brand_sourcing_rules_cache = {}
+_brand_sourcing_rules_map_cache = {}
+
+def _cache_get(cache: dict, key):
+    cached = cache.get(key)
+    if not cached:
+        return None
+    data, timestamp = cached
+    if time.time() - timestamp < ADMIN_CACHE_TTL_SECONDS:
+        return data
+    return None
+
+def _cache_set(cache: dict, key, data):
+    cache[key] = (data, time.time())
+
+def invalidate_brand_sourcing_cache():
+    _brand_sourcing_rules_cache.clear()
+    _brand_sourcing_rules_map_cache.clear()
+    _active_vendor_lead_time_cache.clear()
 
 def fetch_lead_times(lookback_months: int = 3, force_refresh: bool = False) -> pd.DataFrame:
     """

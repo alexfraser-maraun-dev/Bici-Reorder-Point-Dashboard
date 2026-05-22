@@ -115,6 +115,14 @@ const fetcher = async (url: string) => {
   return res.json()
 }
 
+const adminDashboardSWRConfig = {
+  revalidateOnFocus: false,
+  revalidateOnReconnect: false,
+  revalidateIfStale: false,
+  refreshInterval: 0,
+  dedupingInterval: 900000,
+}
+
 export function useReplenishmentData(
   forecastPeriod: number,
   safetyDays: number,
@@ -190,14 +198,18 @@ export function useVendorLeadTimes() {
 
 export function useActiveVendorLeadTimes() {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-  const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/active-vendor-lead-times`, fetcher)
-  return { data: data || null, isLoading, error, refetch: mutate }
+  const url = `${baseUrl}/api/replenishment/active-vendor-lead-times`
+  const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
+  const refetch = () => mutate(fetcher(`${url}?force_refresh=true`), false)
+  return { data: data || null, isLoading, error, refetch }
 }
 
 export function useBrandSourcingRules() {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-  const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/brand-sourcing-rules`, fetcher)
-  return { data: data || null, isLoading, error, refetch: mutate }
+  const url = `${baseUrl}/api/replenishment/brand-sourcing-rules`
+  const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
+  const refetch = () => mutate(fetcher(`${url}?force_refresh=true`), false)
+  return { data: data || null, isLoading, error, refetch }
 }
 
 export async function saveBrandSourcingRule(rule: {

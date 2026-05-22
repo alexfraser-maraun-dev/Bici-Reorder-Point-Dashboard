@@ -26,7 +26,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { AlertCircle, Save, Search, SlidersHorizontal, X } from 'lucide-react'
+import { AlertCircle, RefreshCw, Save, Search, SlidersHorizontal, X } from 'lucide-react'
 
 type FilterMode = 'all' | 'mapped' | 'unmapped'
 
@@ -51,8 +51,8 @@ function getVendorName(vendors: any[], vendorId: string) {
 }
 
 export function BrandConfiguration() {
-  const { data: brandData, isLoading: brandsLoading, refetch: refetchBrands } = useBrandSourcingRules()
-  const { data: vendorData, isLoading: vendorsLoading, refetch: refetchVendors } = useActiveVendorLeadTimes()
+  const { data: brandData, isLoading: brandsLoading, error: brandsError, refetch: refetchBrands } = useBrandSourcingRules()
+  const { data: vendorData, isLoading: vendorsLoading, error: vendorsError, refetch: refetchVendors } = useActiveVendorLeadTimes()
   const [search, setSearch] = useState('')
   const [filterMode, setFilterMode] = useState<FilterMode>('all')
   const [vendorFilter, setVendorFilter] = useState('all')
@@ -62,6 +62,7 @@ export function BrandConfiguration() {
   const brands = brandData?.data || []
   const vendors = vendorData?.data || []
   const isLoading = brandsLoading || vendorsLoading
+  const hasLoadError = brandsError || vendorsError
 
   useEffect(() => {
     if (brands.length > 0) {
@@ -181,6 +182,15 @@ export function BrandConfiguration() {
                 className="h-9 pl-9"
               />
             </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => Promise.all([refetchBrands(), refetchVendors()])}
+              disabled={isLoading}
+            >
+              <RefreshCw className="mr-2 h-4 w-4" />
+              Refresh
+            </Button>
           </div>
         </div>
       </div>
@@ -206,6 +216,22 @@ export function BrandConfiguration() {
                   ))}
                 </TableRow>
               ))
+            ) : hasLoadError ? (
+              <TableRow>
+                <TableCell colSpan={6} className="h-64 text-center text-muted-foreground">
+                  <div className="flex flex-col items-center gap-3">
+                    <AlertCircle className="w-8 h-8 opacity-20" />
+                    <div>
+                      <p className="font-medium text-foreground">Unable to load brand configuration.</p>
+                      <p className="text-sm">Try refreshing the dashboard.</p>
+                    </div>
+                    <Button variant="outline" size="sm" onClick={() => Promise.all([refetchBrands(), refetchVendors()])}>
+                      <RefreshCw className="mr-2 h-4 w-4" />
+                      Retry
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
             ) : filteredBrands.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={6} className="h-64 text-center text-muted-foreground">
