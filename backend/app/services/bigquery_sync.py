@@ -311,7 +311,7 @@ def fetch_inventory_snapshot() -> pd.DataFrame:
 
 _bq_lead_time_cache = {}
 
-def fetch_lead_times(lookback_months: int = 12, force_refresh: bool = False) -> pd.DataFrame:
+def fetch_lead_times(lookback_months: int = 3, force_refresh: bool = False) -> pd.DataFrame:
     """
     Fetches median vendor lead times per location from the po_report table.
     """
@@ -336,7 +336,7 @@ def fetch_lead_times(lookback_months: int = 12, force_refresh: bool = False) -> 
                 AND first_received_at IS NOT NULL
                 AND DATE(po_ordered_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_months MONTH)
                 -- Filter out obvious data entry errors and pre-booked POs (limit to replenishment POs)
-                AND TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY) BETWEEN 0 AND 50
+                AND TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY) BETWEEN 0 AND 40
         )
         SELECT
             vendor_id,
