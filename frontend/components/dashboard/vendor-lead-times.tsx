@@ -1,6 +1,7 @@
 'use client'
 
-import { useVendorLeadTimes } from '@/lib/hooks'
+import { useMemo, useState } from 'react'
+import { useActiveVendorLeadTimes } from '@/lib/hooks'
 import { 
   Table, 
   TableBody, 
@@ -10,24 +11,65 @@ import {
   TableRow 
 } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Truck, AlertCircle, MapPin } from 'lucide-react'
+import { Badge } from '@/components/ui/badge'
+import { Input } from '@/components/ui/input'
+import { Truck, AlertCircle, Search } from 'lucide-react'
+
+const LOCATION_COLUMNS = [
+  { id: 3, key: 'adanac', label: 'Adanac' },
+  { id: 20, key: 'langford', label: 'Langford' },
+  { id: 2, key: 'victoria', label: 'Victoria' },
+]
+
+function formatDate(value: string | null | undefined) {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '—'
+  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+function getLocationLead(vendor: any, locationId: number) {
+  return (vendor.location_lead_times || []).find((entry: any) => Number(entry.location_id) === locationId)
+}
 
 export function VendorLeadTimes() {
-  const { data, isLoading } = useVendorLeadTimes()
+  const { data, isLoading } = useActiveVendorLeadTimes()
+  const [search, setSearch] = useState('')
 
   const leadTimes = data?.data || []
+  const filteredLeadTimes = useMemo(() => {
+    const searchLower = search.trim().toLowerCase()
+    if (!searchLower) return leadTimes
+    return leadTimes.filter((vendor: any) => {
+      const configuredBrands = (vendor.configured_brands || []).join(' ').toLowerCase()
+      return (
+        String(vendor.vendor_name || '').toLowerCase().includes(searchLower) ||
+        String(vendor.vendor_id || '').toLowerCase().includes(searchLower) ||
+        configuredBrands.includes(searchLower)
+      )
+    })
+  }, [leadTimes, search])
 
   return (
     <div className="bg-card rounded-xl border shadow-sm overflow-hidden flex flex-col h-full animate-in fade-in duration-500">
-      <div className="p-4 border-b bg-muted/20 flex items-center justify-between">
+      <div className="p-4 border-b bg-muted/20 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <Truck className="w-5 h-5 text-blue-600" />
-          <h2 className="font-semibold text-lg">Vendor Lead Times Matrix</h2>
+          <div>
+            <h2 className="font-semibold text-lg">Active Vendor Lead Times</h2>
+            <p className="text-xs text-muted-foreground">
+              Vendors with at least one PO placed in the past 120 days
+            </p>
+          </div>
         </div>
-        <div className="flex items-center gap-4 text-[10px] font-bold uppercase text-muted-foreground">
-          <div className="flex items-center gap-1.5"><div className="w-2 h-2 rounded-full bg-blue-500" /> Adanac</div>
-          <div className="flex items-center gap-1.5"><div className="w-2 h-2 rounded-full bg-emerald-500" /> Langford</div>
-          <div className="flex items-center gap-1.5"><div className="w-2 h-2 rounded-full bg-purple-500" /> Victoria</div>
+        <div className="relative w-full max-w-sm">
+          <Search className="text-muted-foreground absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2" />
+          <Input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search vendor, ID, or mapped brand..."
+            className="h-9 pl-9"
+          />
         </div>
       </div>
       
@@ -35,59 +77,81 @@ export function VendorLeadTimes() {
         <Table>
           <TableHeader className="bg-muted/50 sticky top-0 z-10 backdrop-blur-sm">
             <TableRow>
-              <TableHead className="w-[200px]">Vendor Name</TableHead>
-              <TableHead className="text-center bg-blue-50/30 dark:bg-blue-900/10">Adanac Lead</TableHead>
-              <TableHead className="text-center bg-blue-50/30 dark:bg-blue-900/10 border-r">Adanac POs</TableHead>
-              <TableHead className="text-center bg-emerald-50/30 dark:bg-emerald-900/10">Langford Lead</TableHead>
-              <TableHead className="text-center bg-emerald-50/30 dark:bg-emerald-900/10 border-r">Langford POs</TableHead>
-              <TableHead className="text-center bg-purple-50/30 dark:bg-purple-900/10">Victoria Lead</TableHead>
-              <TableHead className="text-center bg-purple-50/30 dark:bg-purple-900/10">Victoria POs</TableHead>
+              <TableHead className="min-w-[230px]">Vendor</TableHead>
+              <TableHead className="text-center">Active POs</TableHead>
+              <TableHead className="text-center">Last PO</TableHead>
+              {LOCATION_COLUMNS.map((location) => (
+                <TableHead key={`${location.key}-lead`} className="text-center">
+                  {location.label} Lead
+                </TableHead>
+              ))}
+              {LOCATION_COLUMNS.map((location) => (
+                <TableHead key={`${location.key}-pos`} className="text-center">
+                  {location.label} Samples
+                </TableHead>
+              ))}
+              <TableHead className="min-w-[260px]">Brands Mapped To Vendor</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {isLoading ? (
               Array.from({ length: 15 }).map((_, i) => (
                 <TableRow key={i}>
-                  {Array.from({ length: 7 }).map((_, j) => (
+                  {Array.from({ length: 12 }).map((_, j) => (
                     <TableCell key={j}><Skeleton className="h-4 w-full" /></TableCell>
                   ))}
                 </TableRow>
               ))
-            ) : leadTimes.length === 0 ? (
+            ) : filteredLeadTimes.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={7} className="h-64 text-center text-muted-foreground">
+                <TableCell colSpan={12} className="h-64 text-center text-muted-foreground">
                   <div className="flex flex-col items-center gap-2">
                     <AlertCircle className="w-8 h-8 opacity-20" />
-                    <p>No vendor lead times found in the spreadsheet.</p>
+                    <p>No active vendors found.</p>
                   </div>
                 </TableCell>
               </TableRow>
             ) : (
-              leadTimes.map((vendor: any, idx: number) => (
-                <TableRow key={idx} className="hover:bg-muted/30 transition-colors">
+              filteredLeadTimes.map((vendor: any) => (
+                <TableRow key={vendor.vendor_id} className="hover:bg-muted/30 transition-colors">
                   <TableCell className="font-semibold text-xs py-3 border-r">
-                    {vendor.vendor}
+                    <div>{vendor.vendor_name}</div>
+                    <div className="text-[10px] font-mono text-muted-foreground">ID {vendor.vendor_id}</div>
                   </TableCell>
-                  
-                  <TableCell className="text-center tabular-nums text-blue-600 font-bold bg-blue-50/5">
-                    {vendor.adanac_lead} d
+                  <TableCell className="text-center tabular-nums text-xs font-semibold">
+                    {vendor.active_po_count}
                   </TableCell>
-                  <TableCell className="text-center tabular-nums text-muted-foreground text-[10px] bg-blue-50/5 border-r">
-                    {vendor.adanac_pos}
+                  <TableCell className="text-center tabular-nums text-xs text-muted-foreground">
+                    {formatDate(vendor.last_po_ordered_at)}
                   </TableCell>
-
-                  <TableCell className="text-center tabular-nums text-emerald-600 font-bold bg-emerald-50/5">
-                    {vendor.langford_lead} d
-                  </TableCell>
-                  <TableCell className="text-center tabular-nums text-muted-foreground text-[10px] bg-emerald-50/5 border-r">
-                    {vendor.langford_pos}
-                  </TableCell>
-
-                  <TableCell className="text-center tabular-nums text-purple-600 font-bold bg-purple-50/5">
-                    {vendor.victoria_lead} d
-                  </TableCell>
-                  <TableCell className="text-center tabular-nums text-muted-foreground text-[10px] bg-purple-50/5">
-                    {vendor.victoria_pos}
+                  {LOCATION_COLUMNS.map((location) => {
+                    const lead = getLocationLead(vendor, location.id)
+                    return (
+                      <TableCell key={`${vendor.vendor_id}-${location.key}-lead`} className="text-center tabular-nums text-xs font-bold">
+                        {lead?.lead_time_days ? `${lead.lead_time_days}d` : '—'}
+                      </TableCell>
+                    )
+                  })}
+                  {LOCATION_COLUMNS.map((location) => {
+                    const lead = getLocationLead(vendor, location.id)
+                    return (
+                      <TableCell key={`${vendor.vendor_id}-${location.key}-pos`} className="text-center tabular-nums text-[10px] text-muted-foreground">
+                        {lead?.po_count ?? '—'}
+                      </TableCell>
+                    )
+                  })}
+                  <TableCell>
+                    {(vendor.configured_brands || []).length > 0 ? (
+                      <div className="flex flex-wrap gap-1">
+                        {(vendor.configured_brands || []).map((brand: string) => (
+                          <Badge key={brand} variant="secondary" className="rounded-sm text-[10px]">
+                            {brand}
+                          </Badge>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">No configured brands</span>
+                    )}
                   </TableCell>
                 </TableRow>
               ))

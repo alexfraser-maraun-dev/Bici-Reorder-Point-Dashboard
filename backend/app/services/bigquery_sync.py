@@ -174,6 +174,242 @@ def upsert_sku_override(override_data: dict):
     client = get_bq_client()
     client.query(merge_query, job_config=job_config).result()
 
+def ensure_brand_sourcing_rules_table():
+    """Creates the brand sourcing rules table if it does not already exist."""
+    query = f"""
+        CREATE TABLE IF NOT EXISTS `{APP_DATASET}.replen_brand_sourcing_rules` (
+            brand_name STRING NOT NULL,
+            preferred_vendor_id STRING,
+            preferred_vendor_name STRING,
+            active BOOL,
+            notes STRING,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP,
+            updated_by STRING
+        )
+    """
+    client = get_bq_client()
+    client.query(query).result()
+
+def get_brand_sourcing_rules_map() -> dict:
+    """Fetches active brand sourcing rules keyed by brand name."""
+    ensure_brand_sourcing_rules_table()
+    query = f"""
+        SELECT
+            brand_name,
+            preferred_vendor_id,
+            preferred_vendor_name,
+            active,
+            notes,
+            created_at,
+            updated_at,
+            updated_by
+        FROM `{APP_DATASET}.replen_brand_sourcing_rules`
+        WHERE active = TRUE
+    """
+    try:
+        client = get_bq_client()
+        rows = client.query(query).result()
+        return {row["brand_name"]: dict(row) for row in rows}
+    except Exception as e:
+        print(f"Failed to fetch brand sourcing rules: {e}")
+        return {}
+
+def upsert_brand_sourcing_rule(rule_data: dict):
+    """Upserts or deactivates a brand preferred vendor mapping."""
+    ensure_brand_sourcing_rules_table()
+    table_id = f"{APP_DATASET}.replen_brand_sourcing_rules"
+    active = bool(rule_data.get("active", True))
+    preferred_vendor_id = rule_data.get("preferred_vendor_id")
+    preferred_vendor_name = rule_data.get("preferred_vendor_name")
+
+    if not preferred_vendor_id:
+        active = False
+        preferred_vendor_id = None
+        preferred_vendor_name = None
+
+    merge_query = f"""
+        MERGE `{table_id}` T
+        USING (SELECT @brand_name AS brand_name) S
+        ON T.brand_name = S.brand_name
+        WHEN MATCHED THEN
+            UPDATE SET
+                preferred_vendor_id = @preferred_vendor_id,
+                preferred_vendor_name = @preferred_vendor_name,
+                active = @active,
+                notes = @notes,
+                updated_at = CURRENT_TIMESTAMP(),
+                updated_by = @updated_by
+        WHEN NOT MATCHED THEN
+            INSERT (
+                brand_name,
+                preferred_vendor_id,
+                preferred_vendor_name,
+                active,
+                notes,
+                created_at,
+                updated_at,
+                updated_by
+            )
+            VALUES (
+                @brand_name,
+                @preferred_vendor_id,
+                @preferred_vendor_name,
+                @active,
+                @notes,
+                CURRENT_TIMESTAMP(),
+                CURRENT_TIMESTAMP(),
+                @updated_by
+            )
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("brand_name", "STRING", rule_data["brand_name"]),
+            bigquery.ScalarQueryParameter("preferred_vendor_id", "STRING", preferred_vendor_id),
+            bigquery.ScalarQueryParameter("preferred_vendor_name", "STRING", preferred_vendor_name),
+            bigquery.ScalarQueryParameter("active", "BOOL", active),
+            bigquery.ScalarQueryParameter("notes", "STRING", rule_data.get("notes")),
+            bigquery.ScalarQueryParameter("updated_by", "STRING", rule_data.get("updated_by", "Dashboard")),
+        ]
+    )
+    client = get_bq_client()
+    client.query(merge_query, job_config=job_config).result()
+
+def fetch_active_vendor_lead_times(active_days: int = 120) -> list:
+    """
+    Returns vendors with at least one PO placed in the active window, plus median
+    received lead times and configured brand mappings.
+    """
+    ensure_brand_sourcing_rules_table()
+    query = f"""
+        WITH active_vendors AS (
+            SELECT
+                CAST(vendor_id AS STRING) AS vendor_id,
+                ANY_VALUE(vendor_name) AS vendor_name,
+                COUNT(DISTINCT order_id) AS active_po_count,
+                MAX(po_ordered_at) AS last_po_ordered_at
+            FROM `{LS_DATASET}.po_report`
+            WHERE vendor_id IS NOT NULL
+                AND po_ordered_at IS NOT NULL
+                AND DATE(po_ordered_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @active_days DAY)
+            GROUP BY vendor_id
+        ),
+        lead_time_samples AS (
+            SELECT
+                CAST(vendor_id AS STRING) AS vendor_id,
+                shop_id AS location_id,
+                TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY) AS lead_time_day,
+                order_id
+            FROM `{LS_DATASET}.po_report`
+            WHERE vendor_id IS NOT NULL
+                AND po_ordered_at IS NOT NULL
+                AND first_received_at IS NOT NULL
+                AND DATE(po_ordered_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @active_days DAY)
+                AND TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY) BETWEEN 0 AND 40
+        ),
+        lead_times AS (
+            SELECT
+                vendor_id,
+                location_id,
+                CEIL(PERCENTILE_CONT(lead_time_day, 0.5) OVER (
+                    PARTITION BY vendor_id, location_id
+                )) AS lead_time_days,
+                COUNT(DISTINCT order_id) OVER (
+                    PARTITION BY vendor_id, location_id
+                ) AS po_count
+            FROM lead_time_samples
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY vendor_id, location_id
+                ORDER BY vendor_id
+            ) = 1
+        ),
+        brand_mappings AS (
+            SELECT
+                preferred_vendor_id AS vendor_id,
+                ARRAY_AGG(brand_name ORDER BY brand_name) AS configured_brands
+            FROM `{APP_DATASET}.replen_brand_sourcing_rules`
+            WHERE active = TRUE
+                AND preferred_vendor_id IS NOT NULL
+            GROUP BY preferred_vendor_id
+        )
+        SELECT
+            av.vendor_id,
+            COALESCE(av.vendor_name, CONCAT('Vendor ', av.vendor_id)) AS vendor_name,
+            av.active_po_count,
+            av.last_po_ordered_at,
+            COALESCE(bm.configured_brands, []) AS configured_brands,
+            ARRAY(
+                SELECT AS STRUCT
+                    lt.location_id AS location_id,
+                    lt.lead_time_days AS lead_time_days,
+                    lt.po_count AS po_count
+                FROM lead_times lt
+                WHERE lt.vendor_id = av.vendor_id
+                ORDER BY lt.location_id
+            ) AS location_lead_times
+        FROM active_vendors av
+        LEFT JOIN brand_mappings bm ON av.vendor_id = bm.vendor_id
+        ORDER BY vendor_name
+    """
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("active_days", "INT64", active_days),
+        ]
+    )
+    rows = client.query(query, job_config=job_config).result()
+    return [dict(row) for row in rows]
+
+def fetch_brand_sourcing_rules() -> list:
+    """Returns all current brands with any configured preferred vendor mapping."""
+    ensure_brand_sourcing_rules_table()
+    query = f"""
+        WITH latest_snapshot_date AS (
+            SELECT MAX(snapshot_date_local) AS snapshot_date_local
+            FROM `{LS_DATASET}.v_master_snapshot_latest`
+        ),
+        brands AS (
+            SELECT
+                brand_name,
+                COUNT(DISTINCT item_id) AS item_count
+            FROM `{LS_DATASET}.v_master_snapshot_latest` s
+            CROSS JOIN latest_snapshot_date lsd
+            WHERE s.snapshot_date_local = lsd.snapshot_date_local
+                AND COALESCE(s.item_archived, FALSE) = FALSE
+                AND brand_name IS NOT NULL
+                AND TRIM(brand_name) != ''
+            GROUP BY brand_name
+        ),
+        rules AS (
+            SELECT
+                brand_name,
+                preferred_vendor_id,
+                preferred_vendor_name,
+                active,
+                notes,
+                created_at,
+                updated_at,
+                updated_by
+            FROM `{APP_DATASET}.replen_brand_sourcing_rules`
+        )
+        SELECT
+            b.brand_name,
+            b.item_count,
+            r.preferred_vendor_id,
+            r.preferred_vendor_name,
+            COALESCE(r.active, FALSE) AS active,
+            r.notes,
+            r.created_at,
+            r.updated_at,
+            r.updated_by
+        FROM brands b
+        LEFT JOIN rules r ON b.brand_name = r.brand_name
+        ORDER BY b.brand_name
+    """
+    client = get_bq_client()
+    rows = client.query(query).result()
+    return [dict(row) for row in rows]
+
 def get_cached_bq_metrics(trailing_days: int = 60) -> dict:
     """
     Returns cached BQ metrics if they are less than 24 hours old.

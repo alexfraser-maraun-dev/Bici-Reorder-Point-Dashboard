@@ -188,6 +188,39 @@ export function useVendorLeadTimes() {
   return { data: data || null, isLoading, error, refetch: mutate }
 }
 
+export function useActiveVendorLeadTimes() {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/active-vendor-lead-times`, fetcher)
+  return { data: data || null, isLoading, error, refetch: mutate }
+}
+
+export function useBrandSourcingRules() {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/brand-sourcing-rules`, fetcher)
+  return { data: data || null, isLoading, error, refetch: mutate }
+}
+
+export async function saveBrandSourcingRule(rule: {
+  brand_name: string
+  preferred_vendor_id?: string | null
+  preferred_vendor_name?: string | null
+  active?: boolean
+  notes?: string | null
+  updated_by?: string
+}) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const res = await fetch(`${baseUrl}/api/replenishment/brand-sourcing-rules`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(rule),
+  })
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || 'Failed to save brand sourcing rule')
+  }
+  return res.json()
+}
+
 export function useConnectionStatus() {
   type ConnectionState = 'checking' | 'connected' | 'disconnected'
 

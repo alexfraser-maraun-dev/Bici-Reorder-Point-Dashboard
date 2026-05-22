@@ -3,7 +3,8 @@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { SheetsReplenishment } from './sheets-replenishment'
 import { VendorLeadTimes } from './vendor-lead-times'
-import { LayoutDashboard, Truck } from 'lucide-react'
+import { BrandConfiguration } from './brand-configuration'
+import { LayoutDashboard, SlidersHorizontal, Truck } from 'lucide-react'
 import type { AdjustmentMode, DemandWeights } from './sheets-replenishment'
 
 interface DashboardContentProps {
@@ -28,7 +29,7 @@ export function DashboardContent(props: DashboardContentProps) {
   return (
     <div className="space-y-3 animate-in fade-in duration-700">
       <Tabs defaultValue="inventory" className="w-full">
-        <TabsList className="grid w-[400px] grid-cols-2 mb-2 bg-muted/50 p-1 rounded-xl">
+        <TabsList className="grid w-[620px] grid-cols-3 mb-2 bg-muted/50 p-1 rounded-xl">
           <TabsTrigger value="inventory" className="gap-2 rounded-lg data-[state=active]:bg-background data-[state=active]:shadow-sm">
             <LayoutDashboard className="w-4 h-4" />
             Inventory Dashboard
@@ -36,6 +37,10 @@ export function DashboardContent(props: DashboardContentProps) {
           <TabsTrigger value="vendors" className="gap-2 rounded-lg data-[state=active]:bg-background data-[state=active]:shadow-sm">
             <Truck className="w-4 h-4" />
             Vendor Lead Times
+          </TabsTrigger>
+          <TabsTrigger value="brands" className="gap-2 rounded-lg data-[state=active]:bg-background data-[state=active]:shadow-sm">
+            <SlidersHorizontal className="w-4 h-4" />
+            Brand Configuration
           </TabsTrigger>
         </TabsList>
         
@@ -45,6 +50,10 @@ export function DashboardContent(props: DashboardContentProps) {
         
         <TabsContent value="vendors" className="mt-0 border-none p-0 focus-visible:ring-0">
           <VendorLeadTimes />
+        </TabsContent>
+
+        <TabsContent value="brands" className="mt-0 border-none p-0 focus-visible:ring-0">
+          <BrandConfiguration />
         </TabsContent>
       </Tabs>
     </div>

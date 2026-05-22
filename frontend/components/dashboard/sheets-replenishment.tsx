@@ -1035,18 +1035,18 @@ export function SheetsReplenishment({
                       <TableCell>
                         <InventoryStatusBadge item={item} />
                       </TableCell>
-                      <TableCell>
-                        <div className="flex flex-col w-[330px]">
+                      <TableCell className="min-w-0">
+                        <div className="flex w-full min-w-0 flex-col">
                           <a 
                             href={`${baseUrl}/api/replenishment/ls-link/${item.lightspeed_item_id ?? item.system_id}`}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="font-semibold text-xs leading-tight mb-0.5 hover:text-blue-600 hover:underline transition-all truncate"
+                            className="mb-0.5 block max-w-full truncate text-xs font-semibold leading-tight transition-all hover:text-blue-600 hover:underline"
                             title={item.description}
                           >
                             {item.description}
                           </a>
-                          <div className="flex items-center gap-1.5 text-[8px] text-muted-foreground">
+                          <div className="flex min-w-0 items-center gap-1.5 text-[8px] text-muted-foreground">
                             <span className="bg-muted px-1 rounded font-mono truncate">{item.sku}</span>
                             <span className="font-medium text-foreground/70 truncate">{item.vendor}</span>
                             <MomentumBadge item={item} />

@@ -18,6 +18,17 @@ from fastapi.responses import Response, RedirectResponse
 def build_lightspeed_item_url(item_id: str) -> str:
     return f"https://us.merchantos.com/?name=item.views.item&form_name=view&id={item_id}&tab=details"
 
+def to_json_safe(value):
+    if isinstance(value, list):
+        return [to_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [to_json_safe(item) for item in value]
+    if hasattr(value, "items"):
+        return {key: to_json_safe(val) for key, val in value.items()}
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
 # App initialization
 app = FastAPI(title="SKU Reorder Point Automation API")
 
@@ -330,6 +341,41 @@ def get_vendor_lead_times():
         data = google_sheets.fetch_vendor_lead_times(spreadsheet_id)
         return {"status": "success", "data": data}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/replenishment/active-vendor-lead-times")
+def get_active_vendor_lead_times():
+    try:
+        from app.services.bigquery_sync import fetch_active_vendor_lead_times
+        data = fetch_active_vendor_lead_times(active_days=120)
+        return {"status": "success", "data": to_json_safe(data)}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/replenishment/brand-sourcing-rules")
+def get_brand_sourcing_rules():
+    try:
+        from app.services.bigquery_sync import fetch_brand_sourcing_rules
+        data = fetch_brand_sourcing_rules()
+        return {"status": "success", "data": to_json_safe(data)}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/replenishment/brand-sourcing-rules")
+def save_brand_sourcing_rule(rule: Dict[str, Any]):
+    if not rule.get("brand_name"):
+        raise HTTPException(status_code=400, detail="brand_name is required")
+    try:
+        from app.services.bigquery_sync import upsert_brand_sourcing_rule
+        upsert_brand_sourcing_rule(rule)
+        return {"status": "success"}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/health/lightspeed")
