@@ -474,7 +474,7 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
     query = f"""
         WITH 
         date_spine_60 AS (
-          SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY), CURRENT_DATE())) AS day
+          SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(DATE_SUB(CURRENT_DATE(), INTERVAL 59 DAY), CURRENT_DATE())) AS day
         ),
         qualified_items AS (
           SELECT item_id FROM `{QUALIFIED_ITEMS_VIEW}`
@@ -523,8 +523,8 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
             item_id,
             location_id,
             COUNTIF(daily_qoh <= 0) AS days_out_of_stock_60,
-            COUNTIF(daily_qoh <= 0 AND day >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)) AS days_out_of_stock_30,
-            COUNTIF(daily_qoh <= 0 AND day >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)) AS days_out_of_stock_14
+            COUNTIF(daily_qoh <= 0 AND day >= DATE_SUB(CURRENT_DATE(), INTERVAL 29 DAY)) AS days_out_of_stock_30,
+            COUNTIF(daily_qoh <= 0 AND day >= DATE_SUB(CURRENT_DATE(), INTERVAL 13 DAY)) AS days_out_of_stock_14
           FROM daily_qoh_mapped_60
           GROUP BY 1, 2
         ),
@@ -544,12 +544,26 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
           SELECT
             sl.item_id,
             sl.shop_id AS location_id,
-            SUM(sl.unit_quantity) AS total_units_sold_14
+            SUM(sl.unit_quantity) AS total_units_sold_14,
+            COUNT(DISTINCT DATE(sale.complete_time)) AS distinct_sale_days_14
           FROM latest_sale_lines sl
           JOIN latest_sales sale ON sl.sale_id = sale.id
           WHERE sale.completed = TRUE
             AND sale.voided = FALSE
-            AND DATE(sale.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+            AND DATE(sale.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 13 DAY)
+          GROUP BY 1, 2
+        ),
+        sale_day_counts AS (
+          SELECT
+            sl.item_id,
+            sl.shop_id AS location_id,
+            COUNT(DISTINCT CASE WHEN DATE(sale.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 29 DAY) THEN DATE(sale.complete_time) END) AS distinct_sale_days_30,
+            COUNT(DISTINCT DATE(sale.complete_time)) AS distinct_sale_days_60
+          FROM latest_sale_lines sl
+          JOIN latest_sales sale ON sl.sale_id = sale.id
+          WHERE sale.completed = TRUE
+            AND sale.voided = FALSE
+            AND DATE(sale.complete_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 59 DAY)
           GROUP BY 1, 2
         )
         SELECT
@@ -564,6 +578,9 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
           COALESCE(s14.total_units_sold_14, 0) AS total_units_sold_14,
           COALESCE(s.sales_units_l30d, 0) AS total_units_sold_30,
           COALESCE(s.sales_units_l60d, 0) AS total_units_sold_60,
+          COALESCE(s14.distinct_sale_days_14, 0) AS distinct_sale_days_14,
+          COALESCE(sdc.distinct_sale_days_30, 0) AS distinct_sale_days_30,
+          COALESCE(sdc.distinct_sale_days_60, 0) AS distinct_sale_days_60,
           COALESCE(sc.days_out_of_stock_14, 0) AS days_out_of_stock_14,
           COALESCE(sc.days_out_of_stock_30, 0) AS days_out_of_stock_30,
           COALESCE(sc.days_out_of_stock_60, 0) AS days_out_of_stock_60,
@@ -574,6 +591,7 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
         FROM snapshot s
         LEFT JOIN stockouts sc ON s.item_id = sc.item_id AND s.shop_id = sc.location_id
         LEFT JOIN sales_14 s14 ON s.item_id = s14.item_id AND s.shop_id = s14.location_id
+        LEFT JOIN sale_day_counts sdc ON s.item_id = sdc.item_id AND s.shop_id = sdc.location_id
     """
     client = get_bq_client()
     df = client.query(query).to_dataframe()

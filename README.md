@@ -120,6 +120,12 @@ cap mode         = 2
 
 The demand weighting below is used as the base daily velocity for replenishment math.
 
+When QOH is zero or negative, that day still counts as an out-of-stock day.
+For adjusted-demand math, however, effective active days are guarded so they
+never fall below the number of distinct sale days in the window or a 3-day
+minimum. This keeps negative-inventory sales from creating unrealistically high
+adjusted demand.
+
 ### Demand Weighting
 
 The replenishment math uses a weighted blend of the last 14 days, days 15-30, and days 31-60:
@@ -142,7 +148,7 @@ It compares stockout-adjusted daily velocities across 14d, 15-30d, and 31-60d:
 surging / rising / spiky / flat / cooling / insufficient data
 ```
 
-Momentum does not directly change ROP or DL. It only explains whether recent demand is accelerating, cooling, or too thin to classify confidently.
+Momentum does not directly change ROP or DL. It only explains whether recent demand is accelerating, cooling, or too thin to classify confidently. `Rising` now requires stronger multi-window evidence instead of a single mild increase.
 
 ### ROP
 

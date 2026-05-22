@@ -161,17 +161,29 @@ def calculate_momentum_status(
         status = "surging"
         reason = "14d velocity is at least 75% above days 31-60 and at least 35% above days 15-30."
     elif (
-        pct_higher(adjusted_daily_sales_14d, adjusted_daily_sales_15_30d, 0.25)
-        or pct_higher(adjusted_daily_sales_15_30d, adjusted_daily_sales_31_60d, 0.25)
+        (
+            pct_higher(adjusted_daily_sales_14d, adjusted_daily_sales_15_30d, 0.40)
+            and adjusted_daily_sales_15_30d >= adjusted_daily_sales_31_60d
+        )
+        or (
+            pct_higher(adjusted_daily_sales_14d, adjusted_daily_sales_31_60d, 0.25)
+            and pct_higher(adjusted_daily_sales_15_30d, adjusted_daily_sales_31_60d, 0.25)
+        )
     ):
         status = "rising"
-        reason = "Recent velocity is at least 25% above an older comparison window."
+        reason = "Recent velocity shows stronger multi-window growth before qualifying as rising."
     elif (
-        pct_lower(adjusted_daily_sales_14d, adjusted_daily_sales_15_30d, 0.25)
-        or pct_lower(adjusted_daily_sales_15_30d, adjusted_daily_sales_31_60d, 0.25)
+        (
+            pct_lower(adjusted_daily_sales_14d, adjusted_daily_sales_15_30d, 0.40)
+            and adjusted_daily_sales_15_30d <= adjusted_daily_sales_31_60d
+        )
+        or (
+            pct_lower(adjusted_daily_sales_14d, adjusted_daily_sales_31_60d, 0.25)
+            and pct_lower(adjusted_daily_sales_15_30d, adjusted_daily_sales_31_60d, 0.25)
+        )
     ):
         status = "cooling"
-        reason = "Recent velocity is at least 25% below an older comparison window."
+        reason = "Recent velocity shows stronger multi-window decline before qualifying as cooling."
     else:
         status = "flat"
         reason = "Adjusted velocity is within the 25% movement threshold across the comparison windows."
@@ -234,6 +246,9 @@ def process_recommendations(
 
         confidence = min(1.0, max(0.0, active_days / 7))
         return raw_daily + ((unbounded_adjusted_daily - raw_daily) * confidence)
+
+    def effective_active_days(period_days, qoh_oos_days, distinct_sale_days):
+        return max(1, min(period_days, max(period_days - qoh_oos_days, distinct_sale_days, 3)))
     
     # Build Lead Time dictionary: (vendor_id, location_id) -> lead_time_days
     # Fallback to a default if not found
@@ -283,27 +298,32 @@ def process_recommendations(
         total_units_sold_14 = row.get("total_units_sold_14", 0)
         total_units_sold_30 = row.get("total_units_sold_30", 0)
         total_units_sold_60 = row.get("total_units_sold_60", 0)
+        distinct_sale_days_14 = row.get("distinct_sale_days_14", 0)
+        distinct_sale_days_30 = row.get("distinct_sale_days_30", 0)
+        distinct_sale_days_60 = row.get("distinct_sale_days_60", 0)
         days_out_of_stock_14 = row.get("days_out_of_stock_14", 0)
         days_out_of_stock_30 = row.get("days_out_of_stock_30", 0)
         days_out_of_stock_60 = row.get("days_out_of_stock_60", 0)
         
-        active_days_14 = max(1, 14 - days_out_of_stock_14)
+        active_days_14 = effective_active_days(14, days_out_of_stock_14, distinct_sale_days_14)
         adjusted_daily_sales_14d = guarded_daily_sales(total_units_sold_14, 14, active_days_14)
 
         mid_units_sold_16 = max(0, total_units_sold_30 - total_units_sold_14)
         mid_days_out_of_stock_16 = min(16, max(0, days_out_of_stock_30 - days_out_of_stock_14))
-        mid_active_days_16 = max(1, 16 - mid_days_out_of_stock_16)
+        mid_distinct_sale_days_16 = min(16, max(0, distinct_sale_days_30 - distinct_sale_days_14))
+        mid_active_days_16 = effective_active_days(16, mid_days_out_of_stock_16, mid_distinct_sale_days_16)
         adjusted_daily_sales_15_30d = guarded_daily_sales(mid_units_sold_16, 16, mid_active_days_16)
 
-        active_days_30 = max(1, 30 - days_out_of_stock_30)
+        active_days_30 = effective_active_days(30, days_out_of_stock_30, distinct_sale_days_30)
         adjusted_daily_sales_30d = guarded_daily_sales(total_units_sold_30, 30, active_days_30)
         
-        active_days_60 = max(1, 60 - days_out_of_stock_60)
+        active_days_60 = effective_active_days(60, days_out_of_stock_60, distinct_sale_days_60)
         adjusted_daily_sales_60d = guarded_daily_sales(total_units_sold_60, 60, active_days_60)
 
         prior_units_sold_30 = max(0, total_units_sold_60 - total_units_sold_30)
         prior_days_out_of_stock_30 = min(30, max(0, days_out_of_stock_60 - days_out_of_stock_30))
-        prior_active_days_30 = max(1, 30 - prior_days_out_of_stock_30)
+        prior_distinct_sale_days_30 = min(30, max(0, distinct_sale_days_60 - distinct_sale_days_30))
+        prior_active_days_30 = effective_active_days(30, prior_days_out_of_stock_30, prior_distinct_sale_days_30)
         adjusted_daily_sales_31_60d = guarded_daily_sales(prior_units_sold_30, 30, prior_active_days_30)
         
         # Blend 14d, 15-30d, and 31-60d velocities for sensitivity plus stability.
@@ -389,6 +409,21 @@ def process_recommendations(
             "raw_units_sold_60d": total_units_sold_60,
             "raw_units_sold_15_30d": mid_units_sold_16,
             "raw_units_sold_31_60d": prior_units_sold_30,
+            "days_out_of_stock_14": days_out_of_stock_14,
+            "active_days_14": active_days_14,
+            "distinct_sale_days_14": distinct_sale_days_14,
+            "days_out_of_stock_30": days_out_of_stock_30,
+            "active_days_30": active_days_30,
+            "distinct_sale_days_30": distinct_sale_days_30,
+            "days_out_of_stock_15_30": mid_days_out_of_stock_16,
+            "active_days_15_30": mid_active_days_16,
+            "distinct_sale_days_15_30": mid_distinct_sale_days_16,
+            "days_out_of_stock_60": days_out_of_stock_60,
+            "active_days_60": active_days_60,
+            "distinct_sale_days_60": distinct_sale_days_60,
+            "days_out_of_stock_31_60": prior_days_out_of_stock_30,
+            "active_days_31_60": prior_active_days_30,
+            "distinct_sale_days_31_60": prior_distinct_sale_days_30,
             "forecast_14d": round(adjusted_daily_sales_14d * 14, 1),
             "forecast_30d": round(adjusted_daily_sales_30d * 30, 1), # Stockout-adjusted 30d demand
             "forecast_15_30d": round(adjusted_daily_sales_15_30d * 16, 1),

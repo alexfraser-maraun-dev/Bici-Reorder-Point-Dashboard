@@ -22,6 +22,9 @@ def item_row(item_id, sku, vendor_id, vendor="Shimano", brand="Shimano", locatio
         "total_units_sold_14": 14,
         "total_units_sold_30": 30,
         "total_units_sold_60": 60,
+        "distinct_sale_days_14": 14,
+        "distinct_sale_days_30": 30,
+        "distinct_sale_days_60": 60,
         "days_out_of_stock_14": 0,
         "days_out_of_stock_30": 0,
         "days_out_of_stock_60": 0,
@@ -180,7 +183,7 @@ class IdentityFieldsTest(unittest.TestCase):
     def test_momentum_statuses_are_classified(self):
         cases = [
             ("surging", 28, 36, 42),
-            ("rising", 12, 28, 44),
+            ("rising", 20, 36, 63),
             ("spiky", 2, 3, 4),
             ("cooling", 7, 31, 91),
             ("flat", 14, 30, 60),
@@ -207,6 +210,53 @@ class IdentityFieldsTest(unittest.TestCase):
                 self.assertEqual(rows[0]["momentum_status"], expected_status)
                 self.assertIn("momentum_label", rows[0])
                 self.assertIn("momentum_reason", rows[0])
+
+    def test_negative_inventory_sales_days_guard_adjusted_14d_demand(self):
+        row = item_row(29070, "NEG-SALES", 55)
+        row["total_units_sold_14"] = 6
+        row["total_units_sold_30"] = 6
+        row["total_units_sold_60"] = 6
+        row["days_out_of_stock_14"] = 11
+        row["days_out_of_stock_30"] = 11
+        row["days_out_of_stock_60"] = 11
+        row["distinct_sale_days_14"] = 4
+        row["distinct_sale_days_30"] = 4
+        row["distinct_sale_days_60"] = 4
+
+        rows = process_recommendations(
+            [row],
+            [{"vendor_id": 55, "location_id": 3, "lead_time_days": 8}],
+            safety_days=0,
+            override_forecast=60,
+            weight_14d=1,
+            weight_15_30d=0,
+            weight_31_60d=0,
+            adjustment_mode="shrink",
+        )
+
+        self.assertEqual(rows[0]["active_days_14"], 4)
+        self.assertEqual(rows[0]["days_out_of_stock_14"], 11)
+        self.assertEqual(rows[0]["distinct_sale_days_14"], 4)
+        self.assertEqual(rows[0]["forecast_14d"], 14.6)
+
+    def test_rising_requires_stronger_multi_window_evidence(self):
+        row = item_row(1001, "WEAK-RISE", 55)
+        row["total_units_sold_14"] = 16
+        row["total_units_sold_30"] = 28
+        row["total_units_sold_60"] = 56
+
+        rows = process_recommendations(
+            [row],
+            [{"vendor_id": 55, "location_id": 3, "lead_time_days": 8}],
+            safety_days=0,
+            override_forecast=60,
+            weight_14d=0.4,
+            weight_15_30d=0.4,
+            weight_31_60d=0.2,
+            adjustment_mode="shrink",
+        )
+
+        self.assertEqual(rows[0]["momentum_status"], "flat")
 
     def test_invalid_demand_weights_are_rejected(self):
         with self.assertRaises(ValueError):

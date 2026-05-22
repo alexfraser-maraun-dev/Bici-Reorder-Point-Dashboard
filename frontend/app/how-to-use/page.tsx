@@ -142,7 +142,7 @@ export default function HowToUsePage() {
           <CardContent className="grid gap-6 md:grid-cols-3">
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Adjusted Demand</h4>
-              <p className="text-sm">Raw sales are adjusted for active in-stock days, then passed through the selected stockout adjustment guardrail.</p>
+              <p className="text-sm">Raw sales are adjusted for active in-stock days, then passed through the selected stockout adjustment guardrail. Negative QOH remains visible, but effective active days never fall below distinct sale days or a 3-day minimum.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Demand Weighting</h4>
@@ -150,7 +150,7 @@ export default function HowToUsePage() {
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Momentum</h4>
-              <p className="text-sm">Flags short-term demand shape as surging, rising, spiky, flat, cooling, or limited data. It explains demand behavior but does not replace inventory status.</p>
+              <p className="text-sm">Flags short-term demand shape as surging, rising, spiky, flat, cooling, or limited data. Rising requires stronger multi-window evidence and does not replace inventory status.</p>
             </div>
             <div className="space-y-1">
               <h4 className="font-bold text-xs uppercase text-muted-foreground">Shrink Adjustment</h4>

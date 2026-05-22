@@ -245,6 +245,58 @@ function AdjustedDemandTooltip({ period }: { period: '14d' | '30d' | '60d' }) {
   )
 }
 
+function DemandCell({
+  item,
+  rawKey,
+  adjustedKey,
+  period,
+  activeKey,
+  oosKey,
+  distinctSaleDaysKey,
+}: {
+  item: any
+  rawKey: string
+  adjustedKey: string
+  period: '14d' | '30d' | '60d'
+  activeKey: string
+  oosKey: string
+  distinctSaleDaysKey: string
+}) {
+  const rawValue = item[rawKey] ?? 0
+  const adjustedValue = item[adjustedKey] ?? 0
+  const activeDays = item[activeKey]
+  const oosDays = item[oosKey]
+  const distinctSaleDays = item[distinctSaleDaysKey]
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div className="flex cursor-help flex-col items-end leading-tight">
+          <span className="text-[11px]">{rawValue}</span>
+          <span className="text-[9px] text-blue-500">{adjustedValue} adj</span>
+        </div>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-80 space-y-1.5 p-3 text-left">
+        <div className="font-bold">{period} demand context</div>
+        <div>Raw sales: <span className="font-mono">{rawValue}</span></div>
+        <div>Adjusted demand: <span className="font-mono">{adjustedValue}</span></div>
+        {activeDays !== undefined && (
+          <div>Effective active days: <span className="font-mono">{activeDays}</span></div>
+        )}
+        {oosDays !== undefined && (
+          <div>QOH OOS days: <span className="font-mono">{oosDays}</span></div>
+        )}
+        {distinctSaleDays !== undefined && (
+          <div>Distinct sale days: <span className="font-mono">{distinctSaleDays}</span></div>
+        )}
+        <div className="border-t border-background/20 pt-1 text-background/80">
+          Effective active days are capped by in-stock days, distinct sale days, and a 3-day minimum so negative inventory does not overinflate adjusted demand.
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 interface SheetsReplenishmentProps {
   data: any
   isLoading: boolean
@@ -997,22 +1049,37 @@ export function SheetsReplenishment({
                         </div>
                       </TableCell>
                       <TableCell className="text-right font-mono tabular-nums bg-blue-50/5">
-                        <div className="flex flex-col items-end leading-tight">
-                          <span className="text-[11px]">{item.raw_units_sold_14d}</span>
-                          <span className="text-[9px] text-blue-500">{item.forecast_14d} adj</span>
-                        </div>
+                        <DemandCell
+                          item={item}
+                          rawKey="raw_units_sold_14d"
+                          adjustedKey="forecast_14d"
+                          period="14d"
+                          activeKey="active_days_14"
+                          oosKey="days_out_of_stock_14"
+                          distinctSaleDaysKey="distinct_sale_days_14"
+                        />
                       </TableCell>
                       <TableCell className="text-right font-mono tabular-nums bg-blue-50/5">
-                        <div className="flex flex-col items-end leading-tight">
-                          <span className="text-[11px]">{item.raw_units_sold_30d}</span>
-                          <span className="text-[9px] text-blue-500">{item.forecast_30d} adj</span>
-                        </div>
+                        <DemandCell
+                          item={item}
+                          rawKey="raw_units_sold_30d"
+                          adjustedKey="forecast_30d"
+                          period="30d"
+                          activeKey="active_days_30"
+                          oosKey="days_out_of_stock_30"
+                          distinctSaleDaysKey="distinct_sale_days_30"
+                        />
                       </TableCell>
                       <TableCell className="text-right font-mono tabular-nums bg-blue-50/5 border-r">
-                        <div className="flex flex-col items-end leading-tight">
-                          <span className="text-[11px]">{item.raw_units_sold_60d}</span>
-                          <span className="text-[9px] text-blue-500">{item.forecast_60d} adj</span>
-                        </div>
+                        <DemandCell
+                          item={item}
+                          rawKey="raw_units_sold_60d"
+                          adjustedKey="forecast_60d"
+                          period="60d"
+                          activeKey="active_days_60"
+                          oosKey="days_out_of_stock_60"
+                          distinctSaleDaysKey="distinct_sale_days_60"
+                        />
                       </TableCell>
                       <TableCell className="text-right font-mono text-[11px] tabular-nums">
                         <span className={cn(item.on_hand <= item.recommended_reorder_point && item.recommended_reorder_point > 0 && "text-red-500 font-bold")}>

@@ -14,6 +14,9 @@ export interface SkuLocationRow {
   avgDailySales: number
   rawUnitsSold14d?: number
   adjustedDailySales14d?: number
+  daysOutOfStock14?: number
+  activeDays14?: number
+  distinctSaleDays14?: number
   momentumStatus?: 'surging' | 'rising' | 'spiky' | 'flat' | 'cooling' | 'insufficient_data'
   momentumLabel?: string
   momentumRank?: number
