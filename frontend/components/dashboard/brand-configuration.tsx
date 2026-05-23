@@ -61,8 +61,8 @@ export function BrandConfiguration() {
 
   const brands = brandData?.data || []
   const vendors = vendorData?.data || []
-  const isLoading = brandsLoading || vendorsLoading
-  const hasLoadError = brandsError || vendorsError
+  const isLoading = brandsLoading
+  const hasLoadError = brandsError
 
   useEffect(() => {
     if (brands.length > 0) {
@@ -193,6 +193,11 @@ export function BrandConfiguration() {
             </Button>
           </div>
         </div>
+        {vendorsError && (
+          <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            Vendor options could not be loaded. Brand rows are still available, but preferred vendor changes need the vendor list.
+          </div>
+        )}
       </div>
 
       <div className="overflow-auto flex-1">
@@ -257,9 +262,10 @@ export function BrandConfiguration() {
                       <Select
                         value={draft.preferredVendorId}
                         onValueChange={(value) => setDraftVendor(brand.brand_name, value)}
+                        disabled={Boolean(vendorsError) || vendorsLoading || vendors.length === 0}
                       >
                         <SelectTrigger className="h-9 w-full">
-                          <SelectValue placeholder="Select preferred vendor" />
+                          <SelectValue placeholder={vendorsError ? 'Vendor options unavailable' : 'Select preferred vendor'} />
                         </SelectTrigger>
                         <SelectContent>
                           {vendors.map((vendor: any) => (

@@ -337,19 +337,21 @@ def fetch_active_vendor_lead_times(active_days: int = 90, force_refresh: bool = 
                 shop_id AS location_id,
                 TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY) AS lead_time_day,
                 order_id,
-                po_ordered_at
+                po_ordered_at,
+                first_received_at
             FROM `{LS_DATASET}.po_report`
             WHERE vendor_id IS NOT NULL
                 AND po_ordered_at IS NOT NULL
                 AND first_received_at IS NOT NULL
-                AND DATE(po_ordered_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @active_days DAY)
+                AND DATE(first_received_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @active_days DAY)
                 AND TIMESTAMP_DIFF(first_received_at, po_ordered_at, DAY) BETWEEN 0 AND 40
         ),
         active_vendors AS (
             SELECT
                 vendor_id,
                 COUNT(DISTINCT order_id) AS active_po_count,
-                MAX(po_ordered_at) AS last_po_ordered_at
+                COUNT(DISTINCT order_id) AS active_sample_count,
+                MAX(first_received_at) AS last_po_ordered_at
             FROM lead_time_samples
             GROUP BY vendor_id
         ),

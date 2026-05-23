@@ -40,6 +40,7 @@ class BrandSourcingTest(unittest.TestCase):
             {
                 "vendor_id": "55",
                 "active_po_count": 3,
+                "active_sample_count": 3,
                 "last_po_ordered_at": "2026-05-01T12:00:00",
                 "location_lead_times": [
                     {"location_id": 3, "lead_time_days": 8, "po_count": 2},
@@ -60,6 +61,7 @@ class BrandSourcingTest(unittest.TestCase):
         self.assertEqual(rows[0]["configured_brands"], ["Shimano"])
         query_text = client.calls[-1]["query"]
         self.assertIn("DATE_SUB(CURRENT_DATE(), INTERVAL @active_days DAY)", query_text)
+        self.assertIn("DATE(first_received_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @active_days DAY)", query_text)
         self.assertIn("PERCENTILE_CONT(lead_time_day, 0.5)", query_text)
         self.assertIn("first_received_at IS NOT NULL", query_text)
         self.assertNotIn("ANY_VALUE(vendor_name)", query_text)
@@ -76,6 +78,7 @@ class BrandSourcingTest(unittest.TestCase):
             {
                 "vendor_id": "99",
                 "active_po_count": 1,
+                "active_sample_count": 1,
                 "last_po_ordered_at": None,
                 "location_lead_times": [],
             }
@@ -99,6 +102,7 @@ class BrandSourcingTest(unittest.TestCase):
             {
                 "vendor_id": "55",
                 "active_po_count": 3,
+                "active_sample_count": 3,
                 "last_po_ordered_at": None,
                 "location_lead_times": [],
             }

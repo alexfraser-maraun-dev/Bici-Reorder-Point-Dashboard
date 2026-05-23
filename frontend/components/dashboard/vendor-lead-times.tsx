@@ -89,8 +89,8 @@ export function VendorLeadTimes() {
           <TableHeader className="bg-muted/50 sticky top-0 z-10 backdrop-blur-sm">
             <TableRow>
               <TableHead className="min-w-[230px]">Vendor</TableHead>
-              <TableHead className="text-center">Active POs</TableHead>
-              <TableHead className="text-center">Last PO</TableHead>
+              <TableHead className="text-center">Samples</TableHead>
+              <TableHead className="text-center">Last Received</TableHead>
               {LOCATION_COLUMNS.map((location) => (
                 <TableHead key={`${location.key}-lead`} className="text-center">
                   {location.label} Lead
