@@ -653,7 +653,8 @@ def fetch_inventory_snapshot() -> pd.DataFrame:
     return client.query(query).to_dataframe()
 
 _bq_lead_time_cache = {}
-ADMIN_CACHE_TTL_SECONDS = 900
+CACHE_TTL = 300          # 5 minutes — tagged items, lead times
+ADMIN_CACHE_TTL_SECONDS = 900  # 15 minutes — brand sourcing rules, active vendor lead times
 _active_vendor_lead_time_cache = {}
 _brand_sourcing_rules_cache = {}
 _brand_sourcing_rules_map_cache = {}
@@ -819,7 +820,6 @@ def fetch_unified_metrics(trailing_days: int = 60) -> pd.DataFrame:
     return client.query(query, job_config=job_config).to_dataframe()
 
 _bq_tag_cache = {}
-CACHE_TTL = 300 # 5 minutes
 
 def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: bool = False) -> pd.DataFrame:
     """

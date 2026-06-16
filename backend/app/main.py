@@ -19,6 +19,12 @@ from fastapi.responses import Response, RedirectResponse
 def build_lightspeed_item_url(item_id: str) -> str:
     return f"https://us.merchantos.com/?name=item.views.item&form_name=view&id={item_id}&tab=details"
 
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(float(value)) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
 def to_json_safe(value):
     if isinstance(value, list):
         return [to_json_safe(item) for item in value]
@@ -156,6 +162,15 @@ def get_replenishment_data(
             weight_15_30d = 0.4
             weight_31_60d = 0.2
 
+        if safety_days < 0:
+            raise HTTPException(status_code=400, detail="safety_days must be 0 or greater.")
+        if forecast_period is not None and forecast_period <= 0:
+            raise HTTPException(status_code=400, detail="forecast_period must be a positive integer.")
+        if growth_multiplier <= 0:
+            raise HTTPException(status_code=400, detail="growth_multiplier must be greater than 0.")
+        if adjustment_mode not in ("shrink", "grow"):
+            raise HTTPException(status_code=400, detail="adjustment_mode must be 'shrink' or 'grow'.")
+
         # 1. Fetch BigQuery Data & Lead Times
         from app.services.bigquery_sync import (
             fetch_tagged_items_metrics,
@@ -167,11 +182,7 @@ def get_replenishment_data(
         # In a real production scenario, caching this result is recommended.
         raw_data = fetch_tagged_items_metrics("auto-replen", force_refresh=force_refresh).to_dict(orient="records")
         lead_times = fetch_lead_times().to_dict(orient="records")
-        try:
-            brand_sourcing_rules = get_brand_sourcing_rules_map()
-        except Exception as e:
-            print(f"Failed to fetch brand sourcing rules for replenishment data: {e}")
-            brand_sourcing_rules = {}
+        brand_sourcing_rules = get_brand_sourcing_rules_map()
         
         # 1.5 Fetch Overrides
         overrides = get_sku_overrides()
@@ -285,10 +296,10 @@ def push_replenishment_updates(updates: List[Dict[str, Any]]):
         log_data = {
             "sku": str(update.get('sku')),
             "location_id": str(update.get('location')),
-            "old_reorder_point": int(update.get('current_reorder_point') or 0),
-            "new_reorder_point": int(update.get('recommended_reorder_point') or 0),
-            "old_desired_inventory": int(update.get('current_desired_level') or 0),
-            "new_desired_inventory": int(update.get('recommended_desired_level') or 0),
+            "old_reorder_point": _safe_int(update.get('current_reorder_point')),
+            "new_reorder_point": _safe_int(update.get('recommended_reorder_point')),
+            "old_desired_inventory": _safe_int(update.get('current_desired_level')),
+            "new_desired_inventory": _safe_int(update.get('recommended_desired_level')),
             "triggered_by": triggered_by,
             "status": "success" if success else "failed",
             "error_message": None if success else "Lightspeed API Write Failure",
