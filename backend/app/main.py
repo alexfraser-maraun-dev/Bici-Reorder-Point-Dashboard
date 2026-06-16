@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import os
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from app.services.bigquery_sync import (
@@ -32,10 +33,13 @@ def to_json_safe(value):
 # App initialization
 app = FastAPI(title="SKU Reorder Point Automation API")
 
-# Setup CORS for frontend
+# Setup CORS for frontend — restrict to known origins via env var
+_raw_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:3002,http://127.0.0.1:3002")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Update this in production
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -343,16 +347,6 @@ def save_override(override: Dict[str, Any]):
     upsert_sku_override(override)
     return {"status": "success"}
 
-@app.get("/api/replenishment/vendor-lead-times")
-def get_vendor_lead_times():
-    spreadsheet_id = "1awrwQd7D_XFq0R6n03kSxMMPsyrU0rVBCjLC_u7-5ak"
-    try:
-        from app.services import google_sheets
-        data = google_sheets.fetch_vendor_lead_times(spreadsheet_id)
-        return {"status": "success", "data": data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/replenishment/active-vendor-lead-times")
 def get_active_vendor_lead_times(force_refresh: bool = False):
     try:
@@ -413,26 +407,6 @@ def check_bigquery_health():
     except Exception as e:
         print(f"BigQuery health check failed: {e}")
         raise HTTPException(status_code=503, detail="Disconnected from BigQuery")
-
-@app.get("/api/health/sheets")
-def check_sheets_health():
-    import concurrent.futures
-    try:
-        from app.services.google_sheets import get_gspread_client
-        
-        # Use a thread pool to enforce a timeout on the gspread initialization
-        # which can hang if it tries to refresh tokens on a slow network
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(get_gspread_client)
-            client = future.result(timeout=5) # 5 second timeout
-            
-        if client:
-            return {"status": "connected"}
-        else:
-            raise Exception("Failed to initialize gspread client")
-    except Exception as e:
-        print(f"Google Sheets health check failed: {e}")
-        raise HTTPException(status_code=503, detail="Disconnected from Google Sheets")
 
 @app.get("/api/replenishment/ls-link/{item_id}")
 def get_lightspeed_link(item_id: str):

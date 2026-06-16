@@ -189,13 +189,6 @@ export function useManagedSkus() {
   return { data: data || [], isLoading, error, refetch: mutate }
 }
 
-// Hook for vendor lead times
-export function useVendorLeadTimes() {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-  const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/vendor-lead-times`, fetcher)
-  return { data: data || null, isLoading, error, refetch: mutate }
-}
-
 export function useActiveVendorLeadTimes() {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
   const url = `${baseUrl}/api/replenishment/active-vendor-lead-times`
