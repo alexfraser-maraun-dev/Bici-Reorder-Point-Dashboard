@@ -211,6 +211,7 @@ export interface CoverageMonth {
 
 export interface CoverageRow {
   sku: string
+  lightspeed_item_id?: string | null
   product: string
   location: string
   weeks_of_cover: CoverageMonth[]
@@ -225,4 +226,72 @@ export interface KpiSummary {
   overrides: number
   readyToPush: number
   failedWritebacks: number
+}
+
+// ---------------------------------------------------------------------------
+// Special Orders
+// ---------------------------------------------------------------------------
+
+// Aging bucket computed server-side from the attached PO's expected (arrival) date
+// and receiving state. See backend special_order_service._compute_aging.
+export type AgingBucket =
+  | 'on_track'   // PO expected in the future
+  | 'due_soon'   // expected within ~3 days
+  | 'overdue'    // 1–7 days past expected, receiving not started
+  | 'critical'   // 8–14 days past expected
+  | 'stale'      // 15+ days past expected
+  | 'no_eta'     // PO exists but has no expected date
+  | 'no_po'      // special order not yet attached to a PO
+  | 'receiving'  // receiving has started (no longer awaiting vendor)
+  | 'received'   // PO fully received
+
+export interface SpecialOrder {
+  special_order_id: string
+  status: string
+  unit_quantity: string | null
+  shop_id: string | null
+  store: string | null
+  timestamp: string | null
+  contacted: boolean
+  completed: boolean
+  // Customer
+  customer_id: string | null
+  customer_name: string | null
+  customer_phone: string | null
+  // Item / product
+  item_id: string | null
+  system_sku: string | null
+  description: string | null
+  // Attached purchase order
+  order_id: string | null
+  vendor_id: string | null
+  vendor_name: string | null
+  expected_date: string | null
+  po_complete: boolean
+  received_started: boolean
+  // Derived overdue / aging
+  is_overdue: boolean
+  days_overdue: number | null
+  aging_bucket: AgingBucket
+  no_eta: boolean
+  ready_not_called: boolean
+  // Deep links into Lightspeed
+  ls_item_url: string | null
+  ls_customer_url: string | null
+  ls_order_url: string | null
+}
+
+export interface SpecialOrderSummary {
+  total_open: number
+  overdue: number
+  critical: number
+  no_eta: number
+  ready_not_called: number
+  by_bucket: Record<string, number>
+}
+
+export interface SpecialOrderDashboard {
+  orders: SpecialOrder[]
+  summary: SpecialOrderSummary
+  fetched_at?: string
 }

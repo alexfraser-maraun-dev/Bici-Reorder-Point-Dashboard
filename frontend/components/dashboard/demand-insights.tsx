@@ -17,7 +17,14 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import { TrendingUp, AlertCircle, RefreshCw, LayoutGrid } from 'lucide-react'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { TrendingUp, AlertCircle, RefreshCw, LayoutGrid, MapPin } from 'lucide-react'
 
 const MONTH_LABELS = [
   'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -26,6 +33,14 @@ const MONTH_LABELS = [
 
 const TOP_LEVEL = 'category_top_level'
 const MAX_DEFAULT_SELECTED = 4
+
+// Lightspeed shop ids; '' = all locations pooled.
+const LOCATIONS = [
+  { value: '', label: 'All locations' },
+  { value: '3', label: 'Bici Adanac' },
+  { value: '2', label: 'Victoria' },
+  { value: '20', label: 'Langford' },
+]
 
 function indexFor(profile: SeasonalProfile, monthNumber: number): number {
   return profile.indices[String(monthNumber)] ?? profile.indices[monthNumber] ?? 1
@@ -48,8 +63,11 @@ function peakTrough(profile: SeasonalProfile) {
 }
 
 export function DemandInsights() {
-  const { data, isLoading, error, refetch } = useSeasonalProfiles()
+  const [location, setLocation] = useState('')
+  const { data, isLoading, error, refetch } = useSeasonalProfiles(location)
   const [selected, setSelected] = useState<string[] | null>(null)
+  // Category the history+forecast chart drills into (click a table row to set it).
+  const [focusOverride, setFocusOverride] = useState<string | null>(null)
 
   // Top-level categories, highest volume first — these carry the clearest signal.
   const topLevelProfiles: SeasonalProfile[] = useMemo(() => {
@@ -78,9 +96,13 @@ export function DemandInsights() {
     )
   }
 
-  // Forward forecast for the first selected category (the "lens" the buyer is on).
-  const focusCategory = selectedProfiles[0]?.category_label ?? null
-  const { data: focusHistory, isLoading: focusLoading } = useDemandHistory('category', focusCategory)
+  // The category the forecast chart drills into: the clicked one if it's still
+  // selected, otherwise the highest-volume selected category.
+  const focusCategory =
+    (focusOverride && effectiveSelected.includes(focusOverride) ? focusOverride : null) ??
+    selectedProfiles[0]?.category_label ??
+    null
+  const { data: focusHistory, isLoading: focusLoading } = useDemandHistory('category', focusCategory, location)
   const focusPayload = focusHistory?.data
   const focusHistoryPoints: DemandHistoryPoint[] = focusPayload?.history ?? []
   const focusForecast: ForecastPoint[] = focusPayload?.forecast ?? []
@@ -88,7 +110,7 @@ export function DemandInsights() {
   const focusReferenceMonth = focusHistory?.meta?.reference_month ?? new Date().getMonth() + 1
 
   // Forward coverage heatmap (soonest stockouts first).
-  const { data: coverageData, isLoading: coverageLoading } = useCoverage()
+  const { data: coverageData, isLoading: coverageLoading } = useCoverage(location)
   const coverageRows: CoverageRow[] = coverageData?.data?.rows ?? []
   const coverageReferenceMonth = coverageData?.meta?.reference_month ?? new Date().getMonth() + 1
 
@@ -106,10 +128,25 @@ export function DemandInsights() {
             </p>
           </div>
         </div>
-        <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading}>
-          <RefreshCw className="mr-2 h-4 w-4" />
-          Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          <Select value={location || 'all'} onValueChange={(v) => setLocation(v === 'all' ? '' : v)}>
+            <SelectTrigger className="h-9 w-[170px]">
+              <MapPin className="mr-1 h-3.5 w-3.5 text-muted-foreground" />
+              <SelectValue placeholder="All locations" />
+            </SelectTrigger>
+            <SelectContent>
+              {LOCATIONS.map((loc) => (
+                <SelectItem key={loc.value || 'all'} value={loc.value || 'all'}>
+                  {loc.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            Refresh
+          </Button>
+        </div>
       </div>
 
       {isLoading ? (
@@ -165,7 +202,7 @@ export function DemandInsights() {
             <Table>
               <TableHeader className="bg-muted/50">
                 <TableRow>
-                  <TableHead className="min-w-[160px]">Category</TableHead>
+                  <TableHead className="min-w-[160px]">Category <span className="text-muted-foreground font-normal">(click to drill into forecast)</span></TableHead>
                   <TableHead className="text-center">Peak</TableHead>
                   <TableHead className="text-center">Trough</TableHead>
                   <TableHead className="text-right">Units (3yr)</TableHead>
@@ -186,9 +223,17 @@ export function DemandInsights() {
                 ) : (
                   selectedProfiles.map((profile) => {
                     const pt = peakTrough(profile)
+                    const isFocused = profile.category_label === focusCategory
                     return (
-                      <TableRow key={profile.category_label} className="hover:bg-muted/30 transition-colors">
-                        <TableCell className="text-xs font-semibold">{profile.category_label}</TableCell>
+                      <TableRow
+                        key={profile.category_label}
+                        onClick={() => setFocusOverride(profile.category_label)}
+                        className={`cursor-pointer transition-colors ${isFocused ? 'bg-emerald-50 hover:bg-emerald-50' : 'hover:bg-muted/30'}`}
+                      >
+                        <TableCell className="text-xs font-semibold">
+                          <span className={isFocused ? 'text-emerald-700' : ''}>{profile.category_label}</span>
+                          {isFocused && <span className="text-muted-foreground ml-1.5 font-normal">• in chart below</span>}
+                        </TableCell>
                         <TableCell className="text-center text-xs">
                           <span className="font-medium text-emerald-600">{pt.peak}</span>
                           <span className="text-muted-foreground ml-1 tabular-nums">

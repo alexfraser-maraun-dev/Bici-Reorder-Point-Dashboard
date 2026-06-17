@@ -22,6 +22,8 @@ function cellClass(risk: string): string {
   }
 }
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+
 interface CoverageHeatmapProps {
   rows: CoverageRow[]
   referenceMonth: number
@@ -68,7 +70,19 @@ export function CoverageHeatmap({ rows, referenceMonth, isLoading }: CoverageHea
             {rows.map((row) => (
               <tr key={`${row.sku}-${row.location}`} className="border-t">
                 <td className="max-w-[220px] px-2 py-1">
-                  <div className="truncate font-medium" title={row.product}>{row.product}</div>
+                  {row.lightspeed_item_id ? (
+                    <a
+                      href={`${API_BASE}/api/replenishment/ls-link/${row.lightspeed_item_id}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="block truncate font-medium hover:text-blue-600 hover:underline"
+                      title={`Open ${row.product} in Lightspeed`}
+                    >
+                      {row.product}
+                    </a>
+                  ) : (
+                    <div className="truncate font-medium" title={row.product}>{row.product}</div>
+                  )}
                   <div className="text-muted-foreground flex items-center gap-1.5 font-mono text-[9px]">
                     <span className="bg-muted rounded px-1">{row.sku}</span>
                     <span>{row.location}</span>

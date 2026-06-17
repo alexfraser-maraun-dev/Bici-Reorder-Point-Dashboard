@@ -406,17 +406,19 @@ def save_brand_sourcing_rule(rule: Dict[str, Any]):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/forecast/seasonal-profiles")
-def get_seasonal_profiles(years: int = 3, smoothing: float = 0.0):
+def get_seasonal_profiles(years: int = 3, smoothing: float = 0.0, location: str = None):
     try:
         from app.services.bigquery_sync import fetch_monthly_sales_history
         from app.services.forecasting import build_seasonal_profile_response
         df = fetch_monthly_sales_history(years=years)
+        if location is not None and len(df) and "location_id" in df.columns:
+            df = df[df["location_id"].astype(str) == str(location)]
         records = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
         profiles = build_seasonal_profile_response(records, smoothing=smoothing)
         return {
             "status": "success",
             "data": to_json_safe(profiles),
-            "meta": {"years": years, "category_count": len(profiles)},
+            "meta": {"years": years, "category_count": len(profiles), "location": location},
         }
     except Exception as e:
         import traceback
@@ -491,11 +493,16 @@ def get_demand_history(
             )
         ]
 
-        reference_month = datetime.now().month
+        # History ends at the last COMPLETE month, so the forecast starts at the
+        # current (in-progress) month -- the two stay contiguous with no gap.
+        current_month = datetime.now().month
+        last_complete_month = current_month - 1 or 12
         forecast = project_monthly_forecast(
-            own_totals, months_observed, indices, reference_month, horizon_months=horizon_months
+            own_totals, months_observed, indices, last_complete_month, horizon_months=horizon_months
         )
-        window = lead_time_window_months(reference_month, lead_time_days, coverage_days)
+        # The PO-coverage window is anchored to TODAY (a PO placed now), not the
+        # forecast's last-complete-month anchor.
+        window = lead_time_window_months(current_month, lead_time_days, coverage_days)
 
         return {
             "status": "success",
@@ -508,7 +515,7 @@ def get_demand_history(
                 "scope": scope,
                 "id": id,
                 "months_observed": months_observed,
-                "reference_month": reference_month,
+                "reference_month": last_complete_month,
             },
         }
     except HTTPException:
@@ -558,10 +565,15 @@ def get_forward_coverage(
         for lf in ("category_top_level", "category_level_2", "category_path"):
             merged_profiles.update(profiles.get(lf, {}))
 
-        reference_month = datetime.now().month
+        # Forecast from the last complete month so the projection lines up with the
+        # history+forecast chart (which excludes the in-progress month).
+        last_complete_month = datetime.now().month - 1 or 12
+        # Location filter accepts a Lightspeed shop id; map it to the rec's name.
+        shop_map = {3: "Bici Adanac", 2: "Victoria", 20: "Langford"}
+        target_location = shop_map.get(_safe_int(location)) if location is not None else None
         rows = []
         for rec in recommendations:
-            if location is not None and str(rec.get("location")) != str(location):
+            if target_location is not None and rec.get("location") != target_location:
                 continue
             indices = merged_profiles.get(rec.get("category"))
             cover = project_weeks_of_cover(
@@ -569,11 +581,12 @@ def get_forward_coverage(
                 on_order=rec.get("on_order") or 0,
                 daily_velocity=rec.get("daily_sales") or 0,
                 indices=indices,
-                reference_month=reference_month,
+                reference_month=last_complete_month,
                 horizon_months=horizon_months,
             )
             rows.append({
                 "sku": rec.get("sku"),
+                "lightspeed_item_id": rec.get("lightspeed_item_id"),
                 "product": rec.get("description"),
                 "location": rec.get("location"),
                 "weeks_of_cover": cover,
@@ -592,7 +605,7 @@ def get_forward_coverage(
         return {
             "status": "success",
             "data": {"rows": to_json_safe(rows)},
-            "meta": {"reference_month": reference_month, "row_count": len(rows)},
+            "meta": {"reference_month": last_complete_month, "row_count": len(rows)},
         }
     except HTTPException:
         raise
@@ -794,3 +807,40 @@ def check_bigquery_health():
 @app.get("/api/replenishment/ls-link/{item_id}")
 def get_lightspeed_link(item_id: str):
     return RedirectResponse(url=build_lightspeed_item_url(item_id))
+
+
+# In-process TTL cache so each Special Order page load doesn't re-walk the whole
+# Lightspeed SO graph (and hit rate limits). The frontend "Sync" button passes
+# refresh=true to force a live re-fetch.
+_special_orders_cache: Dict[str, Any] = {"data": None, "fetched_at": 0.0}
+_SPECIAL_ORDERS_TTL_SECONDS = 90
+
+
+@app.get("/api/special-orders")
+def get_special_orders(refresh: bool = False):
+    """
+    Returns open special orders with derived overdue/aging fields and the summary
+    counts that drive the dashboard KPIs:
+      { "orders": [...], "summary": {...}, "fetched_at": <iso8601> }
+    """
+    import time
+    from app.services.special_order_service import get_special_order_dashboard
+
+    now = time.time()
+    cached = _special_orders_cache.get("data")
+    if (
+        not refresh
+        and cached is not None
+        and (now - _special_orders_cache.get("fetched_at", 0.0)) < _SPECIAL_ORDERS_TTL_SECONDS
+    ):
+        return cached
+
+    try:
+        result = get_special_order_dashboard()
+        result["fetched_at"] = datetime.utcnow().isoformat() + "Z"
+        _special_orders_cache["data"] = result
+        _special_orders_cache["fetched_at"] = now
+        return result
+    except Exception as e:
+        print(f"Error building special-order dashboard: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

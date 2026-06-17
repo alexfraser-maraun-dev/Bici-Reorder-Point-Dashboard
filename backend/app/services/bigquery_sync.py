@@ -792,6 +792,10 @@ def fetch_monthly_sales_history(years: int = 3) -> pd.DataFrame:
             `{LS_DATASET}.sales_master_view`
         WHERE
             sale_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @years YEAR)
+            -- Exclude the in-progress current month: a partial month must never be
+            -- treated as a complete one (it would deflate seasonal indices, the
+            -- monthly baseline, and the last history bar).
+            AND sale_date < DATE_TRUNC(CURRENT_DATE(), MONTH)
             AND shop_id_int IN {TARGET_SHOP_IDS}
             AND NOT COALESCE(is_workorder_warranty_line, FALSE)
         GROUP BY

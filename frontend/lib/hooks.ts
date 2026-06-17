@@ -206,9 +206,14 @@ export function useBrandSourcingRules() {
 }
 
 // Demand & Seasonality: category seasonal profiles for the visualization layer.
-export function useSeasonalProfiles() {
+export function useSeasonalProfiles(location?: string | number | null) {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-  const url = `${baseUrl}/api/forecast/seasonal-profiles`
+  const params = new URLSearchParams()
+  if (location !== undefined && location !== null && location !== '') {
+    params.set('location', String(location))
+  }
+  const qs = params.toString()
+  const url = `${baseUrl}/api/forecast/seasonal-profiles${qs ? `?${qs}` : ''}`
   const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
   const refetch = () => mutate(fetcher(url), false)
   return { data: data || null, isLoading, error, refetch }
@@ -383,11 +388,32 @@ export function useConnectionStatus() {
 
       return () => clearTimeout(timeoutId)
     }
-    
+
     checkHealth()
     const interval = setInterval(checkHealth, 30000)
     return () => clearInterval(interval)
   }, [])
 
   return { lsStatus, bqStatus }
+}
+
+// Live special-order dashboard data (open SOs + derived overdue/aging + summary).
+// Mirrors the live PO-draft hooks above. `refetch()` forces a server-side re-fetch
+// from Lightspeed (bypasses the backend TTL cache).
+export function useSpecialOrders() {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const url = `${baseUrl}/api/special-orders`
+  const { data, error, mutate, isLoading } = useSWR<import('./types').SpecialOrderDashboard>(
+    url,
+    fetcher,
+    adminDashboardSWRConfig
+  )
+  return {
+    orders: data?.orders ?? [],
+    summary: data?.summary,
+    fetchedAt: data?.fetched_at,
+    isLoading,
+    error,
+    refetch: () => mutate(fetcher(`${url}?refresh=true`), false),
+  }
 }

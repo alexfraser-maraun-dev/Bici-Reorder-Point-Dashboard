@@ -8,6 +8,7 @@ import {
   History,
   FileText,
   Package,
+  PackageSearch,
   Menu,
   CircleHelp,
   LogOut,
@@ -23,6 +24,7 @@ import { useState } from 'react'
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
+  { name: 'Special Orders', href: '/special-orders', icon: PackageSearch },
   { name: 'Recommendation Runs', href: '/runs', icon: History },
   { name: 'Writeback Audit', href: '/audit', icon: FileText },
   { name: 'Managed SKUs', href: '/managed-skus', icon: Package },

@@ -12,6 +12,14 @@ LIGHTSPEED_SCOPES = ["employee:inventory", "employee:purchase_orders"]
 LIGHTSPEED_AUTHORIZE_URL = "https://cloud.lightspeedapp.com/auth/oauth/authorize"
 LIGHTSPEED_TOKEN_URL = "https://cloud.lightspeedapp.com/oauth/access_token.php"
 
+
+def _to_number(value, default: float = 0.0) -> float:
+    """Coerce a Lightspeed string/number field (e.g. "0", "2") to a float."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
 class LightspeedClient:
     def __init__(self):
         self.account_id = os.getenv("LIGHTSPEED_ACCOUNT_ID")
@@ -20,7 +28,12 @@ class LightspeedClient:
         self.refresh_token = os.getenv("LIGHTSPEED_REFRESH_TOKEN")
         self.bearer_token = os.getenv("LIGHTSPEED_BEARER_TOKEN")
         self.base_url = f"https://api.lightspeedapp.com/API/V3/Account/{self.account_id}"
-        
+        # Legacy (non-V3) API base. SpecialOrder, its relation chaining, and the
+        # Order.arrivalDate ("expected date") used by the special-order dashboard are
+        # legacy-API features not exposed by V3, so they are fetched from here while
+        # reusing the same OAuth bearer token / refresh machinery as the V3 client.
+        self.legacy_base_url = f"https://api.lightspeedapp.com/API/Account/{self.account_id}"
+
         # Mapping from Spreadsheet Names to Lightspeed shopIDs
         self.shop_id_map = {
             "Victoria": "2",
@@ -313,3 +326,157 @@ class LightspeedClient:
         else:
             print(f"  [Error] Lightspeed rejected the update request")
             return False
+
+    # ------------------------------------------------------------------
+    # Legacy-API access for the Special Order dashboard
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _as_list(value) -> List[Dict[str, Any]]:
+        """
+        Normalize a Lightspeed relation/collection field to a plain list. The API
+        returns a single object when count == 1, a list when count > 1, and omits the
+        key entirely (only an `@attributes` wrapper) when count == 0.
+        """
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]
+
+    def _legacy_request(self, method: str, path: str, params: dict = None, max_retries: int = 3) -> Optional[requests.Response]:
+        """
+        Authenticated request against the legacy (non-V3) Lightspeed API. Mirrors
+        `_request` (401 -> refresh -> retry once) but targets `legacy_base_url` and
+        additionally honors 429 rate-limit back-off via the `retry-after` header.
+        Returns the Response (caller inspects status) or None on a transport error.
+        """
+        url = f"{self.legacy_base_url}{path}"
+        for attempt in range(max_retries):
+            try:
+                headers = self._get_headers()
+                headers["Accept"] = "application/json"
+                response = requests.request(method, url, headers=headers, params=params, timeout=20)
+                if response.status_code == 401:
+                    self._refresh_access_token()
+                    headers = self._get_headers()
+                    headers["Accept"] = "application/json"
+                    response = requests.request(method, url, headers=headers, params=params, timeout=20)
+                if response.status_code == 429:
+                    retry_after = response.headers.get("retry-after", "")
+                    delay = int(retry_after) if retry_after.isdigit() else 2
+                    time.sleep(delay)
+                    continue
+                return response
+            except Exception as e:
+                print(f"Lightspeed legacy API Error ({method} {path}): {e}")
+                if attempt == max_retries - 1:
+                    return None
+                time.sleep(1)
+        return None
+
+    def get_special_orders(self, page_limit: int = 100, max_pages: int = 50) -> List[Dict[str, Any]]:
+        """
+        Pages through open (incomplete) special orders, loading the relations needed to
+        resolve item and the attached purchase order. Returns raw SpecialOrder dicts, each
+        potentially carrying SaleLine / SaleLine.Item / OrderLine. (Customer is NOT an
+        allowed relation here, so customer names are resolved separately via
+        get_customers_by_ids.)
+        """
+        relations = '["SaleLine","SaleLine.Item","OrderLine"]'
+        results: List[Dict[str, Any]] = []
+        offset = 0
+        for _ in range(max_pages):
+            params = {
+                "completed": "false",
+                "load_relations": relations,
+                "limit": str(page_limit),
+                "offset": str(offset),
+            }
+            response = self._legacy_request("GET", "/SpecialOrder.json", params=params)
+            if response is None or response.status_code != 200:
+                if response is not None:
+                    print(f"Error fetching special orders: {response.status_code} {response.text[:300]}")
+                break
+            page = self._as_list(response.json().get("SpecialOrder"))
+            results.extend(page)
+            if len(page) < page_limit:
+                break
+            offset += page_limit
+        return results
+
+    def get_orders_by_ids(self, order_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
+        """
+        Fetches the purchase orders (Order entity) behind a set of special orders and
+        returns, keyed by orderID, just the fields the overdue logic needs:
+          { orderID: { "arrivalDate", "complete", "vendor_id", "vendor_name",
+                       "received_started" } }
+        `arrivalDate` is the PO's expected date; `received_started` is True if any line
+        shows receiving progress (numReceived / checkedIn > 0).
+        """
+        unique_ids = sorted({str(o) for o in order_ids if o and str(o) != "0"})
+        order_map: Dict[str, Dict[str, Any]] = {}
+        for i in range(0, len(unique_ids), chunk_size):
+            chunk = unique_ids[i:i + chunk_size]
+            params = {
+                "orderID": f"IN,[{','.join(chunk)}]",
+                "load_relations": '["Vendor","OrderLines"]',
+                "limit": "100",
+            }
+            response = self._legacy_request("GET", "/Order.json", params=params)
+            if response is None or response.status_code != 200:
+                if response is not None:
+                    print(f"Error fetching orders: {response.status_code} {response.text[:300]}")
+                continue
+            for order in self._as_list(response.json().get("Order")):
+                order_id = str(order.get("orderID"))
+                order_lines_wrap = order.get("OrderLines")
+                lines = self._as_list(order_lines_wrap.get("OrderLine")) if isinstance(order_lines_wrap, dict) else []
+                received_started = any(
+                    _to_number(line.get("numReceived")) > 0 or _to_number(line.get("checkedIn")) > 0
+                    for line in lines
+                )
+                vendor = order.get("Vendor") or {}
+                order_map[order_id] = {
+                    "arrivalDate": order.get("arrivalDate") or None,
+                    "complete": str(order.get("complete")).lower() == "true",
+                    "vendor_id": order.get("vendorID"),
+                    "vendor_name": vendor.get("name"),
+                    "received_started": received_started,
+                }
+        return order_map
+
+    def get_customers_by_ids(self, customer_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
+        """
+        Resolves customer names/contact for a set of special orders, keyed by customerID:
+          { customerID: { "first_name", "last_name", "company", "phone" } }
+        Customer is not loadable as a relation on SpecialOrder, so it's fetched here.
+        """
+        unique_ids = sorted({str(c) for c in customer_ids if c and str(c) != "0"})
+        customer_map: Dict[str, Dict[str, Any]] = {}
+        for i in range(0, len(unique_ids), chunk_size):
+            chunk = unique_ids[i:i + chunk_size]
+            params = {
+                "customerID": f"IN,[{','.join(chunk)}]",
+                "load_relations": '["Contact"]',
+                "limit": "100",
+            }
+            response = self._legacy_request("GET", "/Customer.json", params=params)
+            if response is None or response.status_code != 200:
+                if response is not None:
+                    print(f"Error fetching customers: {response.status_code} {response.text[:300]}")
+                continue
+            for cust in self._as_list(response.json().get("Customer")):
+                cust_id = str(cust.get("customerID"))
+                contact = cust.get("Contact") or {}
+                phones = contact.get("Phones", {}).get("ContactPhone") if isinstance(contact.get("Phones"), dict) else None
+                phone = None
+                phone_list = self._as_list(phones)
+                if phone_list:
+                    phone = phone_list[0].get("number")
+                customer_map[cust_id] = {
+                    "first_name": cust.get("firstName"),
+                    "last_name": cust.get("lastName"),
+                    "company": cust.get("company"),
+                    "phone": phone,
+                }
+        return customer_map
