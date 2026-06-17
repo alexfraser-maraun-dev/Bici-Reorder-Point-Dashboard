@@ -19,6 +19,7 @@ from app.services.forecasting import (
     lead_time_window_months,
     project_monthly_forecast,
     project_weeks_of_cover,
+    _trend_factor,
 )
 
 
@@ -476,6 +477,72 @@ class ProjectMonthlyForecastTest(unittest.TestCase):
         fc = project_monthly_forecast({}, months_observed=0, indices={m: 1.0 for m in range(1, 13)},
                                       reference_month=1, horizon_months=2)
         self.assertTrue(all(p["units"] == 0.0 for p in fc))
+
+
+class ForecastGrowthTrendTest(unittest.TestCase):
+    FLAT_INDICES = {m: 1.0 for m in range(1, 13)}
+
+    def _growing_series(self, monthly_growth=1.02, base=100.0, n=24):
+        # Deseasonalizable monthly rows, oldest -> newest, growing each month.
+        series = []
+        for t in range(n):
+            series.append({
+                "year": 2024 + t // 12,
+                "month": t % 12 + 1,
+                "units": base * (monthly_growth ** t),
+            })
+        return series
+
+    def _totals(self, series):
+        totals = {}
+        for row in series:
+            totals[row["month"]] = totals.get(row["month"], 0.0) + row["units"]
+        return totals
+
+    def test_no_series_is_backward_compatible(self):
+        # Without a history series the model is the original flat baseline.
+        totals = {m: 120.0 for m in range(1, 13)}
+        fc = project_monthly_forecast(totals, 12, self.FLAT_INDICES, reference_month=1)
+        for point in fc:
+            self.assertAlmostEqual(point["units"], 120.0, places=2)
+
+    def test_growing_series_forecasts_above_flat_baseline(self):
+        series = self._growing_series(monthly_growth=1.02, n=24)
+        totals = self._totals(series)
+        flat = project_monthly_forecast(totals, 24, self.FLAT_INDICES, reference_month=12)
+        trended = project_monthly_forecast(
+            totals, 24, self.FLAT_INDICES, reference_month=12, monthly_level_series=series
+        )
+        # Anchoring on the recent run-rate + upward growth -> above the flat average.
+        self.assertGreater(trended[0]["units"], flat[0]["units"])
+        # And it keeps climbing across the horizon (flat indices, so growth only).
+        units = [p["units"] for p in trended]
+        self.assertTrue(all(units[i] <= units[i + 1] for i in range(len(units) - 1)))
+
+    def test_growth_is_damped(self):
+        # Month-over-month growth factor shrinks over the horizon (phi < 1).
+        series = self._growing_series(monthly_growth=1.03, n=24)
+        totals = self._totals(series)
+        fc = project_monthly_forecast(
+            totals, 24, self.FLAT_INDICES, reference_month=12, monthly_level_series=series
+        )
+        early = fc[1]["units"] / fc[0]["units"]
+        late = fc[11]["units"] / fc[10]["units"]
+        self.assertGreater(early, late)
+        self.assertGreater(early, 1.0)
+
+    def test_growth_ratio_is_capped(self):
+        # Absurd growth is clamped to the cap (default 1.30 annual).
+        series = self._growing_series(monthly_growth=1.20, n=24)
+        _, r = _trend_factor(series, self.FLAT_INDICES, months_observed=24)
+        self.assertAlmostEqual(r, 1.30 ** (1.0 / 12.0), places=6)
+
+    def test_shrinkage_weakens_growth_with_thin_history(self):
+        series = self._growing_series(monthly_growth=1.02, n=24)
+        _, r_full = _trend_factor(series, self.FLAT_INDICES, months_observed=24)
+        _, r_thin = _trend_factor(series, self.FLAT_INDICES, months_observed=12)
+        self.assertGreater(r_full, r_thin)
+        self.assertGreater(r_thin, 1.0)
 
 
 class ProjectWeeksOfCoverTest(unittest.TestCase):

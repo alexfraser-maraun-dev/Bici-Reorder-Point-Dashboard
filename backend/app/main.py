@@ -498,7 +498,10 @@ def get_demand_history(
         current_month = datetime.now().month
         last_complete_month = current_month - 1 or 12
         forecast = project_monthly_forecast(
-            own_totals, months_observed, indices, last_complete_month, horizon_months=horizon_months
+            own_totals, months_observed, indices, last_complete_month,
+            horizon_months=horizon_months,
+            # Anchor on recent run-rate + apply the damped/capped growth trend.
+            monthly_level_series=history,
         )
         # The PO-coverage window is anchored to TODAY (a PO placed now), not the
         # forecast's last-complete-month anchor.

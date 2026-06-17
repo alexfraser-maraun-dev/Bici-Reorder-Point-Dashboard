@@ -18,6 +18,10 @@ APP_DATASET = os.getenv("APP_DATASET", "bici-klaviyo-datasync.BiciReorderPointDa
 LS_DATASET = os.getenv("LS_DATASET", "bici-klaviyo-datasync.light_speed_retailne")
 QUALIFIED_ITEMS_VIEW = os.getenv("QUALIFIED_ITEMS_VIEW", f"{APP_DATASET}.replen_qualified_items")
 TARGET_SHOP_IDS = (2, 3, 20)
+# The business went through bankruptcy in fall 2023; sales before 2024 are
+# distorted and unreliable for forecasting. Never let history reach earlier than
+# this, so seasonal indices and the demand baseline use clean data only.
+RELIABLE_HISTORY_START = os.getenv("RELIABLE_HISTORY_START", "2024-01-01")
 CACHE_FILE = "bq_metrics_cache.json"
 CACHE_EXPIRY_SECONDS = 86400 # 24 hours
 
@@ -791,7 +795,9 @@ def fetch_monthly_sales_history(years: int = 3) -> pd.DataFrame:
         FROM
             `{LS_DATASET}.sales_master_view`
         WHERE
-            sale_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @years YEAR)
+            -- Never reach earlier than the reliable-data start (post-bankruptcy);
+            -- a plain N-year lookback would pull in distorted pre-2024 sales.
+            sale_date >= GREATEST(DATE_SUB(CURRENT_DATE(), INTERVAL @years YEAR), DATE(@reliable_start))
             -- Exclude the in-progress current month: a partial month must never be
             -- treated as a complete one (it would deflate seasonal indices, the
             -- monthly baseline, and the last history bar).
@@ -814,6 +820,7 @@ def fetch_monthly_sales_history(years: int = 3) -> pd.DataFrame:
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("years", "INT64", years),
+            bigquery.ScalarQueryParameter("reliable_start", "STRING", RELIABLE_HISTORY_START),
         ]
     )
     return client.query(query, job_config=job_config).to_dataframe()

@@ -23,6 +23,7 @@ BigQuery SQL that would feed (1) lives in ``bigquery_sync.fetch_monthly_sales_hi
 and is *untested against live BQ* (no credentials available offline).
 """
 
+import math
 from typing import Dict, List, Optional, Sequence
 
 
@@ -667,6 +668,94 @@ def lead_time_window_months(
     return {"start_month": start_month, "end_month": end_month}
 
 
+def _deseasonalize_levels(
+    monthly_level_series,
+    indices: Optional[Dict[int, float]],
+    num_periods: int = 12,
+) -> List[float]:
+    """Divide each month's units by its seasonal index -> a trend-only level series.
+
+    Accepts rows as dicts ({"month", "units"}) or (year, month, units) tuples,
+    oldest -> newest. With indices that average ~1.0, dividing removes the
+    seasonal component so a trend can be fit on the level (the standard
+    deseasonalize -> trend -> reseasonalize recipe).
+    """
+    levels: List[float] = []
+    for entry in monthly_level_series or []:
+        if isinstance(entry, dict):
+            month = int(entry.get("month"))
+            units = float(entry.get("units") or 0.0)
+        else:
+            month = int(entry[1])
+            units = float(entry[2] or 0.0)
+        idx = (indices.get(month, 1.0) if indices else 1.0)
+        if idx is None or idx <= 0:
+            idx = 1.0
+        levels.append(units / idx)
+    return levels
+
+
+def _loglinear_annual_growth(levels: List[float]) -> float:
+    """Annualized growth ratio from an OLS fit of log(level) on month index."""
+    pts = [(i, v) for i, v in enumerate(levels) if v and v > 0]
+    if len(pts) < 2:
+        return 1.0
+    n = len(pts)
+    mx = sum(p[0] for p in pts) / n
+    my = sum(math.log(p[1]) for p in pts) / n
+    denom = sum((p[0] - mx) ** 2 for p in pts)
+    if denom <= 0:
+        return 1.0
+    beta = sum((p[0] - mx) * (math.log(p[1]) - my) for p in pts) / denom
+    return math.exp(beta * 12.0)
+
+
+def _trend_factor(
+    monthly_level_series,
+    indices: Optional[Dict[int, float]],
+    months_observed: int,
+    growth_cap=(0.85, 1.30),
+    full_weight_periods: float = 24.0,
+    num_periods: int = 12,
+):
+    """Estimate (anchor level L0, monthly growth factor r) from history.
+
+    Anchors on the trailing deseasonalized run-rate (not the long-run average)
+    and estimates one annual growth ratio -- year-over-year when there are >= 18
+    months, else a log-linear slope. The ratio is clamped to ``growth_cap`` and
+    shrunk toward 1.0 by how much clean history exists (``months_observed /
+    full_weight_periods``), then converted to a monthly factor. Returns
+    ``(None, None)`` when there is too little signal, so the caller falls back to
+    the flat baseline.
+    """
+    levels = _deseasonalize_levels(monthly_level_series, indices, num_periods)
+    if len(levels) < 3:
+        return None, None
+
+    tail = levels[-3:]
+    L0 = sum(tail) / len(tail)
+    if L0 <= 0:
+        return None, None
+
+    n = len(levels)
+    if n >= 18:
+        recent = levels[-12:]
+        prior = levels[-24:-12] if n >= 24 else levels[: n - 12]
+        recent_mean = sum(recent) / len(recent)
+        prior_mean = (sum(prior) / len(prior)) if prior else recent_mean
+        g = (recent_mean / prior_mean) if prior_mean > 0 else 1.0
+    else:
+        g = _loglinear_annual_growth(levels)
+
+    lo, hi = growth_cap
+    g = max(lo, min(hi, g))
+
+    w = max(0.0, min(1.0, months_observed / full_weight_periods)) if full_weight_periods > 0 else 1.0
+    g_eff = 1.0 + (g - 1.0) * w
+    r = g_eff ** (1.0 / 12.0)
+    return L0, r
+
+
 def project_monthly_forecast(
     period_totals: Dict[int, float],
     months_observed: int,
@@ -674,29 +763,49 @@ def project_monthly_forecast(
     reference_month: int,
     horizon_months: int = 12,
     num_periods: int = 12,
+    monthly_level_series=None,
+    growth_cap=(0.85, 1.30),
+    damping: float = 0.90,
+    full_weight_periods: float = 24.0,
 ) -> List[Dict[str, float]]:
-    """Project a forward monthly forecast from a flat baseline × seasonal indices.
+    """Project a forward monthly forecast: (trended) baseline × seasonal indices.
 
-    The baseline is average monthly demand (total observed units / number of
-    observed month-buckets). Each forward month's forecast is that baseline
-    scaled by the month's seasonal index (mean ~= 1.0, so this redistributes
-    rather than inflates demand). Produces ``horizon_months`` points starting at
-    the month *after* ``reference_month``.
+    Without ``monthly_level_series`` this is a flat-baseline model -- average
+    monthly demand (total observed units / observed month-buckets) scaled by each
+    month's seasonal index -- producing output identical to the original level-only
+    behavior.
 
-    Pure / side-effect-free -- the endpoint supplies the aggregated inputs.
+    When ``monthly_level_series`` is supplied (the deseasonalizable monthly history,
+    oldest -> newest), the baseline is instead anchored on the recent run-rate and a
+    capped, history-shrunk, **damped** growth factor is applied so a growing category
+    forecasts upward without over-extrapolating on thin history. ``damping`` (phi,
+    0<phi<=1) flattens growth over the horizon: each step's cumulative growth exponent
+    is ``phi + phi^2 + ... + phi^step``.
+
+    Produces ``horizon_months`` points starting at the month *after*
+    ``reference_month``. Pure / side-effect-free.
     """
     total = sum(v for v in period_totals.values() if v and v > 0)
     base_monthly = (total / months_observed) if months_observed and months_observed > 0 else 0.0
 
+    L0, r = _trend_factor(
+        monthly_level_series, indices, months_observed, growth_cap, full_weight_periods, num_periods
+    )
+    if L0 is None:
+        L0, r = base_monthly, 1.0
+
     forecast: List[Dict[str, float]] = []
+    cumulative = 0.0
     for step in range(1, horizon_months + 1):
+        cumulative += damping ** step
         moy = ((reference_month - 1 + step) % num_periods) + 1
         idx = indices.get(moy, 1.0)
         if idx is None or idx <= 0:
             idx = 1.0
+        units = L0 * (r ** cumulative) * idx
         forecast.append({
             "month": moy,
-            "units": round(base_monthly * idx, 2),
+            "units": round(units, 2),
             "seasonal_index": round(float(idx), 4),
         })
     return forecast
