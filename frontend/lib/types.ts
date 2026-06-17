@@ -151,6 +151,37 @@ export interface UseManagedSkusResult {
   error: Error | null
 }
 
+// Purchase Orders
+export type POStatus = 'draft' | 'submitted' | 'pushed' | 'failed'
+export type POReconciliation = 'new_po' | 'append_to_open_po' | 'already_on_po'
+
+export interface PODraftLine {
+  draft_id: string
+  sku: string
+  item_id: string
+  location_id: string
+  quantity: number
+  unit_cost: number | null
+  source: string
+  recommendation_run_id?: string | null
+  reconciliation: POReconciliation
+  target_lightspeed_order_id?: string | null
+}
+
+export interface PurchaseOrderDraft {
+  draft_id: string
+  vendor_id: string
+  vendor_name?: string | null
+  shop_id: string
+  status: POStatus
+  created_by?: string
+  created_at?: string
+  updated_at?: string
+  lightspeed_order_id?: string | null
+  notes?: string | null
+  lines?: PODraftLine[]
+}
+
 // KPI Summary
 export interface KpiSummary {
   totalManagedRows: number

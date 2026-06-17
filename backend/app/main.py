@@ -41,7 +41,7 @@ app = FastAPI(title="SKU Reorder Point Automation API")
 
 # Setup CORS for frontend — restrict to known origins via env var
 _raw_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:3002,http://127.0.0.1:3002")
-_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+_allowed_origins = [o.strip().rstrip("/") for o in _raw_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
@@ -397,6 +397,157 @@ def save_brand_sourcing_rule(rule: Dict[str, Any]):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+# ---------------------------------------------------------------------------
+# Purchase Order Master Dashboard
+# ---------------------------------------------------------------------------
+
+@app.post("/api/po/draft")
+def create_po_draft_endpoint(payload: Dict[str, Any]):
+    """
+    Builds PO drafts from selected recommendation rows, grouped by vendor + shop
+    and reconciled against currently-open Lightspeed POs so repeated runs don't
+    create duplicates. Body: {"recommendations": [...], "created_by": "..."}.
+    """
+    recs = payload.get("recommendations") or []
+    if not recs:
+        raise HTTPException(status_code=400, detail="No recommendations provided.")
+    created_by = payload.get("created_by") or "UI_User"
+    try:
+        from app.services.lightspeed_client import LightspeedClient
+        from app.services.po_service import reconcile_recommendations
+        from app.services.bigquery_sync import create_po_draft
+
+        client = LightspeedClient()
+        drafts = reconcile_recommendations(recs, client, created_by=created_by)
+        for draft in drafts:
+            lines = draft["lines"]
+            header = {k: v for k, v in draft.items() if k != "lines"}
+            create_po_draft(header, lines)
+        return {"status": "success", "drafts": to_json_safe(drafts)}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to create PO drafts.")
+
+@app.get("/api/po/drafts")
+def list_po_drafts(status: str = None):
+    try:
+        from app.services.bigquery_sync import get_po_drafts
+        return {"status": "success", "data": to_json_safe(get_po_drafts(status))}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to fetch PO drafts.")
+
+@app.get("/api/po/draft/{draft_id}")
+def get_po_draft_endpoint(draft_id: str):
+    try:
+        from app.services.bigquery_sync import get_po_draft
+        draft = get_po_draft(draft_id)
+        if draft is None:
+            raise HTTPException(status_code=404, detail="Draft not found.")
+        return {"status": "success", "data": to_json_safe(draft)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to fetch PO draft.")
+
+@app.put("/api/po/draft/{draft_id}")
+def update_po_draft_endpoint(draft_id: str, payload: Dict[str, Any]):
+    """Replaces the line items on a draft. Body: {"lines": [...]}."""
+    lines = payload.get("lines")
+    if lines is None:
+        raise HTTPException(status_code=400, detail="lines is required.")
+    try:
+        from app.services.bigquery_sync import update_po_draft_lines
+        normalized = []
+        for line in lines:
+            normalized.append({
+                "draft_id": draft_id,
+                "sku": line.get("sku"),
+                "item_id": str(line.get("item_id")) if line.get("item_id") is not None else None,
+                "location_id": str(line.get("location_id")) if line.get("location_id") is not None else None,
+                "quantity": _safe_int(line.get("quantity")),
+                "unit_cost": line.get("unit_cost"),
+                "source": line.get("source") or "manual",
+                "recommendation_run_id": line.get("recommendation_run_id"),
+                "reconciliation": line.get("reconciliation"),
+                "target_lightspeed_order_id": line.get("target_lightspeed_order_id"),
+            })
+        update_po_draft_lines(draft_id, normalized)
+        return {"status": "success"}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to update PO draft.")
+
+@app.delete("/api/po/draft/{draft_id}")
+def delete_po_draft_endpoint(draft_id: str):
+    try:
+        from app.services.bigquery_sync import delete_po_draft
+        delete_po_draft(draft_id)
+        return {"status": "success"}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to delete PO draft.")
+
+@app.get("/api/po/open-orders")
+def list_open_orders(vendor_id: str = None, shop_id: str = None):
+    """Lists open (unsent) Lightspeed POs with their line quantities."""
+    try:
+        from app.services.lightspeed_client import LightspeedClient
+        client = LightspeedClient()
+        orders = client.get_open_orders(vendor_id=vendor_id, shop_id=shop_id)
+        return {"status": "success", "data": to_json_safe(orders)}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to fetch open orders.")
+
+@app.post("/api/po/push/{draft_id}")
+def push_po_draft_endpoint(draft_id: str, payload: Dict[str, Any] = None):
+    """
+    Pushes a draft to Lightspeed: creates a new PO and/or appends/top-ups lines on
+    existing open POs per each line's reconciliation. Idempotent — a draft already
+    pushed is rejected, and open-PO state is re-checked at push time.
+    """
+    triggered_by = (payload or {}).get("pushed_by") or "UI_User"
+    try:
+        from app.services.lightspeed_client import LightspeedClient
+        from app.services.po_service import push_draft
+        from app.services.bigquery_sync import (
+            get_po_draft, log_po_push, update_po_draft_status,
+        )
+
+        draft = get_po_draft(draft_id)
+        if draft is None:
+            raise HTTPException(status_code=404, detail="Draft not found.")
+        if draft.get("status") == "pushed":
+            raise HTTPException(status_code=409, detail="Draft has already been pushed.")
+
+        client = LightspeedClient()
+        audit = push_draft(draft, client, triggered_by=triggered_by)
+        log_po_push(audit)
+
+        failed = any(row.get("status") == "failed" for row in audit)
+        new_status = "failed" if failed else "pushed"
+        pushed_order_id = next(
+            (row.get("lightspeed_order_id") for row in audit
+             if row.get("status") == "success" and row.get("lightspeed_order_id")),
+            None,
+        )
+        update_po_draft_status(draft_id, new_status, pushed_order_id)
+        return {"status": new_status, "results": to_json_safe(audit)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to push PO draft.")
+
 @app.get("/api/health/lightspeed")
 def check_lightspeed_health():
     from app.services.lightspeed_client import LightspeedClient
@@ -406,6 +557,22 @@ def check_lightspeed_health():
         return {"status": "connected"}
     else:
         raise HTTPException(status_code=503, detail="Disconnected from Lightspeed")
+
+@app.get("/api/health/lightspeed-po")
+def check_lightspeed_po_access():
+    """
+    Reports whether the current Lightspeed token can access purchase orders.
+    Used to confirm the token was re-authorized with employee:purchase_orders
+    before relying on the PO push path.
+    """
+    from app.services.lightspeed_client import LightspeedClient
+    client = LightspeedClient()
+    if client.check_po_access():
+        return {"status": "ok", "po_access": True}
+    raise HTTPException(
+        status_code=503,
+        detail="Lightspeed token cannot access purchase orders. Re-authorize with the employee:purchase_orders scope (see backend/reauthorize_lightspeed.py).",
+    )
 
 @app.get("/api/health/bigquery")
 def check_bigquery_health():

@@ -3,6 +3,15 @@ import os
 import time
 from typing import Dict, Any, Optional, List
 
+# OAuth scopes this app requires. Single source of truth shared by the
+# re-authorization helper. `employee:inventory` powers the existing ItemShop
+# reorder-point writeback; `employee:purchase_orders` powers PO creation.
+# NOTE: scope is granted at the authorization step, so re-authorizing for PO
+# access MUST also re-request employee:inventory or the writeback path breaks.
+LIGHTSPEED_SCOPES = ["employee:inventory", "employee:purchase_orders"]
+LIGHTSPEED_AUTHORIZE_URL = "https://cloud.lightspeedapp.com/auth/oauth/authorize"
+LIGHTSPEED_TOKEN_URL = "https://cloud.lightspeedapp.com/oauth/access_token.php"
+
 class LightspeedClient:
     def __init__(self):
         self.account_id = os.getenv("LIGHTSPEED_ACCOUNT_ID")
@@ -57,6 +66,17 @@ class LightspeedClient:
         except Exception as e:
             print(f"Lightspeed health check failed: {e}")
             return False
+
+    def check_po_access(self) -> bool:
+        """
+        Verifies the current token can access the purchase-order (Order) endpoint.
+        Returns True on a 200 from a minimal Order read; False on 401/403 (e.g.
+        the token lacks the employee:purchase_orders scope) or any error.
+        """
+        response = self._request("GET", "/Order.json", params={"limit": 1})
+        if response is None:
+            return False
+        return response.status_code == 200
 
     def get_item_shops(self, item_id: str) -> Dict[str, str]:
         """
@@ -132,6 +152,110 @@ class LightspeedClient:
         except Exception as e:
             print(f"Lightspeed Update Error: {e}")
             return None
+
+    def _request(self, method: str, path: str, params: dict = None, json: dict = None) -> Optional[requests.Response]:
+        """
+        Issues an authenticated request, transparently refreshing the bearer token
+        once on a 401. `path` is appended to base_url (e.g. "/Order.json").
+        Returns the Response (caller inspects status), or None on a transport error.
+        """
+        url = f"{self.base_url}{path}"
+        try:
+            response = requests.request(method, url, headers=self._get_headers(), params=params, json=json, timeout=15)
+            if response.status_code == 401:
+                self._refresh_access_token()
+                response = requests.request(method, url, headers=self._get_headers(), params=params, json=json, timeout=15)
+            return response
+        except Exception as e:
+            print(f"Lightspeed API Error ({method} {path}): {e}")
+            return None
+
+    def get_open_orders(self, vendor_id: str = None, shop_id: str = None) -> List[Dict[str, Any]]:
+        """
+        Fetches open (incomplete, non-archived) purchase orders with their line
+        items loaded, optionally filtered by vendor and/or shop. Used to reconcile
+        suggested buys against POs that already exist so we don't create duplicates.
+        Returns a list of Order dicts, each with a normalized "OrderLine" list.
+        """
+        params = {
+            "complete": "false",
+            "archived": "false",
+            "load_relations": '["OrderLines"]',
+        }
+        if vendor_id is not None:
+            params["vendorID"] = str(vendor_id)
+        if shop_id is not None:
+            params["shopID"] = str(shop_id)
+
+        response = self._request("GET", "/Order.json", params=params)
+        if response is None or response.status_code != 200:
+            if response is not None:
+                print(f"Error fetching open orders: {response.text}")
+            return []
+
+        orders = response.json().get("Order", [])
+        if isinstance(orders, dict):
+            orders = [orders]
+
+        # Normalize the nested OrderLines -> OrderLine into a plain list on each order.
+        for order in orders:
+            lines = order.get("OrderLines", {}).get("OrderLine", [])
+            if isinstance(lines, dict):
+                lines = [lines]
+            order["OrderLine"] = lines
+        return orders
+
+    def create_order(self, vendor_id: str, shop_id: str, ordered_date: str = None) -> Optional[Dict[str, Any]]:
+        """
+        Creates a new (empty) purchase order header. Line items are added separately
+        via add_order_line. Returns the created Order dict (incl. orderID) or None.
+        """
+        payload = {
+            "vendorID": str(vendor_id),
+            "shopID": str(shop_id),
+        }
+        if ordered_date:
+            payload["orderedDate"] = ordered_date
+
+        response = self._request("POST", "/Order.json", json=payload)
+        if response is None or response.status_code not in (200, 201):
+            if response is not None:
+                print(f"Error creating order: {response.text}")
+            return None
+        return response.json().get("Order")
+
+    def add_order_line(self, order_id: str, item_id: str, quantity: int, price: float = None) -> Optional[Dict[str, Any]]:
+        """
+        Adds a line item to an existing purchase order. Returns the created
+        OrderLine dict (incl. orderLineID) or None.
+        """
+        payload = {
+            "orderID": str(order_id),
+            "itemID": str(item_id),
+            "quantity": str(int(quantity)),
+        }
+        if price is not None:
+            payload["price"] = str(price)
+
+        response = self._request("POST", "/OrderLine.json", json=payload)
+        if response is None or response.status_code not in (200, 201):
+            if response is not None:
+                print(f"Error adding order line: {response.text}")
+            return None
+        return response.json().get("OrderLine")
+
+    def update_order_line(self, order_line_id: str, quantity: int) -> Optional[Dict[str, Any]]:
+        """
+        Updates the quantity on an existing order line (used to top up a line that
+        already exists on an open PO). Returns the updated OrderLine dict or None.
+        """
+        payload = {"quantity": str(int(quantity))}
+        response = self._request("PUT", f"/OrderLine/{order_line_id}.json", json=payload)
+        if response is None or response.status_code != 200:
+            if response is not None:
+                print(f"Error updating order line {order_line_id}: {response.text}")
+            return None
+        return response.json().get("OrderLine")
 
     def sync_recommendation(self, rec: Dict[str, Any]) -> bool:
         item_identity = rec.get('lightspeed_item_id') or rec.get('system_id') or rec.get('sku') or ''

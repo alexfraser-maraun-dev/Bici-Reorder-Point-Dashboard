@@ -226,6 +226,96 @@ export async function saveBrandSourcingRule(rule: {
   return res.json()
 }
 
+// ---------------------------------------------------------------------------
+// Purchase Orders
+// ---------------------------------------------------------------------------
+
+// Lists PO drafts (optionally filtered by status).
+export function usePODrafts(status?: string) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const url = `${baseUrl}/api/po/drafts${status ? `?status=${status}` : ''}`
+  const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
+  return { data: data?.data || [], isLoading, error, refetch: mutate }
+}
+
+// Fetches a single draft with its line items.
+export function usePODraft(draftId: string | null) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const url = draftId ? `${baseUrl}/api/po/draft/${draftId}` : null
+  const { data, error, mutate, isLoading } = useSWR(url, fetcher)
+  return { data: data?.data || null, isLoading, error, refetch: mutate }
+}
+
+// Reports whether the Lightspeed token can access purchase orders
+// (i.e. was re-authorized with the employee:purchase_orders scope).
+export function useLightspeedPoAccess() {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const url = `${baseUrl}/api/health/lightspeed-po`
+  // Don't throw on 503 — treat a non-ok response as "no access".
+  const poFetcher = async (u: string) => {
+    const res = await fetch(u)
+    return { poAccess: res.ok }
+  }
+  const { data, isLoading, mutate } = useSWR(url, poFetcher, {
+    revalidateOnFocus: false,
+    refreshInterval: 0,
+  })
+  return { poAccess: data?.poAccess ?? null, isLoading, refetch: mutate }
+}
+
+// Lists open (unsent) Lightspeed POs.
+export function useOpenOrders(vendorId?: string, shopId?: string) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const params = new URLSearchParams()
+  if (vendorId) params.set('vendor_id', vendorId)
+  if (shopId) params.set('shop_id', shopId)
+  const qs = params.toString()
+  const url = `${baseUrl}/api/po/open-orders${qs ? `?${qs}` : ''}`
+  const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
+  return { data: data?.data || [], isLoading, error, refetch: mutate }
+}
+
+// Builds drafts from selected recommendation rows (raw backend rec dicts).
+export async function createPODraft(recommendations: any[], createdBy?: string) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const res = await fetch(`${baseUrl}/api/po/draft`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ recommendations, created_by: createdBy }),
+  })
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || 'Failed to create PO draft')
+  }
+  return res.json()
+}
+
+// Pushes a draft to Lightspeed.
+export async function pushPODraft(draftId: string, pushedBy?: string) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const res = await fetch(`${baseUrl}/api/po/push/${draftId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pushed_by: pushedBy }),
+  })
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || 'Failed to push PO draft')
+  }
+  return res.json()
+}
+
+// Deletes a draft.
+export async function deletePODraft(draftId: string) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const res = await fetch(`${baseUrl}/api/po/draft/${draftId}`, { method: 'DELETE' })
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || 'Failed to delete PO draft')
+  }
+  return res.json()
+}
+
 export function useConnectionStatus() {
   type ConnectionState = 'checking' | 'connected' | 'disconnected'
 

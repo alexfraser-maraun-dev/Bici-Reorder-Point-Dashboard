@@ -61,7 +61,7 @@ def log_writeback(log_data: dict):
 def get_recommendation_runs(limit: int = 50):
     """Fetches historical runs from BigQuery."""
     query = f"""
-        SELECT * FROM `{LS_DATASET}.replen_recommendation_runs`
+        SELECT * FROM `{APP_DATASET}.replen_recommendation_runs`
         ORDER BY started_at DESC
         LIMIT {limit}
     """
@@ -173,6 +173,173 @@ def upsert_sku_override(override_data: dict):
     )
     client = get_bq_client()
     client.query(merge_query, job_config=job_config).result()
+
+def ensure_po_tables():
+    """Creates the purchase-order draft, line, and push-log tables if absent."""
+    client = get_bq_client()
+    client.query(f"""
+        CREATE TABLE IF NOT EXISTS `{APP_DATASET}.replen_po_drafts` (
+            draft_id STRING NOT NULL,
+            vendor_id STRING,
+            vendor_name STRING,
+            shop_id STRING,
+            status STRING,
+            created_by STRING,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP,
+            lightspeed_order_id STRING,
+            notes STRING
+        )
+    """).result()
+    client.query(f"""
+        CREATE TABLE IF NOT EXISTS `{APP_DATASET}.replen_po_draft_lines` (
+            draft_id STRING NOT NULL,
+            sku STRING,
+            item_id STRING,
+            location_id STRING,
+            quantity INT64,
+            unit_cost FLOAT64,
+            source STRING,
+            recommendation_run_id STRING,
+            reconciliation STRING,
+            target_lightspeed_order_id STRING
+        )
+    """).result()
+    client.query(f"""
+        CREATE TABLE IF NOT EXISTS `{APP_DATASET}.replen_po_push_log` (
+            push_id STRING,
+            draft_id STRING,
+            sku STRING,
+            item_id STRING,
+            location_id STRING,
+            action STRING,
+            quantity INT64,
+            lightspeed_order_id STRING,
+            lightspeed_order_line_id STRING,
+            status STRING,
+            error_message STRING,
+            triggered_by STRING,
+            created_at TIMESTAMP
+        )
+    """).result()
+
+def create_po_draft(draft: dict, lines: list):
+    """
+    Persists a PO draft header and its lines. Uses load jobs (not streaming
+    inserts) so the rows are immediately mutable by later edit/delete/push DML.
+    """
+    ensure_po_tables()
+    client = get_bq_client()
+    append = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
+    client.load_table_from_json([draft], f"{APP_DATASET}.replen_po_drafts", job_config=append).result()
+    if lines:
+        client.load_table_from_json(lines, f"{APP_DATASET}.replen_po_draft_lines", job_config=append).result()
+
+def get_po_drafts(status: str = None):
+    """Lists PO draft headers, newest first, optionally filtered by status."""
+    ensure_po_tables()
+    where = "WHERE status = @status" if status else ""
+    query = f"""
+        SELECT * FROM `{APP_DATASET}.replen_po_drafts`
+        {where}
+        ORDER BY created_at DESC
+    """
+    params = [bigquery.ScalarQueryParameter("status", "STRING", status)] if status else []
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    try:
+        client = get_bq_client()
+        return [dict(row) for row in client.query(query, job_config=job_config).result()]
+    except Exception as e:
+        print(f"Failed to fetch PO drafts: {e}")
+        return []
+
+def get_po_draft(draft_id: str):
+    """Fetches a single PO draft header with its line items."""
+    ensure_po_tables()
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("draft_id", "STRING", draft_id)]
+    )
+    header_rows = list(client.query(
+        f"SELECT * FROM `{APP_DATASET}.replen_po_drafts` WHERE draft_id = @draft_id",
+        job_config=job_config,
+    ).result())
+    if not header_rows:
+        return None
+    draft = dict(header_rows[0])
+    line_rows = client.query(
+        f"SELECT * FROM `{APP_DATASET}.replen_po_draft_lines` WHERE draft_id = @draft_id",
+        job_config=job_config,
+    ).result()
+    draft["lines"] = [dict(row) for row in line_rows]
+    return draft
+
+def update_po_draft_lines(draft_id: str, lines: list):
+    """Replaces all lines for a draft (delete + reload) and bumps updated_at."""
+    ensure_po_tables()
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("draft_id", "STRING", draft_id)]
+    )
+    client.query(
+        f"DELETE FROM `{APP_DATASET}.replen_po_draft_lines` WHERE draft_id = @draft_id",
+        job_config=job_config,
+    ).result()
+    if lines:
+        append = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
+        client.load_table_from_json(lines, f"{APP_DATASET}.replen_po_draft_lines", job_config=append).result()
+    client.query(
+        f"UPDATE `{APP_DATASET}.replen_po_drafts` SET updated_at = CURRENT_TIMESTAMP() WHERE draft_id = @draft_id",
+        job_config=job_config,
+    ).result()
+
+def update_po_draft_status(draft_id: str, status: str, lightspeed_order_id: str = None):
+    """Updates a draft's status (and optionally the resulting Lightspeed order id)."""
+    ensure_po_tables()
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("draft_id", "STRING", draft_id),
+            bigquery.ScalarQueryParameter("status", "STRING", status),
+            bigquery.ScalarQueryParameter("lightspeed_order_id", "STRING", lightspeed_order_id),
+        ]
+    )
+    client.query(f"""
+        UPDATE `{APP_DATASET}.replen_po_drafts`
+        SET status = @status,
+            lightspeed_order_id = COALESCE(@lightspeed_order_id, lightspeed_order_id),
+            updated_at = CURRENT_TIMESTAMP()
+        WHERE draft_id = @draft_id
+    """, job_config=job_config).result()
+
+def delete_po_draft(draft_id: str):
+    """Deletes a draft header and its lines."""
+    ensure_po_tables()
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("draft_id", "STRING", draft_id)]
+    )
+    client.query(
+        f"DELETE FROM `{APP_DATASET}.replen_po_draft_lines` WHERE draft_id = @draft_id",
+        job_config=job_config,
+    ).result()
+    client.query(
+        f"DELETE FROM `{APP_DATASET}.replen_po_drafts` WHERE draft_id = @draft_id",
+        job_config=job_config,
+    ).result()
+
+def log_po_push(log_rows: list):
+    """Streams PO push audit rows to BigQuery (append-only, like writeback logs)."""
+    if not log_rows:
+        return
+    table_id = f"{APP_DATASET}.replen_po_push_log"
+    try:
+        client = get_bq_client()
+        errors = client.insert_rows_json(table_id, log_rows)
+        if errors:
+            print(f"BigQuery PO Push Log Errors: {errors}")
+    except Exception as e:
+        print(f"Failed to log PO push to BigQuery: {e}")
 
 def ensure_brand_sourcing_rules_table():
     """Creates the brand sourcing rules table if it does not already exist."""
@@ -591,9 +758,66 @@ def fetch_sales_history(trailing_days: int) -> pd.DataFrame:
     )
     return client.query(query, job_config=job_config).to_dataframe()
 
+def fetch_monthly_sales_history(years: int = 3) -> pd.DataFrame:
+    """
+    Phase 2 (forecasting enrichment) -- multi-year MONTHLY sales aggregation used
+    to build hierarchical category + per-item seasonal profiles (see
+    ``app.services.forecasting``).
+
+    Reads the canonical ``sales_master_view`` (LS-API-backed, favoured over raw
+    Fivetran tables), which already represents completed sales and pre-decomposes
+    the category tree. Per BICI's demand definition, special-order / layaway /
+    workorder lines ARE counted (they are real demand once converted); only
+    warranty workorder lines are excluded. Returns one row per
+    (item_id, location_id, sales_month) with the category hierarchy attached so
+    the caller can compute seasonal indices at any category level.
+
+    Validated against live BigQuery (2026-06-16).
+    """
+    query = f"""
+        SELECT
+            item_id,
+            shop_id_int AS location_id,
+            ANY_VALUE(category_top_level) AS category_top_level,
+            ANY_VALUE(category_level_2) AS category_level_2,
+            ANY_VALUE(category_level_3) AS category_level_3,
+            ANY_VALUE(category_level_4) AS category_level_4,
+            ANY_VALUE(category_path) AS category_path,
+            ANY_VALUE(brand_name) AS brand_name,
+            DATE_TRUNC(sale_date, MONTH) AS sales_month,
+            EXTRACT(MONTH FROM sale_date) AS month_of_year,
+            EXTRACT(YEAR FROM sale_date) AS sales_year,
+            SUM(units_sold) AS total_units_sold
+        FROM
+            `{LS_DATASET}.sales_master_view`
+        WHERE
+            sale_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @years YEAR)
+            AND shop_id_int IN {TARGET_SHOP_IDS}
+            AND NOT COALESCE(is_workorder_warranty_line, FALSE)
+        GROUP BY
+            item_id,
+            location_id,
+            sales_month,
+            month_of_year,
+            sales_year
+        ORDER BY
+            item_id,
+            location_id,
+            sales_month
+    """
+
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("years", "INT64", years),
+        ]
+    )
+    return client.query(query, job_config=job_config).to_dataframe()
+
+
 def fetch_inventory_snapshot() -> pd.DataFrame:
     """
-    Fetches current on_hand from item_shop_history and calculates on_order_units 
+    Fetches current on_hand from item_shop_history and calculates on_order_units
     from open purchase orders. Includes default_vendor_id from item_history.
     """
     query = f"""

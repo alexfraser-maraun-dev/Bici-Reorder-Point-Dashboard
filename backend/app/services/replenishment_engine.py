@@ -1,6 +1,16 @@
 import math
 from typing import List, Dict, Any
 
+# Phase 2 forecasting enrichment (ADDITIVE / OPT-IN). These helpers are only
+# invoked when the corresponding optional params to process_recommendations are
+# provided; with the defaults below they are never called, so existing callers
+# get byte-for-byte identical results.
+from app.services.forecasting import (
+    apply_forecast_enrichment,
+    seasonality_index_for_period,
+    trend_coefficient,
+)
+
 STATUS_RANKS = {
     "critical": 1,
     "low": 2,
@@ -214,9 +224,27 @@ def process_recommendations(
     adjustment_mode: str = "shrink",
     momentum_data: Dict[str, float] = None,
     brand_sourcing_rules: Dict[str, Any] = None,
+    # --- Phase 2 forecasting enrichment (OPT-IN, default OFF/neutral) ---------
+    # All three default to neutral so the live replen path is unchanged.
+    apply_trend: bool = False,
+    seasonality_indices_by_period: Dict[int, float] = None,
+    forecast_month: int = None,
 ) -> List[Dict[str, Any]]:
     """
     Applies the custom BICI calculation logic to the BigQuery data.
+
+    Phase 2 enrichment params (all default to OFF/neutral -- existing callers are
+    unaffected):
+        apply_trend: when True, multiplies each row's base velocity by a bounded
+            trend coefficient (0.5x..2.0x) derived from the same three-window
+            velocities the engine already computes. Default False == no change.
+        seasonality_indices_by_period: optional {period:int -> index:float} map
+            (e.g. month 1..12 -> multiplicative index, mean ~= 1.0) produced by
+            app.services.forecasting.seasonality_indices. When provided together
+            with forecast_month, the matching index multiplies the base velocity.
+        forecast_month: the calendar period (1..12 for months) to look the
+            seasonality index up for. Ignored unless seasonality_indices_by_period
+            is also provided.
     """
     shop_map = {3: "Bici Adanac", 2: "Victoria", 20: "Langford"}
 
@@ -369,8 +397,34 @@ def process_recommendations(
             + adjusted_daily_sales_31_60d * weight_31_60d
         )
         
+        # --- Phase 2 enrichment integration stub (OPT-IN) --------------------
+        # Compute optional trend + seasonality multipliers. With the defaults
+        # (apply_trend=False, no seasonality map) both resolve to 1.0 and
+        # enriched_base_daily_sales == base_daily_sales, so the live path is
+        # unchanged. We enrich the FORWARD-looking velocity only; the reported
+        # base "daily_sales" below still reflects raw weighted velocity.
+        trend_multiplier = None
+        if apply_trend:
+            trend_multiplier = trend_coefficient(
+                adjusted_daily_sales_14d,
+                adjusted_daily_sales_15_30d,
+                adjusted_daily_sales_31_60d,
+            )
+
+        seasonality_index = None
+        if seasonality_indices_by_period and forecast_month is not None:
+            seasonality_index = seasonality_index_for_period(
+                seasonality_indices_by_period, forecast_month
+            )
+
+        enriched_base_daily_sales = apply_forecast_enrichment(
+            base_daily_sales,
+            seasonality_index=seasonality_index,
+            trend_multiplier=trend_multiplier,
+        )
+
         # Apply Growth Multiplier (only affects forward-looking calcs)
-        adjusted_daily_sales = base_daily_sales * growth_multiplier
+        adjusted_daily_sales = enriched_base_daily_sales * growth_multiplier
         
         # Inventory Levels
         on_hand = row.get("current_qoh", 0)
@@ -423,6 +477,9 @@ def process_recommendations(
             "location": loc_name,
             "daily_sales": round(base_daily_sales, 2), # Weighted base velocity
             "adjusted_daily_sales": round(adjusted_daily_sales, 2), # Velocity w/ multiplier
+            # Phase 2 enrichment factors (None when feature is off -- additive fields)
+            "trend_multiplier": round(trend_multiplier, 3) if trend_multiplier is not None else None,
+            "seasonality_index": round(seasonality_index, 3) if seasonality_index is not None else None,
             "days_out_of_stock": days_out_of_stock_60,
             "raw_daily_sales": base_daily_sales,
             "adjusted_daily_sales_14d": round(adjusted_daily_sales_14d, 3),
