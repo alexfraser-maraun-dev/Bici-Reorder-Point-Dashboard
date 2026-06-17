@@ -248,10 +248,13 @@ export type AgingBucket =
 export interface SpecialOrder {
   special_order_id: string
   status: string
+  status_stage: number        // 0=Not Ordered, 1=Ordered, 2=Ready, 3=Received; -1=unknown
   unit_quantity: string | null
   shop_id: string | null
   store: string | null
   timestamp: string | null
+  created_date: string | null
+  days_since_creation: number | null
   contacted: boolean
   completed: boolean
   // Customer
@@ -275,6 +278,7 @@ export interface SpecialOrder {
   aging_bucket: AgingBucket
   no_eta: boolean
   ready_not_called: boolean
+  unordered_too_long: boolean
   // Deep links into Lightspeed
   ls_item_url: string | null
   ls_customer_url: string | null
@@ -287,6 +291,7 @@ export interface SpecialOrderSummary {
   critical: number
   no_eta: number
   ready_not_called: number
+  unordered_too_long: number
   by_bucket: Record<string, number>
 }
 

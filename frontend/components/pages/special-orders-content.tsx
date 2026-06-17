@@ -7,6 +7,13 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { cn } from '@/lib/utils'
 import { SpecialOrdersTable } from '@/components/dashboard/special-orders-table'
 import { SpecialOrderDetailSheet } from '@/components/dashboard/special-orders-detail-sheet'
@@ -16,11 +23,12 @@ import {
   CircleHelp,
   PackageCheck,
   Layers,
+  Clock,
   RefreshCw,
   Search,
 } from 'lucide-react'
 
-type QuickFilter = 'all' | 'overdue' | 'critical' | 'no_eta' | 'ready_not_called'
+type QuickFilter = 'all' | 'overdue' | 'critical' | 'no_eta' | 'ready_not_called' | 'unordered_too_long'
 
 const tiles: {
   key: QuickFilter
@@ -28,27 +36,24 @@ const tiles: {
   icon: typeof AlertTriangle
   color: string
   bgColor: string
-  summaryKey: 'total_open' | 'overdue' | 'critical' | 'no_eta' | 'ready_not_called'
+  summaryKey: 'total_open' | 'overdue' | 'critical' | 'no_eta' | 'ready_not_called' | 'unordered_too_long'
 }[] = [
   { key: 'all', label: 'Total Open', icon: Layers, color: 'text-foreground', bgColor: 'bg-secondary', summaryKey: 'total_open' },
   { key: 'overdue', label: 'Overdue', icon: AlertTriangle, color: 'text-red-600', bgColor: 'bg-red-50', summaryKey: 'overdue' },
   { key: 'critical', label: 'Critical (8d+)', icon: ShieldAlert, color: 'text-red-700', bgColor: 'bg-red-50', summaryKey: 'critical' },
   { key: 'no_eta', label: 'No ETA', icon: CircleHelp, color: 'text-amber-600', bgColor: 'bg-amber-50', summaryKey: 'no_eta' },
   { key: 'ready_not_called', label: 'Ready · Not Called', icon: PackageCheck, color: 'text-emerald-600', bgColor: 'bg-emerald-50', summaryKey: 'ready_not_called' },
+  { key: 'unordered_too_long', label: 'Stale · Not Ordered', icon: Clock, color: 'text-orange-600', bgColor: 'bg-orange-50', summaryKey: 'unordered_too_long' },
 ]
 
 function matchesFilter(o: SpecialOrder, filter: QuickFilter): boolean {
   switch (filter) {
-    case 'overdue':
-      return o.is_overdue
-    case 'critical':
-      return o.aging_bucket === 'critical' || o.aging_bucket === 'stale'
-    case 'no_eta':
-      return o.no_eta
-    case 'ready_not_called':
-      return o.ready_not_called
-    default:
-      return true
+    case 'overdue':      return o.is_overdue
+    case 'critical':     return o.aging_bucket === 'critical' || o.aging_bucket === 'stale'
+    case 'no_eta':       return o.no_eta
+    case 'ready_not_called': return o.ready_not_called
+    case 'unordered_too_long': return o.unordered_too_long
+    default:             return true
   }
 }
 
@@ -56,18 +61,27 @@ export function SpecialOrdersContent() {
   const { orders, summary, isLoading, refetch, fetchedAt } = useSpecialOrders()
   const [filter, setFilter] = useState<QuickFilter>('all')
   const [search, setSearch] = useState('')
+  const [storeFilter, setStoreFilter] = useState<string>('all')
   const [selected, setSelected] = useState<SpecialOrder | null>(null)
   const [sheetOpen, setSheetOpen] = useState(false)
+
+  // Derive unique store names from loaded orders
+  const stores = useMemo(() => {
+    const names = new Set<string>()
+    orders.forEach((o) => { if (o.store) names.add(o.store) })
+    return Array.from(names).sort()
+  }, [orders])
 
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase()
     return orders.filter((o) => {
       if (!matchesFilter(o, filter)) return false
+      if (storeFilter !== 'all' && o.store !== storeFilter) return false
       if (!term) return true
       return [o.customer_name, o.description, o.system_sku, o.vendor_name, o.order_id, o.special_order_id]
         .some((v) => v && String(v).toLowerCase().includes(term))
     })
-  }, [orders, filter, search])
+  }, [orders, filter, search, storeFilter])
 
   const openOrder = (o: SpecialOrder) => {
     setSelected(o)
@@ -94,7 +108,7 @@ export function SpecialOrdersContent() {
 
       {/* KPI tiles — click to filter the queue */}
       {isLoading || !summary ? (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           {tiles.map((t) => (
             <Card key={t.key} className="py-3">
               <CardContent className="px-4 py-0">
@@ -105,7 +119,7 @@ export function SpecialOrdersContent() {
           ))}
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           {tiles.map((t) => {
             const Icon = t.icon
             const active = filter === t.key
@@ -135,15 +149,38 @@ export function SpecialOrdersContent() {
         </div>
       )}
 
-      {/* Search */}
-      <div className="relative max-w-sm">
-        <Search className="text-muted-foreground absolute left-2.5 top-2.5 h-4 w-4" />
-        <Input
-          placeholder="Search customer, product, SKU, vendor, PO…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="pl-8"
-        />
+      {/* Search + store filter */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative max-w-sm flex-1">
+          <Search className="text-muted-foreground absolute left-2.5 top-2.5 h-4 w-4" />
+          <Input
+            placeholder="Search customer, product, SKU, vendor, PO…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="pl-8"
+          />
+        </div>
+        <Select value={storeFilter} onValueChange={setStoreFilter}>
+          <SelectTrigger className="w-[160px]">
+            <SelectValue placeholder="All locations" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All locations</SelectItem>
+            {stores.map((s) => (
+              <SelectItem key={s} value={s}>{s}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {(filter !== 'all' || storeFilter !== 'all' || search) && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-muted-foreground"
+            onClick={() => { setFilter('all'); setStoreFilter('all'); setSearch('') }}
+          >
+            Clear filters
+          </Button>
+        )}
       </div>
 
       <SpecialOrdersTable orders={filtered} isLoading={isLoading} onRowClick={openOrder} />

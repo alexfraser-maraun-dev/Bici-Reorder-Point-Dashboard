@@ -27,6 +27,22 @@ _DUE_SOON_DAYS = 3       # within this many days of the expected date => "due so
 _OVERDUE_MAX = 7         # 1..7 days late
 _CRITICAL_MAX = 14       # 8..14 days late; 15+ => "stale"
 
+# How many days an SO can sit without a PO before it's flagged (unordered_too_long).
+_UNORDERED_TOO_LONG_DAYS = 3
+
+# Canonical SO lifecycle stages in order (for the status path stepper).
+# LS may return variants — we match case-insensitively.
+_STATUS_STAGES = ["Not Ordered", "Ordered", "Ready For Pickup", "Received"]
+
+
+def _status_stage_index(status: str) -> int:
+    """Return 0-based index of status in _STATUS_STAGES, or -1 if unknown."""
+    sl = status.strip().lower()
+    for i, stage in enumerate(_STATUS_STAGES):
+        if sl.startswith(stage.lower()) or stage.lower().startswith(sl.split()[0] if sl else ""):
+            return i
+    return -1
+
 
 def _ls_url(view: str, entity_id: Optional[str]) -> Optional[str]:
     if not entity_id or str(entity_id) in ("", "0"):
@@ -134,13 +150,21 @@ def _normalize(
     status = so.get("status") or "Unknown"
     contacted = _coerce_bool(so.get("contacted"))
 
+    # SO record timestamp (last-modified; for unordered SOs this is effectively creation time).
+    ts_raw = so.get("timeStamp")
+    created_date = _parse_ls_date(ts_raw)
+    days_since_creation = (today - created_date).days if created_date else None
+
     return {
         "special_order_id": so.get("specialOrderID"),
         "status": status,
+        "status_stage": _status_stage_index(status),
         "unit_quantity": so.get("unitQuantity"),
         "shop_id": shop_id,
         "store": shop_names.get(shop_id) if shop_id else None,
-        "timestamp": so.get("timeStamp"),
+        "timestamp": ts_raw,
+        "created_date": created_date.isoformat() if created_date else None,
+        "days_since_creation": days_since_creation,
         "contacted": contacted,
         "completed": _coerce_bool(so.get("completed")),
         # Customer
@@ -167,6 +191,12 @@ def _normalize(
         "ready_not_called": (
             bool(po.get("complete")) or status.lower().startswith("ready")
         ) and not contacted,
+        # SO has no PO attached and has been open too long — needs to be ordered
+        "unordered_too_long": (
+            order_id is None
+            and days_since_creation is not None
+            and days_since_creation > _UNORDERED_TOO_LONG_DAYS
+        ),
         # Deep links into Lightspeed
         "ls_item_url": _ls_url("item.views.item", item_id),
         "ls_customer_url": _ls_url("customer.views.customer", customer_id),
@@ -184,6 +214,7 @@ def _summarize(orders: List[Dict[str, Any]]) -> Dict[str, int]:
         "critical": buckets.get("critical", 0) + buckets.get("stale", 0),
         "no_eta": buckets.get("no_eta", 0) + buckets.get("no_po", 0),
         "ready_not_called": sum(1 for o in orders if o["ready_not_called"]),
+        "unordered_too_long": sum(1 for o in orders if o["unordered_too_long"]),
         "by_bucket": buckets,
     }
 
