@@ -182,6 +182,40 @@ export interface PurchaseOrderDraft {
   lines?: PODraftLine[]
 }
 
+// Demand & Seasonality visualization layer
+export interface SeasonalProfile {
+  category_label: string
+  level: string
+  // Multiplicative seasonal index per month number (1..12); mean ~= 1.0.
+  indices: Record<string, number>
+  sample_units: number
+}
+
+export interface DemandHistoryPoint {
+  month: number
+  year?: number
+  units: number
+}
+
+export interface ForecastPoint {
+  month: number
+  units: number
+  seasonal_index: number
+}
+
+export interface CoverageMonth {
+  month: number
+  weeks: number
+  stockout_risk: 'critical' | 'low' | 'healthy'
+}
+
+export interface CoverageRow {
+  sku: string
+  product: string
+  location: string
+  weeks_of_cover: CoverageMonth[]
+}
+
 // KPI Summary
 export interface KpiSummary {
   totalManagedRows: number

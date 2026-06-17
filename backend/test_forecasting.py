@@ -15,6 +15,10 @@ from app.services.forecasting import (
     resolve_category_profile,
     blend_seasonal_indices,
     seasonal_profile_for_item,
+    build_seasonal_profile_response,
+    lead_time_window_months,
+    project_monthly_forecast,
+    project_weeks_of_cover,
 )
 
 
@@ -369,6 +373,145 @@ class HierarchicalSeasonalityTest(unittest.TestCase):
         )
         self.assertGreater(prof[11], prof[6])
         self.assertAlmostEqual(sum(prof.values()) / 12, 1.0, places=6)
+
+
+class SeasonalProfileResponseTest(unittest.TestCase):
+    """The /api/forecast/seasonal-profiles response builder."""
+
+    LEVELS = ("category_top_level", "category_level_2")
+
+    def _records(self):
+        # Opposite peaks at top level, with a level_2 subcategory under each.
+        recs = []
+        for mo in range(1, 13):
+            trainers = 30.0 if mo in (10, 11, 12) else 2.0
+            nutrition = 30.0 if mo in (5, 6, 7) else 2.0
+            recs.append({"category_top_level": "Trainers", "category_level_2": "Trainers/Smart",
+                         "month_of_year": mo, "total_units_sold": trainers})
+            recs.append({"category_top_level": "Nutrition", "category_level_2": "Nutrition/Gels",
+                         "month_of_year": mo, "total_units_sold": nutrition})
+        return recs
+
+    def _by_label(self, response, label, level):
+        for entry in response:
+            if entry["category_label"] == label and entry["level"] == level:
+                return entry
+        self.fail(f"profile for {label!r} at {level!r} not found")
+
+    def test_opposite_peaks_surface_in_response(self):
+        resp = build_seasonal_profile_response(self._records(), level_fields=self.LEVELS)
+        trainers = self._by_label(resp, "Trainers", "category_top_level")
+        nutrition = self._by_label(resp, "Nutrition", "category_top_level")
+        # Trainers peak in Nov (11), trough in June (6); Nutrition the reverse.
+        self.assertGreater(trainers["indices"][11], 1.5)
+        self.assertLess(trainers["indices"][6], 0.5)
+        self.assertGreater(nutrition["indices"][6], 1.5)
+        self.assertLess(nutrition["indices"][11], 0.5)
+
+    def test_shape_and_fields(self):
+        resp = build_seasonal_profile_response(self._records(), level_fields=self.LEVELS)
+        # Two top-level + two level_2 categories = 4 entries.
+        self.assertEqual(len(resp), 4)
+        trainers = self._by_label(resp, "Trainers", "category_top_level")
+        self.assertEqual(set(trainers["indices"].keys()), set(range(1, 13)))
+        self.assertAlmostEqual(sum(trainers["indices"].values()) / 12, 1.0, places=3)
+        # Trainers total = 3*30 + 9*2 = 108 units backing the profile.
+        self.assertAlmostEqual(trainers["sample_units"], 108.0, places=2)
+
+    def test_sorted_by_sample_units_desc(self):
+        resp = build_seasonal_profile_response(self._records(), level_fields=self.LEVELS)
+        units = [entry["sample_units"] for entry in resp]
+        self.assertEqual(units, sorted(units, reverse=True))
+
+    def test_empty_records_returns_empty(self):
+        self.assertEqual(build_seasonal_profile_response([], level_fields=self.LEVELS), [])
+
+
+class LeadTimeWindowTest(unittest.TestCase):
+    def test_short_lead_time_lands_on_first_forecast_months(self):
+        # Aug order (ref 8), ~14d lead -> floored to the first forecast month (Sep),
+        # +30d coverage -> Sep..Oct. Never the reference month itself.
+        w = lead_time_window_months(8, lead_time_days=14, coverage_days=30)
+        self.assertEqual(w["start_month"], 9)
+        self.assertEqual(w["end_month"], 10)
+
+    def test_longer_lead_time_pushes_window_forward(self):
+        # Aug (8), ~60d lead (2 months) + 30d coverage -> Oct..Nov (buy ahead of peak).
+        w = lead_time_window_months(8, lead_time_days=60, coverage_days=30)
+        self.assertEqual(w["start_month"], 10)
+        self.assertEqual(w["end_month"], 11)
+
+    def test_year_wraps_around(self):
+        w = lead_time_window_months(12, lead_time_days=30, coverage_days=30)
+        self.assertEqual(w["start_month"], 1)
+        self.assertEqual(w["end_month"], 2)
+
+
+class ProjectMonthlyForecastTest(unittest.TestCase):
+    def test_flat_history_projects_flat_baseline(self):
+        totals = {m: 120.0 for m in range(1, 13)}  # 1440 over 12 months -> 120/mo
+        indices = {m: 1.0 for m in range(1, 13)}
+        fc = project_monthly_forecast(totals, months_observed=12, indices=indices, reference_month=1)
+        self.assertEqual(len(fc), 12)
+        for point in fc:
+            self.assertAlmostEqual(point["units"], 120.0, places=2)
+
+    def test_seasonal_index_scales_the_month(self):
+        totals = {m: 120.0 for m in range(1, 13)}
+        indices = {m: 1.0 for m in range(1, 13)}
+        indices[11] = 2.0  # November runs double
+        fc = project_monthly_forecast(totals, months_observed=12, indices=indices, reference_month=1)
+        nov = next(p for p in fc if p["month"] == 11)
+        self.assertAlmostEqual(nov["units"], 240.0, places=2)
+        self.assertAlmostEqual(nov["seasonal_index"], 2.0, places=4)
+
+    def test_starts_month_after_reference(self):
+        totals = {m: 12.0 for m in range(1, 13)}
+        indices = {m: 1.0 for m in range(1, 13)}
+        fc = project_monthly_forecast(totals, months_observed=12, indices=indices,
+                                      reference_month=8, horizon_months=3)
+        self.assertEqual([p["month"] for p in fc], [9, 10, 11])
+
+    def test_no_history_yields_zero_baseline(self):
+        fc = project_monthly_forecast({}, months_observed=0, indices={m: 1.0 for m in range(1, 13)},
+                                      reference_month=1, horizon_months=2)
+        self.assertTrue(all(p["units"] == 0.0 for p in fc))
+
+
+class ProjectWeeksOfCoverTest(unittest.TestCase):
+    def test_no_velocity_is_always_healthy(self):
+        cover = project_weeks_of_cover(on_hand=10, on_order=0, daily_velocity=0,
+                                       indices=None, reference_month=1)
+        self.assertEqual(len(cover), 12)
+        self.assertTrue(all(c["stockout_risk"] == "healthy" for c in cover))
+
+    def test_flat_demand_drains_inventory_over_time(self):
+        # 100 units, 1/day flat -> ~14.3 wks at start, draining each month.
+        cover = project_weeks_of_cover(on_hand=100, on_order=0, daily_velocity=1.0,
+                                       indices={m: 1.0 for m in range(1, 13)}, reference_month=1)
+        weeks = [c["weeks"] for c in cover]
+        # Monotonically non-increasing as stock drains.
+        self.assertTrue(all(weeks[i] >= weeks[i + 1] for i in range(len(weeks) - 1)))
+        # Eventually hits a stockout (critical) within the year.
+        self.assertEqual(cover[-1]["stockout_risk"], "critical")
+
+    def test_on_order_adds_to_starting_inventory(self):
+        low = project_weeks_of_cover(on_hand=10, on_order=0, daily_velocity=1.0,
+                                     indices={m: 1.0 for m in range(1, 13)}, reference_month=1)
+        high = project_weeks_of_cover(on_hand=10, on_order=90, daily_velocity=1.0,
+                                      indices={m: 1.0 for m in range(1, 13)}, reference_month=1)
+        self.assertGreater(high[0]["weeks"], low[0]["weeks"])
+
+    def test_seasonal_peak_shortens_cover(self):
+        # Same stock; a 3x peak month should show far fewer weeks of cover than flat.
+        peak = {m: 1.0 for m in range(1, 13)}
+        peak[2] = 3.0  # next month after Jan reference
+        flat = project_weeks_of_cover(on_hand=40, on_order=0, daily_velocity=1.0,
+                                      indices={m: 1.0 for m in range(1, 13)}, reference_month=1)
+        ramp = project_weeks_of_cover(on_hand=40, on_order=0, daily_velocity=1.0,
+                                      indices=peak, reference_month=1)
+        # First forward month is February (index 2).
+        self.assertLess(ramp[0]["weeks"], flat[0]["weeks"])
 
 
 if __name__ == "__main__":

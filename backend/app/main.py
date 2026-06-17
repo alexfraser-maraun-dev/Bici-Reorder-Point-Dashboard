@@ -398,6 +398,211 @@ def save_brand_sourcing_rule(rule: Dict[str, Any]):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ---------------------------------------------------------------------------
+# Demand & Seasonality (forecast visualization layer)
+#
+# Read-only endpoints that expose the already-built seasonal/forecast signal for
+# charting. They visualize the profile and a projected forecast only -- they do
+# NOT flip the opt-in seasonality engine on for live ROP/DL writeback.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/forecast/seasonal-profiles")
+def get_seasonal_profiles(years: int = 3, smoothing: float = 0.0):
+    try:
+        from app.services.bigquery_sync import fetch_monthly_sales_history
+        from app.services.forecasting import build_seasonal_profile_response
+        df = fetch_monthly_sales_history(years=years)
+        records = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
+        profiles = build_seasonal_profile_response(records, smoothing=smoothing)
+        return {
+            "status": "success",
+            "data": to_json_safe(profiles),
+            "meta": {"years": years, "category_count": len(profiles)},
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/forecast/history")
+def get_demand_history(
+    scope: str,
+    id: str,
+    location: str = None,
+    years: int = 3,
+    horizon_months: int = 12,
+    lead_time_days: float = 14.0,
+    coverage_days: float = 30.0,
+):
+    """Monthly sales history + forward forecast for a category or a single SKU.
+
+    The forecast is a flat monthly baseline scaled by the (blended, for SKUs)
+    seasonal index per month. ``lead_time_window`` marks the months a PO placed
+    now would cover, so the chart can shade "buy ahead of the ramp".
+    """
+    if scope not in ("category", "sku"):
+        raise HTTPException(status_code=400, detail="scope must be 'category' or 'sku'")
+    try:
+        from app.services.bigquery_sync import fetch_monthly_sales_history
+        from app.services.forecasting import (
+            seasonality_indices,
+            blend_seasonal_indices,
+            project_monthly_forecast,
+            lead_time_window_months,
+        )
+
+        df = fetch_monthly_sales_history(years=years)
+        if location is not None and len(df) and "location_id" in df.columns:
+            df = df[df["location_id"].astype(str) == str(location)]
+
+        if scope == "sku":
+            rows = df[df["item_id"].astype(str) == str(id)]
+        else:
+            rows = df[
+                (df["category_top_level"].astype(str) == str(id))
+                | (df.get("category_path", pd.Series(dtype=str)).astype(str) == str(id))
+                | (df.get("category_level_2", pd.Series(dtype=str)).astype(str) == str(id))
+            ]
+
+        def period_totals(frame):
+            grouped = frame.groupby("month_of_year")["total_units_sold"].sum()
+            return {int(m): float(v) for m, v in grouped.items()}
+
+        own_totals = period_totals(rows)
+        # Distinct (year, month) buckets observed -- the baseline divisor + blend weight.
+        months_observed = int(rows.groupby(["sales_year", "month_of_year"]).ngroups) if len(rows) else 0
+
+        if scope == "sku":
+            cat_label = str(rows["category_top_level"].dropna().iloc[0]) if len(rows.dropna(subset=["category_top_level"])) else None
+            cat_rows = df[df["category_top_level"].astype(str) == cat_label] if cat_label else rows
+            own_indices = seasonality_indices(own_totals)
+            category_indices = seasonality_indices(period_totals(cat_rows))
+            indices = blend_seasonal_indices(own_indices, category_indices, own_history_periods=months_observed)
+        else:
+            indices = seasonality_indices(own_totals)
+
+        history = [
+            {"year": int(r.sales_year), "month": int(r.month_of_year), "units": round(float(r.units), 2)}
+            for r in (
+                rows.groupby(["sales_year", "month_of_year"])["total_units_sold"].sum()
+                .reset_index(name="units")
+                .sort_values(["sales_year", "month_of_year"])
+                .itertuples()
+            )
+        ]
+
+        reference_month = datetime.now().month
+        forecast = project_monthly_forecast(
+            own_totals, months_observed, indices, reference_month, horizon_months=horizon_months
+        )
+        window = lead_time_window_months(reference_month, lead_time_days, coverage_days)
+
+        return {
+            "status": "success",
+            "data": {
+                "history": to_json_safe(history),
+                "forecast": to_json_safe(forecast),
+                "lead_time_window": window,
+            },
+            "meta": {
+                "scope": scope,
+                "id": id,
+                "months_observed": months_observed,
+                "reference_month": reference_month,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/forecast/coverage")
+def get_forward_coverage(
+    location: str = None,
+    horizon_months: int = 12,
+    limit: int = None,
+    force_refresh: bool = False,
+):
+    """Forward weeks-of-cover per SKU x location for the next ``horizon_months``.
+
+    Projects on-hand + on-order draw-down using each SKU's velocity scaled by its
+    category's seasonal shape, so the heatmap surfaces *future* (often seasonal)
+    stockouts before they happen. Rows are sorted with the soonest stockouts first.
+    """
+    try:
+        from app.services.bigquery_sync import (
+            fetch_tagged_items_metrics,
+            fetch_lead_times,
+            get_brand_sourcing_rules_map,
+            fetch_monthly_sales_history,
+        )
+        from app.services.replenishment_engine import process_recommendations
+        from app.services.forecasting import build_seasonal_profiles, project_weeks_of_cover
+
+        raw_data = fetch_tagged_items_metrics("auto-replen", force_refresh=force_refresh).to_dict(orient="records")
+        lead_times = fetch_lead_times().to_dict(orient="records")
+        brand_sourcing_rules = get_brand_sourcing_rules_map()
+        recommendations = process_recommendations(
+            raw_data, lead_times, brand_sourcing_rules=brand_sourcing_rules,
+            weight_14d=0.4, weight_15_30d=0.4, weight_31_60d=0.2, momentum_data={},
+        )
+
+        # One seasonal profile per category, merged across levels (most specific wins).
+        history_records = fetch_monthly_sales_history(years=3).to_dict("records")
+        level_fields = ("category_path", "category_level_2", "category_top_level")
+        profiles = build_seasonal_profiles(history_records, level_fields)
+        merged_profiles = {}
+        for lf in ("category_top_level", "category_level_2", "category_path"):
+            merged_profiles.update(profiles.get(lf, {}))
+
+        reference_month = datetime.now().month
+        rows = []
+        for rec in recommendations:
+            if location is not None and str(rec.get("location")) != str(location):
+                continue
+            indices = merged_profiles.get(rec.get("category"))
+            cover = project_weeks_of_cover(
+                on_hand=rec.get("on_hand") or 0,
+                on_order=rec.get("on_order") or 0,
+                daily_velocity=rec.get("daily_sales") or 0,
+                indices=indices,
+                reference_month=reference_month,
+                horizon_months=horizon_months,
+            )
+            rows.append({
+                "sku": rec.get("sku"),
+                "product": rec.get("description"),
+                "location": rec.get("location"),
+                "weeks_of_cover": cover,
+            })
+
+        # Soonest stockout first: index of the first critical month (12 = none).
+        def first_critical(row):
+            for i, month in enumerate(row["weeks_of_cover"]):
+                if month["stockout_risk"] == "critical":
+                    return i
+            return len(row["weeks_of_cover"])
+        rows.sort(key=first_critical)
+        if limit is not None and limit > 0:
+            rows = rows[:limit]
+
+        return {
+            "status": "success",
+            "data": {"rows": to_json_safe(rows)},
+            "meta": {"reference_month": reference_month, "row_count": len(rows)},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
 # Purchase Order Master Dashboard
 # ---------------------------------------------------------------------------
 

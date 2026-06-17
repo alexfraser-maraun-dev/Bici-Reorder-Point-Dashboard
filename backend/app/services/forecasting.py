@@ -570,3 +570,189 @@ def apply_forecast_enrichment(
         velocity *= max(0.0, float(seasonality_index))
 
     return velocity
+
+
+# ---------------------------------------------------------------------------
+# API response builders (shape pure service output for the frontend charts)
+# ---------------------------------------------------------------------------
+
+# Calendar-month labels for monthly (num_periods == 12) seasonal profiles.
+MONTH_ABBREVIATIONS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def build_seasonal_profile_response(
+    records,
+    level_fields: Sequence[str] = ("category_top_level", "category_level_2"),
+    period_field: str = "month_of_year",
+    value_field: str = "total_units_sold",
+    num_periods: int = 12,
+    min_group_total: float = 0.0,
+    smoothing: float = 0.0,
+) -> List[Dict[str, object]]:
+    """Assemble seasonal-profile chart data for ``/api/forecast/seasonal-profiles``.
+
+    Builds one multiplicative seasonal profile per category value at each level in
+    ``level_fields`` (reusing :func:`build_seasonal_profiles`) and shapes each for the
+    frontend chart + paired table: the category label, the level it was computed at,
+    its ``1..num_periods`` index map, and the total units backing it (so the UI can
+    rank categories by volume and signal how trustworthy each curve is).
+
+    Pure / side-effect-free: the endpoint feeds it rows from
+    ``bigquery_sync.fetch_monthly_sales_history``; tests feed it fixtures. Results are
+    sorted by ``sample_units`` descending so the highest-signal categories surface
+    first.
+    """
+    records = list(records)
+    profiles = build_seasonal_profiles(
+        records,
+        level_fields,
+        period_field=period_field,
+        value_field=value_field,
+        num_periods=num_periods,
+        min_group_total=min_group_total,
+        smoothing=smoothing,
+    )
+
+    # Total units backing each (level, category), used for ranking + confidence.
+    totals: Dict[str, Dict[object, float]] = {lf: {} for lf in level_fields}
+    for row in records:
+        try:
+            value = float(row.get(value_field) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        for lf in level_fields:
+            cat = row.get(lf)
+            if cat is None or cat == "":
+                continue
+            totals[lf][cat] = totals[lf].get(cat, 0.0) + value
+
+    result: List[Dict[str, object]] = []
+    for lf in level_fields:
+        for cat, indices in profiles.get(lf, {}).items():
+            result.append({
+                "category_label": str(cat),
+                "level": lf,
+                "indices": {int(p): round(float(v), 4) for p, v in sorted(indices.items())},
+                "sample_units": round(totals[lf].get(cat, 0.0), 2),
+            })
+
+    result.sort(key=lambda entry: entry["sample_units"], reverse=True)
+    return result
+
+
+def lead_time_window_months(
+    reference_month: int,
+    lead_time_days: float = 14.0,
+    coverage_days: float = 30.0,
+    num_periods: int = 12,
+) -> Dict[str, int]:
+    """The months a PO placed in ``reference_month`` would be covering.
+
+    A PO arrives after the lead time, then covers demand for ``coverage_days``.
+    The chart shades this window so the buyer sees they must buy *ahead of* a
+    ramp (the research's "Aug PO for the Oct trainers peak" point). Months are
+    1-based and wrap around the year.
+
+    The window is expressed on the forward forecast timeline, which begins the
+    month *after* ``reference_month``. The start offset is therefore floored at 1
+    so a short (sub-month) lead time still lands on the first forecast month
+    rather than the reference month itself (which is 12 months out in the wrapped
+    forecast sequence).
+    """
+    start_offset = max(1, round(float(lead_time_days) / 30.0))
+    end_offset = start_offset + max(1, round(float(coverage_days) / 30.0))
+    start_month = ((reference_month - 1 + start_offset) % num_periods) + 1
+    end_month = ((reference_month - 1 + end_offset) % num_periods) + 1
+    return {"start_month": start_month, "end_month": end_month}
+
+
+def project_monthly_forecast(
+    period_totals: Dict[int, float],
+    months_observed: int,
+    indices: Dict[int, float],
+    reference_month: int,
+    horizon_months: int = 12,
+    num_periods: int = 12,
+) -> List[Dict[str, float]]:
+    """Project a forward monthly forecast from a flat baseline × seasonal indices.
+
+    The baseline is average monthly demand (total observed units / number of
+    observed month-buckets). Each forward month's forecast is that baseline
+    scaled by the month's seasonal index (mean ~= 1.0, so this redistributes
+    rather than inflates demand). Produces ``horizon_months`` points starting at
+    the month *after* ``reference_month``.
+
+    Pure / side-effect-free -- the endpoint supplies the aggregated inputs.
+    """
+    total = sum(v for v in period_totals.values() if v and v > 0)
+    base_monthly = (total / months_observed) if months_observed and months_observed > 0 else 0.0
+
+    forecast: List[Dict[str, float]] = []
+    for step in range(1, horizon_months + 1):
+        moy = ((reference_month - 1 + step) % num_periods) + 1
+        idx = indices.get(moy, 1.0)
+        if idx is None or idx <= 0:
+            idx = 1.0
+        forecast.append({
+            "month": moy,
+            "units": round(base_monthly * idx, 2),
+            "seasonal_index": round(float(idx), 4),
+        })
+    return forecast
+
+
+DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+
+def project_weeks_of_cover(
+    on_hand: float,
+    on_order: float,
+    daily_velocity: float,
+    indices: Optional[Dict[int, float]],
+    reference_month: int,
+    horizon_months: int = 12,
+    num_periods: int = 12,
+    critical_weeks: float = 2.0,
+    low_weeks: float = 4.0,
+) -> List[Dict[str, object]]:
+    """Project forward weeks-of-cover per month for one SKU at one location.
+
+    Starting inventory is ``on_hand + on_order``. Each forward month consumes
+    ``daily_velocity`` scaled by that month's seasonal index, and weeks-of-cover
+    is the inventory at the *start* of the month divided by that month's weekly
+    demand rate. This surfaces *future* stockouts (e.g. a seasonal ramp draining
+    stock three months out) before they happen -- the heatmap's whole point.
+
+    ``stockout_risk`` buckets the cover for color-coding. An item with no velocity
+    is always "healthy" (it cannot stock out). Pure / side-effect-free.
+    """
+    inventory = max(0.0, float(on_hand or 0.0)) + max(0.0, float(on_order or 0.0))
+    velocity = max(0.0, float(daily_velocity or 0.0))
+
+    result: List[Dict[str, object]] = []
+    for step in range(1, horizon_months + 1):
+        moy = ((reference_month - 1 + step) % num_periods) + 1
+        idx = (indices.get(moy, 1.0) if indices else 1.0)
+        if idx is None or idx <= 0:
+            idx = 1.0
+        days = DAYS_IN_MONTH[(moy - 1) % 12]
+        weekly_demand = velocity * 7.0 * idx
+        monthly_demand = velocity * days * idx
+
+        if weekly_demand <= 0:
+            weeks = 52.0 if inventory > 0 else 0.0
+        else:
+            weeks = min(52.0, round(inventory / weekly_demand, 1))
+
+        risk = "healthy"
+        if velocity > 0:
+            if weeks < critical_weeks:
+                risk = "critical"
+            elif weeks < low_weeks:
+                risk = "low"
+
+        result.append({"month": moy, "weeks": weeks, "stockout_risk": risk})
+        inventory = max(0.0, inventory - monthly_demand)
+
+    return result

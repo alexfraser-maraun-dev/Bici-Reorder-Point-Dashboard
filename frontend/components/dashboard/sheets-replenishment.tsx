@@ -43,9 +43,11 @@ import {
   CircleAlert,
   Info,
   BookmarkPlus,
-  AlertTriangle
+  AlertTriangle,
+  LineChart
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { SkuDetailSheet } from './sku-detail-sheet'
 
 export type AdjustmentMode = 'shrink' | 'min_days' | 'cap' | 'raw'
 export type DemandWeights = {
@@ -343,6 +345,7 @@ export function SheetsReplenishment({
   
   const [isPushing, setIsPushing] = useState(false)
   const [pushResult, setPushResult] = useState<{status: 'success'|'warning'|'error', msg: string} | null>(null)
+  const [detailItem, setDetailItem] = useState<any | null>(null)
   
   const [selectedLocation, setSelectedLocation] = useState('Bici Adanac')
   const [searchQuery, setSearchQuery] = useState('')
@@ -1050,6 +1053,14 @@ export function SheetsReplenishment({
                             <span className="bg-muted px-1 rounded font-mono truncate">{item.sku}</span>
                             <span className="font-medium text-foreground/70 truncate">{item.vendor}</span>
                             <MomentumBadge item={item} />
+                            <button
+                              type="button"
+                              onClick={() => setDetailItem(item)}
+                              title="View demand history & forecast"
+                              className="shrink-0 rounded p-0.5 text-muted-foreground/60 opacity-0 transition-all hover:bg-muted hover:text-blue-600 group-hover:opacity-100"
+                            >
+                              <LineChart className="h-3 w-3" />
+                            </button>
                           </div>
                         </div>
                       </TableCell>
@@ -1201,6 +1212,12 @@ export function SheetsReplenishment({
           </div>
         </div>
       </div>
+
+      <SkuDetailSheet
+        item={detailItem}
+        open={!!detailItem}
+        onOpenChange={(value) => { if (!value) setDetailItem(null) }}
+      />
     </div>
   )
 }

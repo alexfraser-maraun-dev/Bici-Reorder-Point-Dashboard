@@ -205,6 +205,45 @@ export function useBrandSourcingRules() {
   return { data: data || null, isLoading, error, refetch }
 }
 
+// Demand & Seasonality: category seasonal profiles for the visualization layer.
+export function useSeasonalProfiles() {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const url = `${baseUrl}/api/forecast/seasonal-profiles`
+  const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
+  const refetch = () => mutate(fetcher(url), false)
+  return { data: data || null, isLoading, error, refetch }
+}
+
+// Demand & Seasonality: monthly history + forward forecast for a category or SKU.
+// Passing a null id disables the fetch (used while a detail panel is closed).
+export function useDemandHistory(
+  scope: 'category' | 'sku',
+  id: string | null,
+  location?: string | number | null,
+) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  let url: string | null = null
+  if (id) {
+    const params = new URLSearchParams({ scope, id: String(id) })
+    if (location !== undefined && location !== null && location !== '') {
+      params.set('location', String(location))
+    }
+    url = `${baseUrl}/api/forecast/history?${params.toString()}`
+  }
+  const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
+  return { data: data || null, isLoading, error, refetch: () => mutate() }
+}
+
+// Demand & Seasonality: forward weeks-of-cover heatmap (soonest stockouts first).
+export function useCoverage(location?: string | null, limit: number = 150) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const params = new URLSearchParams({ limit: String(limit) })
+  if (location) params.set('location', location)
+  const url = `${baseUrl}/api/forecast/coverage?${params.toString()}`
+  const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
+  return { data: data || null, isLoading, error, refetch: () => mutate() }
+}
+
 export async function saveBrandSourcingRule(rule: {
   brand_name: string
   preferred_vendor_id?: string | null
