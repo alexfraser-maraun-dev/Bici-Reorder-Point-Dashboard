@@ -136,8 +136,7 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
                 'cursor-pointer',
                 o.flag === 'overdue' && 'bg-red-50/60 hover:bg-red-50',
                 o.flag === 'overdue_mid' && 'bg-red-100/70 hover:bg-red-100',
-                o.flag === 'critical' && 'bg-red-200/70 hover:bg-red-200',
-                o.flag === 'aged' && 'bg-amber-50/40 hover:bg-amber-50/70'
+                o.flag === 'critical' && 'bg-red-200/70 hover:bg-red-200'
               )}
             >
               <TableCell className="font-mono text-xs">{o.special_order_id}</TableCell>
@@ -165,7 +164,7 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
               <TableCell className="text-right">
                 {o.kind === 'shopify'
                   ? <ShopifyMatchBadge match="none" />
-                  : <FlagBadge stage={o.procurement_stage} flag={o.flag} daysOverdue={o.days_overdue} daysInStage={o.days_since_creation} />}
+                  : <FlagBadge stage={o.procurement_stage} flag={o.flag} daysOverdue={o.days_overdue} />}
               </TableCell>
             </TableRow>
           ))}

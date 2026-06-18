@@ -134,7 +134,7 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
               {/* Stage + attention flag */}
               <div className="flex flex-wrap items-center gap-2">
                 <StageBadge stage={order.procurement_stage} />
-                <FlagBadge stage={order.procurement_stage} flag={order.flag} daysOverdue={order.days_overdue} daysInStage={order.days_since_creation} />
+                <FlagBadge stage={order.procurement_stage} flag={order.flag} daysOverdue={order.days_overdue} />
               </div>
 
               {/* Procurement stage stepper */}
@@ -177,7 +177,7 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
                   label="Days open"
                   value={
                     order.days_since_creation !== null ? (
-                      <span className={cn(order.flag === 'aged' && 'font-semibold text-amber-600')}>
+                      <span className={cn(order.is_overdue && 'font-semibold text-red-600')}>
                         {order.days_since_creation}
                       </span>
                     ) : null

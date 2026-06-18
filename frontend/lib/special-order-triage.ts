@@ -4,9 +4,6 @@
 // wording stays in lock-step.
 import type { ProcurementStage, SpecialOrder, SpecialOrderFlag } from './types'
 
-// Keep in sync with _STALE_STAGE_DAYS in backend/app/services/special_order_service.py.
-export const STALE_STAGE_DAYS = 5
-
 export type TriageTone = 'danger' | 'warn' | 'ok'
 
 export interface SubTriage {
@@ -21,18 +18,16 @@ export interface SubTriage {
 // (customer-promised date) drives the bucket even before the SO is ordered in Lightspeed.
 export const STAGE_SUBTRIAGES: Record<ProcurementStage, SubTriage[]> = {
   open_pool: [
-    { key: 'critical', label: 'Open Order 8d+', tone: 'danger' },
-    { key: 'overdue_mid', label: 'Open Order 3-7d', tone: 'danger' },
-    { key: 'overdue', label: 'Open Order 1-2d', tone: 'danger' },
-    { key: 'aged', label: `Open Pool > ${STALE_STAGE_DAYS} Days`, tone: 'warn' },
-    { key: 'healthy', label: 'Healthy', tone: 'ok' },
+    { key: 'critical', label: 'Open Order 12d+', tone: 'danger' },
+    { key: 'overdue_mid', label: 'Open Order 7-11d', tone: 'danger' },
+    { key: 'overdue', label: 'Open Order 5-6d', tone: 'danger' },
+    { key: 'healthy', label: 'Healthy (0-4d)', tone: 'ok' },
   ],
   unordered_po: [
-    { key: 'critical', label: 'Unordered 8d+', tone: 'danger' },
-    { key: 'overdue_mid', label: 'Unordered 3-7d', tone: 'danger' },
-    { key: 'overdue', label: 'Unordered 1-2d', tone: 'danger' },
-    { key: 'aged', label: `Unordered PO > ${STALE_STAGE_DAYS} Days`, tone: 'warn' },
-    { key: 'healthy', label: 'Healthy', tone: 'ok' },
+    { key: 'critical', label: 'Unordered 12d+', tone: 'danger' },
+    { key: 'overdue_mid', label: 'Unordered 7-11d', tone: 'danger' },
+    { key: 'overdue', label: 'Unordered 5-6d', tone: 'danger' },
+    { key: 'healthy', label: 'Healthy (0-4d)', tone: 'ok' },
   ],
   ordered: [
     { key: 'critical', label: 'Critical (8d+)', tone: 'danger' },

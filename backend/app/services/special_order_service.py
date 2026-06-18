@@ -16,9 +16,10 @@ Records are triaged on TWO axes:
       ordered       -> PO placed with the vendor (Order.orderedDate is set)
       received      -> the SO has been checked in (SpecialOrder.status says so)
 
-  flag — the attention state WITHIN a stage (or "none" when nothing needs action):
-      aged             -> open_pool / unordered_po sitting too long
-      overdue/critical -> ordered PO past its expected (arrival) date; two-step on day 8
+  flag — the attention state WITHIN a stage (or "none" when nothing needs action), bucketed
+    into escalating 1-2d / 3-7d / 8+d tiers:
+      overdue/overdue_mid/critical -> days past the classification date (Shopify ETA / PO
+        expected date), or — for the pre-order stages with no such date — days sitting in stage
       no_eta           -> ordered PO with no expected date to judge lateness against
       ready_not_called -> received but the customer hasn't been contacted
 
@@ -41,14 +42,15 @@ from app.services import shopify_match
 # pattern and should be confirmed.
 _MERCHANTOS = "https://us.merchantos.com/?name={view}&form_name=view&id={id}"
 
-# Days an SO can sit in the open-pool / unordered-PO stages before it's flagged "aged".
-# Keep in sync with STALE_STAGE_DAYS in frontend/lib/special-order-triage.ts (tile labels).
-_STALE_STAGE_DAYS = 5
-
-# Overdue thresholds (days past the classification date). Three escalating tiers, tunable:
+# Overdue thresholds (days "into trouble"). Three escalating tiers, tunable:
 #   1..2 days  => "overdue"      3..7 days => "overdue_mid"      8+ days => "critical"
 _OVERDUE_MID_MIN = 3
 _OVERDUE_MAX = 7
+
+# Pre-order stages (open_pool / unordered_po) are flagged by REAL age (time in stage): healthy
+# for the first few days, then the three tiers ramp by actual days. With a 5-day grace the tiers
+# land at 5-6d / 7-11d / 12d+.
+_PREORDER_GRACE_DAYS = 5
 
 # Flags that count as "overdue" (late against the classification date).
 _OVERDUE_FLAGS = ("overdue", "overdue_mid", "critical")
@@ -104,36 +106,48 @@ def _compute_flag(
     today: date,
 ) -> Dict[str, Any]:
     """
-    The within-stage attention flag, measured against `classification_date` — the
-    customer-promised Shopify ETA when present, else the PO's expected date. Returns
-    { flag, days_overdue }.
+    The within-stage attention flag, returned as { flag, days_overdue }, in three escalating
+    tiers. Two regimes:
 
-    A present date drives overdue/critical in every non-received stage (a blown customer
-    promise matters even before the SO is ordered in Lightspeed), and supersedes the
-    time-in-stage `aged` flag. With no date to judge against, ordered SOs read `no_eta` and
-    open-pool / unordered SOs fall back to `aged` once they've sat past _STALE_STAGE_DAYS.
+      ordered    -> date-driven: days past `classification_date` (the customer-promised Shopify
+                    ETA when present, else the PO's expected date); tiers at 1-2d / 3-7d / 8d+;
+                    no date at all => `no_eta`.
+      open_pool/  -> age-driven: days the SO has been sitting (days_since_creation), healthy for
+      unordered_po   a grace window, then tiers at 5-6d / 7-11d / 12d+. `days_overdue` carries the
+                     real age. (The Shopify ETA still shows in its column but doesn't drive these.)
     """
     if stage == "received":
         return {"flag": "none" if contacted else "ready_not_called", "days_overdue": None}
 
-    if classification_date is not None:
-        days_overdue = (today - classification_date).days  # signed: negative = still early
-        if days_overdue > _OVERDUE_MAX:
+    if stage == "ordered":
+        # Date-driven (Shopify ETA preferred, else PO date), no grace. No date => no_eta.
+        # days_overdue = days past that date; tiers at 1-2d / 3-7d / 8d+.
+        if classification_date is None:
+            return {"flag": "no_eta", "days_overdue": None}
+        days = (today - classification_date).days  # signed: negative = still on time
+        if days > _OVERDUE_MAX:
             flag = "critical"
-        elif days_overdue >= _OVERDUE_MID_MIN:
+        elif days >= _OVERDUE_MID_MIN:
             flag = "overdue_mid"
-        elif days_overdue >= 1:
+        elif days >= 1:
             flag = "overdue"
         else:
             flag = "none"
-        return {"flag": flag, "days_overdue": days_overdue}
+        return {"flag": flag, "days_overdue": days}
 
-    # No date to judge against.
-    if stage == "ordered":
-        return {"flag": "no_eta", "days_overdue": None}
-    if days_since_creation is not None and days_since_creation > _STALE_STAGE_DAYS:
-        return {"flag": "aged", "days_overdue": None}
-    return {"flag": "none", "days_overdue": None}
+    # open_pool / unordered_po: flagged by REAL age (time in stage). Healthy for the grace
+    # window, then the tiers ramp by actual days; days_overdue carries the real age so the
+    # badge and the 5-6d / 7-11d / 12d+ tile labels agree.
+    if days_since_creation is None or days_since_creation < _PREORDER_GRACE_DAYS:
+        return {"flag": "none", "days_overdue": None}
+    into_trouble = days_since_creation - _PREORDER_GRACE_DAYS + 1
+    if into_trouble > _OVERDUE_MAX:
+        flag = "critical"
+    elif into_trouble >= _OVERDUE_MID_MIN:
+        flag = "overdue_mid"
+    else:
+        flag = "overdue"
+    return {"flag": flag, "days_overdue": days_since_creation}
 
 
 def _compute_stage_and_flag(
@@ -287,7 +301,6 @@ def _summarize(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         "flagged_by_stage": flagged_by_stage,
         "by_flag": by_flag,
         # Flat convenience counts
-        "aged": by_flag.get("aged", 0),
         "overdue": sum(by_flag.get(f, 0) for f in _OVERDUE_FLAGS),
         "critical": by_flag.get("critical", 0),
         "no_eta": by_flag.get("no_eta", 0),
@@ -296,7 +309,7 @@ def _summarize(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # Severity rank so flagged items bubble to the top within their stage.
-_FLAG_RANK = {"critical": 6, "overdue_mid": 5, "overdue": 4, "no_eta": 3, "aged": 3, "ready_not_called": 1, "none": 0}
+_FLAG_RANK = {"critical": 6, "overdue_mid": 5, "overdue": 4, "no_eta": 3, "ready_not_called": 1, "none": 0}
 
 # Shopify SO rows change slowly (Fivetran sync lag), so cache the BigQuery pull beyond the
 # 90s endpoint cache to keep the live SO refresh cheap.

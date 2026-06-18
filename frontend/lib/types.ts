@@ -243,10 +243,9 @@ export type ProcurementStage =
 // The one thing (if any) that needs attention within a stage. 'none' = nothing to action.
 export type SpecialOrderFlag =
   | 'none'
-  | 'aged'             // open_pool / unordered_po sitting too long
-  | 'overdue'          // 1–2 days past the classification date
-  | 'overdue_mid'      // 3–7 days past
-  | 'critical'         // 8+ days past
+  | 'overdue'          // 1–2 days past the classification date (or sitting in stage)
+  | 'overdue_mid'      // 3–7 days
+  | 'critical'         // 8+ days
   | 'no_eta'           // ordered, no date to judge against
   | 'ready_not_called' // received but customer not yet contacted
 
@@ -324,7 +323,6 @@ export interface SpecialOrderSummary {
   flagged_by_stage: Record<ProcurementStage, number>
   by_flag: Record<string, number>
   // Flat convenience counts
-  aged: number
   overdue: number
   critical: number
   no_eta: number
