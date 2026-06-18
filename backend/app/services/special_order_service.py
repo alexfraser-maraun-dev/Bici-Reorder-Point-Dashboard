@@ -45,8 +45,13 @@ _MERCHANTOS = "https://us.merchantos.com/?name={view}&form_name=view&id={id}"
 # Keep in sync with STALE_STAGE_DAYS in frontend/lib/special-order-triage.ts (tile labels).
 _STALE_STAGE_DAYS = 5
 
-# Overdue thresholds (days past an ordered PO's expected date). Tunable.
-_OVERDUE_MAX = 7         # 1..7 days late => "overdue"; 8+ => "critical"
+# Overdue thresholds (days past the classification date). Three escalating tiers, tunable:
+#   1..2 days  => "overdue"      3..7 days => "overdue_mid"      8+ days => "critical"
+_OVERDUE_MID_MIN = 3
+_OVERDUE_MAX = 7
+
+# Flags that count as "overdue" (late against the classification date).
+_OVERDUE_FLAGS = ("overdue", "overdue_mid", "critical")
 
 # SpecialOrder.status keywords meaning the item has been checked in / received.
 _RECEIVED_STATUS_KEYS = ("received", "ready", "arrived", "pickup", "checked in", "in stock")
@@ -91,6 +96,46 @@ def _customer_name(customer: Dict[str, Any]) -> Optional[str]:
     return name or customer.get("company") or None
 
 
+def _compute_flag(
+    stage: str,
+    classification_date: Optional[date],
+    days_since_creation: Optional[int],
+    contacted: bool,
+    today: date,
+) -> Dict[str, Any]:
+    """
+    The within-stage attention flag, measured against `classification_date` — the
+    customer-promised Shopify ETA when present, else the PO's expected date. Returns
+    { flag, days_overdue }.
+
+    A present date drives overdue/critical in every non-received stage (a blown customer
+    promise matters even before the SO is ordered in Lightspeed), and supersedes the
+    time-in-stage `aged` flag. With no date to judge against, ordered SOs read `no_eta` and
+    open-pool / unordered SOs fall back to `aged` once they've sat past _STALE_STAGE_DAYS.
+    """
+    if stage == "received":
+        return {"flag": "none" if contacted else "ready_not_called", "days_overdue": None}
+
+    if classification_date is not None:
+        days_overdue = (today - classification_date).days  # signed: negative = still early
+        if days_overdue > _OVERDUE_MAX:
+            flag = "critical"
+        elif days_overdue >= _OVERDUE_MID_MIN:
+            flag = "overdue_mid"
+        elif days_overdue >= 1:
+            flag = "overdue"
+        else:
+            flag = "none"
+        return {"flag": flag, "days_overdue": days_overdue}
+
+    # No date to judge against.
+    if stage == "ordered":
+        return {"flag": "no_eta", "days_overdue": None}
+    if days_since_creation is not None and days_since_creation > _STALE_STAGE_DAYS:
+        return {"flag": "aged", "days_overdue": None}
+    return {"flag": "none", "days_overdue": None}
+
+
 def _compute_stage_and_flag(
     has_po: bool,
     po_ordered: bool,
@@ -105,10 +150,9 @@ def _compute_stage_and_flag(
       { procurement_stage, procurement_stage_index, flag, days_overdue }
 
     Stage is a waterfall — "received" is terminal and authoritative, then ordered/unordered
-    POs, then the open pool. The within-stage `flag` is the one thing (if any) that needs
-    attention. Only ORDERED special orders can be overdue.
+    POs, then the open pool. The flag here is the PO-date baseline; once the Shopify ETA is
+    known, the dashboard re-runs `_compute_flag` with it as the preferred classification date.
     """
-    # --- Stage (procurement flow position) ---
     if received:
         stage, stage_index = "received", 3
     elif has_po and po_ordered:
@@ -118,31 +162,15 @@ def _compute_stage_and_flag(
     else:
         stage, stage_index = "open_pool", 0
 
-    # --- Flag (attention state within the stage) ---
-    flag = "none"
-    days_overdue: Optional[int] = None
-
-    if stage in ("open_pool", "unordered_po"):
-        if days_since_creation is not None and days_since_creation > _STALE_STAGE_DAYS:
-            flag = "aged"
-    elif stage == "ordered":
-        if expected_date is None:
-            flag = "no_eta"
-        else:
-            days_overdue = (today - expected_date).days  # signed: negative = still early
-            if days_overdue > _OVERDUE_MAX:
-                flag = "critical"
-            elif days_overdue >= 1:
-                flag = "overdue"
-    elif stage == "received":
-        if not contacted:
-            flag = "ready_not_called"
+    # PO expected date only counts as a classification date once the PO is actually placed.
+    classification_date = expected_date if stage == "ordered" else None
+    fl = _compute_flag(stage, classification_date, days_since_creation, contacted, today)
 
     return {
         "procurement_stage": stage,
         "procurement_stage_index": stage_index,
-        "flag": flag,
-        "days_overdue": days_overdue,
+        "flag": fl["flag"],
+        "days_overdue": fl["days_overdue"],
     }
 
 
@@ -229,7 +257,7 @@ def _normalize(
         "procurement_stage_index": triage["procurement_stage_index"],
         "flag": triage["flag"],
         "days_overdue": triage["days_overdue"],
-        "is_overdue": triage["flag"] in ("overdue", "critical"),
+        "is_overdue": triage["flag"] in _OVERDUE_FLAGS,
         # Deep links into Lightspeed
         "ls_item_url": _ls_url("item.views.item", item_id),
         "ls_customer_url": _ls_url("customer.views.customer", customer_id),
@@ -260,7 +288,7 @@ def _summarize(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         "by_flag": by_flag,
         # Flat convenience counts
         "aged": by_flag.get("aged", 0),
-        "overdue": by_flag.get("overdue", 0) + by_flag.get("critical", 0),
+        "overdue": sum(by_flag.get(f, 0) for f in _OVERDUE_FLAGS),
         "critical": by_flag.get("critical", 0),
         "no_eta": by_flag.get("no_eta", 0),
         "ready_not_called": by_flag.get("ready_not_called", 0),
@@ -268,7 +296,7 @@ def _summarize(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # Severity rank so flagged items bubble to the top within their stage.
-_FLAG_RANK = {"critical": 5, "overdue": 4, "no_eta": 3, "aged": 3, "ready_not_called": 1, "none": 0}
+_FLAG_RANK = {"critical": 6, "overdue_mid": 5, "overdue": 4, "no_eta": 3, "aged": 3, "ready_not_called": 1, "none": 0}
 
 # Shopify SO rows change slowly (Fivetran sync lag), so cache the BigQuery pull beyond the
 # 90s endpoint cache to keep the live SO refresh cheap.
@@ -294,11 +322,14 @@ def _shopify_order_url(order_id: Optional[str]) -> Optional[str]:
     return f"https://admin.shopify.com/store/{handle}/orders/{order_id}"
 
 
-def _enrich_with_shopify(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _enrich_with_shopify(orders: List[Dict[str, Any]], today: date) -> List[Dict[str, Any]]:
     """
     Mutates each LS SO with its Shopify match (customer-promised ETA + order link) and returns
     the Shopify-only orders (tagged `SO`, referenced by no LS SO) — the "Unmatched" population.
-    Never raises: if the Shopify pull is empty, every SO simply stays unmatched.
+
+    Where a Shopify ETA is found, it becomes the preferred classification date and the flag /
+    days_overdue are recomputed against it (a blown customer promise outranks the PO timeline).
+    Never raises: if the Shopify pull is empty, every SO simply stays unmatched / PO-classified.
     """
     rows = _shopify_rows()
     if not rows:
@@ -313,6 +344,16 @@ def _enrich_with_shopify(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         o["shopify_order_name"] = m["shopify_order_name"]
         o["shopify_expected_date"] = m["shopify_expected_date"]
         o["shopify_order_url"] = _shopify_order_url(m["shopify_order_id"])
+
+        # Re-bucket: prefer the Shopify ETA as the classification date when present.
+        shopify_eta = _parse_ls_date(m["shopify_expected_date"])
+        po_eta = _parse_ls_date(o.get("expected_date"))
+        stage = o["procurement_stage"]
+        classification_date = shopify_eta or (po_eta if stage == "ordered" else None)
+        fl = _compute_flag(stage, classification_date, o.get("days_since_creation"), o.get("contacted", False), today)
+        o["flag"] = fl["flag"]
+        o["days_overdue"] = fl["days_overdue"]
+        o["is_overdue"] = fl["flag"] in _OVERDUE_FLAGS
     unmatched = shopify_match.shopify_only_orders(index, consumed)
     for u in unmatched:
         u["shopify_order_url"] = _shopify_order_url(u["order_id"])
@@ -340,7 +381,7 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
     orders = [_normalize(so, order_map, customer_map, shop_names, today) for so in special_orders]
 
     # Enrich with the Shopify customer-promised ETA and collect Shopify-only ("Unmatched") orders.
-    shopify_only = _enrich_with_shopify(orders)
+    shopify_only = _enrich_with_shopify(orders, today)
 
     # Flagged items first, ranked by flag severity, then most-overdue / oldest within that.
     orders.sort(

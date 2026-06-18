@@ -121,7 +121,7 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
             {th('PO #', 'order_id', 'hidden lg:table-cell')}
             {th('Ordered', 'ordered_date', 'hidden xl:table-cell')}
             {th('PO date', 'expected_date')}
-            {th('Customer date', 'shopify_expected_date')}
+            {th('Shopify ETA', 'shopify_expected_date')}
             {th('Created', 'created_date', 'hidden xl:table-cell')}
             {th('Stage', 'procurement_stage_index')}
             {th('Flag', 'flag', 'text-right')}
@@ -134,7 +134,9 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
               onClick={() => onRowClick(o)}
               className={cn(
                 'cursor-pointer',
-                (o.flag === 'overdue' || o.flag === 'critical') && 'bg-red-50/50 hover:bg-red-50',
+                o.flag === 'overdue' && 'bg-red-50/60 hover:bg-red-50',
+                o.flag === 'overdue_mid' && 'bg-red-100/70 hover:bg-red-100',
+                o.flag === 'critical' && 'bg-red-200/70 hover:bg-red-200',
                 o.flag === 'aged' && 'bg-amber-50/40 hover:bg-amber-50/70'
               )}
             >
@@ -163,7 +165,7 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
               <TableCell className="text-right">
                 {o.kind === 'shopify'
                   ? <ShopifyMatchBadge match="none" />
-                  : <FlagBadge stage={o.procurement_stage} flag={o.flag} daysOverdue={o.days_overdue} />}
+                  : <FlagBadge stage={o.procurement_stage} flag={o.flag} daysOverdue={o.days_overdue} daysInStage={o.days_since_creation} />}
               </TableCell>
             </TableRow>
           ))}

@@ -169,7 +169,15 @@ def get_shopify_special_orders():
                  o.display_financial_status AS financial_status, o.created_at
           FROM `{SHOPIFY_DATASET}.order` o
           JOIN `{SHOPIFY_DATASET}.order_tag` ot ON ot.order_id = o.id
-          WHERE LOWER(ot.value) = 'so' AND o.display_fulfillment_status != 'FULFILLED'
+          WHERE LOWER(ot.value) = 'so'
+            AND o.display_fulfillment_status != 'FULFILLED'
+            -- Exclude refunded / voided / cancelled / archived / test / deleted orders so the
+            -- Shopify consideration window only holds live, financially-sound special orders.
+            AND o.display_financial_status NOT IN ('REFUNDED', 'PARTIALLY_REFUNDED', 'VOIDED')
+            AND o.cancelled_at IS NULL
+            AND COALESCE(o.closed, FALSE) = FALSE
+            AND COALESCE(o.test, FALSE) = FALSE
+            AND COALESCE(o._fivetran_deleted, FALSE) = FALSE
         ),
         eta AS (
           SELECT owner_id, value AS eta

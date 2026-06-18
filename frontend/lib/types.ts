@@ -244,9 +244,10 @@ export type ProcurementStage =
 export type SpecialOrderFlag =
   | 'none'
   | 'aged'             // open_pool / unordered_po sitting too long
-  | 'overdue'          // ordered PO 1–7 days past its expected date
-  | 'critical'         // ordered PO 8+ days past its expected date
-  | 'no_eta'           // ordered PO with no expected date
+  | 'overdue'          // 1–2 days past the classification date
+  | 'overdue_mid'      // 3–7 days past
+  | 'critical'         // 8+ days past
+  | 'no_eta'           // ordered, no date to judge against
   | 'ready_not_called' // received but customer not yet contacted
 
 // Whether a live LS SO was matched to a Shopify `SO`-tagged order (by customer email + SKU).

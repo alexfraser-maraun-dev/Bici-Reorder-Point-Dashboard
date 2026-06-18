@@ -69,34 +69,49 @@ export function ShopifyMatchBadge({ match }: { match: ShopifyMatch | 'unmatched'
   )
 }
 
-// The within-stage attention flag (the "what needs doing" axis). Colour + icon are keyed
-// off the flag; the text comes from the shared sub-triage labels so it matches the tiles.
+// The within-stage attention flag (the "what needs doing" axis). Colour + icon are keyed off
+// the flag; lateness escalates 1-2d -> 3-7d -> 8+d for a progressively more dramatic highlight.
 const flagStyle: Record<SpecialOrderFlag, { className: string; icon: typeof AlertTriangle }> = {
   none: { className: 'bg-secondary text-muted-foreground border-border', icon: CircleCheck },
   aged: { className: 'bg-amber-100 text-amber-700 border-amber-200', icon: Clock },
   overdue: { className: 'bg-red-100 text-red-700 border-red-200', icon: AlertTriangle },
-  critical: { className: 'bg-red-200 text-red-800 border-red-300', icon: AlertTriangle },
+  overdue_mid: { className: 'bg-red-300 text-red-900 border-red-400', icon: AlertTriangle },
+  critical: { className: 'border-red-700 bg-red-600 text-white', icon: AlertTriangle },
   no_eta: { className: 'bg-amber-100 text-amber-700 border-amber-200', icon: CircleHelp },
   ready_not_called: { className: 'bg-emerald-100 text-emerald-700 border-emerald-200', icon: PackageCheck },
 }
+
+const LATE_FLAGS: SpecialOrderFlag[] = ['overdue', 'overdue_mid', 'critical']
 
 export function FlagBadge({
   stage,
   flag,
   daysOverdue,
+  daysInStage,
 }: {
   stage: ProcurementStage
   flag: SpecialOrderFlag
   daysOverdue?: number | null
+  daysInStage?: number | null
 }) {
   const { className, icon: Icon } = flagStyle[flag]
-  // For an ordered SO that's late, show the actual day count alongside the label.
-  const showDays = daysOverdue != null && daysOverdue > 0 && (flag === 'overdue' || flag === 'critical')
-  const label = showDays
-    ? `${flag === 'critical' ? 'Critical' : 'Overdue'} · ${daysOverdue}d`
-    : subTriageLabel(stage, flag)
+
+  let label: string
+  if (LATE_FLAGS.includes(flag)) {
+    // Late against the classification date — show the day count, like the screenshot's "Overdue 4d".
+    const word = flag === 'critical' ? 'Critical' : 'Overdue'
+    label = daysOverdue != null && daysOverdue > 0 ? `${word} · ${daysOverdue}d` : word
+  } else if (flag === 'aged') {
+    // Sitting too long in stage — carry the days-in-stage, mirroring the overdue badges.
+    const shortStage = stage === 'unordered_po' ? 'Unordered PO' : 'Open pool'
+    label = daysInStage != null ? `${shortStage} · ${daysInStage}d` : subTriageLabel(stage, flag)
+  } else {
+    label = subTriageLabel(stage, flag)
+  }
+
+  const bold = flag === 'critical' || flag === 'overdue_mid'
   return (
-    <Badge variant="outline" className={cn('gap-1 text-[10px] font-medium', className)}>
+    <Badge variant="outline" className={cn('gap-1 text-[10px]', bold ? 'font-semibold' : 'font-medium', className)}>
       <Icon className="h-3 w-3" />
       {label}
     </Badge>

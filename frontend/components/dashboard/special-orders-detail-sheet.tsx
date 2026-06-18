@@ -103,7 +103,7 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
             <div className="flex flex-col gap-4 px-4 pb-6">
               <div className="grid grid-cols-2 gap-4">
                 <Field label="Customer" value={order.customer_email} />
-                <Field label="Customer-promised date" value={order.shopify_expected_date} />
+                <Field label="Shopify ETA" value={order.shopify_expected_date} />
                 <Field label="SKU(s)" value={order.description ? <span className="font-mono text-xs">{order.description}</span> : null} />
                 <Field label="Created" value={order.created_date} />
               </div>
@@ -134,7 +134,7 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
               {/* Stage + attention flag */}
               <div className="flex flex-wrap items-center gap-2">
                 <StageBadge stage={order.procurement_stage} />
-                <FlagBadge stage={order.procurement_stage} flag={order.flag} daysOverdue={order.days_overdue} />
+                <FlagBadge stage={order.procurement_stage} flag={order.flag} daysOverdue={order.days_overdue} daysInStage={order.days_since_creation} />
               </div>
 
               {/* Procurement stage stepper */}
@@ -190,7 +190,7 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
               {/* Shopify (customer-promised) date + match */}
               <div className="grid grid-cols-2 gap-4">
                 <Field
-                  label="Customer date (Shopify)"
+                  label="Shopify ETA"
                   value={
                     order.shopify_expected_date ? (
                       <span className="flex items-center gap-1.5">
