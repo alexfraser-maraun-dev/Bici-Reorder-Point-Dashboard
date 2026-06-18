@@ -103,7 +103,7 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
               {/* Stage + attention flag */}
               <div className="flex flex-wrap items-center gap-2">
                 <StageBadge stage={order.procurement_stage} />
-                <FlagBadge flag={order.flag} daysOverdue={order.days_overdue} />
+                <FlagBadge stage={order.procurement_stage} flag={order.flag} daysOverdue={order.days_overdue} />
               </div>
 
               {/* Procurement stage stepper */}

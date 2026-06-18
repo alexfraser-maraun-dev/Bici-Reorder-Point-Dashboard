@@ -3,10 +3,12 @@
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
 import type { ProcurementStage, SpecialOrderFlag } from '@/lib/types'
+import { subTriageLabel } from '@/lib/special-order-triage'
 import {
   AlertTriangle,
   Clock,
   CircleHelp,
+  CircleCheck,
   PackageCheck,
   Inbox,
   FileClock,
@@ -38,25 +40,36 @@ export function StageBadge({ stage }: { stage: ProcurementStage }) {
   )
 }
 
-// The within-stage attention flag (the "what needs doing" axis).
-const flagConfig: Record<Exclude<SpecialOrderFlag, 'none'>, BadgeConfig> = {
-  aged: { label: 'Stale', className: 'bg-amber-100 text-amber-700 border-amber-200', icon: Clock },
-  overdue: { label: 'Overdue', className: 'bg-red-100 text-red-700 border-red-200', icon: AlertTriangle },
-  critical: { label: 'Critical', className: 'bg-red-200 text-red-800 border-red-300', icon: AlertTriangle },
-  no_eta: { label: 'No ETA', className: 'bg-amber-100 text-amber-700 border-amber-200', icon: CircleHelp },
-  ready_not_called: { label: 'Ready · not called', className: 'bg-emerald-100 text-emerald-700 border-emerald-200', icon: PackageCheck },
+// The within-stage attention flag (the "what needs doing" axis). Colour + icon are keyed
+// off the flag; the text comes from the shared sub-triage labels so it matches the tiles.
+const flagStyle: Record<SpecialOrderFlag, { className: string; icon: typeof AlertTriangle }> = {
+  none: { className: 'bg-secondary text-muted-foreground border-border', icon: CircleCheck },
+  aged: { className: 'bg-amber-100 text-amber-700 border-amber-200', icon: Clock },
+  overdue: { className: 'bg-red-100 text-red-700 border-red-200', icon: AlertTriangle },
+  critical: { className: 'bg-red-200 text-red-800 border-red-300', icon: AlertTriangle },
+  no_eta: { className: 'bg-amber-100 text-amber-700 border-amber-200', icon: CircleHelp },
+  ready_not_called: { className: 'bg-emerald-100 text-emerald-700 border-emerald-200', icon: PackageCheck },
 }
 
-export function FlagBadge({ flag, daysOverdue }: { flag: SpecialOrderFlag; daysOverdue?: number | null }) {
-  if (flag === 'none') return null
-  const config = flagConfig[flag]
-  const Icon = config.icon
+export function FlagBadge({
+  stage,
+  flag,
+  daysOverdue,
+}: {
+  stage: ProcurementStage
+  flag: SpecialOrderFlag
+  daysOverdue?: number | null
+}) {
+  const { className, icon: Icon } = flagStyle[flag]
+  // For an ordered SO that's late, show the actual day count alongside the label.
   const showDays = daysOverdue != null && daysOverdue > 0 && (flag === 'overdue' || flag === 'critical')
+  const label = showDays
+    ? `${flag === 'critical' ? 'Critical' : 'Overdue'} · ${daysOverdue}d`
+    : subTriageLabel(stage, flag)
   return (
-    <Badge variant="outline" className={cn('gap-1 text-[10px] font-medium', config.className)}>
+    <Badge variant="outline" className={cn('gap-1 text-[10px] font-medium', className)}>
       <Icon className="h-3 w-3" />
-      {config.label}
-      {showDays ? ` ${daysOverdue}d` : ''}
+      {label}
     </Badge>
   )
 }

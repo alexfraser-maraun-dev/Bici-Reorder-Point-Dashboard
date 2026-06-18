@@ -37,7 +37,8 @@ from app.services.lightspeed_client import LightspeedClient
 _MERCHANTOS = "https://us.merchantos.com/?name={view}&form_name=view&id={id}"
 
 # Days an SO can sit in the open-pool / unordered-PO stages before it's flagged "aged".
-_STALE_STAGE_DAYS = 3
+# Keep in sync with STALE_STAGE_DAYS in frontend/lib/special-order-triage.ts (tile labels).
+_STALE_STAGE_DAYS = 5
 
 # Overdue thresholds (days past an ordered PO's expected date). Tunable.
 _OVERDUE_MAX = 7         # 1..7 days late => "overdue"; 8+ => "critical"

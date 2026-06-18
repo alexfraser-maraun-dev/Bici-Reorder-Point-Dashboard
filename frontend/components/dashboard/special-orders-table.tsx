@@ -153,7 +153,7 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
                 <StageBadge stage={o.procurement_stage} />
               </TableCell>
               <TableCell className="text-right">
-                <FlagBadge flag={o.flag} daysOverdue={o.days_overdue} />
+                <FlagBadge stage={o.procurement_stage} flag={o.flag} daysOverdue={o.days_overdue} />
               </TableCell>
             </TableRow>
           ))}

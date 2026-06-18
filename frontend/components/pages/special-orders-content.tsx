@@ -3,6 +3,7 @@
 import { useMemo, useState } from 'react'
 import { useSpecialOrders } from '@/lib/hooks'
 import type { SpecialOrder, ProcurementStage } from '@/lib/types'
+import { STAGE_SUBTRIAGES, subKeyForOrder, type TriageTone } from '@/lib/special-order-triage'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -30,8 +31,6 @@ import {
 // "Live SOs": hide special orders created more than this many days ago (likely abandoned).
 const LIVE_SO_MAX_DAYS = 365
 
-type StageFilter = ProcurementStage | 'all'
-
 // The 4 procurement-flow stages, in order — the primary triage axis.
 const stageTiles: {
   key: ProcurementStage
@@ -46,14 +45,24 @@ const stageTiles: {
   { key: 'received', label: 'Received', icon: PackageCheck, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
 ]
 
+const toneDot: Record<TriageTone, string> = {
+  danger: 'bg-red-500',
+  warn: 'bg-amber-500',
+  ok: 'bg-emerald-500',
+}
+
+// Selection is at the sub-triage "segment" level: `${stage}::${subKey}`. A stage tile
+// toggles all of its segments at once; a sub-triage toggles just one.
+const seg = (stage: ProcurementStage, subKey: string) => `${stage}::${subKey}`
+
 export function SpecialOrdersContent() {
-  const { orders, summary, isLoading, refetch, fetchedAt } = useSpecialOrders()
-  const [stage, setStage] = useState<StageFilter>('all')
+  const { orders, isLoading, refetch, fetchedAt } = useSpecialOrders()
+  const [selected, setSelected] = useState<Set<string>>(new Set())
   const [search, setSearch] = useState('')
   const [storeFilter, setStoreFilter] = useState<string>('all')
   const [liveOnly, setLiveOnly] = useState(true)
   const [flaggedOnly, setFlaggedOnly] = useState(false)
-  const [selected, setSelected] = useState<SpecialOrder | null>(null)
+  const [selectedOrder, setSelectedOrder] = useState<SpecialOrder | null>(null)
   const [sheetOpen, setSheetOpen] = useState(false)
 
   // Derive unique store names from loaded orders
@@ -63,26 +72,65 @@ export function SpecialOrdersContent() {
     return Array.from(names).sort()
   }, [orders])
 
-  const filtered = useMemo(() => {
+  // Base set: everything EXCEPT the stage/sub selection. The tiles read their counts from
+  // this, so they react live to "Flagged only" / "Live SOs" / search / store.
+  const base = useMemo(() => {
     const term = search.trim().toLowerCase()
     return orders.filter((o) => {
-      if (stage !== 'all' && o.procurement_stage !== stage) return false
       if (flaggedOnly && o.flag === 'none') return false
       if (storeFilter !== 'all' && o.store !== storeFilter) return false
-      // Live SOs: drop year+ old orders, but keep ones with no known created date.
       if (liveOnly && o.days_since_creation !== null && o.days_since_creation > LIVE_SO_MAX_DAYS) return false
       if (!term) return true
       return [o.customer_name, o.description, o.system_sku, o.vendor_name, o.order_id, o.special_order_id]
         .some((v) => v && String(v).toLowerCase().includes(term))
     })
-  }, [orders, stage, flaggedOnly, search, storeFilter, liveOnly])
+  }, [orders, flaggedOnly, storeFilter, liveOnly, search])
+
+  // The table additionally applies the stage/sub selection.
+  const filtered = useMemo(
+    () => (selected.size === 0
+      ? base
+      : base.filter((o) => selected.has(seg(o.procurement_stage, subKeyForOrder(o))))),
+    [base, selected]
+  )
+
+  // Counts over the base set, grouped by stage and sub-triage segment.
+  const { stageTotals, segCounts } = useMemo(() => {
+    const stageTotals: Record<string, number> = {}
+    const segCounts: Record<string, number> = {}
+    for (const o of base) {
+      stageTotals[o.procurement_stage] = (stageTotals[o.procurement_stage] ?? 0) + 1
+      const id = seg(o.procurement_stage, subKeyForOrder(o))
+      segCounts[id] = (segCounts[id] ?? 0) + 1
+    }
+    return { stageTotals, segCounts }
+  }, [base])
+
+  const toggleSeg = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleStage = (stage: ProcurementStage) => {
+    const ids = STAGE_SUBTRIAGES[stage].map((s) => seg(stage, s.key))
+    const allOn = ids.every((id) => selected.has(id))
+    setSelected((prev) => {
+      const next = new Set(prev)
+      ids.forEach((id) => (allOn ? next.delete(id) : next.add(id)))
+      return next
+    })
+  }
 
   const openOrder = (o: SpecialOrder) => {
-    setSelected(o)
+    setSelectedOrder(o)
     setSheetOpen(true)
   }
 
-  const filtersActive = stage !== 'all' || storeFilter !== 'all' || search || flaggedOnly || !liveOnly
+  const filtersActive = selected.size > 0 || storeFilter !== 'all' || search || flaggedOnly || !liveOnly
 
   return (
     <div className="space-y-4">
@@ -102,48 +150,70 @@ export function SpecialOrdersContent() {
         </Button>
       </div>
 
-      {/* Stage tiles — the procurement flow; click to filter. Each shows total + flagged. */}
-      {isLoading || !summary ? (
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      {/* Stage tiles (procurement flow) with sub-triage KPIs beneath. Click a stage to
+          select all of it, or a sub-triage to drill in. Multiple selectable at once. */}
+      {isLoading ? (
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
           {stageTiles.map((t) => (
             <Card key={t.key} className="py-3">
               <CardContent className="px-4 py-0">
                 <Skeleton className="mb-2 h-4 w-24" />
                 <Skeleton className="h-7 w-12" />
+                <Skeleton className="mt-3 h-3 w-full" />
+                <Skeleton className="mt-1.5 h-3 w-full" />
               </CardContent>
             </Card>
           ))}
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
           {stageTiles.map((t) => {
             const Icon = t.icon
-            const active = stage === t.key
-            const total = summary.by_stage?.[t.key] ?? 0
-            const flagged = summary.flagged_by_stage?.[t.key] ?? 0
+            const ids = STAGE_SUBTRIAGES[t.key].map((s) => seg(t.key, s.key))
+            const stageActive = ids.length > 0 && ids.every((id) => selected.has(id))
+            const total = stageTotals[t.key] ?? 0
             return (
               <Card
                 key={t.key}
-                onClick={() => setStage(active ? 'all' : t.key)}
-                className={cn(
-                  'cursor-pointer py-3 transition-colors hover:bg-muted/50',
-                  active && 'ring-primary ring-2'
-                )}
+                className={cn('py-3 transition-colors', stageActive && 'ring-primary ring-2')}
               >
                 <CardContent className="px-4 py-0">
-                  <div className="flex items-center gap-2">
+                  {/* Stage header — toggles the whole stage */}
+                  <button
+                    type="button"
+                    onClick={() => toggleStage(t.key)}
+                    className="flex w-full items-center gap-2 text-left"
+                  >
                     <div className={cn('rounded-md p-1.5', t.bgColor)}>
                       <Icon className={cn('h-3.5 w-3.5', t.color)} />
                     </div>
                     <span className="text-muted-foreground text-xs font-medium">{t.label}</span>
-                  </div>
-                  <div className="mt-1.5 flex items-baseline gap-2">
-                    <p className="text-2xl font-semibold tabular-nums">{total.toLocaleString()}</p>
-                    {flagged > 0 && (
-                      <span className="rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-medium text-red-700">
-                        {flagged} flagged
-                      </span>
-                    )}
+                    <span className="ml-auto text-2xl font-semibold tabular-nums">{total.toLocaleString()}</span>
+                  </button>
+
+                  {/* Sub-triages — each toggles its own segment */}
+                  <div className="mt-2.5 flex flex-col gap-1 border-t pt-2">
+                    {STAGE_SUBTRIAGES[t.key].map((s) => {
+                      const id = seg(t.key, s.key)
+                      const count = segCounts[id] ?? 0
+                      const subActive = selected.has(id)
+                      return (
+                        <button
+                          type="button"
+                          key={s.key}
+                          onClick={() => toggleSeg(id)}
+                          className={cn(
+                            'flex items-center gap-2 rounded px-1.5 py-1 text-left transition-colors hover:bg-muted/60',
+                            subActive && 'bg-muted ring-1 ring-primary/40',
+                            count === 0 && !subActive && 'opacity-50'
+                          )}
+                        >
+                          <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', toneDot[s.tone])} />
+                          <span className="text-[11px] text-muted-foreground">{s.label}</span>
+                          <span className="ml-auto text-xs font-medium tabular-nums">{count.toLocaleString()}</span>
+                        </button>
+                      )
+                    })}
                   </div>
                 </CardContent>
               </Card>
@@ -187,7 +257,7 @@ export function SpecialOrdersContent() {
             variant="ghost"
             size="sm"
             className="text-muted-foreground"
-            onClick={() => { setStage('all'); setStoreFilter('all'); setSearch(''); setFlaggedOnly(false); setLiveOnly(true) }}
+            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setSearch(''); setFlaggedOnly(false); setLiveOnly(true) }}
           >
             Clear filters
           </Button>
@@ -196,7 +266,7 @@ export function SpecialOrdersContent() {
 
       <SpecialOrdersTable orders={filtered} isLoading={isLoading} onRowClick={openOrder} />
 
-      <SpecialOrderDetailSheet order={selected} open={sheetOpen} onOpenChange={setSheetOpen} />
+      <SpecialOrderDetailSheet order={selectedOrder} open={sheetOpen} onOpenChange={setSheetOpen} />
     </div>
   )
 }
