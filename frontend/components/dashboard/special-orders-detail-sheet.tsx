@@ -10,11 +10,11 @@ import {
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import type { SpecialOrder } from '@/lib/types'
-import { AgingBadge, SpecialOrderStatusBadge, ReadyNotCalledBadge } from './special-order-badges'
+import { StageBadge, FlagBadge, SpecialOrderStatusBadge } from './special-order-badges'
 import { ExternalLink, Package, User, FileText, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-const STATUS_STAGES = ['Not Ordered', 'Ordered', 'Ready for Pickup', 'Received'] as const
+const STAGE_LABELS = ['Open Order Pool', 'Unordered PO', 'Ordered', 'Received'] as const
 
 function Field({ label, value }: { label: string; value: React.ReactNode }) {
   return (
@@ -41,7 +41,7 @@ function LightspeedLink({ url, label, icon: Icon }: { url: string | null; label:
 function StatusStepper({ stage }: { stage: number }) {
   return (
     <div className="flex items-center gap-0">
-      {STATUS_STAGES.map((label, i) => {
+      {STAGE_LABELS.map((label, i) => {
         const done = i < stage
         const active = i === stage
         const future = i > stage
@@ -100,20 +100,15 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
             </SheetHeader>
 
             <div className="flex flex-col gap-4 px-4 pb-6">
-              {/* Aging + flags */}
+              {/* Stage + attention flag */}
               <div className="flex flex-wrap items-center gap-2">
-                <AgingBadge bucket={order.aging_bucket} daysOverdue={order.days_overdue} />
-                <ReadyNotCalledBadge active={order.ready_not_called} />
-                {order.unordered_too_long && (
-                  <span className="inline-flex items-center rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-medium text-orange-700">
-                    Not ordered · {order.days_since_creation}d open
-                  </span>
-                )}
+                <StageBadge stage={order.procurement_stage} />
+                <FlagBadge flag={order.flag} daysOverdue={order.days_overdue} />
               </div>
 
-              {/* Status path stepper */}
+              {/* Procurement stage stepper */}
               <div className="overflow-x-auto py-1">
-                <StatusStepper stage={order.status_stage >= 0 ? order.status_stage : 0} />
+                <StatusStepper stage={order.procurement_stage_index} />
               </div>
 
               <Separator />
@@ -133,6 +128,7 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
               {/* PO + dates */}
               <div className="grid grid-cols-2 gap-4">
                 <Field label="PO #" value={order.order_id} />
+                <Field label="Ordered date" value={order.ordered_date} />
                 <Field label="Expected date" value={order.expected_date} />
                 <Field
                   label="Days overdue"
@@ -150,7 +146,7 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
                   label="Days open"
                   value={
                     order.days_since_creation !== null ? (
-                      <span className={cn(order.unordered_too_long && 'font-semibold text-orange-600')}>
+                      <span className={cn(order.flag === 'aged' && 'font-semibold text-amber-600')}>
                         {order.days_since_creation}
                       </span>
                     ) : null

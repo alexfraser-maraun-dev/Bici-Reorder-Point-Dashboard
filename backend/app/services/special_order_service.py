@@ -6,10 +6,24 @@ records for the procurement cockpit's Special Order page:
 
     SpecialOrder --(OrderLine.orderID)--> Order   (the attached purchase order)
 
-The "expected date" the overdue logic hangs on is the PO's `Order.arrivalDate`. A special
-order is OVERDUE when its attached PO is LATE: the expected date has passed and receiving
-on that PO has not started or completed. See `_compute_aging` for the exact rule, which is
-intentionally tunable.
+Records are triaged on TWO axes:
+
+  procurement_stage — the SO's position in the procurement flow, derived from the *PO's*
+    real state rather than the SpecialOrder.status string (which flips to "Ordered" the
+    moment a PO is attached, even if that PO was never actually placed with the vendor):
+      open_pool     -> no PO attached yet
+      unordered_po  -> PO attached but not yet placed with the vendor (no orderedDate)
+      ordered       -> PO placed with the vendor (Order.orderedDate is set)
+      received      -> the SO has been checked in (SpecialOrder.status says so)
+
+  flag — the attention state WITHIN a stage (or "none" when nothing needs action):
+      aged             -> open_pool / unordered_po sitting too long
+      overdue/critical -> ordered PO past its expected (arrival) date; two-step on day 8
+      no_eta           -> ordered PO with no expected date to judge lateness against
+      ready_not_called -> received but the customer hasn't been contacted
+
+Only ORDERED special orders can be overdue: an unplaced PO's expected date is speculative,
+so lateness is judged solely against placed POs. See `_compute_stage_and_flag`.
 """
 
 from datetime import date, datetime
@@ -22,26 +36,20 @@ from app.services.lightspeed_client import LightspeedClient
 # same pattern and should be confirmed against the live UI.
 _MERCHANTOS = "https://us.merchantos.com/?name={view}&form_name=view&id={id}"
 
-# Aging thresholds (days past the PO's expected date). Tunable — see plan.
-_DUE_SOON_DAYS = 3       # within this many days of the expected date => "due soon"
-_OVERDUE_MAX = 7         # 1..7 days late
-_CRITICAL_MAX = 14       # 8..14 days late; 15+ => "stale"
+# Days an SO can sit in the open-pool / unordered-PO stages before it's flagged "aged".
+_STALE_STAGE_DAYS = 3
 
-# How many days an SO can sit without a PO before it's flagged (unordered_too_long).
-_UNORDERED_TOO_LONG_DAYS = 3
+# Overdue thresholds (days past an ordered PO's expected date). Tunable.
+_OVERDUE_MAX = 7         # 1..7 days late => "overdue"; 8+ => "critical"
 
-# Canonical SO lifecycle stages in order (for the status path stepper).
-# LS may return variants — we match case-insensitively.
-_STATUS_STAGES = ["Not Ordered", "Ordered", "Ready For Pickup", "Received"]
+# SpecialOrder.status keywords meaning the item has been checked in / received.
+_RECEIVED_STATUS_KEYS = ("received", "ready", "arrived", "pickup", "checked in", "in stock")
 
 
-def _status_stage_index(status: str) -> int:
-    """Return 0-based index of status in _STATUS_STAGES, or -1 if unknown."""
-    sl = status.strip().lower()
-    for i, stage in enumerate(_STATUS_STAGES):
-        if sl.startswith(stage.lower()) or stage.lower().startswith(sl.split()[0] if sl else ""):
-            return i
-    return -1
+def _status_is_received(status: str) -> bool:
+    """True if the SpecialOrder.status indicates the item has been checked in/received."""
+    sl = (status or "").strip().lower()
+    return any(key in sl for key in _RECEIVED_STATUS_KEYS)
 
 
 def _ls_url(view: str, entity_id: Optional[str]) -> Optional[str]:
@@ -77,45 +85,59 @@ def _customer_name(customer: Dict[str, Any]) -> Optional[str]:
     return name or customer.get("company") or None
 
 
-def _compute_aging(
-    expected_date: Optional[date],
-    po_complete: bool,
-    received_started: bool,
+def _compute_stage_and_flag(
     has_po: bool,
+    po_ordered: bool,
+    received: bool,
+    expected_date: Optional[date],
+    days_since_creation: Optional[int],
+    contacted: bool,
     today: date,
 ) -> Dict[str, Any]:
     """
-    Returns { aging_bucket, is_overdue, days_overdue }.
+    Two-axis triage. Returns:
+      { procurement_stage, procurement_stage_index, flag, days_overdue }
 
-    Overdue trigger (per user): the attached PO is late — expected date has passed AND
-    receiving has neither started nor completed. Receiving state of the PO is authoritative;
-    once any receipt is recorded (or the PO is complete) the SO is no longer "awaiting vendor"
-    and drops out of overdue.
+    Stage is a waterfall — "received" is terminal and authoritative, then ordered/unordered
+    POs, then the open pool. The within-stage `flag` is the one thing (if any) that needs
+    attention. Only ORDERED special orders can be overdue.
     """
-    # Receiving already underway/finished -> not waiting on the vendor.
-    if po_complete:
-        return {"aging_bucket": "received", "is_overdue": False, "days_overdue": None}
-    if received_started:
-        return {"aging_bucket": "receiving", "is_overdue": False, "days_overdue": None}
-
-    # No expected date to judge against (no PO, or PO with no arrival date).
-    if expected_date is None:
-        bucket = "no_po" if not has_po else "no_eta"
-        return {"aging_bucket": bucket, "is_overdue": False, "days_overdue": None}
-
-    days_overdue = (today - expected_date).days  # signed: negative = still early
-
-    if days_overdue <= 0:
-        bucket = "due_soon" if days_overdue >= -_DUE_SOON_DAYS else "on_track"
-        return {"aging_bucket": bucket, "is_overdue": False, "days_overdue": days_overdue}
-
-    if days_overdue <= _OVERDUE_MAX:
-        bucket = "overdue"
-    elif days_overdue <= _CRITICAL_MAX:
-        bucket = "critical"
+    # --- Stage (procurement flow position) ---
+    if received:
+        stage, stage_index = "received", 3
+    elif has_po and po_ordered:
+        stage, stage_index = "ordered", 2
+    elif has_po:
+        stage, stage_index = "unordered_po", 1
     else:
-        bucket = "stale"
-    return {"aging_bucket": bucket, "is_overdue": True, "days_overdue": days_overdue}
+        stage, stage_index = "open_pool", 0
+
+    # --- Flag (attention state within the stage) ---
+    flag = "none"
+    days_overdue: Optional[int] = None
+
+    if stage in ("open_pool", "unordered_po"):
+        if days_since_creation is not None and days_since_creation > _STALE_STAGE_DAYS:
+            flag = "aged"
+    elif stage == "ordered":
+        if expected_date is None:
+            flag = "no_eta"
+        else:
+            days_overdue = (today - expected_date).days  # signed: negative = still early
+            if days_overdue > _OVERDUE_MAX:
+                flag = "critical"
+            elif days_overdue >= 1:
+                flag = "overdue"
+    elif stage == "received":
+        if not contacted:
+            flag = "ready_not_called"
+
+    return {
+        "procurement_stage": stage,
+        "procurement_stage_index": stage_index,
+        "flag": flag,
+        "days_overdue": days_overdue,
+    }
 
 
 def _normalize(
@@ -134,35 +156,40 @@ def _normalize(
     order_id = str(order_id) if order_id and str(order_id) != "0" else None
     po = order_map.get(order_id, {}) if order_id else {}
 
-    expected_raw = po.get("arrivalDate")
-    expected_date = _parse_ls_date(expected_raw)
-    aging = _compute_aging(
-        expected_date=expected_date,
-        po_complete=bool(po.get("complete")),
-        received_started=bool(po.get("received_started")),
-        has_po=order_id is not None,
-        today=today,
-    )
-
     item_id = item.get("itemID")
     customer_id = so.get("customerID")
     shop_id = str(so.get("shopID")) if so.get("shopID") is not None else None
     status = so.get("status") or "Unknown"
     contacted = _coerce_bool(so.get("contacted"))
 
-    # SO record timestamp (last-modified; for unordered SOs this is effectively creation time).
-    ts_raw = so.get("timeStamp")
-    created_date = _parse_ls_date(ts_raw)
+    # True creation time comes from the linked SaleLine (createTime). Fall back to the
+    # SpecialOrder's timeStamp (last-modified) when the SaleLine/createTime is absent.
+    created_raw = sale_line.get("createTime") or so.get("timeStamp")
+    created_date = _parse_ls_date(created_raw)
     days_since_creation = (today - created_date).days if created_date else None
+
+    # The attached PO's expected (arrival) date and the date it was actually placed with
+    # the vendor. A present orderedDate is what distinguishes an "ordered" PO from a draft.
+    expected_date = _parse_ls_date(po.get("arrivalDate"))
+    ordered_date = _parse_ls_date(po.get("orderedDate"))
+
+    triage = _compute_stage_and_flag(
+        has_po=order_id is not None,
+        po_ordered=ordered_date is not None,
+        received=_status_is_received(status),
+        expected_date=expected_date,
+        days_since_creation=days_since_creation,
+        contacted=contacted,
+        today=today,
+    )
 
     return {
         "special_order_id": so.get("specialOrderID"),
         "status": status,
-        "status_stage": _status_stage_index(status),
         "unit_quantity": so.get("unitQuantity"),
         "shop_id": shop_id,
         "store": shop_names.get(shop_id) if shop_id else None,
-        "timestamp": ts_raw,
+        "timestamp": created_raw,
         "created_date": created_date.isoformat() if created_date else None,
         "days_since_creation": days_since_creation,
         "contacted": contacted,
@@ -180,23 +207,16 @@ def _normalize(
         "vendor_id": po.get("vendor_id"),
         "vendor_name": po.get("vendor_name"),
         "expected_date": expected_date.isoformat() if expected_date else None,
+        "ordered_date": ordered_date.isoformat() if ordered_date else None,
+        "po_ordered": ordered_date is not None,
         "po_complete": bool(po.get("complete")),
         "received_started": bool(po.get("received_started")),
-        # Derived overdue / aging
-        "is_overdue": aging["is_overdue"],
-        "days_overdue": aging["days_overdue"],
-        "aging_bucket": aging["aging_bucket"],
-        "no_eta": aging["aging_bucket"] in ("no_eta", "no_po"),
-        # "Ready, Not Called": received but customer not yet contacted
-        "ready_not_called": (
-            bool(po.get("complete")) or status.lower().startswith("ready")
-        ) and not contacted,
-        # SO has no PO attached and has been open too long — needs to be ordered
-        "unordered_too_long": (
-            order_id is None
-            and days_since_creation is not None
-            and days_since_creation > _UNORDERED_TOO_LONG_DAYS
-        ),
+        # Triage: procurement stage + within-stage attention flag
+        "procurement_stage": triage["procurement_stage"],
+        "procurement_stage_index": triage["procurement_stage_index"],
+        "flag": triage["flag"],
+        "days_overdue": triage["days_overdue"],
+        "is_overdue": triage["flag"] in ("overdue", "critical"),
         # Deep links into Lightspeed
         "ls_item_url": _ls_url("item.views.item", item_id),
         "ls_customer_url": _ls_url("customer.views.customer", customer_id),
@@ -204,19 +224,37 @@ def _normalize(
     }
 
 
-def _summarize(orders: List[Dict[str, Any]]) -> Dict[str, int]:
-    buckets: Dict[str, int] = {}
+_STAGES = ["open_pool", "unordered_po", "ordered", "received"]
+
+
+def _summarize(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Per-stage totals + how many in each stage carry an attention flag, plus a flat
+    flag breakdown for convenience tiles."""
+    by_stage = {s: 0 for s in _STAGES}
+    flagged_by_stage = {s: 0 for s in _STAGES}
+    by_flag: Dict[str, int] = {}
     for o in orders:
-        buckets[o["aging_bucket"]] = buckets.get(o["aging_bucket"], 0) + 1
+        stage = o["procurement_stage"]
+        by_stage[stage] = by_stage.get(stage, 0) + 1
+        if o["flag"] != "none":
+            flagged_by_stage[stage] = flagged_by_stage.get(stage, 0) + 1
+        by_flag[o["flag"]] = by_flag.get(o["flag"], 0) + 1
     return {
         "total_open": len(orders),
-        "overdue": sum(1 for o in orders if o["is_overdue"]),
-        "critical": buckets.get("critical", 0) + buckets.get("stale", 0),
-        "no_eta": buckets.get("no_eta", 0) + buckets.get("no_po", 0),
-        "ready_not_called": sum(1 for o in orders if o["ready_not_called"]),
-        "unordered_too_long": sum(1 for o in orders if o["unordered_too_long"]),
-        "by_bucket": buckets,
+        "by_stage": by_stage,
+        "flagged_by_stage": flagged_by_stage,
+        "by_flag": by_flag,
+        # Flat convenience counts
+        "aged": by_flag.get("aged", 0),
+        "overdue": by_flag.get("overdue", 0) + by_flag.get("critical", 0),
+        "critical": by_flag.get("critical", 0),
+        "no_eta": by_flag.get("no_eta", 0),
+        "ready_not_called": by_flag.get("ready_not_called", 0),
     }
+
+
+# Severity rank so flagged items bubble to the top within their stage.
+_FLAG_RANK = {"critical": 5, "overdue": 4, "no_eta": 3, "aged": 3, "ready_not_called": 1, "none": 0}
 
 
 def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Dict[str, Any]:
@@ -238,7 +276,13 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
     customer_map = client.get_customers_by_ids([so.get("customerID") for so in special_orders])
 
     orders = [_normalize(so, order_map, customer_map, shop_names, today) for so in special_orders]
-    # Most-overdue first; records without a days_overdue sort to the bottom.
-    orders.sort(key=lambda o: (o["days_overdue"] is None, -(o["days_overdue"] or 0)))
+    # Flagged items first, ranked by flag severity, then most-overdue / oldest within that.
+    orders.sort(
+        key=lambda o: (
+            -_FLAG_RANK.get(o["flag"], 0),
+            -(o["days_overdue"] or 0),
+            -(o["days_since_creation"] or 0),
+        )
+    )
 
     return {"orders": orders, "summary": _summarize(orders)}

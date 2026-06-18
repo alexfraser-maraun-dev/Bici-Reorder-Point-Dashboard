@@ -407,11 +407,13 @@ class LightspeedClient:
     def get_orders_by_ids(self, order_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
         """
         Fetches the purchase orders (Order entity) behind a set of special orders and
-        returns, keyed by orderID, just the fields the overdue logic needs:
-          { orderID: { "arrivalDate", "complete", "vendor_id", "vendor_name",
-                       "received_started" } }
-        `arrivalDate` is the PO's expected date; `received_started` is True if any line
-        shows receiving progress (numReceived / checkedIn > 0).
+        returns, keyed by orderID, just the fields the triage logic needs:
+          { orderID: { "arrivalDate", "orderedDate", "complete", "vendor_id",
+                       "vendor_name", "received_started" } }
+        `arrivalDate` is the PO's expected date; `orderedDate` is the date the PO was
+        actually placed with the vendor (empty/None until the PO is ordered); and
+        `received_started` is True if any line shows receiving progress
+        (numReceived / checkedIn > 0).
         """
         unique_ids = sorted({str(o) for o in order_ids if o and str(o) != "0"})
         order_map: Dict[str, Dict[str, Any]] = {}
@@ -438,6 +440,7 @@ class LightspeedClient:
                 vendor = order.get("Vendor") or {}
                 order_map[order_id] = {
                     "arrivalDate": order.get("arrivalDate") or None,
+                    "orderedDate": order.get("orderedDate") or None,
                     "complete": str(order.get("complete")).lower() == "true",
                     "vendor_id": order.get("vendorID"),
                     "vendor_name": vendor.get("name"),

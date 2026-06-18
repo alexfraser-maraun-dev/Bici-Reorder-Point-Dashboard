@@ -232,23 +232,26 @@ export interface KpiSummary {
 // Special Orders
 // ---------------------------------------------------------------------------
 
-// Aging bucket computed server-side from the attached PO's expected (arrival) date
-// and receiving state. See backend special_order_service._compute_aging.
-export type AgingBucket =
-  | 'on_track'   // PO expected in the future
-  | 'due_soon'   // expected within ~3 days
-  | 'overdue'    // 1–7 days past expected, receiving not started
-  | 'critical'   // 8–14 days past expected
-  | 'stale'      // 15+ days past expected
-  | 'no_eta'     // PO exists but has no expected date
-  | 'no_po'      // special order not yet attached to a PO
-  | 'receiving'  // receiving has started (no longer awaiting vendor)
-  | 'received'   // PO fully received
+// The SO's position in the procurement flow, derived server-side from the attached PO's
+// real state (not the SpecialOrder.status string). See special_order_service.
+export type ProcurementStage =
+  | 'open_pool'     // no PO attached yet
+  | 'unordered_po'  // PO attached but not yet placed with the vendor
+  | 'ordered'       // PO placed with the vendor (Order.orderedDate is set)
+  | 'received'      // SO has been checked in / received
+
+// The one thing (if any) that needs attention within a stage. 'none' = nothing to action.
+export type SpecialOrderFlag =
+  | 'none'
+  | 'aged'             // open_pool / unordered_po sitting too long
+  | 'overdue'          // ordered PO 1–7 days past its expected date
+  | 'critical'         // ordered PO 8+ days past its expected date
+  | 'no_eta'           // ordered PO with no expected date
+  | 'ready_not_called' // received but customer not yet contacted
 
 export interface SpecialOrder {
   special_order_id: string
   status: string
-  status_stage: number        // 0=Not Ordered, 1=Ordered, 2=Ready, 3=Received; -1=unknown
   unit_quantity: string | null
   shop_id: string | null
   store: string | null
@@ -270,15 +273,16 @@ export interface SpecialOrder {
   vendor_id: string | null
   vendor_name: string | null
   expected_date: string | null
+  ordered_date: string | null
+  po_ordered: boolean
   po_complete: boolean
   received_started: boolean
-  // Derived overdue / aging
-  is_overdue: boolean
-  days_overdue: number | null
-  aging_bucket: AgingBucket
-  no_eta: boolean
-  ready_not_called: boolean
-  unordered_too_long: boolean
+  // Triage: procurement stage + within-stage attention flag
+  procurement_stage: ProcurementStage
+  procurement_stage_index: number   // 0=open_pool, 1=unordered_po, 2=ordered, 3=received
+  flag: SpecialOrderFlag
+  days_overdue: number | null       // signed; only set for the 'ordered' stage
+  is_overdue: boolean               // flag is overdue or critical
   // Deep links into Lightspeed
   ls_item_url: string | null
   ls_customer_url: string | null
@@ -287,12 +291,15 @@ export interface SpecialOrder {
 
 export interface SpecialOrderSummary {
   total_open: number
+  by_stage: Record<ProcurementStage, number>
+  flagged_by_stage: Record<ProcurementStage, number>
+  by_flag: Record<string, number>
+  // Flat convenience counts
+  aged: number
   overdue: number
   critical: number
   no_eta: number
   ready_not_called: number
-  unordered_too_long: number
-  by_bucket: Record<string, number>
 }
 
 export interface SpecialOrderDashboard {

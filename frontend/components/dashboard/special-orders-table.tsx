@@ -12,7 +12,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import type { SpecialOrder } from '@/lib/types'
-import { AgingBadge } from './special-order-badges'
+import { StageBadge, FlagBadge } from './special-order-badges'
 import { ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
 
 type SortKey =
@@ -22,11 +22,11 @@ type SortKey =
   | 'vendor_name'
   | 'store'
   | 'order_id'
+  | 'ordered_date'
   | 'expected_date'
-  | 'days_overdue'
   | 'created_date'
-  | 'days_since_creation'
-  | 'aging_bucket'
+  | 'procurement_stage_index'
+  | 'flag'
 
 type SortDir = 'asc' | 'desc'
 
@@ -57,8 +57,8 @@ interface Props {
 }
 
 export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
-  const [sortKey, setSortKey] = useState<SortKey>('days_overdue')
-  const [sortDir, setSortDir] = useState<SortDir>('desc')
+  const [sortKey, setSortKey] = useState<SortKey>('procurement_stage_index')
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
 
   function handleSort(key: SortKey) {
     if (sortKey === key) {
@@ -118,10 +118,11 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
             {th('Vendor', 'vendor_name')}
             {th('Store', 'store', 'hidden md:table-cell')}
             {th('PO #', 'order_id', 'hidden lg:table-cell')}
+            {th('Ordered', 'ordered_date', 'hidden xl:table-cell')}
             {th('Expected', 'expected_date')}
             {th('Created', 'created_date', 'hidden xl:table-cell')}
-            {th('Overdue', 'days_overdue', 'text-right')}
-            {th('Status', 'aging_bucket')}
+            {th('Stage', 'procurement_stage_index')}
+            {th('Flag', 'flag', 'text-right')}
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -131,8 +132,8 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
               onClick={() => onRowClick(o)}
               className={cn(
                 'cursor-pointer',
-                o.is_overdue && 'bg-red-50/50 hover:bg-red-50',
-                o.unordered_too_long && !o.is_overdue && 'bg-amber-50/40 hover:bg-amber-50/70'
+                (o.flag === 'overdue' || o.flag === 'critical') && 'bg-red-50/50 hover:bg-red-50',
+                o.flag === 'aged' && 'bg-amber-50/40 hover:bg-amber-50/70'
               )}
             >
               <TableCell className="font-mono text-xs">{o.special_order_id}</TableCell>
@@ -143,19 +144,16 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
               <TableCell className="max-w-[120px] truncate">{o.vendor_name ?? '—'}</TableCell>
               <TableCell className="hidden md:table-cell">{o.store ?? '—'}</TableCell>
               <TableCell className="hidden font-mono text-xs lg:table-cell">{o.order_id ?? '—'}</TableCell>
+              <TableCell className="hidden whitespace-nowrap text-sm xl:table-cell">{o.ordered_date ?? '—'}</TableCell>
               <TableCell className="whitespace-nowrap text-sm">{o.expected_date ?? '—'}</TableCell>
               <TableCell className="hidden whitespace-nowrap text-sm xl:table-cell">
                 {o.created_date ?? '—'}
               </TableCell>
-              <TableCell className="text-right tabular-nums">
-                {o.days_overdue !== null && o.days_overdue > 0 ? (
-                  <span className="font-semibold text-red-600">{o.days_overdue}d</span>
-                ) : (
-                  <span className="text-muted-foreground">—</span>
-                )}
-              </TableCell>
               <TableCell>
-                <AgingBadge bucket={o.aging_bucket} daysOverdue={o.days_overdue} />
+                <StageBadge stage={o.procurement_stage} />
+              </TableCell>
+              <TableCell className="text-right">
+                <FlagBadge flag={o.flag} daysOverdue={o.days_overdue} />
               </TableCell>
             </TableRow>
           ))}
