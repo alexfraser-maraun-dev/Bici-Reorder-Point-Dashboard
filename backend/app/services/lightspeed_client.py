@@ -476,10 +476,16 @@ class LightspeedClient:
                 phone_list = self._as_list(phones)
                 if phone_list:
                     phone = phone_list[0].get("number")
+                emails = contact.get("Emails", {}).get("ContactEmail") if isinstance(contact.get("Emails"), dict) else None
+                email = None
+                email_list = self._as_list(emails)
+                if email_list:
+                    email = email_list[0].get("address")
                 customer_map[cust_id] = {
                     "first_name": cust.get("firstName"),
                     "last_name": cust.get("lastName"),
                     "company": cust.get("company"),
                     "phone": phone,
+                    "email": email,
                 }
         return customer_map

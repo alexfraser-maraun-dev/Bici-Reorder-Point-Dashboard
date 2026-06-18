@@ -12,7 +12,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import type { SpecialOrder } from '@/lib/types'
-import { StageBadge, FlagBadge } from './special-order-badges'
+import { StageBadge, FlagBadge, ShopifyMatchBadge } from './special-order-badges'
 import { ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
 
 type SortKey =
@@ -24,6 +24,7 @@ type SortKey =
   | 'order_id'
   | 'ordered_date'
   | 'expected_date'
+  | 'shopify_expected_date'
   | 'created_date'
   | 'procurement_stage_index'
   | 'flag'
@@ -119,7 +120,8 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
             {th('Store', 'store', 'hidden md:table-cell')}
             {th('PO #', 'order_id', 'hidden lg:table-cell')}
             {th('Ordered', 'ordered_date', 'hidden xl:table-cell')}
-            {th('Expected', 'expected_date')}
+            {th('PO date', 'expected_date')}
+            {th('Customer date', 'shopify_expected_date')}
             {th('Created', 'created_date', 'hidden xl:table-cell')}
             {th('Stage', 'procurement_stage_index')}
             {th('Flag', 'flag', 'text-right')}
@@ -128,7 +130,7 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
         <TableBody>
           {sorted.map((o) => (
             <TableRow
-              key={o.special_order_id}
+              key={`${o.kind ?? 'ls'}-${o.special_order_id}`}
               onClick={() => onRowClick(o)}
               className={cn(
                 'cursor-pointer',
@@ -146,14 +148,22 @@ export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
               <TableCell className="hidden font-mono text-xs lg:table-cell">{o.order_id ?? '—'}</TableCell>
               <TableCell className="hidden whitespace-nowrap text-sm xl:table-cell">{o.ordered_date ?? '—'}</TableCell>
               <TableCell className="whitespace-nowrap text-sm">{o.expected_date ?? '—'}</TableCell>
+              <TableCell className="whitespace-nowrap text-sm">
+                {o.shopify_expected_date ?? '—'}
+                {o.shopify_match === 'ambiguous' && (
+                  <span className="ml-1 text-[10px] text-amber-600" title="Multiple Shopify orders match — verify">≈</span>
+                )}
+              </TableCell>
               <TableCell className="hidden whitespace-nowrap text-sm xl:table-cell">
                 {o.created_date ?? '—'}
               </TableCell>
               <TableCell>
-                <StageBadge stage={o.procurement_stage} />
+                <StageBadge stage={o.kind === 'shopify' ? 'shopify' : o.procurement_stage} />
               </TableCell>
               <TableCell className="text-right">
-                <FlagBadge stage={o.procurement_stage} flag={o.flag} daysOverdue={o.days_overdue} />
+                {o.kind === 'shopify'
+                  ? <ShopifyMatchBadge match="none" />
+                  : <FlagBadge stage={o.procurement_stage} flag={o.flag} daysOverdue={o.days_overdue} />}
               </TableCell>
             </TableRow>
           ))}

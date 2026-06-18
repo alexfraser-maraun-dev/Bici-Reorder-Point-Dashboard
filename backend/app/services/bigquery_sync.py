@@ -16,6 +16,7 @@ def get_bq_client():
 
 APP_DATASET = os.getenv("APP_DATASET", "bici-klaviyo-datasync.BiciReorderPointDashboard")
 LS_DATASET = os.getenv("LS_DATASET", "bici-klaviyo-datasync.light_speed_retailne")
+SHOPIFY_DATASET = os.getenv("SHOPIFY_DATASET", "bici-klaviyo-datasync.shopifybici")
 QUALIFIED_ITEMS_VIEW = os.getenv("QUALIFIED_ITEMS_VIEW", f"{APP_DATASET}.replen_qualified_items")
 TARGET_SHOP_IDS = (2, 3, 20)
 # The business went through bankruptcy in fall 2023; sales before 2024 are
@@ -148,6 +149,49 @@ def get_sku_overrides():
     except Exception as e:
         print(f"Failed to fetch overrides: {e}")
         return {}
+
+def get_shopify_special_orders():
+    """
+    Fetches open Shopify special orders (orders tagged 'SO', not yet fulfilled) from the
+    Fivetran Shopify dataset, one row per (order x line SKU). The customer-promised expected
+    date comes from the `special_order_eta` order metafield (namespace 'custom', type date);
+    it is LEFT-joined, so orders without an ETA are still included.
+
+    Returns a list of dicts: {order_id, order_name, email, fulfillment_status,
+    financial_status, created_at (ISO), eta (ISO date or None), sku}. Returns [] on any
+    failure so the (Lightspeed-based) special-order triage never breaks when Shopify/BigQuery
+    is unavailable.
+    """
+    query = f"""
+        WITH so AS (
+          SELECT o.id AS order_id, o.name AS order_name, LOWER(TRIM(o.email)) AS email,
+                 o.display_fulfillment_status AS fulfillment_status,
+                 o.display_financial_status AS financial_status, o.created_at
+          FROM `{SHOPIFY_DATASET}.order` o
+          JOIN `{SHOPIFY_DATASET}.order_tag` ot ON ot.order_id = o.id
+          WHERE LOWER(ot.value) = 'so' AND o.display_fulfillment_status != 'FULFILLED'
+        ),
+        eta AS (
+          SELECT owner_id, value AS eta
+          FROM `{SHOPIFY_DATASET}.metafield`
+          WHERE key = 'special_order_eta' AND UPPER(owner_resource) = 'ORDER'
+        )
+        SELECT
+          CAST(so.order_id AS STRING) AS order_id,
+          so.order_name, so.email, so.fulfillment_status, so.financial_status,
+          FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%S%z', so.created_at) AS created_at,
+          eta.eta, ol.sku
+        FROM so
+        LEFT JOIN eta ON eta.owner_id = so.order_id
+        JOIN `{SHOPIFY_DATASET}.order_line` ol ON ol.order_id = so.order_id
+    """
+    try:
+        client = get_bq_client()
+        return [dict(row) for row in client.query(query).result()]
+    except Exception as e:
+        print(f"Failed to fetch Shopify special orders: {e}")
+        return []
+
 
 def upsert_sku_override(override_data: dict):
     """Upserts a single override into BigQuery."""

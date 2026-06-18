@@ -26,14 +26,19 @@ Only ORDERED special orders can be overdue: an unplaced PO's expected date is sp
 so lateness is judged solely against placed POs. See `_compute_stage_and_flag`.
 """
 
+import os
+import time
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from app.services.lightspeed_client import LightspeedClient
+from app.services import bigquery_sync
+from app.services import shopify_match
 
-# merchantOS (Lightspeed Retail web UI) deep-link views. The item view is known-good
-# (matches build_lightspeed_item_url in main.py); the customer and order views follow the
-# same pattern and should be confirmed against the live UI.
+# merchantOS (Lightspeed Retail web UI) deep-link views. The item view (matches
+# build_lightspeed_item_url in main.py) and the purchase-order view (purchase.views.purchase,
+# &tab=main) are confirmed against the live UI; the customer view still follows the same
+# pattern and should be confirmed.
 _MERCHANTOS = "https://us.merchantos.com/?name={view}&form_name=view&id={id}"
 
 # Days an SO can sit in the open-pool / unordered-PO stages before it's flagged "aged".
@@ -53,10 +58,10 @@ def _status_is_received(status: str) -> bool:
     return any(key in sl for key in _RECEIVED_STATUS_KEYS)
 
 
-def _ls_url(view: str, entity_id: Optional[str]) -> Optional[str]:
+def _ls_url(view: str, entity_id: Optional[str], extra: str = "") -> Optional[str]:
     if not entity_id or str(entity_id) in ("", "0"):
         return None
-    return _MERCHANTOS.format(view=view, id=entity_id)
+    return _MERCHANTOS.format(view=view, id=entity_id) + extra
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -199,6 +204,13 @@ def _normalize(
         "customer_id": customer_id,
         "customer_name": _customer_name(customer),
         "customer_phone": customer.get("phone"),
+        "customer_email": customer.get("email"),
+        # Shopify enrichment (filled in by the dashboard merge; defaults for safety).
+        "shopify_match": "none",
+        "shopify_order_id": None,
+        "shopify_order_name": None,
+        "shopify_order_url": None,
+        "shopify_expected_date": None,
         # Item / product
         "item_id": item_id,
         "system_sku": item.get("systemSku"),
@@ -221,7 +233,8 @@ def _normalize(
         # Deep links into Lightspeed
         "ls_item_url": _ls_url("item.views.item", item_id),
         "ls_customer_url": _ls_url("customer.views.customer", customer_id),
-        "ls_order_url": _ls_url("inventory.views.order", order_id),
+        # PO deep link: the Retail web UI purchase-order view (confirmed against the live UI).
+        "ls_order_url": _ls_url("purchase.views.purchase", order_id, extra="&tab=main"),
     }
 
 
@@ -257,6 +270,54 @@ def _summarize(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
 # Severity rank so flagged items bubble to the top within their stage.
 _FLAG_RANK = {"critical": 5, "overdue": 4, "no_eta": 3, "aged": 3, "ready_not_called": 1, "none": 0}
 
+# Shopify SO rows change slowly (Fivetran sync lag), so cache the BigQuery pull beyond the
+# 90s endpoint cache to keep the live SO refresh cheap.
+_shopify_cache: Dict[str, Any] = {"rows": None, "fetched_at": 0.0}
+_SHOPIFY_TTL_SECONDS = 600
+
+
+def _shopify_rows() -> List[Dict[str, Any]]:
+    now = time.time()
+    if _shopify_cache["rows"] is not None and (now - _shopify_cache["fetched_at"]) < _SHOPIFY_TTL_SECONDS:
+        return _shopify_cache["rows"]
+    rows = bigquery_sync.get_shopify_special_orders()
+    _shopify_cache["rows"] = rows
+    _shopify_cache["fetched_at"] = now
+    return rows
+
+
+def _shopify_order_url(order_id: Optional[str]) -> Optional[str]:
+    """Admin deep link, only when SHOPIFY_ADMIN_STORE_HANDLE is configured."""
+    handle = os.getenv("SHOPIFY_ADMIN_STORE_HANDLE")
+    if not handle or not order_id:
+        return None
+    return f"https://admin.shopify.com/store/{handle}/orders/{order_id}"
+
+
+def _enrich_with_shopify(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Mutates each LS SO with its Shopify match (customer-promised ETA + order link) and returns
+    the Shopify-only orders (tagged `SO`, referenced by no LS SO) — the "Unmatched" population.
+    Never raises: if the Shopify pull is empty, every SO simply stays unmatched.
+    """
+    rows = _shopify_rows()
+    if not rows:
+        return []
+    index = shopify_match.build_shopify_index(rows)
+    consumed: set = set()
+    for o in orders:
+        m = shopify_match.match_special_order(o.get("customer_email"), o.get("system_sku"), index)
+        consumed |= m.pop("_candidates", set())
+        o["shopify_match"] = m["shopify_match"]
+        o["shopify_order_id"] = m["shopify_order_id"]
+        o["shopify_order_name"] = m["shopify_order_name"]
+        o["shopify_expected_date"] = m["shopify_expected_date"]
+        o["shopify_order_url"] = _shopify_order_url(m["shopify_order_id"])
+    unmatched = shopify_match.shopify_only_orders(index, consumed)
+    for u in unmatched:
+        u["shopify_order_url"] = _shopify_order_url(u["order_id"])
+    return unmatched
+
 
 def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Dict[str, Any]:
     """
@@ -277,6 +338,10 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
     customer_map = client.get_customers_by_ids([so.get("customerID") for so in special_orders])
 
     orders = [_normalize(so, order_map, customer_map, shop_names, today) for so in special_orders]
+
+    # Enrich with the Shopify customer-promised ETA and collect Shopify-only ("Unmatched") orders.
+    shopify_only = _enrich_with_shopify(orders)
+
     # Flagged items first, ranked by flag severity, then most-overdue / oldest within that.
     orders.sort(
         key=lambda o: (
@@ -286,4 +351,4 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
         )
     )
 
-    return {"orders": orders, "summary": _summarize(orders)}
+    return {"orders": orders, "summary": _summarize(orders), "shopify_only": shopify_only}

@@ -10,8 +10,8 @@ import {
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import type { SpecialOrder } from '@/lib/types'
-import { StageBadge, FlagBadge, SpecialOrderStatusBadge } from './special-order-badges'
-import { ExternalLink, Package, User, FileText, Check } from 'lucide-react'
+import { StageBadge, FlagBadge, ShopifyMatchBadge, SpecialOrderStatusBadge } from './special-order-badges'
+import { ExternalLink, Package, User, FileText, Store, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const STAGE_LABELS = ['Open Order Pool', 'Unordered PO', 'Ordered', 'Received'] as const
@@ -89,7 +89,38 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-[480px]">
-        {order && (
+        {order && order.kind === 'shopify' && (
+          <>
+            <SheetHeader>
+              <SheetTitle className="flex items-center gap-2">
+                <span className="font-mono text-sm">{order.shopify_order_name ?? order.special_order_id}</span>
+                <StageBadge stage="shopify" />
+                <ShopifyMatchBadge match="none" />
+              </SheetTitle>
+              <SheetDescription>Shopify SO — not matched to a Lightspeed special order.</SheetDescription>
+            </SheetHeader>
+
+            <div className="flex flex-col gap-4 px-4 pb-6">
+              <div className="grid grid-cols-2 gap-4">
+                <Field label="Customer" value={order.customer_email} />
+                <Field label="Customer-promised date" value={order.shopify_expected_date} />
+                <Field label="SKU(s)" value={order.description ? <span className="font-mono text-xs">{order.description}</span> : null} />
+                <Field label="Created" value={order.created_date} />
+              </div>
+
+              <Separator />
+
+              <div className="flex flex-col gap-2">
+                <span className="text-muted-foreground text-[11px] font-medium uppercase tracking-wide">Open in Shopify</span>
+                {order.shopify_order_url
+                  ? <LightspeedLink url={order.shopify_order_url} label={order.shopify_order_name ?? 'Shopify order'} icon={Store} />
+                  : <span className="text-muted-foreground text-sm">{order.shopify_order_name ?? '—'}</span>}
+              </div>
+            </div>
+          </>
+        )}
+
+        {order && order.kind !== 'shopify' && (
           <>
             <SheetHeader>
               <SheetTitle className="flex items-center gap-2">
@@ -129,7 +160,7 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
               <div className="grid grid-cols-2 gap-4">
                 <Field label="PO #" value={order.order_id} />
                 <Field label="Ordered date" value={order.ordered_date} />
-                <Field label="Expected date" value={order.expected_date} />
+                <Field label="Expected date (PO)" value={order.expected_date} />
                 <Field
                   label="Days overdue"
                   value={
@@ -150,6 +181,31 @@ export function SpecialOrderDetailSheet({ order, open, onOpenChange }: Props) {
                         {order.days_since_creation}
                       </span>
                     ) : null
+                  }
+                />
+              </div>
+
+              <Separator />
+
+              {/* Shopify (customer-promised) date + match */}
+              <div className="grid grid-cols-2 gap-4">
+                <Field
+                  label="Customer date (Shopify)"
+                  value={
+                    order.shopify_expected_date ? (
+                      <span className="flex items-center gap-1.5">
+                        {order.shopify_expected_date}
+                        {order.shopify_match === 'ambiguous' && <ShopifyMatchBadge match="ambiguous" />}
+                      </span>
+                    ) : null
+                  }
+                />
+                <Field
+                  label="Shopify order"
+                  value={
+                    order.shopify_order_url
+                      ? <a href={order.shopify_order_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">{order.shopify_order_name ?? 'order'}</a>
+                      : order.shopify_order_name
                   }
                 />
               </div>

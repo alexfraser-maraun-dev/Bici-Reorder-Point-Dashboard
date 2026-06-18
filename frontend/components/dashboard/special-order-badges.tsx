@@ -2,7 +2,7 @@
 
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
-import type { ProcurementStage, SpecialOrderFlag } from '@/lib/types'
+import type { ProcurementStage, SpecialOrderFlag, ShopifyMatch, TriageStage } from '@/lib/types'
 import { subTriageLabel } from '@/lib/special-order-triage'
 import {
   AlertTriangle,
@@ -13,6 +13,9 @@ import {
   Inbox,
   FileClock,
   ShoppingCart,
+  Store,
+  Link2,
+  Unlink,
 } from 'lucide-react'
 
 interface BadgeConfig {
@@ -21,21 +24,47 @@ interface BadgeConfig {
   icon: typeof AlertTriangle
 }
 
-// The procurement-flow stage (the "where is it" axis).
-const stageConfig: Record<ProcurementStage, BadgeConfig> = {
+// The triage stage (the "where is it" axis). `shopify` is the leftmost inbound stage.
+const stageConfig: Record<TriageStage, BadgeConfig> = {
+  shopify: { label: 'Shopify', className: 'bg-violet-100 text-violet-700 border-violet-200', icon: Store },
   open_pool: { label: 'Open Pool', className: 'bg-secondary text-muted-foreground border-border', icon: Inbox },
   unordered_po: { label: 'Unordered PO', className: 'bg-orange-100 text-orange-700 border-orange-200', icon: FileClock },
   ordered: { label: 'Ordered', className: 'bg-blue-100 text-blue-700 border-blue-200', icon: ShoppingCart },
   received: { label: 'Received', className: 'bg-emerald-100 text-emerald-700 border-emerald-200', icon: PackageCheck },
 }
 
-export function StageBadge({ stage }: { stage: ProcurementStage }) {
+export function StageBadge({ stage }: { stage: TriageStage }) {
   const config = stageConfig[stage] ?? stageConfig.open_pool
   const Icon = config.icon
   return (
     <Badge variant="outline" className={cn('gap-1 text-[10px] font-medium', config.className)}>
       <Icon className="h-3 w-3" />
       {config.label}
+    </Badge>
+  )
+}
+
+// Shopify match status — used in the Flag cell for Shopify-only ("Unmatched") rows and as a
+// small hint on matched/ambiguous LS rows.
+export function ShopifyMatchBadge({ match }: { match: ShopifyMatch | 'unmatched' }) {
+  if (match === 'matched') {
+    return (
+      <Badge variant="outline" className="gap-1 border-violet-200 bg-violet-100 text-[10px] font-medium text-violet-700">
+        <Link2 className="h-3 w-3" />Matched
+      </Badge>
+    )
+  }
+  if (match === 'ambiguous') {
+    return (
+      <Badge variant="outline" className="gap-1 border-amber-200 bg-amber-100 text-[10px] font-medium text-amber-700">
+        <CircleHelp className="h-3 w-3" />Ambiguous
+      </Badge>
+    )
+  }
+  // 'none' on an LS row means "no Shopify order"; on a Shopify-only row it reads as Unmatched.
+  return (
+    <Badge variant="outline" className="gap-1 border-border bg-secondary text-[10px] font-medium text-muted-foreground">
+      <Unlink className="h-3 w-3" />Unmatched
     </Badge>
   )
 }

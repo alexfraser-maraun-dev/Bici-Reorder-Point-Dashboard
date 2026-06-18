@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react'
 import { useSpecialOrders } from '@/lib/hooks'
-import type { SpecialOrder, ProcurementStage } from '@/lib/types'
+import type { SpecialOrder, ShopifyOnlyOrder, TriageStage } from '@/lib/types'
 import { STAGE_SUBTRIAGES, subKeyForOrder, type TriageTone } from '@/lib/special-order-triage'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -20,6 +20,7 @@ import { cn } from '@/lib/utils'
 import { SpecialOrdersTable } from '@/components/dashboard/special-orders-table'
 import { SpecialOrderDetailSheet } from '@/components/dashboard/special-orders-detail-sheet'
 import {
+  Store,
   Inbox,
   FileClock,
   ShoppingCart,
@@ -31,19 +32,45 @@ import {
 // "Live SOs": hide special orders created more than this many days ago (likely abandoned).
 const LIVE_SO_MAX_DAYS = 365
 
-// The 4 procurement-flow stages, in order — the primary triage axis.
-const stageTiles: {
-  key: ProcurementStage
-  label: string
-  icon: typeof Inbox
-  color: string
-  bgColor: string
-}[] = [
-  { key: 'open_pool', label: 'Open Order Pool', icon: Inbox, color: 'text-foreground', bgColor: 'bg-secondary' },
-  { key: 'unordered_po', label: 'Unordered PO', icon: FileClock, color: 'text-orange-600', bgColor: 'bg-orange-50' },
-  { key: 'ordered', label: 'Ordered', icon: ShoppingCart, color: 'text-blue-600', bgColor: 'bg-blue-50' },
-  { key: 'received', label: 'Received', icon: PackageCheck, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
+const seg = (stage: TriageStage, subKey: string) => `${stage}::${subKey}`
+
+type Sub = { key: string; label: string; tone: TriageTone; pred: (o: SpecialOrder) => boolean }
+type Tile = { stage: TriageStage; label: string; icon: typeof Store; color: string; bgColor: string; subs: Sub[] }
+
+const isLs = (o: SpecialOrder) => o.kind !== 'shopify'
+
+// Build the tile config (predicate-based so the Shopify stage can overlap the LS stages).
+const TILES: Tile[] = [
+  {
+    stage: 'shopify', label: 'Shopify', icon: Store, color: 'text-violet-600', bgColor: 'bg-violet-50',
+    subs: [
+      { key: 'matched', label: 'Matched', tone: 'ok', pred: (o) => isLs(o) && (o.shopify_match === 'matched' || o.shopify_match === 'ambiguous') },
+      { key: 'unmatched', label: 'Unmatched', tone: 'warn', pred: (o) => o.kind === 'shopify' },
+    ],
+  },
+  ...(['open_pool', 'unordered_po', 'ordered', 'received'] as const).map((stage) => {
+    const meta = {
+      open_pool: { label: 'Open Order Pool', icon: Inbox, color: 'text-foreground', bgColor: 'bg-secondary' },
+      unordered_po: { label: 'Unordered PO', icon: FileClock, color: 'text-orange-600', bgColor: 'bg-orange-50' },
+      ordered: { label: 'Ordered', icon: ShoppingCart, color: 'text-blue-600', bgColor: 'bg-blue-50' },
+      received: { label: 'Received', icon: PackageCheck, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
+    }[stage]
+    return {
+      stage,
+      ...meta,
+      subs: STAGE_SUBTRIAGES[stage].map((s) => ({
+        key: s.key,
+        label: s.label,
+        tone: s.tone,
+        pred: (o: SpecialOrder) => isLs(o) && o.procurement_stage === stage && subKeyForOrder(o) === s.key,
+      })),
+    }
+  }),
 ]
+
+// Predicate lookup by segment id, for evaluating the current selection.
+const SEG_PRED: Record<string, (o: SpecialOrder) => boolean> = {}
+for (const t of TILES) for (const s of t.subs) SEG_PRED[seg(t.stage, s.key)] = s.pred
 
 const toneDot: Record<TriageTone, string> = {
   danger: 'bg-red-500',
@@ -51,12 +78,54 @@ const toneDot: Record<TriageTone, string> = {
   ok: 'bg-emerald-500',
 }
 
-// Selection is at the sub-triage "segment" level: `${stage}::${subKey}`. A stage tile
-// toggles all of its segments at once; a sub-triage toggles just one.
-const seg = (stage: ProcurementStage, subKey: string) => `${stage}::${subKey}`
+// Adapt a Shopify-only order into a row the unified table can render (kind: 'shopify').
+function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
+  const days = o.created_at ? Math.floor((Date.now() - Date.parse(o.created_at)) / 86_400_000) : null
+  return {
+    special_order_id: o.order_name ?? o.order_id,
+    status: 'Shopify',
+    unit_quantity: null,
+    shop_id: null,
+    store: null,
+    timestamp: o.created_at,
+    created_date: o.created_at ? o.created_at.slice(0, 10) : null,
+    days_since_creation: days,
+    contacted: false,
+    completed: false,
+    customer_id: null,
+    customer_name: o.customer_email,
+    customer_phone: null,
+    customer_email: o.customer_email,
+    item_id: null,
+    system_sku: o.skus[0] ?? null,
+    description: o.skus.join(', ') || null,
+    order_id: null,
+    vendor_id: null,
+    vendor_name: null,
+    expected_date: null,
+    ordered_date: null,
+    po_ordered: false,
+    po_complete: false,
+    received_started: false,
+    procurement_stage: 'open_pool', // unused for shopify rows — the table branches on `kind`
+    procurement_stage_index: -1,
+    flag: 'none',
+    days_overdue: null,
+    is_overdue: false,
+    shopify_match: 'none',
+    shopify_order_id: o.order_id,
+    shopify_order_name: o.order_name,
+    shopify_order_url: o.shopify_order_url,
+    shopify_expected_date: o.shopify_expected_date,
+    ls_item_url: null,
+    ls_customer_url: null,
+    ls_order_url: null,
+    kind: 'shopify',
+  }
+}
 
 export function SpecialOrdersContent() {
-  const { orders, isLoading, refetch, fetchedAt } = useSpecialOrders()
+  const { orders, shopifyOnly, isLoading, refetch, fetchedAt } = useSpecialOrders()
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [search, setSearch] = useState('')
   const [storeFilter, setStoreFilter] = useState<string>('all')
@@ -65,58 +134,55 @@ export function SpecialOrdersContent() {
   const [selectedOrder, setSelectedOrder] = useState<SpecialOrder | null>(null)
   const [sheetOpen, setSheetOpen] = useState(false)
 
-  // Derive unique store names from loaded orders
+  // Unified rows: live LS SOs + Shopify-only ("Unmatched") pseudo-rows.
+  const allRows = useMemo(
+    () => [...orders, ...shopifyOnly.map(shopifyRow)],
+    [orders, shopifyOnly]
+  )
+
   const stores = useMemo(() => {
     const names = new Set<string>()
     orders.forEach((o) => { if (o.store) names.add(o.store) })
     return Array.from(names).sort()
   }, [orders])
 
-  // Base set: everything EXCEPT the stage/sub selection. The tiles read their counts from
-  // this, so they react live to "Flagged only" / "Live SOs" / search / store.
+  // Base set: everything EXCEPT the tile selection — so the tile counts react to the toggles.
   const base = useMemo(() => {
     const term = search.trim().toLowerCase()
-    return orders.filter((o) => {
+    return allRows.filter((o) => {
       if (flaggedOnly && o.flag === 'none') return false
       if (storeFilter !== 'all' && o.store !== storeFilter) return false
       if (liveOnly && o.days_since_creation !== null && o.days_since_creation > LIVE_SO_MAX_DAYS) return false
       if (!term) return true
-      return [o.customer_name, o.description, o.system_sku, o.vendor_name, o.order_id, o.special_order_id]
+      return [o.customer_name, o.customer_email, o.description, o.system_sku, o.vendor_name, o.order_id, o.special_order_id, o.shopify_order_name]
         .some((v) => v && String(v).toLowerCase().includes(term))
     })
-  }, [orders, flaggedOnly, storeFilter, liveOnly, search])
+  }, [allRows, flaggedOnly, storeFilter, liveOnly, search])
 
-  // The table additionally applies the stage/sub selection.
-  const filtered = useMemo(
-    () => (selected.size === 0
-      ? base
-      : base.filter((o) => selected.has(seg(o.procurement_stage, subKeyForOrder(o))))),
-    [base, selected]
-  )
+  // Table = base, plus the tile selection (a row matches if ANY selected segment's predicate holds).
+  const filtered = useMemo(() => {
+    if (selected.size === 0) return base
+    const preds = Array.from(selected).map((id) => SEG_PRED[id]).filter(Boolean)
+    return base.filter((o) => preds.some((p) => p(o)))
+  }, [base, selected])
 
-  // Counts over the base set, grouped by stage and sub-triage segment.
-  const { stageTotals, segCounts } = useMemo(() => {
-    const stageTotals: Record<string, number> = {}
-    const segCounts: Record<string, number> = {}
-    for (const o of base) {
-      stageTotals[o.procurement_stage] = (stageTotals[o.procurement_stage] ?? 0) + 1
-      const id = seg(o.procurement_stage, subKeyForOrder(o))
-      segCounts[id] = (segCounts[id] ?? 0) + 1
-    }
-    return { stageTotals, segCounts }
+  // Counts per segment over the base set.
+  const segCounts = useMemo(() => {
+    const counts: Record<string, number> = {}
+    for (const t of TILES) for (const s of t.subs) counts[seg(t.stage, s.key)] = base.filter(s.pred).length
+    return counts
   }, [base])
 
   const toggleSeg = (id: string) => {
     setSelected((prev) => {
       const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
+      next.has(id) ? next.delete(id) : next.add(id)
       return next
     })
   }
 
-  const toggleStage = (stage: ProcurementStage) => {
-    const ids = STAGE_SUBTRIAGES[stage].map((s) => seg(stage, s.key))
+  const toggleStage = (t: Tile) => {
+    const ids = t.subs.map((s) => seg(t.stage, s.key))
     const allOn = ids.every((id) => selected.has(id))
     setSelected((prev) => {
       const next = new Set(prev)
@@ -138,7 +204,7 @@ export function SpecialOrdersContent() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Special Orders</h1>
           <p className="text-muted-foreground text-sm">
-            Live triage — special orders by procurement stage, flagging what needs action in each.
+            Live triage — Shopify inbound and Lightspeed procurement stages, flagging what needs action.
             {fetchedAt && (
               <span className="ml-1 text-xs">Updated {new Date(fetchedAt).toLocaleTimeString()}.</span>
             )}
@@ -150,12 +216,11 @@ export function SpecialOrdersContent() {
         </Button>
       </div>
 
-      {/* Stage tiles (procurement flow) with sub-triage KPIs beneath. Click a stage to
-          select all of it, or a sub-triage to drill in. Multiple selectable at once. */}
+      {/* Triage tiles: Shopify inbound (leftmost) + the four LS procurement stages. */}
       {isLoading ? (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          {stageTiles.map((t) => (
-            <Card key={t.key} className="py-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
+          {TILES.map((t) => (
+            <Card key={t.stage} className="py-3">
               <CardContent className="px-4 py-0">
                 <Skeleton className="mb-2 h-4 w-24" />
                 <Skeleton className="h-7 w-12" />
@@ -166,22 +231,18 @@ export function SpecialOrdersContent() {
           ))}
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          {stageTiles.map((t) => {
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
+          {TILES.map((t) => {
             const Icon = t.icon
-            const ids = STAGE_SUBTRIAGES[t.key].map((s) => seg(t.key, s.key))
-            const stageActive = ids.length > 0 && ids.every((id) => selected.has(id))
-            const total = stageTotals[t.key] ?? 0
+            const ids = t.subs.map((s) => seg(t.stage, s.key))
+            const stageActive = ids.every((id) => selected.has(id))
+            const total = ids.reduce((sum, id) => sum + (segCounts[id] ?? 0), 0)
             return (
-              <Card
-                key={t.key}
-                className={cn('py-3 transition-colors', stageActive && 'ring-primary ring-2')}
-              >
+              <Card key={t.stage} className={cn('py-3 transition-colors', stageActive && 'ring-primary ring-2')}>
                 <CardContent className="px-4 py-0">
-                  {/* Stage header — toggles the whole stage */}
                   <button
                     type="button"
-                    onClick={() => toggleStage(t.key)}
+                    onClick={() => toggleStage(t)}
                     className="flex w-full items-center gap-2 text-left"
                   >
                     <div className={cn('rounded-md p-1.5', t.bgColor)}>
@@ -190,11 +251,9 @@ export function SpecialOrdersContent() {
                     <span className="text-muted-foreground text-xs font-medium">{t.label}</span>
                     <span className="ml-auto text-2xl font-semibold tabular-nums">{total.toLocaleString()}</span>
                   </button>
-
-                  {/* Sub-triages — each toggles its own segment */}
                   <div className="mt-2.5 flex flex-col gap-1 border-t pt-2">
-                    {STAGE_SUBTRIAGES[t.key].map((s) => {
-                      const id = seg(t.key, s.key)
+                    {t.subs.map((s) => {
+                      const id = seg(t.stage, s.key)
                       const count = segCounts[id] ?? 0
                       const subActive = selected.has(id)
                       return (
@@ -227,7 +286,7 @@ export function SpecialOrdersContent() {
         <div className="relative max-w-sm flex-1">
           <Search className="text-muted-foreground absolute left-2.5 top-2.5 h-4 w-4" />
           <Input
-            placeholder="Search customer, product, SKU, vendor, PO…"
+            placeholder="Search customer, product, SKU, vendor, PO, Shopify #…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="pl-8"

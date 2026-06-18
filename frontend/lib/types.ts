@@ -249,6 +249,25 @@ export type SpecialOrderFlag =
   | 'no_eta'           // ordered PO with no expected date
   | 'ready_not_called' // received but customer not yet contacted
 
+// Whether a live LS SO was matched to a Shopify `SO`-tagged order (by customer email + SKU).
+export type ShopifyMatch = 'matched' | 'ambiguous' | 'none'
+
+// The triage tile axis: the Shopify inbound stage sits left of the four LS procurement stages.
+export type TriageStage = 'shopify' | ProcurementStage
+
+// A Shopify `SO`-tagged order with no matching live LS SO — the "Unmatched" population.
+export interface ShopifyOnlyOrder {
+  order_id: string
+  order_name: string | null
+  customer_email: string | null
+  shopify_expected_date: string | null
+  created_at: string | null
+  fulfillment_status: string | null
+  financial_status: string | null
+  skus: string[]
+  shopify_order_url: string | null
+}
+
 export interface SpecialOrder {
   special_order_id: string
   status: string
@@ -283,10 +302,19 @@ export interface SpecialOrder {
   flag: SpecialOrderFlag
   days_overdue: number | null       // signed; only set for the 'ordered' stage
   is_overdue: boolean               // flag is overdue or critical
+  // Customer (Shopify) identity + matched promise date
+  customer_email: string | null
+  shopify_match: ShopifyMatch
+  shopify_order_id: string | null
+  shopify_order_name: string | null
+  shopify_order_url: string | null
+  shopify_expected_date: string | null   // the customer-promised ETA from Shopify
   // Deep links into Lightspeed
   ls_item_url: string | null
   ls_customer_url: string | null
   ls_order_url: string | null
+  // Client-only: 'shopify' marks a Shopify-only (Unmatched) pseudo-row in the unified table.
+  kind?: 'ls' | 'shopify'
 }
 
 export interface SpecialOrderSummary {
@@ -305,5 +333,6 @@ export interface SpecialOrderSummary {
 export interface SpecialOrderDashboard {
   orders: SpecialOrder[]
   summary: SpecialOrderSummary
+  shopify_only: ShopifyOnlyOrder[]
   fetched_at?: string
 }

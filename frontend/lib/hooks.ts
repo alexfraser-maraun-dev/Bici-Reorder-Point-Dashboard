@@ -411,6 +411,7 @@ export function useSpecialOrders() {
   return {
     orders: data?.orders ?? [],
     summary: data?.summary,
+    shopifyOnly: data?.shopify_only ?? [],
     fetchedAt: data?.fetched_at,
     isLoading,
     error,
