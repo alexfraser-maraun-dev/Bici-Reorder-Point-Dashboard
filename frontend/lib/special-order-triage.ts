@@ -21,16 +21,16 @@ export interface SubTriage {
 // (customer-promised date) drives the bucket even before the SO is ordered in Lightspeed.
 export const STAGE_SUBTRIAGES: Record<ProcurementStage, SubTriage[]> = {
   open_pool: [
-    { key: 'critical', label: 'Critical (8d+)', tone: 'danger' },
-    { key: 'overdue_mid', label: 'Overdue (3-7d)', tone: 'danger' },
-    { key: 'overdue', label: 'Overdue (1-2d)', tone: 'danger' },
+    { key: 'critical', label: 'Open Order 8d+', tone: 'danger' },
+    { key: 'overdue_mid', label: 'Open Order 3-7d', tone: 'danger' },
+    { key: 'overdue', label: 'Open Order 1-2d', tone: 'danger' },
     { key: 'aged', label: `Open Pool > ${STALE_STAGE_DAYS} Days`, tone: 'warn' },
     { key: 'healthy', label: 'Healthy', tone: 'ok' },
   ],
   unordered_po: [
-    { key: 'critical', label: 'Critical (8d+)', tone: 'danger' },
-    { key: 'overdue_mid', label: 'Overdue (3-7d)', tone: 'danger' },
-    { key: 'overdue', label: 'Overdue (1-2d)', tone: 'danger' },
+    { key: 'critical', label: 'Unordered 8d+', tone: 'danger' },
+    { key: 'overdue_mid', label: 'Unordered 3-7d', tone: 'danger' },
+    { key: 'overdue', label: 'Unordered 1-2d', tone: 'danger' },
     { key: 'aged', label: `Unordered PO > ${STALE_STAGE_DAYS} Days`, tone: 'warn' },
     { key: 'healthy', label: 'Healthy', tone: 'ok' },
   ],
