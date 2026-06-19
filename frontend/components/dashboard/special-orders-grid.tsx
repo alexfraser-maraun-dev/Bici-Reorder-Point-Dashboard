@@ -17,7 +17,6 @@ import {
   StageBadge,
   FlagBadge,
   ShopifyMatchBadge,
-  SpecialOrderStatusBadge,
 } from './special-order-badges'
 import {
   ExternalLink,
@@ -88,16 +87,18 @@ function Field({ label, value }: { label: string; value: React.ReactNode }) {
 function FieldGroup({
   title,
   cols = 1,
+  className,
   children,
 }: {
   title: string
   cols?: 1 | 2
+  className?: string
   children: React.ReactNode
 }) {
   return (
-    <div className="flex min-w-0 flex-col gap-2">
+    <div className={cn('flex min-w-0 flex-col gap-2', className)}>
       <span className="text-muted-foreground/70 text-[10px] font-semibold uppercase tracking-wider">{title}</span>
-      <div className={cn('gap-x-5 gap-y-2.5', cols === 2 ? 'grid grid-cols-2' : 'flex flex-col')}>
+      <div className={cn('gap-x-6 gap-y-2.5', cols === 2 ? 'grid grid-cols-2' : 'flex flex-col')}>
         {children}
       </div>
     </div>
@@ -172,7 +173,6 @@ function SpecialOrderRow({ order }: { order: SpecialOrder }) {
         {/* Header line: identity + product + badges + Shopify indicator */}
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0 font-mono text-sm font-medium">SO #{order.special_order_id}</span>
-          <SpecialOrderStatusBadge status={order.status} />
           <StageBadge stage={order.procurement_stage} />
           <FlagBadge stage={order.procurement_stage} flag={order.flag} daysOverdue={order.days_overdue} />
           <span className="min-w-0 flex-1 truncate text-sm font-medium" title={order.description ?? ''}>
@@ -200,8 +200,9 @@ function SpecialOrderRow({ order }: { order: SpecialOrder }) {
         </div>
 
         {/* Fields grouped into logical clusters that read left-to-right:
-            who/what → sourcing PO → when (all dates together) → how late. */}
-        <div className="flex flex-wrap gap-x-8 gap-y-4">
+            who/what → sourcing PO → when (all dates together) → how late.
+            A full-width grid spreads the groups evenly across the available room. */}
+        <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3 lg:grid-cols-6">
           <FieldGroup title="Customer">
             <Field label="Customer" value={order.customer_name} />
             <Field label="Phone" value={order.customer_phone} />
@@ -225,7 +226,7 @@ function SpecialOrderRow({ order }: { order: SpecialOrder }) {
             />
           </FieldGroup>
 
-          <FieldGroup title="Dates" cols={2}>
+          <FieldGroup title="Dates" cols={2} className="col-span-2">
             <Field label="SO created" value={order.created_date} />
             <Field label="Ordered" value={order.ordered_date} />
             <Field label="Expected (PO)" value={order.expected_date} />
