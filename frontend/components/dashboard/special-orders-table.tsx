@@ -58,8 +58,8 @@ interface Props {
 }
 
 export function SpecialOrdersTable({ orders, isLoading, onRowClick }: Props) {
-  const [sortKey, setSortKey] = useState<SortKey>('procurement_stage_index')
-  const [sortDir, setSortDir] = useState<SortDir>('asc')
+  const [sortKey, setSortKey] = useState<SortKey>('created_date')
+  const [sortDir, setSortDir] = useState<SortDir>('desc')
 
   function handleSort(key: SortKey) {
     if (sortKey === key) {
