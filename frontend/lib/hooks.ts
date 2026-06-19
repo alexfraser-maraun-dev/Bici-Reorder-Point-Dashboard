@@ -408,13 +408,31 @@ export function useSpecialOrders() {
     fetcher,
     adminDashboardSWRConfig
   )
+
+  const [isRefreshing, setIsRefreshing] = useState(false)
+
+  // Force a server-side re-fetch from Lightspeed (bypasses the backend TTL cache).
+  // Awaits the result before writing it so the caller can show progress and catch
+  // failures, rather than firing a promise into mutate and hoping (the live walk
+  // can be slow or fail, and a fire-and-forget mutate swallows both).
+  const refetch = async () => {
+    setIsRefreshing(true)
+    try {
+      const fresh = await fetcher(`${url}?refresh=true`)
+      await mutate(fresh, { revalidate: false })
+    } finally {
+      setIsRefreshing(false)
+    }
+  }
+
   return {
     orders: data?.orders ?? [],
     summary: data?.summary,
     shopifyOnly: data?.shopify_only ?? [],
     fetchedAt: data?.fetched_at,
     isLoading,
+    isRefreshing,
     error,
-    refetch: () => mutate(fetcher(`${url}?refresh=true`), false),
+    refetch,
   }
 }

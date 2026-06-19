@@ -53,6 +53,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _warm_replenishment_caches() -> None:
+    """Populate the heavy BigQuery-backed caches (tagged item metrics, lead times,
+    brand sourcing) on boot so the first Inventory dashboard load reads a hot cache
+    instead of running the 60-day stockout query cold. Best-effort; failures here
+    just mean the first real request pays the cold cost as before."""
+    try:
+        from app.services.bigquery_sync import (
+            fetch_tagged_items_metrics,
+            fetch_lead_times,
+            get_brand_sourcing_rules_map,
+        )
+        fetch_tagged_items_metrics("auto-replen")
+        fetch_lead_times()
+        get_brand_sourcing_rules_map()
+    except Exception as e:
+        print(f"Error warming replenishment caches: {e}")
+
+
+@app.on_event("startup")
+def _warm_dashboard_caches_on_startup() -> None:
+    """Warm the Inventory dashboard caches on boot in a daemon thread so app
+    startup isn't blocked by the BigQuery queries."""
+    threading.Thread(target=_warm_replenishment_caches, daemon=True).start()
+
+
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "Replenishment API is running"}
@@ -140,6 +166,7 @@ def add_managed_skus_bulk(items: List[Dict[str, Any]]):
 
 @app.get("/api/replenishment/data")
 def get_replenishment_data(
+    background_tasks: BackgroundTasks,
     forecast_period: int = None,
     safety_days: int = 7,
     growth_multiplier: float = 1.0,
@@ -237,7 +264,10 @@ def get_replenishment_data(
                     rec['recommended_desired_level'] != rec['current_desired_level']
                 )
         
-        # 4. Save NEW snapshots and run info to BigQuery
+        # 4. Save NEW snapshots and run info to BigQuery. These are two streaming
+        # inserts that don't affect the response payload, so defer them to run
+        # AFTER the response is sent — they no longer sit in front of every load
+        # (and every debounced slider change).
         run_id = str(uuid.uuid4())
         run_log = {
             "run_id": run_id,
@@ -248,7 +278,7 @@ def get_replenishment_data(
             "status": "completed",
             "row_count": len(recommendations)
         }
-        log_recommendation_run(run_log)
+        background_tasks.add_task(log_recommendation_run, run_log)
 
         snapshots = []
         for rec in recommendations:
@@ -259,8 +289,8 @@ def get_replenishment_data(
                 "daily_sales": float(rec['raw_daily_sales'] if 'raw_daily_sales' in rec else rec['daily_sales']),
                 "created_at": datetime.utcnow().isoformat()
             })
-        log_velocity_snapshots(snapshots)
-        
+        background_tasks.add_task(log_velocity_snapshots, snapshots)
+
         # Organize by location
         by_location = {
             "Bici Adanac": [],

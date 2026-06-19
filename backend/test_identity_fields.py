@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from fastapi import BackgroundTasks
+
 from app.main import build_lightspeed_item_url, get_replenishment_data
 from app.services.replenishment_engine import process_recommendations
 
@@ -198,7 +200,7 @@ class IdentityFieldsTest(unittest.TestCase):
              patch("app.main.get_sku_overrides", return_value={"NEG-QOH_Bici Adanac": {"manual_desired_level": 40}}), \
              patch("app.main.log_recommendation_run"), \
              patch("app.main.log_velocity_snapshots"):
-            response = get_replenishment_data(forecast_period=60, safety_days=0)
+            response = get_replenishment_data(BackgroundTasks(), forecast_period=60, safety_days=0)
 
         rec = response["data"]["Bici Adanac"][0]
         self.assertEqual(rec["on_hand"], -5)
@@ -229,7 +231,7 @@ class IdentityFieldsTest(unittest.TestCase):
              patch("app.main.get_sku_overrides", return_value={}), \
              patch("app.main.log_recommendation_run"), \
              patch("app.main.log_velocity_snapshots"):
-            response = get_replenishment_data(forecast_period=60, safety_days=0)
+            response = get_replenishment_data(BackgroundTasks(), forecast_period=60, safety_days=0)
 
         rec = response["data"]["Bici Adanac"][0]
         self.assertEqual(rec["weight_14d"], 0.4)

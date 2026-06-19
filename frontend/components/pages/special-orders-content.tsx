@@ -1,6 +1,7 @@
 'use client'
 
 import { useMemo, useState } from 'react'
+import { toast } from 'sonner'
 import { useSpecialOrders } from '@/lib/hooks'
 import type { SpecialOrder, ShopifyOnlyOrder, TriageStage } from '@/lib/types'
 import { STAGE_SUBTRIAGES, subKeyForOrder, type TriageTone } from '@/lib/special-order-triage'
@@ -124,7 +125,16 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
 }
 
 export function SpecialOrdersContent() {
-  const { orders, shopifyOnly, isLoading, refetch, fetchedAt } = useSpecialOrders()
+  const { orders, shopifyOnly, isLoading, isRefreshing, refetch, fetchedAt } = useSpecialOrders()
+
+  const handleSync = async () => {
+    try {
+      await refetch()
+      toast.success('Special orders synced from Lightspeed.')
+    } catch {
+      toast.error('Sync failed. Lightspeed may be unavailable — try again.')
+    }
+  }
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [search, setSearch] = useState('')
   const [storeFilter, setStoreFilter] = useState<string>('all')
@@ -202,9 +212,15 @@ export function SpecialOrdersContent() {
             )}
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={() => refetch()} className="gap-2">
-          <RefreshCw className="h-4 w-4" />
-          Sync
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={handleSync}
+          disabled={isRefreshing}
+          className="gap-2"
+        >
+          <RefreshCw className={cn('h-4 w-4', isRefreshing && 'animate-spin')} />
+          {isRefreshing ? 'Syncing…' : 'Sync'}
         </Button>
       </div>
 
