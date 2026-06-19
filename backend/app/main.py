@@ -921,3 +921,54 @@ def get_special_orders(background_tasks: BackgroundTasks, refresh: bool = False)
     except Exception as e:
         print(f"Error building special-order dashboard: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/special-orders/eta")
+def update_special_order_eta(payload: Dict[str, Any]):
+    """
+    Writes the customer-promised ETA back to Shopify (the `custom.special_order_eta` order
+    metafield) via the Admin API, then busts the special-order caches so the change is live on
+    the next read. Body: { shopify_order_id, eta (YYYY-MM-DD), updated_by? }.
+    """
+    from app.services import special_order_service
+    from app.services.shopify_client import ShopifyClient
+    from app.services.bigquery_sync import log_shopify_eta_writeback
+
+    order_id = str(payload.get("shopify_order_id") or "").strip()
+    eta = payload.get("eta")
+    if not order_id:
+        raise HTTPException(status_code=400, detail="shopify_order_id is required")
+    if not eta:
+        raise HTTPException(status_code=400, detail="eta is required")
+    try:
+        datetime.strptime(eta, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="eta must be an ISO date (YYYY-MM-DD)")
+
+    try:
+        ShopifyClient().set_order_eta(order_id, eta)
+    except Exception as e:
+        log_shopify_eta_writeback({
+            "shopify_order_id": order_id,
+            "new_eta": eta,
+            "triggered_by": payload.get("updated_by") or "UI_Manual_Edit",
+            "status": "failed",
+            "error_message": str(e),
+            "created_at": datetime.utcnow().isoformat(),
+        })
+        raise HTTPException(status_code=502, detail=f"Shopify update failed: {e}")
+
+    # Read and write now share one source of truth: drop the Shopify pull cache and the
+    # special-orders response cache so the next GET re-pulls the just-written value live.
+    special_order_service.invalidate_shopify_cache()
+    _special_orders_cache["fetched_at"] = 0.0
+
+    log_shopify_eta_writeback({
+        "shopify_order_id": order_id,
+        "new_eta": eta,
+        "triggered_by": payload.get("updated_by") or "UI_Manual_Edit",
+        "status": "success",
+        "error_message": None,
+        "created_at": datetime.utcnow().isoformat(),
+    })
+    return {"status": "success", "shopify_order_id": order_id, "eta": eta}

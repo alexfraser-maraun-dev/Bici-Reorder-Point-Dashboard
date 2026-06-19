@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional
 from app.services.lightspeed_client import LightspeedClient
 from app.services import bigquery_sync
 from app.services import shopify_match
+from app.services.shopify_client import ShopifyClient
 
 # merchantOS (Lightspeed Retail web UI) deep-link views. The item view (matches
 # build_lightspeed_item_url in main.py) and the purchase-order view (purchase.views.purchase,
@@ -312,17 +313,26 @@ def _summarize(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
 # Severity rank so flagged items bubble to the top within their stage.
 _FLAG_RANK = {"critical": 6, "overdue_mid": 5, "overdue": 4, "no_eta": 3, "ready_not_called": 1, "none": 0}
 
-# Shopify SO rows change slowly (Fivetran sync lag), so cache the BigQuery pull beyond the
-# 90s endpoint cache to keep the live SO refresh cheap.
+# The open-SO population + ETAs are pulled live from the Shopify Admin API, so cache the pull
+# briefly to keep each live SO refresh cheap (and stay under Shopify's API cost limits).
 _shopify_cache: Dict[str, Any] = {"rows": None, "fetched_at": 0.0}
 _SHOPIFY_TTL_SECONDS = 600
+
+
+def invalidate_shopify_cache() -> None:
+    """Drops the cached Shopify pull so the next read re-fetches live from Shopify. Called
+    right after an ETA write so the change is reflected immediately, with no TTL lag."""
+    _shopify_cache["rows"] = None
+    _shopify_cache["fetched_at"] = 0.0
 
 
 def _shopify_rows() -> List[Dict[str, Any]]:
     now = time.time()
     if _shopify_cache["rows"] is not None and (now - _shopify_cache["fetched_at"]) < _SHOPIFY_TTL_SECONDS:
         return _shopify_cache["rows"]
-    rows = bigquery_sync.get_shopify_special_orders()
+    # Sourced live from the Shopify Admin API (was Fivetran -> BigQuery). The row shape is
+    # identical to bigquery_sync.get_shopify_special_orders(), which remains as a fallback.
+    rows = ShopifyClient().get_open_special_orders()
     _shopify_cache["rows"] = rows
     _shopify_cache["fetched_at"] = now
     return rows

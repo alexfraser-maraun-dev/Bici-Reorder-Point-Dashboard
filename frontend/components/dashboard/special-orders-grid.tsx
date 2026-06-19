@@ -1,8 +1,10 @@
 'use client'
 
 import { useState, useMemo } from 'react'
+import { toast } from 'sonner'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
@@ -12,6 +14,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
+import { updateShopifyEta } from '@/lib/hooks'
 import type { SpecialOrder } from '@/lib/types'
 import {
   StageBadge,
@@ -26,6 +29,9 @@ import {
   Store,
   ArrowDownNarrowWide,
   ArrowUpNarrowWide,
+  Pencil,
+  Check,
+  X,
 } from 'lucide-react'
 
 type SortKey =
@@ -82,6 +88,102 @@ function Field({ label, value }: { label: string; value: React.ReactNode }) {
   )
 }
 
+// The Shopify ETA, editable inline. Writes back to the Shopify order metafield (create or
+// update) and calls onSaved (a dashboard refetch) to pull the now-live value. When the order
+// has no Shopify id to attach the metafield to (an unmatched LS SO) it renders read-only.
+function EditableEta({
+  orderId,
+  value,
+  ambiguous,
+  onSaved,
+}: {
+  orderId: string | null
+  value: string | null
+  ambiguous?: boolean
+  onSaved?: () => void | Promise<void>
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const [saving, setSaving] = useState(false)
+  // Show the just-saved value immediately, before the background refetch lands.
+  const [localValue, setLocalValue] = useState<string | null>(null)
+  const display = localValue ?? value
+
+  if (!orderId) {
+    return (
+      <span
+        className="text-muted-foreground"
+        title="No matched Shopify order to write the ETA to."
+      >
+        {display ?? '—'}
+      </span>
+    )
+  }
+
+  if (!editing) {
+    return (
+      <span className="flex items-center gap-1.5">
+        {display ?? <span className="text-muted-foreground">—</span>}
+        {ambiguous && <ShopifyMatchBadge match="ambiguous" />}
+        <button
+          type="button"
+          onClick={() => { setDraft(display ?? ''); setEditing(true) }}
+          className="text-muted-foreground hover:text-foreground shrink-0"
+          title="Edit Shopify ETA"
+        >
+          <Pencil className="h-3 w-3" />
+        </button>
+      </span>
+    )
+  }
+
+  const save = async () => {
+    if (!draft) return
+    setSaving(true)
+    try {
+      await updateShopifyEta({ shopify_order_id: orderId, eta: draft })
+      setLocalValue(draft)
+      setEditing(false)
+      toast.success('Shopify ETA updated.')
+      await onSaved?.()
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to update ETA.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <span className="flex items-center gap-1">
+      <Input
+        type="date"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        disabled={saving}
+        className="h-7 w-[9.5rem] px-2 text-sm"
+      />
+      <button
+        type="button"
+        onClick={save}
+        disabled={saving || !draft}
+        className="text-emerald-600 hover:text-emerald-700 disabled:opacity-40"
+        title="Save"
+      >
+        <Check className="h-4 w-4" />
+      </button>
+      <button
+        type="button"
+        onClick={() => setEditing(false)}
+        disabled={saving}
+        className="text-muted-foreground hover:text-foreground"
+        title="Cancel"
+      >
+        <X className="h-4 w-4" />
+      </button>
+    </span>
+  )
+}
+
 // A captioned cluster of related fields, so the row reads as logical groups rather than a
 // flat scatter of cells. `cols` lays the group's fields out internally (1 col by default).
 function FieldGroup({
@@ -126,7 +228,7 @@ const ACCENT: Partial<Record<SpecialOrder['flag'], string>> = {
 }
 
 // A Shopify-only ("Unmatched") pseudo-row — full-width horizontal row, simpler content.
-function ShopifyOnlyRow({ order }: { order: SpecialOrder }) {
+function ShopifyOnlyRow({ order, onEtaSaved }: { order: SpecialOrder; onEtaSaved?: () => void | Promise<void> }) {
   return (
     <Card className="flex-row gap-0 overflow-hidden p-0">
       <div className="w-1 shrink-0 self-stretch bg-violet-400" />
@@ -138,7 +240,16 @@ function ShopifyOnlyRow({ order }: { order: SpecialOrder }) {
         </div>
         <div className="grid grid-cols-2 gap-x-5 gap-y-2 sm:grid-cols-4">
           <Field label="Customer" value={order.customer_email} />
-          <Field label="Shopify ETA" value={order.shopify_expected_date} />
+          <Field
+            label="Shopify ETA"
+            value={
+              <EditableEta
+                orderId={order.shopify_order_id}
+                value={order.shopify_expected_date}
+                onSaved={onEtaSaved}
+              />
+            }
+          />
           <Field
             label="SKU(s)"
             value={order.description ? <span className="font-mono text-xs">{order.description}</span> : null}
@@ -158,8 +269,8 @@ function ShopifyOnlyRow({ order }: { order: SpecialOrder }) {
   )
 }
 
-function SpecialOrderRow({ order }: { order: SpecialOrder }) {
-  if (order.kind === 'shopify') return <ShopifyOnlyRow order={order} />
+function SpecialOrderRow({ order, onEtaSaved }: { order: SpecialOrder; onEtaSaved?: () => void | Promise<void> }) {
+  if (order.kind === 'shopify') return <ShopifyOnlyRow order={order} onEtaSaved={onEtaSaved} />
 
   const hasShopify = order.shopify_match === 'matched' || order.shopify_match === 'ambiguous'
 
@@ -233,12 +344,12 @@ function SpecialOrderRow({ order }: { order: SpecialOrder }) {
             <Field
               label="Shopify ETA"
               value={
-                order.shopify_expected_date ? (
-                  <span className="flex items-center gap-1.5">
-                    {order.shopify_expected_date}
-                    {order.shopify_match === 'ambiguous' && <ShopifyMatchBadge match="ambiguous" />}
-                  </span>
-                ) : null
+                <EditableEta
+                  orderId={order.shopify_order_id}
+                  value={order.shopify_expected_date}
+                  ambiguous={order.shopify_match === 'ambiguous'}
+                  onSaved={onEtaSaved}
+                />
               }
             />
           </FieldGroup>
@@ -282,9 +393,11 @@ function SpecialOrderRow({ order }: { order: SpecialOrder }) {
 interface Props {
   orders: SpecialOrder[]
   isLoading?: boolean
+  // Called after an ETA is written to Shopify, so the parent can refetch the live value.
+  onEtaSaved?: () => void | Promise<void>
 }
 
-export function SpecialOrdersGrid({ orders, isLoading }: Props) {
+export function SpecialOrdersGrid({ orders, isLoading, onEtaSaved }: Props) {
   // Default to the parent's server-side ordering (flag severity); only re-sort once the user picks.
   const [sortKey, setSortKey] = useState<SortKey | 'default'>('default')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
@@ -346,7 +459,7 @@ export function SpecialOrdersGrid({ orders, isLoading }: Props) {
 
       <div className="flex flex-col gap-3">
         {sorted.map((o) => (
-          <SpecialOrderRow key={`${o.kind ?? 'ls'}-${o.special_order_id}`} order={o} />
+          <SpecialOrderRow key={`${o.kind ?? 'ls'}-${o.special_order_id}`} order={o} onEtaSaved={onEtaSaved} />
         ))}
       </div>
     </div>

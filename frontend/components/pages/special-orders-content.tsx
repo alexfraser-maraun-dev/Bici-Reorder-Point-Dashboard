@@ -331,7 +331,7 @@ export function SpecialOrdersContent() {
         )}
       </div>
 
-      <SpecialOrdersGrid orders={filtered} isLoading={isLoading} />
+      <SpecialOrdersGrid orders={filtered} isLoading={isLoading} onEtaSaved={refetch} />
     </div>
   )
 }

@@ -270,6 +270,27 @@ export async function saveBrandSourcingRule(rule: {
   return res.json()
 }
 
+// Writes the customer-promised ETA back to Shopify (the custom.special_order_eta order
+// metafield). The backend busts its caches on success, so the caller should refetch the
+// dashboard to pull the now-live value. `shopify_order_id` is the numeric Shopify order id.
+export async function updateShopifyEta(input: {
+  shopify_order_id: string
+  eta: string
+  updated_by?: string
+}) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const res = await fetch(`${baseUrl}/api/special-orders/eta`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || 'Failed to update Shopify ETA')
+  }
+  return res.json()
+}
+
 // ---------------------------------------------------------------------------
 // Purchase Orders
 // ---------------------------------------------------------------------------

@@ -63,6 +63,19 @@ def log_writeback(log_data: dict):
     except Exception as e:
         print(f"Failed to log writeback to BigQuery: {e}")
 
+def log_shopify_eta_writeback(log_data: dict):
+    """Best-effort audit of a Shopify special-order ETA edit. Streams to a
+    `shopify_eta_writeback_logs` table; swallows all errors (incl. a missing table) so an
+    audit-logging hiccup never fails the user's edit."""
+    table_id = f"{APP_DATASET}.shopify_eta_writeback_logs"
+    try:
+        client = get_bq_client()
+        errors = client.insert_rows_json(table_id, [log_data])
+        if errors:
+            print(f"BigQuery Shopify ETA Log Errors: {errors}")
+    except Exception as e:
+        print(f"Failed to log Shopify ETA writeback to BigQuery: {e}")
+
 def get_recommendation_runs(limit: int = 50):
     """Fetches historical runs from BigQuery."""
     query = f"""
