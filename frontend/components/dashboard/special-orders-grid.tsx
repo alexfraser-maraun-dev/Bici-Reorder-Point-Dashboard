@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { toast } from 'sonner'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -29,9 +29,6 @@ import {
   Store,
   ArrowDownNarrowWide,
   ArrowUpNarrowWide,
-  Pencil,
-  Check,
-  X,
 } from 'lucide-react'
 
 type SortKey =
@@ -88,9 +85,10 @@ function Field({ label, value }: { label: string; value: React.ReactNode }) {
   )
 }
 
-// The Shopify ETA, editable inline. Writes back to the Shopify order metafield (create or
-// update) and calls onSaved (a dashboard refetch) to pull the now-live value. When the order
-// has no Shopify id to attach the metafield to (an unmatched LS SO) it renders read-only.
+// The Shopify ETA, rendered as an always-editable native date box. Picking a (complete) new
+// date writes it straight back to the Shopify order metafield (create or update) and calls
+// onSaved (a dashboard refetch) to pull the now-live value. When the order has no Shopify id to
+// attach the metafield to (an unmatched LS SO) it renders read-only.
 function EditableEta({
   orderId,
   value,
@@ -102,84 +100,58 @@ function EditableEta({
   ambiguous?: boolean
   onSaved?: () => void | Promise<void>
 }) {
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState('')
+  const [val, setVal] = useState<string>(value ?? '')
   const [saving, setSaving] = useState(false)
-  // Show the just-saved value immediately, before the background refetch lands.
-  const [localValue, setLocalValue] = useState<string | null>(null)
-  const display = localValue ?? value
+  // The last value we know is persisted in Shopify, so we only save real changes (and can
+  // revert to it if a save fails).
+  const savedRef = useRef<string>(value ?? '')
+
+  // Keep the box in sync when the upstream value changes (e.g. after a refetch) while idle.
+  useEffect(() => {
+    if (!saving) {
+      setVal(value ?? '')
+      savedRef.current = value ?? ''
+    }
+  }, [value, saving])
 
   if (!orderId) {
     return (
-      <span
-        className="text-muted-foreground"
-        title="No matched Shopify order to write the ETA to."
-      >
-        {display ?? '—'}
+      <span className="text-muted-foreground" title="No matched Shopify order to write the ETA to.">
+        {value ?? '—'}
       </span>
     )
   }
 
-  if (!editing) {
-    return (
-      <span className="flex items-center gap-1.5">
-        {display ?? <span className="text-muted-foreground">—</span>}
-        {ambiguous && <ShopifyMatchBadge match="ambiguous" />}
-        <button
-          type="button"
-          onClick={() => { setDraft(display ?? ''); setEditing(true) }}
-          className="text-muted-foreground hover:text-foreground shrink-0"
-          title="Edit Shopify ETA"
-        >
-          <Pencil className="h-3 w-3" />
-        </button>
-      </span>
-    )
-  }
-
-  const save = async () => {
-    if (!draft) return
+  const handleChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const next = e.target.value
+    setVal(next)
+    // Ignore partial/cleared input (native date input emits these mid-edit). No clear support.
+    if (next.length !== 10 || next === savedRef.current) return
     setSaving(true)
     try {
-      await updateShopifyEta({ shopify_order_id: orderId, eta: draft })
-      setLocalValue(draft)
-      setEditing(false)
+      await updateShopifyEta({ shopify_order_id: orderId, eta: next })
+      savedRef.current = next
       toast.success('Shopify ETA updated.')
       await onSaved?.()
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to update ETA.')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to update ETA.')
+      setVal(savedRef.current) // revert on failure
     } finally {
       setSaving(false)
     }
   }
 
   return (
-    <span className="flex items-center gap-1">
+    <span className="flex items-center gap-1.5">
       <Input
         type="date"
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
+        value={val}
+        onChange={handleChange}
         disabled={saving}
+        aria-label="Shopify ETA"
         className="h-7 w-[9.5rem] px-2 text-sm"
       />
-      <button
-        type="button"
-        onClick={save}
-        disabled={saving || !draft}
-        className="text-emerald-600 hover:text-emerald-700 disabled:opacity-40"
-        title="Save"
-      >
-        <Check className="h-4 w-4" />
-      </button>
-      <button
-        type="button"
-        onClick={() => setEditing(false)}
-        disabled={saving}
-        className="text-muted-foreground hover:text-foreground"
-        title="Cancel"
-      >
-        <X className="h-4 w-4" />
-      </button>
+      {ambiguous && <ShopifyMatchBadge match="ambiguous" />}
     </span>
   )
 }
