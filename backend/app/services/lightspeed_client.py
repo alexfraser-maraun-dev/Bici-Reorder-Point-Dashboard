@@ -1,6 +1,8 @@
 import requests
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Optional, List
 
 # OAuth scopes this app requires. Single source of truth shared by the
@@ -34,6 +36,10 @@ class LightspeedClient:
         # reusing the same OAuth bearer token / refresh machinery as the V3 client.
         self.legacy_base_url = f"https://api.lightspeedapp.com/API/Account/{self.account_id}"
 
+        # Serializes token refreshes so parallel chunk fetches that all 401 at once
+        # don't stampede the OAuth refresh endpoint.
+        self._token_lock = threading.Lock()
+
         # Mapping from Spreadsheet Names to Lightspeed shopIDs
         self.shop_id_map = {
             "Victoria": "2",
@@ -42,20 +48,24 @@ class LightspeedClient:
         }
         
     def _refresh_access_token(self):
-        url = "https://cloud.lightspeedapp.com/oauth/access_token.php"
-        payload = {
-            "refresh_token": self.refresh_token,
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "grant_type": "refresh_token"
-        }
-        response = requests.post(url, data=payload, timeout=10)
-        if response.status_code == 200:
-            new_token = response.json().get("access_token")
-            self.bearer_token = new_token
-            return new_token
-        else:
-            raise Exception(f"Failed to refresh Lightspeed token: {response.text}")
+        # Lock so concurrent 401s (from parallel chunk fetches) serialize into a
+        # single refresh rather than racing. A redundant back-to-back refresh is
+        # harmless, so a plain mutex is enough.
+        with self._token_lock:
+            url = "https://cloud.lightspeedapp.com/oauth/access_token.php"
+            payload = {
+                "refresh_token": self.refresh_token,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "grant_type": "refresh_token"
+            }
+            response = requests.post(url, data=payload, timeout=10)
+            if response.status_code == 200:
+                new_token = response.json().get("access_token")
+                self.bearer_token = new_token
+                return new_token
+            else:
+                raise Exception(f"Failed to refresh Lightspeed token: {response.text}")
 
     def _get_headers(self):
         if not self.bearer_token:
@@ -404,6 +414,24 @@ class LightspeedClient:
             offset += page_limit
         return results
 
+    # Parallelize the independent IN,[...] chunks below. The legacy API self-throttles
+    # via the 429/retry-after handling in `_legacy_request`, so a modest fan-out
+    # collapses many sequential round-trips into a few without tripping rate limits.
+    _CHUNK_FETCH_WORKERS = 6
+
+    def _fetch_in_chunks(self, unique_ids: List[str], chunk_size: int, worker) -> Dict[str, Dict[str, Any]]:
+        """Splits ``unique_ids`` into chunks and runs ``worker(chunk)`` over them in
+        parallel, merging the returned partial maps. ``worker`` must never raise
+        (network/HTTP errors are swallowed and returned as an empty partial)."""
+        if not unique_ids:
+            return {}
+        chunks = [unique_ids[i:i + chunk_size] for i in range(0, len(unique_ids), chunk_size)]
+        merged: Dict[str, Dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=min(self._CHUNK_FETCH_WORKERS, len(chunks))) as executor:
+            for partial in executor.map(worker, chunks):
+                merged.update(partial)
+        return merged
+
     def get_orders_by_ids(self, order_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
         """
         Fetches the purchase orders (Order entity) behind a set of special orders and
@@ -416,37 +444,38 @@ class LightspeedClient:
         (numReceived / checkedIn > 0).
         """
         unique_ids = sorted({str(o) for o in order_ids if o and str(o) != "0"})
-        order_map: Dict[str, Dict[str, Any]] = {}
-        for i in range(0, len(unique_ids), chunk_size):
-            chunk = unique_ids[i:i + chunk_size]
-            params = {
-                "orderID": f"IN,[{','.join(chunk)}]",
-                "load_relations": '["Vendor","OrderLines"]',
-                "limit": "100",
+        return self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_order_chunk)
+
+    def _fetch_order_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
+        params = {
+            "orderID": f"IN,[{','.join(chunk)}]",
+            "load_relations": '["Vendor","OrderLines"]',
+            "limit": "100",
+        }
+        out: Dict[str, Dict[str, Any]] = {}
+        response = self._legacy_request("GET", "/Order.json", params=params)
+        if response is None or response.status_code != 200:
+            if response is not None:
+                print(f"Error fetching orders: {response.status_code} {response.text[:300]}")
+            return out
+        for order in self._as_list(response.json().get("Order")):
+            order_id = str(order.get("orderID"))
+            order_lines_wrap = order.get("OrderLines")
+            lines = self._as_list(order_lines_wrap.get("OrderLine")) if isinstance(order_lines_wrap, dict) else []
+            received_started = any(
+                _to_number(line.get("numReceived")) > 0 or _to_number(line.get("checkedIn")) > 0
+                for line in lines
+            )
+            vendor = order.get("Vendor") or {}
+            out[order_id] = {
+                "arrivalDate": order.get("arrivalDate") or None,
+                "orderedDate": order.get("orderedDate") or None,
+                "complete": str(order.get("complete")).lower() == "true",
+                "vendor_id": order.get("vendorID"),
+                "vendor_name": vendor.get("name"),
+                "received_started": received_started,
             }
-            response = self._legacy_request("GET", "/Order.json", params=params)
-            if response is None or response.status_code != 200:
-                if response is not None:
-                    print(f"Error fetching orders: {response.status_code} {response.text[:300]}")
-                continue
-            for order in self._as_list(response.json().get("Order")):
-                order_id = str(order.get("orderID"))
-                order_lines_wrap = order.get("OrderLines")
-                lines = self._as_list(order_lines_wrap.get("OrderLine")) if isinstance(order_lines_wrap, dict) else []
-                received_started = any(
-                    _to_number(line.get("numReceived")) > 0 or _to_number(line.get("checkedIn")) > 0
-                    for line in lines
-                )
-                vendor = order.get("Vendor") or {}
-                order_map[order_id] = {
-                    "arrivalDate": order.get("arrivalDate") or None,
-                    "orderedDate": order.get("orderedDate") or None,
-                    "complete": str(order.get("complete")).lower() == "true",
-                    "vendor_id": order.get("vendorID"),
-                    "vendor_name": vendor.get("name"),
-                    "received_started": received_started,
-                }
-        return order_map
+        return out
 
     def get_customers_by_ids(self, customer_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
         """
@@ -455,37 +484,38 @@ class LightspeedClient:
         Customer is not loadable as a relation on SpecialOrder, so it's fetched here.
         """
         unique_ids = sorted({str(c) for c in customer_ids if c and str(c) != "0"})
-        customer_map: Dict[str, Dict[str, Any]] = {}
-        for i in range(0, len(unique_ids), chunk_size):
-            chunk = unique_ids[i:i + chunk_size]
-            params = {
-                "customerID": f"IN,[{','.join(chunk)}]",
-                "load_relations": '["Contact"]',
-                "limit": "100",
+        return self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_customer_chunk)
+
+    def _fetch_customer_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
+        params = {
+            "customerID": f"IN,[{','.join(chunk)}]",
+            "load_relations": '["Contact"]',
+            "limit": "100",
+        }
+        out: Dict[str, Dict[str, Any]] = {}
+        response = self._legacy_request("GET", "/Customer.json", params=params)
+        if response is None or response.status_code != 200:
+            if response is not None:
+                print(f"Error fetching customers: {response.status_code} {response.text[:300]}")
+            return out
+        for cust in self._as_list(response.json().get("Customer")):
+            cust_id = str(cust.get("customerID"))
+            contact = cust.get("Contact") or {}
+            phones = contact.get("Phones", {}).get("ContactPhone") if isinstance(contact.get("Phones"), dict) else None
+            phone = None
+            phone_list = self._as_list(phones)
+            if phone_list:
+                phone = phone_list[0].get("number")
+            emails = contact.get("Emails", {}).get("ContactEmail") if isinstance(contact.get("Emails"), dict) else None
+            email = None
+            email_list = self._as_list(emails)
+            if email_list:
+                email = email_list[0].get("address")
+            out[cust_id] = {
+                "first_name": cust.get("firstName"),
+                "last_name": cust.get("lastName"),
+                "company": cust.get("company"),
+                "phone": phone,
+                "email": email,
             }
-            response = self._legacy_request("GET", "/Customer.json", params=params)
-            if response is None or response.status_code != 200:
-                if response is not None:
-                    print(f"Error fetching customers: {response.status_code} {response.text[:300]}")
-                continue
-            for cust in self._as_list(response.json().get("Customer")):
-                cust_id = str(cust.get("customerID"))
-                contact = cust.get("Contact") or {}
-                phones = contact.get("Phones", {}).get("ContactPhone") if isinstance(contact.get("Phones"), dict) else None
-                phone = None
-                phone_list = self._as_list(phones)
-                if phone_list:
-                    phone = phone_list[0].get("number")
-                emails = contact.get("Emails", {}).get("ContactEmail") if isinstance(contact.get("Emails"), dict) else None
-                email = None
-                email_list = self._as_list(emails)
-                if email_list:
-                    email = email_list[0].get("address")
-                customer_map[cust_id] = {
-                    "first_name": cust.get("firstName"),
-                    "last_name": cust.get("lastName"),
-                    "company": cust.get("company"),
-                    "phone": phone,
-                    "email": email,
-                }
-        return customer_map
+        return out

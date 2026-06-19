@@ -29,6 +29,7 @@ so lateness is judged solely against placed POs. See `_compute_stage_and_flag`.
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -388,8 +389,14 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
         (so.get("OrderLine") or {}).get("orderID") or so.get("orderID")
         for so in special_orders
     ]
-    order_map = client.get_orders_by_ids(order_ids)
-    customer_map = client.get_customers_by_ids([so.get("customerID") for so in special_orders])
+    customer_ids = [so.get("customerID") for so in special_orders]
+    # The PO and customer lookups are independent of each other, so fan them out
+    # concurrently (each already parallelizes its own chunks internally).
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        order_future = executor.submit(client.get_orders_by_ids, order_ids)
+        customer_future = executor.submit(client.get_customers_by_ids, customer_ids)
+        order_map = order_future.result()
+        customer_map = customer_future.result()
 
     orders = [_normalize(so, order_map, customer_map, shop_names, today) for so in special_orders]
 

@@ -2,7 +2,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import time
+import threading
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from app.services.bigquery_sync import (
     log_recommendation_run, log_velocity_snapshots, log_writeback,
@@ -814,36 +816,78 @@ def get_lightspeed_link(item_id: str):
 
 # In-process TTL cache so each Special Order page load doesn't re-walk the whole
 # Lightspeed SO graph (and hit rate limits). The frontend "Sync" button passes
-# refresh=true to force a live re-fetch.
+# refresh=true to force a live re-fetch. Past the TTL the cached payload is still
+# served immediately while a background task refreshes it (stale-while-revalidate),
+# so only a genuine cold start (empty cache) or an explicit Sync ever blocks.
 _special_orders_cache: Dict[str, Any] = {"data": None, "fetched_at": 0.0}
-_SPECIAL_ORDERS_TTL_SECONDS = 90
+_SPECIAL_ORDERS_TTL_SECONDS = 300
+# Serializes rebuilds so concurrent cold/stale requests share one Lightspeed walk
+# instead of stampeding the API.
+_special_orders_lock = threading.Lock()
+
+
+def _rebuild_special_orders_cache(force: bool = False) -> Dict[str, Any]:
+    """Runs the live Lightspeed walk under the lock and stores the result. If
+    another thread refreshed a still-fresh payload while we waited for the lock,
+    that payload is returned instead of walking again."""
+    from app.services.special_order_service import get_special_order_dashboard
+
+    with _special_orders_lock:
+        cached = _special_orders_cache.get("data")
+        age = time.time() - _special_orders_cache.get("fetched_at", 0.0)
+        if not force and cached is not None and age < _SPECIAL_ORDERS_TTL_SECONDS:
+            return cached
+        result = get_special_order_dashboard()
+        result["fetched_at"] = datetime.utcnow().isoformat() + "Z"
+        _special_orders_cache["data"] = result
+        _special_orders_cache["fetched_at"] = time.time()
+        return result
+
+
+def _refresh_special_orders_in_background() -> None:
+    """Best-effort background refresh. Skips if a rebuild is already running, so a
+    burst of stale requests only triggers one walk."""
+    if not _special_orders_lock.acquire(blocking=False):
+        return
+    try:
+        from app.services.special_order_service import get_special_order_dashboard
+        result = get_special_order_dashboard()
+        result["fetched_at"] = datetime.utcnow().isoformat() + "Z"
+        _special_orders_cache["data"] = result
+        _special_orders_cache["fetched_at"] = time.time()
+    except Exception as e:
+        print(f"Error refreshing special-order dashboard: {e}")
+    finally:
+        _special_orders_lock.release()
+
+
+@app.on_event("startup")
+def _warm_special_orders_cache() -> None:
+    """Build the special-orders cache on boot in a daemon thread so the first user
+    after a deploy/restart doesn't pay the full Lightspeed walk."""
+    threading.Thread(target=_refresh_special_orders_in_background, daemon=True).start()
 
 
 @app.get("/api/special-orders")
-def get_special_orders(refresh: bool = False):
+def get_special_orders(background_tasks: BackgroundTasks, refresh: bool = False):
     """
     Returns open special orders with derived overdue/aging fields and the summary
     counts that drive the dashboard KPIs:
       { "orders": [...], "summary": {...}, "fetched_at": <iso8601> }
     """
-    import time
-    from app.services.special_order_service import get_special_order_dashboard
-
-    now = time.time()
     cached = _special_orders_cache.get("data")
-    if (
-        not refresh
-        and cached is not None
-        and (now - _special_orders_cache.get("fetched_at", 0.0)) < _SPECIAL_ORDERS_TTL_SECONDS
-    ):
+    age = time.time() - _special_orders_cache.get("fetched_at", 0.0)
+
+    if not refresh and cached is not None:
+        if age < _SPECIAL_ORDERS_TTL_SECONDS:
+            return cached
+        # Stale: serve the cached payload now, refresh it after the response.
+        background_tasks.add_task(_refresh_special_orders_in_background)
         return cached
 
+    # Cold start or an explicit Sync: block for a fresh walk (deduped via the lock).
     try:
-        result = get_special_order_dashboard()
-        result["fetched_at"] = datetime.utcnow().isoformat() + "Z"
-        _special_orders_cache["data"] = result
-        _special_orders_cache["fetched_at"] = now
-        return result
+        return _rebuild_special_orders_cache(force=refresh)
     except Exception as e:
         print(f"Error building special-order dashboard: {e}")
         raise HTTPException(status_code=500, detail=str(e))
