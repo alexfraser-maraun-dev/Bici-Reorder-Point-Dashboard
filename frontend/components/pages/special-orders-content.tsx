@@ -17,8 +17,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
-import { SpecialOrdersTable } from '@/components/dashboard/special-orders-table'
-import { SpecialOrderDetailSheet } from '@/components/dashboard/special-orders-detail-sheet'
+import { SpecialOrdersGrid } from '@/components/dashboard/special-orders-grid'
 import {
   Store,
   Inbox,
@@ -131,8 +130,6 @@ export function SpecialOrdersContent() {
   const [storeFilter, setStoreFilter] = useState<string>('all')
   const [liveOnly, setLiveOnly] = useState(true)
   const [flaggedOnly, setFlaggedOnly] = useState(false)
-  const [selectedOrder, setSelectedOrder] = useState<SpecialOrder | null>(null)
-  const [sheetOpen, setSheetOpen] = useState(false)
 
   // Unified rows: live LS SOs + Shopify-only ("Unmatched") pseudo-rows.
   const allRows = useMemo(
@@ -189,11 +186,6 @@ export function SpecialOrdersContent() {
       ids.forEach((id) => (allOn ? next.delete(id) : next.add(id)))
       return next
     })
-  }
-
-  const openOrder = (o: SpecialOrder) => {
-    setSelectedOrder(o)
-    setSheetOpen(true)
   }
 
   const filtersActive = selected.size > 0 || storeFilter !== 'all' || search || flaggedOnly || !liveOnly
@@ -323,9 +315,7 @@ export function SpecialOrdersContent() {
         )}
       </div>
 
-      <SpecialOrdersTable orders={filtered} isLoading={isLoading} onRowClick={openOrder} />
-
-      <SpecialOrderDetailSheet order={selectedOrder} open={sheetOpen} onOpenChange={setSheetOpen} />
+      <SpecialOrdersGrid orders={filtered} isLoading={isLoading} />
     </div>
   )
 }
