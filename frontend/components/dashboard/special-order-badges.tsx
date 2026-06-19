@@ -87,7 +87,7 @@ const LATE_FLAGS: SpecialOrderFlag[] = ['overdue', 'overdue_mid', 'critical']
 function lateWord(stage: ProcurementStage, flag: SpecialOrderFlag): string {
   if (stage === 'open_pool') return 'Open Order'
   if (stage === 'unordered_po') return 'Unordered'
-  return flag === 'critical' ? 'Critical' : 'Overdue'
+  return flag === 'critical' ? 'PO Critically Overdue' : 'PO Overdue'
 }
 
 export function FlagBadge({

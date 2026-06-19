@@ -30,9 +30,9 @@ export const STAGE_SUBTRIAGES: Record<ProcurementStage, SubTriage[]> = {
     { key: 'healthy', label: 'Healthy (0-4d)', tone: 'ok' },
   ],
   ordered: [
-    { key: 'critical', label: 'Critical (8d+)', tone: 'danger' },
-    { key: 'overdue_mid', label: 'Overdue (3-7d)', tone: 'danger' },
-    { key: 'overdue', label: 'Overdue (1-2d)', tone: 'danger' },
+    { key: 'critical', label: 'PO Critically Overdue (8d+)', tone: 'danger' },
+    { key: 'overdue_mid', label: 'PO Overdue (3-7d)', tone: 'danger' },
+    { key: 'overdue', label: 'PO Overdue (1-2d)', tone: 'danger' },
     { key: 'no_eta', label: 'No ETA', tone: 'warn' },
     { key: 'healthy', label: 'Healthy', tone: 'ok' },
   ],
