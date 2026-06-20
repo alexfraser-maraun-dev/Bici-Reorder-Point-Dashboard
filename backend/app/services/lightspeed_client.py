@@ -3,6 +3,7 @@ import os
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
 
 # OAuth scopes this app requires. Single source of truth shared by the
@@ -406,6 +407,46 @@ class LightspeedClient:
             if response is None or response.status_code != 200:
                 if response is not None:
                     print(f"Error fetching special orders: {response.status_code} {response.text[:300]}")
+                break
+            page = self._as_list(response.json().get("SpecialOrder"))
+            results.extend(page)
+            if len(page) < page_limit:
+                break
+            offset += page_limit
+        return results
+
+    def get_completed_special_orders(
+        self, lookback_days: int = 60, page_limit: int = 100, max_pages: int = 40
+    ) -> List[Dict[str, Any]]:
+        """
+        Pages through *recently-completed* special orders (completed=true, last `lookback_days`
+        by SpecialOrder.timeStamp). These are excluded from get_special_orders() (completed=false),
+        but a special order is often marked completed / "Ready For Pickup" in Lightspeed the moment
+        the item arrives — while the customer's Shopify order stays open/unfulfilled until pickup.
+        The dashboard needs these so their still-open Shopify order is matched (received), not
+        falsely surfaced as "Unmatched".
+
+        Bounded by recency (and max_pages) to stay cheap; older completions are unlikely to still
+        have an open Shopify order. Same relations as get_special_orders so rows normalize identically.
+        Returns raw SpecialOrder dicts; [] on any failure (matching simply falls back to open SOs).
+        """
+        # The legacy API has no sort param; it filters by field operator instead — `timeStamp=>,<iso>`.
+        since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        relations = '["SaleLine","SaleLine.Item","OrderLine"]'
+        results: List[Dict[str, Any]] = []
+        offset = 0
+        for _ in range(max_pages):
+            params = {
+                "completed": "true",
+                "timeStamp": f">,{since}",
+                "load_relations": relations,
+                "limit": str(page_limit),
+                "offset": str(offset),
+            }
+            response = self._legacy_request("GET", "/SpecialOrder.json", params=params)
+            if response is None or response.status_code != 200:
+                if response is not None:
+                    print(f"Error fetching completed special orders: {response.status_code} {response.text[:300]}")
                 break
             page = self._as_list(response.json().get("SpecialOrder"))
             results.extend(page)

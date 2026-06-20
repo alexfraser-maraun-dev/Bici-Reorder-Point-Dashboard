@@ -346,42 +346,69 @@ def _shopify_order_url(order_id: Optional[str]) -> Optional[str]:
     return f"https://admin.shopify.com/store/{handle}/orders/{order_id}"
 
 
-def _enrich_with_shopify(orders: List[Dict[str, Any]], today: date) -> List[Dict[str, Any]]:
-    """
-    Mutates each LS SO with its Shopify match (customer-promised ETA + order link) and returns
-    the Shopify-only orders (tagged `SO`, referenced by no LS SO) — the "Unmatched" population.
+def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> None:
+    """Writes one LS SO's Shopify match (ETA + order link) onto it and re-buckets its flag,
+    preferring the Shopify ETA as the classification date when present (a blown customer promise
+    outranks the PO timeline)."""
+    o["shopify_match"] = m["shopify_match"]
+    o["shopify_order_id"] = m["shopify_order_id"]
+    o["shopify_order_name"] = m["shopify_order_name"]
+    o["shopify_expected_date"] = m["shopify_expected_date"]
+    o["shopify_order_url"] = _shopify_order_url(m["shopify_order_id"])
 
-    Where a Shopify ETA is found, it becomes the preferred classification date and the flag /
-    days_overdue are recomputed against it (a blown customer promise outranks the PO timeline).
-    Never raises: if the Shopify pull is empty, every SO simply stays unmatched / PO-classified.
+    shopify_eta = _parse_ls_date(m["shopify_expected_date"])
+    po_eta = _parse_ls_date(o.get("expected_date"))
+    stage = o["procurement_stage"]
+    classification_date = shopify_eta or (po_eta if stage == "ordered" else None)
+    fl = _compute_flag(stage, classification_date, o.get("days_since_creation"), o.get("contacted", False), today)
+    o["flag"] = fl["flag"]
+    o["days_overdue"] = fl["days_overdue"]
+    o["is_overdue"] = fl["flag"] in _OVERDUE_FLAGS
+
+
+def _enrich_with_shopify(
+    index: Dict[str, Any],
+    orders: List[Dict[str, Any]],
+    completed_orders: List[Dict[str, Any]],
+    today: date,
+) -> List[Dict[str, Any]]:
     """
-    rows = _shopify_rows()
-    if not rows:
+    Matches LS SOs to Shopify `SO`-tagged orders and returns the Shopify-only ("Unmatched")
+    population. Open SOs claim their match first. Then recently-completed SOs adopt any Shopify
+    order still left unmatched — the item is received in Lightspeed (SO completed / "Ready For
+    Pickup") but its Shopify order hasn't been fulfilled yet — and join the displayed set so they
+    surface under "Matched, received" rather than a false "Unmatched". `completed_orders` is
+    appended to `orders` in place for the ones that adopt something.
+
+    Never raises: with no Shopify data, every SO simply stays unmatched / PO-classified.
+    """
+    if not index["orders"]:
         return []
-    index = shopify_match.build_shopify_index(rows)
     consumed: set = set()
+
     for o in orders:
         m = shopify_match.match_special_order(o.get("customer_email"), o.get("system_sku"), index)
-        consumed |= m.pop("_candidates", set())
-        o["shopify_match"] = m["shopify_match"]
-        o["shopify_order_id"] = m["shopify_order_id"]
-        o["shopify_order_name"] = m["shopify_order_name"]
-        o["shopify_expected_date"] = m["shopify_expected_date"]
-        o["shopify_order_url"] = _shopify_order_url(m["shopify_order_id"])
+        consumed |= m.get("_candidates", set())
+        _apply_shopify_match(o, m, today)
 
-        # Re-bucket: prefer the Shopify ETA as the classification date when present.
-        shopify_eta = _parse_ls_date(m["shopify_expected_date"])
-        po_eta = _parse_ls_date(o.get("expected_date"))
-        stage = o["procurement_stage"]
-        classification_date = shopify_eta or (po_eta if stage == "ordered" else None)
-        fl = _compute_flag(stage, classification_date, o.get("days_since_creation"), o.get("contacted", False), today)
-        o["flag"] = fl["flag"]
-        o["days_overdue"] = fl["days_overdue"]
-        o["is_overdue"] = fl["flag"] in _OVERDUE_FLAGS
+    for co in completed_orders:
+        m = shopify_match.match_special_order(co.get("customer_email"), co.get("system_sku"), index)
+        # Only keep a completed SO if it claims a Shopify order no open SO already did.
+        if not (m.get("_candidates", set()) - consumed):
+            continue
+        consumed |= m.get("_candidates", set())
+        _apply_shopify_match(co, m, today)
+        orders.append(co)
+
     unmatched = shopify_match.shopify_only_orders(index, consumed)
     for u in unmatched:
         u["shopify_order_url"] = _shopify_order_url(u["order_id"])
     return unmatched
+
+
+def _raw_so_system_sku(so: Dict[str, Any]) -> str:
+    """The item systemSku off a raw SpecialOrder dict, normalized like the Shopify index keys."""
+    return str(((so.get("SaleLine") or {}).get("Item") or {}).get("systemSku") or "").strip()
 
 
 def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Dict[str, Any]:
@@ -393,15 +420,29 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
     today = date.today()
     shop_names = {v: k for k, v in client.shop_id_map.items()}
 
-    special_orders = client.get_special_orders()
+    # Open SOs (always shown), recently-completed SOs (candidates to adopt a still-open Shopify
+    # order), and the Shopify rows are all independent — fan them out concurrently.
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        open_future = executor.submit(client.get_special_orders)
+        completed_future = executor.submit(client.get_completed_special_orders)
+        shopify_future = executor.submit(_shopify_rows)
+        special_orders = open_future.result()
+        completed_all = completed_future.result()
+        shop_rows = shopify_future.result()
 
+    index = shopify_match.build_shopify_index(shop_rows)
+    candidate_skus = set(index["by_sku"].keys())
+    # Narrow the completed pool to SOs whose SKU could match an open Shopify order — turns a wide
+    # recency window into a handful before we pay for customer/PO resolution.
+    completed_candidates = [so for so in completed_all if _raw_so_system_sku(so) in candidate_skus]
+
+    # PO + customer lookups cover both the open SOs and the completed candidates.
+    sos_to_resolve = special_orders + completed_candidates
     order_ids = [
         (so.get("OrderLine") or {}).get("orderID") or so.get("orderID")
-        for so in special_orders
+        for so in sos_to_resolve
     ]
-    customer_ids = [so.get("customerID") for so in special_orders]
-    # The PO and customer lookups are independent of each other, so fan them out
-    # concurrently (each already parallelizes its own chunks internally).
+    customer_ids = [so.get("customerID") for so in sos_to_resolve]
     with ThreadPoolExecutor(max_workers=2) as executor:
         order_future = executor.submit(client.get_orders_by_ids, order_ids)
         customer_future = executor.submit(client.get_customers_by_ids, customer_ids)
@@ -409,9 +450,11 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
         customer_map = customer_future.result()
 
     orders = [_normalize(so, order_map, customer_map, shop_names, today) for so in special_orders]
+    completed_orders = [_normalize(so, order_map, customer_map, shop_names, today) for so in completed_candidates]
 
-    # Enrich with the Shopify customer-promised ETA and collect Shopify-only ("Unmatched") orders.
-    shopify_only = _enrich_with_shopify(orders, today)
+    # Enrich with the Shopify ETA; matched-completed SOs are appended to `orders`, and the
+    # genuinely-orphaned Shopify orders come back as the "Unmatched" population.
+    shopify_only = _enrich_with_shopify(index, orders, completed_orders, today)
 
     # Flagged items first, ranked by flag severity, then most-overdue / oldest within that.
     orders.sort(

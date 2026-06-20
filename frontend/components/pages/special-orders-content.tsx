@@ -44,8 +44,11 @@ const TILES: Tile[] = [
   {
     stage: 'shopify', label: 'Shopify', icon: Store, color: 'text-violet-600', bgColor: 'bg-violet-50',
     subs: [
-      { key: 'matched', label: 'Matched', tone: 'ok', pred: (o) => isLs(o) && (o.shopify_match === 'matched' || o.shopify_match === 'ambiguous') },
-      { key: 'unmatched', label: 'Unmatched', tone: 'warn', pred: (o) => o.kind === 'shopify' },
+      // A matched LS SO already knows whether it's received (its procurement_stage). Completed
+      // SOs that adopted a still-open Shopify order arrive here as received rows.
+      { key: 'matched_unreceived', label: 'Matched, unreceived', tone: 'warn', pred: (o) => isLs(o) && (o.shopify_match === 'matched' || o.shopify_match === 'ambiguous') && o.procurement_stage !== 'received' },
+      { key: 'matched_received', label: 'Matched, received', tone: 'ok', pred: (o) => isLs(o) && (o.shopify_match === 'matched' || o.shopify_match === 'ambiguous') && o.procurement_stage === 'received' },
+      { key: 'unmatched', label: 'Unmatched', tone: 'danger', pred: (o) => o.kind === 'shopify' },
     ],
   },
   ...(['open_pool', 'unordered_po', 'ordered', 'received'] as const).map((stage) => {
