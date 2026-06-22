@@ -5,15 +5,13 @@ import { usePathname } from 'next/navigation'
 import { cn } from '@/lib/utils'
 import {
   LayoutDashboard,
-  History,
-  FileText,
-  Package,
   PackageSearch,
   Menu,
   CircleHelp,
   LogOut,
 } from 'lucide-react'
 import { signOut, useSession } from 'next-auth/react'
+import { APP_VERSION, APP_VERSION_SUMMARY } from '@/lib/version'
 import { Button } from '@/components/ui/button'
 import {
   Sheet,
@@ -23,11 +21,8 @@ import {
 import { useState } from 'react'
 
 const navigation = [
-  { name: 'Dashboard', href: '/', icon: LayoutDashboard },
+  { name: 'Ordering', href: '/', icon: LayoutDashboard },
   { name: 'Special Orders', href: '/special-orders', icon: PackageSearch },
-  { name: 'Recommendation Runs', href: '/runs', icon: History },
-  { name: 'Writeback Audit', href: '/audit', icon: FileText },
-  { name: 'Managed SKUs', href: '/managed-skus', icon: Package },
   { name: 'How it Works', href: '/how-to-use', icon: CircleHelp },
 ]
 
@@ -93,9 +88,20 @@ export function AppShell({ children, headerActions, mainClassName }: AppShellPro
               />
             </div>
             <div className="h-6 w-[1px] bg-muted mx-1 hidden sm:block" />
-            <span className="hidden font-semibold text-foreground/80 tracking-tight sm:inline-block">
-              Reorder Point Config Tool
-            </span>
+            <div className="hidden items-baseline gap-2 sm:flex">
+              <span className="font-semibold text-foreground/80 tracking-tight">
+                Procurement Tool
+              </span>
+              <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground">
+                v{APP_VERSION}
+              </span>
+              <span
+                className="hidden max-w-[300px] truncate text-[11px] italic text-muted-foreground/80 xl:inline"
+                title={APP_VERSION_SUMMARY}
+              >
+                {APP_VERSION_SUMMARY}
+              </span>
+            </div>
           </div>
 
           {/* Desktop navigation */}
