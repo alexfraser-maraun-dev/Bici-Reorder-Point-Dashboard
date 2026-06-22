@@ -13,6 +13,7 @@ import {
   FileClock,
   ShoppingCart,
   Store,
+  ListChecks,
   Link2,
   Unlink,
 } from 'lucide-react'
@@ -26,6 +27,9 @@ interface BadgeConfig {
 // The triage stage (the "where is it" axis). `shopify` is the leftmost inbound stage.
 const stageConfig: Record<TriageStage, BadgeConfig> = {
   shopify: { label: 'Shopify', className: 'bg-violet-100 text-violet-700 border-violet-200', icon: Store },
+  // Overlay tile id — no row ever carries this as its real stage, so this badge never renders;
+  // the entry only satisfies the Record<TriageStage, …> type.
+  recommended_action: { label: 'Recommended Action', className: 'bg-slate-100 text-slate-700 border-slate-200', icon: ListChecks },
   open_pool: { label: 'Open Pool', className: 'bg-secondary text-muted-foreground border-border', icon: Inbox },
   unordered_po: { label: 'Unordered PO', className: 'bg-orange-100 text-orange-700 border-orange-200', icon: FileClock },
   ordered: { label: 'Ordered', className: 'bg-blue-100 text-blue-700 border-blue-200', icon: ShoppingCart },

@@ -3,7 +3,7 @@
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { useSpecialOrders } from '@/lib/hooks'
-import type { SpecialOrder, ShopifyOnlyOrder, TriageStage } from '@/lib/types'
+import type { SpecialOrder, ShopifyOnlyOrder, TriageStage, SpecialOrderFlag } from '@/lib/types'
 import { STAGE_SUBTRIAGES, subKeyForOrder, type TriageTone } from '@/lib/special-order-triage'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -21,6 +21,7 @@ import { cn } from '@/lib/utils'
 import { SpecialOrdersGrid } from '@/components/dashboard/special-orders-grid'
 import {
   Store,
+  ListChecks,
   Inbox,
   FileClock,
   ShoppingCart,
@@ -35,20 +36,34 @@ const LIVE_SO_MAX_DAYS = 365
 const seg = (stage: TriageStage, subKey: string) => `${stage}::${subKey}`
 
 type Sub = { key: string; label: string; tone: TriageTone; pred: (o: SpecialOrder) => boolean }
-type Tile = { stage: TriageStage; label: string; icon: typeof Store; color: string; bgColor: string; subs: Sub[] }
+// `overlay` marks the cross-cutting tiles (Shopify + Recommended Action): an order can appear in one
+// of these AND in its flow-stage tile, so they get a distinct (dashed/slate) card treatment.
+type Tile = { stage: TriageStage; label: string; icon: typeof Store; color: string; bgColor: string; overlay?: boolean; subs: Sub[] }
 
 const isLs = (o: SpecialOrder) => o.kind !== 'shopify'
 
-// Build the tile config (predicate-based so the Shopify stage can overlap the LS stages).
+// The "late" attention flags an unactioned order can carry, regardless of stage.
+const LATE_FLAGS: SpecialOrderFlag[] = ['overdue', 'overdue_mid', 'critical']
+
+// Build the tile config (predicate-based so the overlay tiles can overlap the LS flow stages).
 const TILES: Tile[] = [
   {
-    stage: 'shopify', label: 'Shopify', icon: Store, color: 'text-violet-600', bgColor: 'bg-violet-50',
+    stage: 'shopify', label: 'Shopify', icon: Store, color: 'text-violet-600', bgColor: 'bg-violet-50', overlay: true,
     subs: [
       // A matched LS SO already knows whether it's received (its procurement_stage). Completed
       // SOs that adopted a still-open Shopify order arrive here as received rows.
       { key: 'matched_unreceived', label: 'Matched, unreceived', tone: 'warn', pred: (o) => isLs(o) && (o.shopify_match === 'matched' || o.shopify_match === 'ambiguous') && o.procurement_stage !== 'received' },
       { key: 'matched_received', label: 'Matched, received', tone: 'ok', pred: (o) => isLs(o) && (o.shopify_match === 'matched' || o.shopify_match === 'ambiguous') && o.procurement_stage === 'received' },
       { key: 'unmatched', label: 'Unmatched', tone: 'danger', pred: (o) => o.kind === 'shopify' },
+    ],
+  },
+  {
+    // Cross-cutting "what should I do now?" tile. Action-only — no healthy bucket. Each sub overlaps
+    // a flow stage (an "Order PO today" row is also in its open_pool/unordered_po tile).
+    stage: 'recommended_action', label: 'Recommended Action', icon: ListChecks, color: 'text-slate-600', bgColor: 'bg-slate-100', overlay: true,
+    subs: [
+      { key: 'order_po_today', label: 'Order PO today', tone: 'danger', pred: (o) => isLs(o) && (o.procurement_stage === 'open_pool' || o.procurement_stage === 'unordered_po') && LATE_FLAGS.includes(o.flag) },
+      { key: 'follow_up_po', label: 'Follow up on ordered PO', tone: 'warn', pred: (o) => isLs(o) && o.procurement_stage === 'ordered' && (LATE_FLAGS.includes(o.flag) || o.flag === 'no_eta') },
     ],
   },
   ...(['open_pool', 'unordered_po', 'ordered', 'received'] as const).map((stage) => {
@@ -229,7 +244,7 @@ export function SpecialOrdersContent() {
 
       {/* Triage tiles: Shopify inbound (leftmost) + the four LS procurement stages. */}
       {isLoading ? (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-6">
           {TILES.map((t) => (
             <Card key={t.stage} className="py-3">
               <CardContent className="px-4 py-0">
@@ -242,14 +257,14 @@ export function SpecialOrdersContent() {
           ))}
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-6">
           {TILES.map((t) => {
             const Icon = t.icon
             const ids = t.subs.map((s) => seg(t.stage, s.key))
             const stageActive = ids.every((id) => selected.has(id))
             const total = ids.reduce((sum, id) => sum + (segCounts[id] ?? 0), 0)
             return (
-              <Card key={t.stage} className={cn('py-3 transition-colors', stageActive && 'ring-primary ring-2')}>
+              <Card key={t.stage} className={cn('py-3 transition-colors', t.overlay && 'border-dashed bg-slate-50 dark:bg-slate-900/30', stageActive && 'ring-primary ring-2')}>
                 <CardContent className="px-4 py-0">
                   <button
                     type="button"

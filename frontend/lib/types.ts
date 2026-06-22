@@ -252,8 +252,10 @@ export type SpecialOrderFlag =
 // Whether a live LS SO was matched to a Shopify `SO`-tagged order (by customer email + SKU).
 export type ShopifyMatch = 'matched' | 'ambiguous' | 'none'
 
-// The triage tile axis: the Shopify inbound stage sits left of the four LS procurement stages.
-export type TriageStage = 'shopify' | ProcurementStage
+// The triage tile axis: the Shopify inbound stage and the cross-cutting Recommended Action tile
+// sit left of the four LS procurement stages. Both are "overlay" tiles — a single order can appear
+// in one of them AND in its flow stage, since they're derived from the same per-row state.
+export type TriageStage = 'shopify' | 'recommended_action' | ProcurementStage
 
 // A Shopify `SO`-tagged order with no matching live LS SO — the "Unmatched" population.
 export interface ShopifyOnlyOrder {
