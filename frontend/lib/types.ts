@@ -288,6 +288,7 @@ export interface SpecialOrder {
   // Item / product
   item_id: string | null
   system_sku: string | null
+  upc: string | null
   description: string | null
   // Attached purchase order
   order_id: string | null

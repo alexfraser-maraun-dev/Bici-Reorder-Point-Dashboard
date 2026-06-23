@@ -258,6 +258,8 @@ def _normalize(
         # Item / product
         "item_id": item_id,
         "system_sku": item.get("systemSku"),
+        # UPC for B2B product research; empty string from Lightspeed -> None.
+        "upc": item.get("upc") or None,
         "description": item.get("description") or sale_line.get("description"),
         # Attached purchase order
         "order_id": order_id,

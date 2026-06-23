@@ -116,6 +116,7 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
     customer_email: o.customer_email,
     item_id: null,
     system_sku: o.skus[0] ?? null,
+    upc: null,
     description: o.skus.join(', ') || null,
     order_id: null,
     vendor_id: null,
@@ -179,7 +180,7 @@ export function SpecialOrdersContent() {
       if (storeFilter !== 'all' && o.store !== storeFilter) return false
       if (liveOnly && o.days_since_creation !== null && o.days_since_creation > LIVE_SO_MAX_DAYS) return false
       if (!term) return true
-      return [o.customer_name, o.customer_email, o.description, o.system_sku, o.vendor_name, o.order_id, o.special_order_id, o.shopify_order_name]
+      return [o.customer_name, o.customer_email, o.description, o.system_sku, o.upc, o.vendor_name, o.order_id, o.special_order_id, o.shopify_order_name]
         .some((v) => v && String(v).toLowerCase().includes(term))
     })
   }, [allRows, flaggedOnly, storeFilter, liveOnly, search])

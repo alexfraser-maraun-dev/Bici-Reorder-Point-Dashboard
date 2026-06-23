@@ -29,6 +29,8 @@ import {
   Store,
   ArrowDownNarrowWide,
   ArrowUpNarrowWide,
+  Copy,
+  Check,
 } from 'lucide-react'
 
 type SortKey =
@@ -76,6 +78,38 @@ function compare(a: SpecialOrder, b: SpecialOrder, key: SortKey, dir: SortDir): 
 }
 
 // Compact label-over-value cell used across the horizontal field grid.
+// The item UPC, rendered as a one-click-copy chip. Users paste it into a vendor B2B site to
+// research the product, so the copy affordance is the whole point of surfacing it here.
+function CopyableUpc({ upc }: { upc: string }) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(upc)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      toast.error('Could not copy UPC.')
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      title="Copy UPC"
+      className="inline-flex max-w-full items-center gap-1.5 text-left hover:text-foreground"
+    >
+      <span className="truncate font-mono text-xs">{upc}</span>
+      {copied ? (
+        <Check className="size-3 shrink-0 text-green-600" />
+      ) : (
+        <Copy className="text-muted-foreground size-3 shrink-0" />
+      )}
+    </button>
+  )
+}
+
 function Field({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="flex min-w-0 flex-col gap-0.5">
@@ -297,6 +331,7 @@ function SpecialOrderRow({ order, onEtaSaved }: { order: SpecialOrder; onEtaSave
               label="SKU"
               value={order.system_sku ? <span className="font-mono text-xs">{order.system_sku}</span> : null}
             />
+            <Field label="UPC" value={order.upc ? <CopyableUpc upc={order.upc} /> : null} />
             <Field label="Vendor" value={order.vendor_name} />
             <Field label="Quantity" value={order.unit_quantity} />
           </FieldGroup>
