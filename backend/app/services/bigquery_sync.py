@@ -607,21 +607,30 @@ def fetch_active_vendor_lead_times(active_days: int = 90, force_refresh: bool = 
                 PARTITION BY vendor_id, location_id
                 ORDER BY vendor_id
             ) = 1
+        ),
+        lead_times_by_vendor AS (
+            -- De-correlated aggregation: one array of per-location lead times per
+            -- vendor, joined below instead of a correlated ARRAY(SELECT ...) subquery.
+            SELECT
+                vendor_id,
+                ARRAY_AGG(
+                    STRUCT(
+                        location_id AS location_id,
+                        lead_time_days AS lead_time_days,
+                        po_count AS po_count
+                    )
+                    ORDER BY location_id
+                ) AS location_lead_times
+            FROM lead_times
+            GROUP BY vendor_id
         )
         SELECT
             av.vendor_id,
             av.active_po_count,
             av.last_po_ordered_at,
-            ARRAY(
-                SELECT AS STRUCT
-                    lt.location_id AS location_id,
-                    lt.lead_time_days AS lead_time_days,
-                    lt.po_count AS po_count
-                FROM lead_times lt
-                WHERE lt.vendor_id = av.vendor_id
-                ORDER BY lt.location_id
-            ) AS location_lead_times
+            ltv.location_lead_times AS location_lead_times
         FROM active_vendors av
+        LEFT JOIN lead_times_by_vendor ltv USING (vendor_id)
         ORDER BY av.vendor_id
     """
     client = get_bq_client()
