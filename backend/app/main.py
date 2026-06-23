@@ -64,10 +64,13 @@ def _warm_replenishment_caches() -> None:
             fetch_tagged_items_metrics,
             fetch_lead_times,
             get_brand_sourcing_rules_map,
+            fetch_brand_vendor_sourcing,
         )
         fetch_tagged_items_metrics("auto-replen")
         fetch_lead_times()
         get_brand_sourcing_rules_map()
+        # Brand-level "Available from" sourcing for the Special Orders page.
+        fetch_brand_vendor_sourcing()
     except Exception as e:
         print(f"Error warming replenishment caches: {e}")
 

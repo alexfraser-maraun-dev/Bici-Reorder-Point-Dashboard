@@ -15,7 +15,7 @@ import {
 } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
 import { updateShopifyEta } from '@/lib/hooks'
-import type { SpecialOrder } from '@/lib/types'
+import type { SpecialOrder, AvailableVendor } from '@/lib/types'
 import {
   StageBadge,
   FlagBadge,
@@ -107,6 +107,35 @@ function CopyableUpc({ upc }: { upc: string }) {
         <Copy className="text-muted-foreground size-3 shrink-0" />
       )}
     </button>
+  )
+}
+
+// The brand-level "Available from" vendors, fastest lead time first. The first chip (fastest)
+// is highlighted green so the best sourcing option reads at a glance. A "~" prefix marks a lead
+// time that's the vendor's cross-store median (no sample at this SO's own store).
+function AvailableVendors({ vendors }: { vendors: AvailableVendor[] }) {
+  if (!vendors.length) return null
+  return (
+    <div className="flex flex-wrap gap-1">
+      {vendors.map((v, i) => (
+        <span
+          key={v.vendor_id}
+          title={v.lead_time_source === 'vendor_median' ? 'Median lead time across stores' : undefined}
+          className={cn(
+            'inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs',
+            i === 0 ? 'border-green-300 bg-green-50 text-green-800' : 'border-border bg-muted/40',
+          )}
+        >
+          <span className="font-medium">{v.vendor_name}</span>
+          {v.lead_time_days !== null && (
+            <span className="tabular-nums opacity-80">
+              {v.lead_time_source === 'vendor_median' ? '~' : ''}
+              {v.lead_time_days}d
+            </span>
+          )}
+        </span>
+      ))}
+    </div>
   )
 }
 
@@ -384,6 +413,17 @@ function SpecialOrderRow({ order, onEtaSaved }: { order: SpecialOrder; onEtaSave
             />
           </FieldGroup>
         </div>
+
+        {/* Brand-level sourcing options: which vendors carry this SKU's brand and how fast each
+            is to this store. Full-width so the (variable-length) vendor chips have room to wrap. */}
+        {order.available_vendors.length > 0 && (
+          <div className="flex min-w-0 flex-wrap items-center gap-2 border-t pt-2.5">
+            <span className="text-muted-foreground/70 shrink-0 text-[10px] font-semibold uppercase tracking-wider">
+              Available from
+            </span>
+            <AvailableVendors vendors={order.available_vendors} />
+          </div>
+        )}
       </div>
 
       {/* Lightspeed deep links (right edge) */}

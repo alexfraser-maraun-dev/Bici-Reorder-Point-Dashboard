@@ -270,6 +270,15 @@ export interface ShopifyOnlyOrder {
   shopify_order_url: string | null
 }
 
+// A vendor that can supply a SKU's brand, with its median lead time to the SO's store.
+export interface AvailableVendor {
+  vendor_id: string
+  vendor_name: string
+  lead_time_days: number | null
+  lead_time_source: 'store' | 'vendor_median' | null
+  distinct_items?: number | null
+}
+
 export interface SpecialOrder {
   special_order_id: string
   status: string
@@ -289,6 +298,9 @@ export interface SpecialOrder {
   item_id: string | null
   system_sku: string | null
   upc: string | null
+  brand: string | null
+  // Brand-level "Available from" vendors, fastest lead time first (top 3).
+  available_vendors: AvailableVendor[]
   description: string | null
   // Attached purchase order
   order_id: string | null

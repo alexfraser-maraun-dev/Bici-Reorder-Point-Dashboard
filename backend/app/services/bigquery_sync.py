@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import json
 import time
+import statistics
 
 # Initialize BigQuery client lazily to avoid startup crashes
 _client = None
@@ -958,6 +959,7 @@ ADMIN_CACHE_TTL_SECONDS = 900  # 15 minutes — brand sourcing rules, active ven
 _active_vendor_lead_time_cache = {}
 _brand_sourcing_rules_cache = {}
 _brand_sourcing_rules_map_cache = {}
+_brand_vendor_sourcing_cache = {}
 
 def _cache_get(cache: dict, key):
     cached = cache.get(key)
@@ -975,6 +977,7 @@ def invalidate_brand_sourcing_cache():
     _brand_sourcing_rules_cache.clear()
     _brand_sourcing_rules_map_cache.clear()
     _active_vendor_lead_time_cache.clear()
+    _brand_vendor_sourcing_cache.clear()
 
 def fetch_lead_times(lookback_months: int = 3, force_refresh: bool = False) -> pd.DataFrame:
     """
@@ -1032,6 +1035,129 @@ def fetch_lead_times(lookback_months: int = 3, force_refresh: bool = False) -> p
     df = client.query(query, job_config=job_config).to_dataframe()
     _bq_lead_time_cache[lookback_months] = (df, time.time())
     return df
+
+
+def build_lead_time_lookup(lookback_months: int = 3, force_refresh: bool = False) -> tuple:
+    """
+    Reshapes the working fetch_lead_times() result into two in-memory lookups for fast per-SKU
+    sourcing decisions:
+      - by_vendor_location: {(vendor_id, location_id): lead_time_days}  — exact store lead time
+      - by_vendor:          {vendor_id: median lead_time_days}          — fallback when a store
+                                                                          has no sample of its own
+    Both keys are normalized to strings. (Mirrors fetch_lead_times rather than
+    fetch_active_vendor_lead_times, which currently errors on a correlated subquery.)
+    """
+    records = fetch_lead_times(lookback_months=lookback_months, force_refresh=force_refresh).to_dict("records")
+    by_vendor_location: dict = {}
+    per_vendor_samples: dict = {}
+    for row in records:
+        vid = row.get("vendor_id")
+        lid = row.get("location_id")
+        lt = row.get("lead_time_days")
+        if vid is None or lt is None:
+            continue
+        vid = str(vid)
+        lt = float(lt)
+        if lid is not None:
+            by_vendor_location[(vid, str(lid))] = lt
+        per_vendor_samples.setdefault(vid, []).append(lt)
+    by_vendor = {vid: statistics.median(samples) for vid, samples in per_vendor_samples.items() if samples}
+    return by_vendor_location, by_vendor
+
+
+def fetch_item_brands(item_ids: list) -> dict:
+    """{item_id (str): brand_name} for the given item ids, from the latest master snapshot.
+    Used to resolve a special order's SKU to its brand so brand-level sourcing can be looked up."""
+    ids = sorted({str(i) for i in item_ids if i is not None and str(i) not in ("", "0")})
+    if not ids:
+        return {}
+    query = f"""
+        SELECT DISTINCT
+            CAST(item_id AS STRING) AS item_id,
+            brand_name
+        FROM `{LS_DATASET}.v_master_snapshot_latest`
+        WHERE CAST(item_id AS STRING) IN UNNEST(@item_ids)
+            AND brand_name IS NOT NULL AND brand_name != ''
+    """
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("item_ids", "STRING", ids)]
+    )
+    rows = client.query(query, job_config=job_config).result()
+    return {row["item_id"]: row["brand_name"] for row in rows}
+
+
+def fetch_brand_vendor_sourcing(
+    lookback_days: int = 365, min_distinct_items: int = 3, force_refresh: bool = False
+) -> dict:
+    """
+    Returns {brand_name: [{vendor_id, vendor_name, distinct_items}, ...]} — the vendors each brand
+    has actually been purchased from in the recency window, ranked by how many distinct items of
+    that brand they supplied.
+
+    "Which vendors carry a brand" is stored nowhere, so it's derived empirically from PO line
+    history joined to the item->brand map. A vendor must have supplied at least `min_distinct_items`
+    distinct items of the brand to count, which drops one-off / mis-tagged noise vendors (e.g. a
+    single Shimano item bought once from a non-distributor). Cached for ADMIN_CACHE_TTL_SECONDS.
+
+    NOTE: the item->brand side is de-duplicated (SELECT DISTINCT) before the join — without it the
+    snapshot's per-itemshop rows fan the join out massively.
+    """
+    cache_key = (lookback_days, min_distinct_items)
+    if not force_refresh:
+        cached = _cache_get(_brand_vendor_sourcing_cache, cache_key)
+        if cached is not None:
+            return cached
+
+    query = f"""
+        WITH item_brand AS (
+            SELECT DISTINCT
+                CAST(item_id AS STRING) AS item_id,
+                brand_name
+            FROM `{LS_DATASET}.v_master_snapshot_latest`
+            WHERE brand_name IS NOT NULL AND brand_name != ''
+        ),
+        po_lines AS (
+            SELECT
+                CAST(orderLine_itemID AS STRING) AS item_id,
+                CAST(order_vendorID AS STRING) AS vendor_id,
+                vendor_name
+            FROM `{LS_DATASET}.LS_purchase_order_line_history`
+            WHERE order_vendorID IS NOT NULL
+                AND order_vendorID != 0
+                AND DATE(order_timeStamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_days DAY)
+        )
+        SELECT
+            ib.brand_name,
+            p.vendor_id,
+            ANY_VALUE(p.vendor_name) AS vendor_name,
+            COUNT(DISTINCT p.item_id) AS distinct_items
+        FROM po_lines p
+        JOIN item_brand ib USING (item_id)
+        GROUP BY ib.brand_name, p.vendor_id
+        HAVING COUNT(DISTINCT p.item_id) >= @min_distinct_items
+        ORDER BY ib.brand_name, distinct_items DESC
+    """
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
+            bigquery.ScalarQueryParameter("min_distinct_items", "INT64", min_distinct_items),
+        ]
+    )
+    rows = client.query(query, job_config=job_config).result()
+
+    sourcing: dict = {}
+    for row in rows:
+        d = dict(row)
+        sourcing.setdefault(d["brand_name"], []).append({
+            "vendor_id": str(d["vendor_id"]),
+            "vendor_name": d.get("vendor_name") or f"Vendor {d['vendor_id']}",
+            "distinct_items": int(d["distinct_items"]),
+        })
+
+    _cache_set(_brand_vendor_sourcing_cache, cache_key, sourcing)
+    return sourcing
 
 
 def fetch_unified_metrics(trailing_days: int = 60) -> pd.DataFrame:

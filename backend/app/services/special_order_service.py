@@ -100,6 +100,57 @@ def _customer_name(customer: Dict[str, Any]) -> Optional[str]:
     return name or customer.get("company") or None
 
 
+# Most "Available from" vendors to surface per SO tile — the fastest few, so the buyer sees the
+# best sourcing options without the tile turning into a vendor dump.
+_MAX_AVAILABLE_VENDORS = 3
+
+
+def _safe(fn, default):
+    """Runs a sourcing-data fetch, returning `default` on any failure so a BigQuery hiccup
+    degrades the 'Available from' field to empty rather than failing the whole SO dashboard."""
+    try:
+        return fn()
+    except Exception as e:
+        print(f"[special_orders] sourcing fetch failed: {e}")
+        return default
+
+
+def _compute_available_vendors(
+    brand: Optional[str],
+    shop_id: Optional[str],
+    sourcing_map: Dict[str, List[Dict[str, Any]]],
+    lt_by_vendor_loc: Dict[Any, float],
+    lt_by_vendor: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    """The brand's candidate vendors, each annotated with its lead time at THIS SO's store
+    (falling back to the vendor's median across stores), fastest first, capped at
+    `_MAX_AVAILABLE_VENDORS`. Empty when the brand is unknown or has no qualifying vendors."""
+    if not brand:
+        return []
+    out: List[Dict[str, Any]] = []
+    for c in sourcing_map.get(brand, []):
+        vid = str(c["vendor_id"])
+        lead = None
+        source = None
+        if shop_id is not None and (vid, str(shop_id)) in lt_by_vendor_loc:
+            lead = lt_by_vendor_loc[(vid, str(shop_id))]
+            source = "store"
+        elif vid in lt_by_vendor:
+            lead = lt_by_vendor[vid]
+            source = "vendor_median"
+        out.append({
+            "vendor_id": vid,
+            "vendor_name": c["vendor_name"],
+            "lead_time_days": int(round(lead)) if lead is not None else None,
+            "lead_time_source": source,
+            "distinct_items": c.get("distinct_items"),
+        })
+    # Fastest first; vendors with a known lead time rank ahead of unknown ones, which keep their
+    # most-established-first (distinct-items) order from the sourcing map.
+    out.sort(key=lambda v: (v["lead_time_days"] is None, v["lead_time_days"] or 0))
+    return out[:_MAX_AVAILABLE_VENDORS]
+
+
 def _compute_flag(
     stage: str,
     classification_date: Optional[date],
@@ -196,6 +247,7 @@ def _normalize(
     customer_map: Dict[str, Dict[str, Any]],
     shop_names: Dict[str, str],
     today: date,
+    sourcing_ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     sale_line = so.get("SaleLine") or {}
     item = sale_line.get("Item") or {}
@@ -233,6 +285,18 @@ def _normalize(
         today=today,
     )
 
+    # Brand-level "Available from" sourcing: which vendors can supply this SKU's brand, and how
+    # fast each one is to this SO's store. Resolved from the in-memory maps the dashboard built.
+    ctx = sourcing_ctx or {}
+    brand = (ctx.get("brand_map") or {}).get(str(item_id)) if item_id is not None else None
+    available_vendors = _compute_available_vendors(
+        brand,
+        shop_id,
+        ctx.get("sourcing_map") or {},
+        ctx.get("lt_by_vendor_loc") or {},
+        ctx.get("lt_by_vendor") or {},
+    )
+
     return {
         "special_order_id": so.get("specialOrderID"),
         "status": status,
@@ -261,6 +325,9 @@ def _normalize(
         # UPC for B2B product research; empty string from Lightspeed -> None.
         "upc": item.get("upc") or None,
         "description": item.get("description") or sale_line.get("description"),
+        # Brand + brand-level "Available from" vendors (with per-store lead times).
+        "brand": brand,
+        "available_vendors": available_vendors,
         # Attached purchase order
         "order_id": order_id,
         "vendor_id": po.get("vendor_id"),
@@ -413,6 +480,12 @@ def _raw_so_system_sku(so: Dict[str, Any]) -> str:
     return str(((so.get("SaleLine") or {}).get("Item") or {}).get("systemSku") or "").strip()
 
 
+def _raw_so_item_id(so: Dict[str, Any]) -> Optional[str]:
+    """The item itemID off a raw SpecialOrder dict, used to resolve the SKU's brand."""
+    item_id = ((so.get("SaleLine") or {}).get("Item") or {}).get("itemID")
+    return str(item_id) if item_id is not None else None
+
+
 def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Dict[str, Any]:
     """
     Live-fetches open special orders and their attached POs, then returns
@@ -438,21 +511,36 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
     # recency window into a handful before we pay for customer/PO resolution.
     completed_candidates = [so for so in completed_all if _raw_so_system_sku(so) in candidate_skus]
 
-    # PO + customer lookups cover both the open SOs and the completed candidates.
+    # PO + customer lookups cover both the open SOs and the completed candidates. The brand->vendor
+    # sourcing map and the lead-time lookup are independent of Lightspeed, so fan them all out
+    # together; each sourcing fetch degrades to empty (no "Available from") rather than failing.
     sos_to_resolve = special_orders + completed_candidates
     order_ids = [
         (so.get("OrderLine") or {}).get("orderID") or so.get("orderID")
         for so in sos_to_resolve
     ]
     customer_ids = [so.get("customerID") for so in sos_to_resolve]
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    item_ids = [_raw_so_item_id(so) for so in sos_to_resolve]
+    with ThreadPoolExecutor(max_workers=5) as executor:
         order_future = executor.submit(client.get_orders_by_ids, order_ids)
         customer_future = executor.submit(client.get_customers_by_ids, customer_ids)
+        brand_future = executor.submit(_safe, lambda: bigquery_sync.fetch_item_brands(item_ids), {})
+        sourcing_future = executor.submit(_safe, bigquery_sync.fetch_brand_vendor_sourcing, {})
+        leadtime_future = executor.submit(_safe, bigquery_sync.build_lead_time_lookup, ({}, {}))
         order_map = order_future.result()
         customer_map = customer_future.result()
+        brand_map = brand_future.result()
+        sourcing_map = sourcing_future.result()
+        lt_by_vendor_loc, lt_by_vendor = leadtime_future.result()
 
-    orders = [_normalize(so, order_map, customer_map, shop_names, today) for so in special_orders]
-    completed_orders = [_normalize(so, order_map, customer_map, shop_names, today) for so in completed_candidates]
+    sourcing_ctx = {
+        "brand_map": brand_map,
+        "sourcing_map": sourcing_map,
+        "lt_by_vendor_loc": lt_by_vendor_loc,
+        "lt_by_vendor": lt_by_vendor,
+    }
+    orders = [_normalize(so, order_map, customer_map, shop_names, today, sourcing_ctx) for so in special_orders]
+    completed_orders = [_normalize(so, order_map, customer_map, shop_names, today, sourcing_ctx) for so in completed_candidates]
 
     # Enrich with the Shopify ETA; matched-completed SOs are appended to `orders`, and the
     # genuinely-orphaned Shopify orders come back as the "Unmatched" population.
