@@ -11,7 +11,7 @@ import {
   LogOut,
 } from 'lucide-react'
 import { signOut, useSession } from 'next-auth/react'
-import { APP_VERSION, APP_VERSION_SUMMARY } from '@/lib/version'
+import { APP_VERSION, APP_VERSION_SUMMARY, APP_GIT_SHA, APP_GIT_DATE } from '@/lib/version'
 import { ConnectionIndicators } from '@/components/layout/connection-indicators'
 import { Button } from '@/components/ui/button'
 import {
@@ -93,15 +93,20 @@ export function AppShell({ children, headerActions, mainClassName }: AppShellPro
               <span className="font-semibold text-foreground/80 tracking-tight">
                 Procurement Tool
               </span>
-              <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground">
-                v{APP_VERSION}
-              </span>
               <span
-                className="hidden max-w-[300px] truncate text-[11px] italic text-muted-foreground/80 xl:inline"
-                title={APP_VERSION_SUMMARY}
+                className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground"
+                title={APP_GIT_DATE ? `Built from ${APP_GIT_SHA} · ${APP_GIT_DATE}` : undefined}
               >
-                {APP_VERSION_SUMMARY}
+                v{APP_VERSION}{APP_GIT_SHA && ` · ${APP_GIT_SHA}`}
               </span>
+              {APP_VERSION_SUMMARY && (
+                <span
+                  className="hidden max-w-[300px] truncate text-[11px] italic text-muted-foreground/80 xl:inline"
+                  title={APP_VERSION_SUMMARY}
+                >
+                  {APP_VERSION_SUMMARY}
+                </span>
+              )}
             </div>
           </div>
 
