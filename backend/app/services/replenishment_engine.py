@@ -222,7 +222,6 @@ def process_recommendations(
     weight_15_30d: float = None,
     weight_31_60d: float = None,
     adjustment_mode: str = "shrink",
-    momentum_data: Dict[str, float] = None,
     brand_sourcing_rules: Dict[str, Any] = None,
     # --- Phase 2 forecasting enrichment (OPT-IN, default OFF/neutral) ---------
     # All three default to neutral so the live replen path is unchanged.

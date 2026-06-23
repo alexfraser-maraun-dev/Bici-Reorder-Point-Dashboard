@@ -391,7 +391,6 @@ export function useConnectionStatus() {
   useEffect(() => {
     const checkHealth = () => {
       const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
-      console.log(`[HealthCheck] Pinging backend at: ${baseUrl}`)
 
       const controller = new AbortController()
       const timeoutId = setTimeout(() => controller.abort(), 8000) // 8s timeout
@@ -405,16 +404,28 @@ export function useConnectionStatus() {
           })
       }
       
-      fetchWithTimeout('lightspeed').then(setLsStatus)
-      fetchWithTimeout('bigquery').then(setBqStatus)
-      fetchWithTimeout('shopify').then(setShopifyStatus)
+      activeController = controller
+      activeTimeout = timeoutId
 
-      return () => clearTimeout(timeoutId)
+      // When all three settle, cancel the 8s abort timer so it doesn't linger.
+      Promise.allSettled([
+        fetchWithTimeout('lightspeed').then(setLsStatus),
+        fetchWithTimeout('bigquery').then(setBqStatus),
+        fetchWithTimeout('shopify').then(setShopifyStatus),
+      ]).finally(() => clearTimeout(timeoutId))
     }
+
+    // Track the in-flight cycle so unmount can abort it and clear its timer.
+    let activeController: AbortController | null = null
+    let activeTimeout: ReturnType<typeof setTimeout> | null = null
 
     checkHealth()
     const interval = setInterval(checkHealth, 30000)
-    return () => clearInterval(interval)
+    return () => {
+      clearInterval(interval)
+      if (activeTimeout) clearTimeout(activeTimeout)
+      activeController?.abort()
+    }
   }, [])
 
   return { lsStatus, bqStatus, shopifyStatus }

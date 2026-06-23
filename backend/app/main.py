@@ -231,7 +231,6 @@ def get_replenishment_data(
             weight_15_30d=weight_15_30d,
             weight_31_60d=weight_31_60d,
             adjustment_mode=adjustment_mode,
-            momentum_data={}
         )
 
         # 3. Apply Overrides (Locked, Manual ROP/DL)
@@ -589,7 +588,7 @@ def get_forward_coverage(
         brand_sourcing_rules = get_brand_sourcing_rules_map()
         recommendations = process_recommendations(
             raw_data, lead_times, brand_sourcing_rules=brand_sourcing_rules,
-            weight_14d=0.4, weight_15_30d=0.4, weight_31_60d=0.2, momentum_data={},
+            weight_14d=0.4, weight_15_30d=0.4, weight_31_60d=0.2,
         )
 
         # One seasonal profile per category, merged across levels (most specific wins).
