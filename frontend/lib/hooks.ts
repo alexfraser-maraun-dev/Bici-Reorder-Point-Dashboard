@@ -386,6 +386,7 @@ export function useConnectionStatus() {
 
   const [lsStatus, setLsStatus] = useState<ConnectionState>('checking')
   const [bqStatus, setBqStatus] = useState<ConnectionState>('checking')
+  const [shopifyStatus, setShopifyStatus] = useState<ConnectionState>('checking')
 
   useEffect(() => {
     const checkHealth = () => {
@@ -406,6 +407,7 @@ export function useConnectionStatus() {
       
       fetchWithTimeout('lightspeed').then(setLsStatus)
       fetchWithTimeout('bigquery').then(setBqStatus)
+      fetchWithTimeout('shopify').then(setShopifyStatus)
 
       return () => clearTimeout(timeoutId)
     }
@@ -415,7 +417,7 @@ export function useConnectionStatus() {
     return () => clearInterval(interval)
   }, [])
 
-  return { lsStatus, bqStatus }
+  return { lsStatus, bqStatus, shopifyStatus }
 }
 
 // Live special-order dashboard data (open SOs + derived overdue/aging + summary).

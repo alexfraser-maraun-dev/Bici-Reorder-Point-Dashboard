@@ -126,6 +126,21 @@ class ShopifyClient:
             return self._token
         return self._fetch_token()
 
+    def check_health(self) -> bool:
+        """
+        Reports whether Shopify is configured and reachable with valid credentials.
+        Mirrors LightspeedClient.check_health: a trivial GraphQL ping that returns False
+        (rather than raising) when unconfigured or on any error.
+        """
+        if not self._configured():
+            return False
+        try:
+            self._graphql("query { shop { name } }")
+            return True
+        except Exception as e:
+            print(f"Shopify health check failed: {e}")
+            return False
+
     def _graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Issues a GraphQL request and returns the `data` payload. Transparently refreshes a
         client-credentials token once on a 401. Raises on transport, HTTP, or GraphQL-level

@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { signOut, useSession } from 'next-auth/react'
 import { APP_VERSION, APP_VERSION_SUMMARY } from '@/lib/version'
+import { ConnectionIndicators } from '@/components/layout/connection-indicators'
 import { Button } from '@/components/ui/button'
 import {
   Sheet,
@@ -132,6 +133,7 @@ export function AppShell({ children, headerActions, mainClassName }: AppShellPro
                 {headerActions}
               </div>
             )}
+            <ConnectionIndicators />
             <div className="h-4 w-[1px] bg-border hidden sm:block" />
 
             {/* User Profile */}

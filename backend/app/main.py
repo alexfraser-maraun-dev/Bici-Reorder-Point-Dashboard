@@ -197,8 +197,8 @@ def get_replenishment_data(
             raise HTTPException(status_code=400, detail="forecast_period must be a positive integer.")
         if growth_multiplier <= 0:
             raise HTTPException(status_code=400, detail="growth_multiplier must be greater than 0.")
-        if adjustment_mode not in ("shrink", "grow"):
-            raise HTTPException(status_code=400, detail="adjustment_mode must be 'shrink' or 'grow'.")
+        if adjustment_mode not in ("shrink", "min_days", "cap", "raw"):
+            raise HTTPException(status_code=400, detail="adjustment_mode must be one of 'shrink', 'min_days', 'cap', or 'raw'.")
 
         # 1. Fetch BigQuery Data & Lead Times
         from app.services.bigquery_sync import (
@@ -826,6 +826,14 @@ def check_lightspeed_po_access():
         status_code=503,
         detail="Lightspeed token cannot access purchase orders. Re-authorize with the employee:purchase_orders scope (see backend/reauthorize_lightspeed.py).",
     )
+
+@app.get("/api/health/shopify")
+def check_shopify_health():
+    from app.services.shopify_client import ShopifyClient
+    client = ShopifyClient()
+    if client.check_health():
+        return {"status": "connected"}
+    raise HTTPException(status_code=503, detail="Disconnected from Shopify")
 
 @app.get("/api/health/bigquery")
 def check_bigquery_health():
