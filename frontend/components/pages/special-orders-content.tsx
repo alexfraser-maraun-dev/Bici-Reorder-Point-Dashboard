@@ -86,10 +86,6 @@ const TILES: Tile[] = [
   }),
 ]
 
-// Predicate lookup by segment id, for evaluating the current selection.
-const SEG_PRED: Record<string, (o: SpecialOrder) => boolean> = {}
-for (const t of TILES) for (const s of t.subs) SEG_PRED[seg(t.stage, s.key)] = s.pred
-
 const toneDot: Record<TriageTone, string> = {
   danger: 'bg-red-500',
   warn: 'bg-amber-500',
@@ -188,19 +184,35 @@ export function SpecialOrdersContent() {
     })
   }, [allRows, flaggedOnly, storeFilter, liveOnly, search])
 
-  // Table = base, plus the tile selection (a row matches if ANY selected segment's predicate holds).
-  const filtered = useMemo(() => {
-    if (selected.size === 0) return base
-    const preds = Array.from(selected).map((id) => SEG_PRED[id]).filter(Boolean)
-    return base.filter((o) => preds.some((p) => p(o)))
-  }, [base, selected])
+  // The tiles that currently have ≥1 selected sub-triage. A tile is "active" once you pick any of
+  // its buckets; selection combines as AND across tiles, OR within a tile.
+  const activeTiles = useMemo(
+    () => TILES.filter((t) => t.subs.some((s) => selected.has(seg(t.stage, s.key)))),
+    [selected]
+  )
 
-  // Counts per segment over the base set.
+  // Does row `o` satisfy a tile's selection? (true when the tile has no selection — it's not a
+  // constraint yet.) Within the tile it's an OR over the selected buckets' predicates.
+  const matchesTile = (o: SpecialOrder, t: Tile) =>
+    t.subs.some((s) => selected.has(seg(t.stage, s.key)) && s.pred(o))
+
+  // Table = base narrowed to rows passing EVERY active tile (AND across tiles).
+  const filtered = useMemo(() => {
+    if (activeTiles.length === 0) return base
+    return base.filter((o) => activeTiles.every((t) => matchesTile(o, t)))
+  }, [base, activeTiles])
+
+  // Faceted counts: each tile's buckets are counted over the rows passing all the OTHER active
+  // tiles' selections (a tile ignores its own selection, so you can still see/toggle its buckets).
   const segCounts = useMemo(() => {
     const counts: Record<string, number> = {}
-    for (const t of TILES) for (const s of t.subs) counts[seg(t.stage, s.key)] = base.filter(s.pred).length
+    for (const t of TILES) {
+      const others = activeTiles.filter((a) => a.stage !== t.stage)
+      const rows = others.length === 0 ? base : base.filter((o) => others.every((a) => matchesTile(o, a)))
+      for (const s of t.subs) counts[seg(t.stage, s.key)] = rows.filter(s.pred).length
+    }
     return counts
-  }, [base])
+  }, [base, activeTiles])
 
   const toggleSeg = (id: string) => {
     setSelected((prev) => {

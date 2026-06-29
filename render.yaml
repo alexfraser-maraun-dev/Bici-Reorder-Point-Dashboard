@@ -5,6 +5,12 @@ services:
     runtime: docker
     rootDir: backend
     plan: free # Ensure it stays on free tier if needed
+    envVars:
+      # Cap glibc malloc arenas so freed pandas/pyarrow buffers are returned to
+      # the OS instead of fragmenting across per-thread arenas. Cheap insurance
+      # against RSS creep on the 512MB instance, independent of the query fixes.
+      - key: MALLOC_ARENA_MAX
+        value: "2"
 
   # Frontend Dashboard
   - type: web

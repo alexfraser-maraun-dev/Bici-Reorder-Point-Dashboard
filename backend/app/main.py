@@ -442,9 +442,9 @@ def save_brand_sourcing_rule(rule: Dict[str, Any]):
 @app.get("/api/forecast/seasonal-profiles")
 def get_seasonal_profiles(years: int = 3, smoothing: float = 0.0, location: str = None):
     try:
-        from app.services.bigquery_sync import fetch_monthly_sales_history
+        from app.services.bigquery_sync import fetch_monthly_category_history
         from app.services.forecasting import build_seasonal_profile_response
-        df = fetch_monthly_sales_history(years=years)
+        df = fetch_monthly_category_history(years=years)
         if location is not None and len(df) and "location_id" in df.columns:
             df = df[df["location_id"].astype(str) == str(location)]
         records = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
@@ -479,7 +479,10 @@ def get_demand_history(
     if scope not in ("category", "sku"):
         raise HTTPException(status_code=400, detail="scope must be 'category' or 'sku'")
     try:
-        from app.services.bigquery_sync import fetch_monthly_sales_history
+        from app.services.bigquery_sync import (
+            fetch_monthly_category_history,
+            fetch_item_monthly_history,
+        )
         from app.services.forecasting import (
             seasonality_indices,
             blend_seasonal_indices,
@@ -487,17 +490,22 @@ def get_demand_history(
             lead_time_window_months,
         )
 
-        df = fetch_monthly_sales_history(years=years)
-        if location is not None and len(df) and "location_id" in df.columns:
-            df = df[df["location_id"].astype(str) == str(location)]
+        def _filter_location(frame):
+            if location is not None and len(frame) and "location_id" in frame.columns:
+                return frame[frame["location_id"].astype(str) == str(location)]
+            return frame
 
+        # Pull only what the scope needs server-side: a single item's rows for a
+        # SKU, or category-grain rows for a category. Neither materializes the full
+        # catalog the way the old per-item pull did.
         if scope == "sku":
-            rows = df[df["item_id"].astype(str) == str(id)]
+            rows = _filter_location(fetch_item_monthly_history(id, years=years))
         else:
-            rows = df[
-                (df["category_top_level"].astype(str) == str(id))
-                | (df.get("category_path", pd.Series(dtype=str)).astype(str) == str(id))
-                | (df.get("category_level_2", pd.Series(dtype=str)).astype(str) == str(id))
+            cat_df = _filter_location(fetch_monthly_category_history(years=years))
+            rows = cat_df[
+                (cat_df["category_top_level"].astype(str) == str(id))
+                | (cat_df.get("category_path", pd.Series(dtype=str)).astype(str) == str(id))
+                | (cat_df.get("category_level_2", pd.Series(dtype=str)).astype(str) == str(id))
             ]
 
         def period_totals(frame):
@@ -510,7 +518,11 @@ def get_demand_history(
 
         if scope == "sku":
             cat_label = str(rows["category_top_level"].dropna().iloc[0]) if len(rows.dropna(subset=["category_top_level"])) else None
-            cat_rows = df[df["category_top_level"].astype(str) == cat_label] if cat_label else rows
+            if cat_label:
+                cat_df = _filter_location(fetch_monthly_category_history(years=years))
+                cat_rows = cat_df[cat_df["category_top_level"].astype(str) == cat_label]
+            else:
+                cat_rows = rows
             own_indices = seasonality_indices(own_totals)
             category_indices = seasonality_indices(period_totals(cat_rows))
             indices = blend_seasonal_indices(own_indices, category_indices, own_history_periods=months_observed)
@@ -581,7 +593,7 @@ def get_forward_coverage(
             fetch_tagged_items_metrics,
             fetch_lead_times,
             get_brand_sourcing_rules_map,
-            fetch_monthly_sales_history,
+            fetch_monthly_category_history,
         )
         from app.services.replenishment_engine import process_recommendations
         from app.services.forecasting import build_seasonal_profiles, project_weeks_of_cover
@@ -595,7 +607,7 @@ def get_forward_coverage(
         )
 
         # One seasonal profile per category, merged across levels (most specific wins).
-        history_records = fetch_monthly_sales_history(years=3).to_dict("records")
+        history_records = fetch_monthly_category_history(years=3).to_dict("records")
         level_fields = ("category_path", "category_level_2", "category_top_level")
         profiles = build_seasonal_profiles(history_records, level_fields)
         merged_profiles = {}

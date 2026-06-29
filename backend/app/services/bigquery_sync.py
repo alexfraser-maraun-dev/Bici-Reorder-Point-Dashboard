@@ -837,33 +837,51 @@ def fetch_sales_history(trailing_days: int) -> pd.DataFrame:
     )
     return client.query(query, job_config=job_config).to_dataframe()
 
-def fetch_monthly_sales_history(years: int = 3) -> pd.DataFrame:
-    """
-    Phase 2 (forecasting enrichment) -- multi-year MONTHLY sales aggregation used
-    to build hierarchical category + per-item seasonal profiles (see
+_monthly_category_history_cache: dict = {}
+# Sales history only advances once a day, so a short TTL keeps repeated chart
+# loads / slider changes from re-running the scan while staying fresh enough.
+MONTHLY_HISTORY_TTL_SECONDS = 3600  # 1 hour
+
+
+def fetch_monthly_category_history(years: int = 3, force_refresh: bool = False) -> pd.DataFrame:
+    """Phase 2 (forecasting enrichment) -- multi-year MONTHLY sales aggregated at
+    CATEGORY grain for building hierarchical seasonal profiles (see
     ``app.services.forecasting``).
 
     Reads the canonical ``sales_master_view`` (LS-API-backed, favoured over raw
     Fivetran tables), which already represents completed sales and pre-decomposes
     the category tree. Per BICI's demand definition, special-order / layaway /
     workorder lines ARE counted (they are real demand once converted); only
-    warranty workorder lines are excluded. Returns one row per
-    (item_id, location_id, sales_month) with the category hierarchy attached so
-    the caller can compute seasonal indices at any category level.
+    warranty workorder lines are excluded.
+
+    Crucially, units are summed *in BigQuery* at the
+    (location, full category tree, year, month) grain. The previous per-item pull
+    returned the whole catalog (hundreds of thousands of item-month rows) and the
+    forecast endpoints then exploded it into Python dicts -- a transient spike big
+    enough to OOM the 512MB instance. Seasonal profiles only ever need
+    category-level totals (``build_seasonal_profiles`` re-sums per level), so this
+    collapses the result to a few thousand category-month rows.
+
+    Cached with a short TTL (history advances daily) so charts and debounced
+    sliders don't re-scan. The cached frame is small, so keeping it resident does
+    not meaningfully raise baseline memory.
 
     Validated against live BigQuery (2026-06-16).
     """
+    current_time = time.time()
+    if not force_refresh and years in _monthly_category_history_cache:
+        cached_data, timestamp = _monthly_category_history_cache[years]
+        if current_time - timestamp < MONTHLY_HISTORY_TTL_SECONDS:
+            return cached_data
+
     query = f"""
         SELECT
-            item_id,
             shop_id_int AS location_id,
-            ANY_VALUE(category_top_level) AS category_top_level,
-            ANY_VALUE(category_level_2) AS category_level_2,
-            ANY_VALUE(category_level_3) AS category_level_3,
-            ANY_VALUE(category_level_4) AS category_level_4,
-            ANY_VALUE(category_path) AS category_path,
-            ANY_VALUE(brand_name) AS brand_name,
-            DATE_TRUNC(sale_date, MONTH) AS sales_month,
+            category_top_level,
+            category_level_2,
+            category_level_3,
+            category_level_4,
+            category_path,
             EXTRACT(MONTH FROM sale_date) AS month_of_year,
             EXTRACT(YEAR FROM sale_date) AS sales_year,
             SUM(units_sold) AS total_units_sold
@@ -880,20 +898,63 @@ def fetch_monthly_sales_history(years: int = 3) -> pd.DataFrame:
             AND shop_id_int IN {TARGET_SHOP_IDS}
             AND NOT COALESCE(is_workorder_warranty_line, FALSE)
         GROUP BY
-            item_id,
             location_id,
-            sales_month,
+            category_top_level,
+            category_level_2,
+            category_level_3,
+            category_level_4,
+            category_path,
             month_of_year,
             sales_year
-        ORDER BY
-            item_id,
-            location_id,
-            sales_month
     """
 
     client = get_bq_client()
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
+            bigquery.ScalarQueryParameter("years", "INT64", years),
+            bigquery.ScalarQueryParameter("reliable_start", "STRING", RELIABLE_HISTORY_START),
+        ]
+    )
+    df = client.query(query, job_config=job_config).to_dataframe()
+    _monthly_category_history_cache[years] = (df, time.time())
+    return df
+
+
+def fetch_item_monthly_history(item_id, years: int = 3) -> pd.DataFrame:
+    """Per-(year, month) sales for a SINGLE item, filtered server-side.
+
+    Used by ``/api/forecast/history`` for a SKU-scoped chart. The ``item_id =``
+    filter runs in BigQuery so the result is at most a few dozen rows -- it never
+    materializes the whole catalog the way the old per-item full pull did. Not
+    cached, because keying a cache by item_id would grow unbounded.
+    """
+    query = f"""
+        SELECT
+            CAST(item_id AS STRING) AS item_id,
+            shop_id_int AS location_id,
+            ANY_VALUE(category_top_level) AS category_top_level,
+            EXTRACT(MONTH FROM sale_date) AS month_of_year,
+            EXTRACT(YEAR FROM sale_date) AS sales_year,
+            SUM(units_sold) AS total_units_sold
+        FROM
+            `{LS_DATASET}.sales_master_view`
+        WHERE
+            CAST(item_id AS STRING) = @item_id
+            AND sale_date >= GREATEST(DATE_SUB(CURRENT_DATE(), INTERVAL @years YEAR), DATE(@reliable_start))
+            AND sale_date < DATE_TRUNC(CURRENT_DATE(), MONTH)
+            AND shop_id_int IN {TARGET_SHOP_IDS}
+            AND NOT COALESCE(is_workorder_warranty_line, FALSE)
+        GROUP BY
+            item_id,
+            location_id,
+            month_of_year,
+            sales_year
+    """
+
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
             bigquery.ScalarQueryParameter("years", "INT64", years),
             bigquery.ScalarQueryParameter("reliable_start", "STRING", RELIABLE_HISTORY_START),
         ]

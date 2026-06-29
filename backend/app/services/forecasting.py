@@ -19,7 +19,7 @@ Three building blocks live here:
    single bounded trend multiplier (formalizes the momentum label as a number).
 
 All functions are fully unit-tested in ``backend/test_forecasting.py``. The
-BigQuery SQL that would feed (1) lives in ``bigquery_sync.fetch_monthly_sales_history``
+BigQuery SQL that would feed (1) lives in ``bigquery_sync.fetch_monthly_category_history``
 and is *untested against live BQ* (no credentials available offline).
 """
 
@@ -600,7 +600,7 @@ def build_seasonal_profile_response(
     rank categories by volume and signal how trustworthy each curve is).
 
     Pure / side-effect-free: the endpoint feeds it rows from
-    ``bigquery_sync.fetch_monthly_sales_history``; tests feed it fixtures. Results are
+    ``bigquery_sync.fetch_monthly_category_history``; tests feed it fixtures. Results are
     sorted by ``sample_units`` descending so the highest-signal categories surface
     first.
     """
