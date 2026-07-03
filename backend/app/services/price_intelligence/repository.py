@@ -191,12 +191,35 @@ def _rows(query: str, params=None):
     return [dict(r) for r in get_bq_client().query(query, job_config=job_config).result()]
 
 
+_schema_cache = {}
+
+
+def _table_schema(table_id: str):
+    if table_id not in _schema_cache:
+        _schema_cache[table_id] = get_bq_client().get_table(table_id).schema
+    return _schema_cache[table_id]
+
+
 def load_rows(table_id: str, rows: list):
-    """Batch-appends rows via a load job (immediately DML-safe, no streaming buffer)."""
+    """Batch-appends rows via a load job (immediately DML-safe, no streaming buffer).
+
+    Passes the table's real schema instead of letting load_table_from_json
+    autodetect: a batch whose competitor_sku / match_item_id values are all
+    numeric would otherwise be typed INTEGER and rejected against the STRING
+    columns. STRING-typed values are also coerced so a JSON-LD sku/gtin that
+    arrives as a number still loads cleanly.
+    """
     if not rows:
         return
     ensure_pi_tables()
-    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
+    schema = _table_schema(table_id)
+    string_fields = {f.name for f in schema if f.field_type == "STRING"}
+    for row in rows:
+        for key in string_fields:
+            value = row.get(key)
+            if value is not None and not isinstance(value, str):
+                row[key] = str(value)
+    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND", schema=schema)
     get_bq_client().load_table_from_json(rows, table_id, job_config=job_config).result()
 
 
