@@ -177,6 +177,26 @@ class LightspeedClient:
             print(f"Lightspeed Update Error: {e}")
             return None
 
+    def update_item_price(self, item_id: str, price: float, use_type: str = "Default") -> Optional[Dict[str, Any]]:
+        """
+        Updates one item's retail price (the "Default" ItemPrice) via PUT
+        /Item/{itemID}.json. Covered by the employee:inventory scope, same as the
+        ItemShop reorder-level writeback. Returns the updated Item dict, or None.
+        """
+        payload = {
+            "Prices": {
+                "ItemPrice": [{"amount": f"{float(price):.2f}", "useType": use_type}]
+            }
+        }
+        response = self._request("PUT", f"/Item/{item_id}.json", json=payload)
+        if response is None:
+            return None
+        if response.status_code == 200:
+            return response.json().get("Item")
+        print(f"Lightspeed price update failed for item {item_id}: "
+              f"{response.status_code} {response.text[:300]}")
+        return None
+
     def _request(self, method: str, path: str, params: dict = None, json: dict = None) -> Optional[requests.Response]:
         """
         Issues an authenticated request, transparently refreshing the bearer token

@@ -11,3 +11,7 @@ python-multipart==0.0.6
 gunicorn==21.2.0
 google-cloud-bigquery==3.13.0
 db-dtypes==1.2.0
+beautifulsoup4==4.12.3
+lxml==5.2.2
+rapidfuzz==3.9.6
+anthropic==0.39.0

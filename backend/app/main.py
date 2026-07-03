@@ -53,6 +53,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Price Intelligence is fully feature-flagged: with the flag off the package is
+# never imported, so a disabled deployment carries none of its code, deps, or
+# scheduler thread.
+if os.getenv("PRICE_INTEL_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"):
+    from app.services.price_intelligence.router import router as price_intel_router
+    from app.services.price_intelligence.scrape_runner import start_scheduler as _start_pi_scheduler
+
+    app.include_router(price_intel_router)
+
+    @app.on_event("startup")
+    def _start_price_intel_scheduler() -> None:
+        _start_pi_scheduler()
+
 
 def _warm_replenishment_caches() -> None:
     """Populate the heavy BigQuery-backed caches (tagged item metrics, lead times,

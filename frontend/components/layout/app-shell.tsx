@@ -9,7 +9,9 @@ import {
   Menu,
   CircleHelp,
   LogOut,
+  TrendingUp,
 } from 'lucide-react'
+import { PriceIntelNavBadge } from '@/components/price-intel/nav-badge'
 import { signOut, useSession } from 'next-auth/react'
 import { APP_VERSION, APP_VERSION_SUMMARY, APP_GIT_SHA, APP_GIT_DATE } from '@/lib/version'
 import { ConnectionIndicators } from '@/components/layout/connection-indicators'
@@ -24,6 +26,10 @@ import { useState } from 'react'
 const navigation = [
   { name: 'Ordering', href: '/', icon: LayoutDashboard },
   { name: 'Special Orders', href: '/special-orders', icon: PackageSearch },
+  // Feature-flagged: set NEXT_PUBLIC_PRICE_INTEL_ENABLED=true (build-time) to show.
+  ...(process.env.NEXT_PUBLIC_PRICE_INTEL_ENABLED === 'true'
+    ? [{ name: 'Price Intel', href: '/price-intelligence', icon: TrendingUp }]
+    : []),
   { name: 'How it Works', href: '/how-to-use', icon: CircleHelp },
 ]
 
@@ -72,6 +78,7 @@ export function AppShell({ children, headerActions, mainClassName }: AppShellPro
                     >
                       <item.icon className="h-4 w-4" />
                       {item.name}
+                      {item.href === '/price-intelligence' && <PriceIntelNavBadge />}
                     </Link>
                   )
                 })}
@@ -127,6 +134,7 @@ export function AppShell({ children, headerActions, mainClassName }: AppShellPro
                 >
                   <item.icon className="h-4 w-4" />
                   {item.name}
+                  {item.href === '/price-intelligence' && <PriceIntelNavBadge />}
                 </Link>
               )
             })}
