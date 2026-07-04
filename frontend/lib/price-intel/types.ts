@@ -24,6 +24,9 @@ export interface TrackedUrl {
   created_at: string | null
   last_scraped_at: string | null
   last_status: string | null
+  // joined from pi_tracked_products when item_id is set
+  item_title: string | null
+  item_brand: string | null
 }
 
 export interface TrackedProduct {
@@ -43,8 +46,13 @@ export interface TrackedProduct {
   min_price_override: number | null
   is_map: boolean
   map_price: number | null
+  item_matrix_id: string | null
+  matrix_description: string | null
+  attribute_1: string | null
+  attribute_2: string | null
+  attribute_3: string | null
   updated_at: string | null
-  // joined market fields
+  // joined market fields (matrix-grain when the item belongs to a matrix)
   market_min_in_stock: number | null
   market_min: number | null
   market_median: number | null
@@ -70,12 +78,22 @@ export interface ChangeEvent {
   competitor_name: string | null
   item_id: string | null
   item_title: string | null
+  item_brand: string | null
   url: string | null
   old_price: number | null
   new_price: number | null
   pct_change: number | null
   acknowledged: boolean
   acknowledged_at: string | null
+}
+
+export interface ChangeFeedFilters {
+  days?: number
+  unacknowledgedOnly?: boolean
+  competitorId?: string | null
+  eventTypes?: ChangeEventType[]
+  minPct?: number | null
+  brand?: string | null
 }
 
 export interface ScrapeStatus {
@@ -116,6 +134,8 @@ export interface PriceIntelSummary {
   price_index_vs_market_min: number | null
   unacknowledged_changes: number
   map_tracked_count: number
+  upc_tracked_count: number
+  pending_links: number
   last_run: ScrapeRun | null
   scrape_status: ScrapeStatus
 }
@@ -165,4 +185,48 @@ export interface ItemSearchResult {
   brand: string | null
   manufacturer_sku: string | null
   current_retail: number | null
+  item_matrix_id: string | null
+  matrix_description: string | null
+  attribute_1: string | null
+  attribute_2: string | null
+  attribute_3: string | null
+}
+
+export type ProductLinkStatus = 'pending' | 'confirmed' | 'rejected'
+
+export interface ProductLink {
+  link_id: string
+  item_id: string | null
+  competitor_id: string | null
+  match_key: string
+  competitor_url: string | null
+  competitor_sku: string | null
+  competitor_title: string | null
+  gtin: string | null
+  level: 'variant' | 'model' | null
+  status: ProductLinkStatus
+  source: 'gtin' | 'llm' | 'human' | 'manual_url'
+  confidence: number | null
+  fuzzy_score: number | null
+  llm_verdict: string | null
+  llm_reason: string | null
+  our_price: number | null
+  their_price: number | null
+  decided_by: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface ItemCompetitorPrice {
+  competitor_id: string | null
+  competitor_name: string | null
+  source: 'catalog' | 'url'
+  url: string | null
+  competitor_title: string | null
+  price: number | null
+  compare_at_price: number | null
+  in_stock: boolean | null
+  observed_at: string
+  match_method: string | null
+  match_confidence: number | null
 }

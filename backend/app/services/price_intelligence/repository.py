@@ -22,6 +22,7 @@ T_EVENTS = f"{APP_DATASET}.pi_change_events"
 T_DIGESTS = f"{APP_DATASET}.pi_digests"
 T_PUSH_LOG = f"{APP_DATASET}.pi_price_push_log"
 T_RUNS = f"{APP_DATASET}.pi_scrape_runs"
+T_LINKS = f"{APP_DATASET}.pi_product_links"
 
 _tables_ensured = False
 _ensure_lock = threading.Lock()
@@ -158,10 +159,54 @@ def ensure_pi_tables():
                 changes_count INT64,
                 error STRING
             )""",
+            # Persistent competitor-listing <-> item links: the self-building
+            # "pre-matched URL catalog". match_key identifies one scraped
+            # listing (see matcher.build_match_key); one row per match_key.
+            # A 'rejected' row is a tombstone — its key is never re-proposed.
+            f"""CREATE TABLE IF NOT EXISTS `{T_LINKS}` (
+                link_id STRING NOT NULL,
+                item_id STRING,
+                competitor_id STRING,
+                match_key STRING NOT NULL,
+                competitor_url STRING,
+                competitor_sku STRING,
+                competitor_title STRING,
+                gtin STRING,
+                level STRING,
+                status STRING,
+                source STRING,
+                confidence FLOAT64,
+                fuzzy_score FLOAT64,
+                llm_verdict STRING,
+                llm_reason STRING,
+                our_price FLOAT64,
+                their_price FLOAT64,
+                decided_by STRING,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )""",
         ]
         for stmt in statements:
             client.query(stmt).result()
+        _ensure_columns(client, T_TRACKED, {
+            "item_matrix_id": "STRING",
+            "matrix_description": "STRING",
+            "attribute_1": "STRING",
+            "attribute_2": "STRING",
+            "attribute_3": "STRING",
+        })
+        _ensure_columns(client, T_EVENTS, {"item_brand": "STRING"})
         _tables_ensured = True
+
+
+def _ensure_columns(client, table_id: str, columns: dict):
+    """Additive schema migration: ADD COLUMN IF NOT EXISTS per column (metadata-only
+    for nullable columns). Drops the cached schema so load_rows sees new columns."""
+    for name, col_type in columns.items():
+        client.query(
+            f"ALTER TABLE `{table_id}` ADD COLUMN IF NOT EXISTS {name} {col_type}"
+        ).result()
+    _schema_cache.pop(table_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -322,10 +367,34 @@ def mark_competitor_scraped(competitor_id: str, status: str):
 
 def get_tracked_urls(include_disabled: bool = True):
     ensure_pi_tables()
-    rows = _rows(f"SELECT * FROM `{T_URLS}` ORDER BY created_at DESC")
+    rows = _rows(f"""
+        SELECT u.*, t.title AS item_title, t.brand AS item_brand
+        FROM `{T_URLS}` u
+        LEFT JOIN `{T_TRACKED}` t ON t.item_id = u.item_id
+        ORDER BY u.created_at DESC
+    """)
     if not include_disabled:
         rows = [r for r in rows if r.get("enabled")]
     return rows
+
+
+def update_tracked_url(url_id: str, fields: dict):
+    """Updates the mutable fields of a tracked URL (item_id / label / competitor_id)."""
+    ensure_pi_tables()
+    allowed = {"item_id", "label", "competitor_id"}
+    sets, params = [], [bigquery.ScalarQueryParameter("uid", "STRING", str(url_id))]
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        sets.append(f"{k} = @{k}")
+        params.append(bigquery.ScalarQueryParameter(k, "STRING", None if v is None else str(v)))
+    if not sets:
+        return
+    get_bq_client().query(
+        f"UPDATE `{T_URLS}` SET {', '.join(sets)} WHERE url_id = @uid",
+        job_config=bigquery.QueryJobConfig(query_parameters=params),
+    ).result()
+    invalidate_pi_caches()
 
 
 def upsert_tracked_url(data: dict) -> dict:
@@ -391,7 +460,12 @@ def get_tracked_products(include_excluded: bool = True):
 
 def get_tracked_products_with_market(days: int = 7):
     """Tracked products joined with market min/median from the latest observation
-    per (competitor, product) over the trailing window."""
+    per (competitor, product) over the trailing window.
+
+    Market data aggregates at the model/matrix grain when the item belongs to a
+    matrix (sizes share MSRP, so a 56cm listing prices every tracked size), else
+    per item. competitor_count COALESCEs NULL competitor_id (tracked-URL rows)
+    to the URL so URL-only tracking still counts as a store."""
     ensure_pi_tables()
     cache_key = f"tracked_market_{days}"
     cached = _cache_get(cache_key)
@@ -404,24 +478,75 @@ def get_tracked_products_with_market(days: int = 7):
               AND match_item_id IS NOT NULL AND price IS NOT NULL
             QUALIFY ROW_NUMBER() OVER (PARTITION BY diff_key ORDER BY observed_at DESC) = 1
         ),
+        grouped AS (
+            SELECT l.*, COALESCE(t.item_matrix_id, t.item_id) AS group_key
+            FROM latest l
+            JOIN `{T_TRACKED}` t ON t.item_id = l.match_item_id
+        ),
         market AS (
             SELECT
-                match_item_id,
+                group_key,
                 MIN(IF(in_stock, price, NULL)) AS market_min_in_stock,
                 MIN(price) AS market_min,
                 APPROX_QUANTILES(price, 2)[SAFE_OFFSET(1)] AS market_median,
-                COUNT(DISTINCT competitor_id) AS competitor_count,
+                COUNT(DISTINCT COALESCE(competitor_id, CONCAT('url:', url))) AS competitor_count,
                 MAX(observed_at) AS last_observed_at
-            FROM latest
-            GROUP BY match_item_id
+            FROM grouped
+            GROUP BY group_key
         )
         SELECT t.*, m.market_min_in_stock, m.market_min, m.market_median,
                m.competitor_count, m.last_observed_at
         FROM `{T_TRACKED}` t
-        LEFT JOIN market m ON m.match_item_id = t.item_id
+        LEFT JOIN market m ON m.group_key = COALESCE(t.item_matrix_id, t.item_id)
         ORDER BY t.revenue_rank
     """, params=[bigquery.ScalarQueryParameter("days", "INT64", days)])
     _cache_set(cache_key, rows)
+    return rows
+
+
+def get_item_competitor_prices(item_id: str, days: int = 45):
+    """Latest price per competitor (or tracked URL) for one item, including its
+    matrix siblings' matches — the per-store breakdown behind the market columns.
+    Rows with NULL competitor_id get the URL's domain as a pseudo-name."""
+    ensure_pi_tables()
+    rows = _rows(f"""
+        WITH me AS (
+            SELECT item_id, item_matrix_id FROM `{T_TRACKED}`
+            WHERE item_id = @item_id
+        ),
+        variants AS (
+            SELECT t.item_id FROM `{T_TRACKED}` t, me
+            WHERE t.item_id = me.item_id
+               OR (me.item_matrix_id IS NOT NULL AND t.item_matrix_id = me.item_matrix_id)
+        ),
+        latest AS (
+            SELECT o.* FROM `{T_OBSERVATIONS}` o
+            JOIN variants v ON v.item_id = o.match_item_id
+            WHERE o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+              AND o.price IS NOT NULL
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY o.diff_key ORDER BY o.observed_at DESC) = 1
+        ),
+        per_store AS (
+            SELECT * FROM latest
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY COALESCE(competitor_id, CONCAT('url:', url))
+                ORDER BY IF(COALESCE(in_stock, FALSE), 0, 1), price
+            ) = 1
+        )
+        SELECT p.competitor_id, c.name AS competitor_name, p.source, p.url,
+               p.competitor_title, p.price, p.compare_at_price, p.in_stock,
+               p.observed_at, p.match_method, p.match_confidence
+        FROM per_store p
+        LEFT JOIN `{T_COMPETITORS}` c ON c.competitor_id = p.competitor_id
+        ORDER BY p.price
+    """, params=[
+        bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
+        bigquery.ScalarQueryParameter("days", "INT64", days),
+    ])
+    from urllib.parse import urlparse
+    for row in rows:
+        if not row.get("competitor_name") and row.get("url"):
+            row["competitor_name"] = urlparse(row["url"]).netloc
     return rows
 
 
@@ -463,29 +588,53 @@ def update_tracked_current_retail(item_id: str, price: float):
         print(f"pi: failed to update tracked retail: {e}")
 
 
-def search_snapshot_items(q: str, limit: int = 20):
-    """Item search (for pinning) against the latest master snapshot."""
+def search_snapshot_items(q: str, limit: int = 40):
+    """Item search (for pinning) against the latest master snapshot, joined to
+    item_history/item_matrix_history for matrix + variant attributes so the UI
+    can tell 'Rapha Core Bib - M / Black' from its 19 siblings."""
     like = f"%{q.lower()}%"
     return _rows(f"""
         WITH latest AS (
             SELECT MAX(snapshot_date_local) AS d FROM `{LS_DATASET}.v_master_snapshot_latest`
+        ),
+        attrs AS (
+            SELECT
+                CAST(id AS STRING) AS item_id,
+                CAST(NULLIF(item_matrix_id, 0) AS STRING) AS item_matrix_id,
+                attribute_1, attribute_2, attribute_3
+            FROM `{LS_DATASET}.item_history`
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        matrix AS (
+            SELECT CAST(id AS STRING) AS matrix_id, description AS matrix_description
+            FROM `{LS_DATASET}.item_matrix_history`
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        snap AS (
+            SELECT
+                CAST(item_id AS STRING) AS item_id,
+                ANY_VALUE(COALESCE(product_display_name, item_description)) AS title,
+                ANY_VALUE(brand_name) AS brand,
+                ANY_VALUE(manufacturer_sku) AS manufacturer_sku,
+                MAX(item_current_price) AS current_retail,
+                MAX(COALESCE(sales_revenue_l90d, 0)) AS rev
+            FROM `{LS_DATASET}.v_master_snapshot_latest` s CROSS JOIN latest
+            WHERE s.snapshot_date_local = latest.d
+              AND COALESCE(item_archived, FALSE) = FALSE
+            GROUP BY item_id
         )
         SELECT
-            CAST(item_id AS STRING) AS item_id,
-            ANY_VALUE(COALESCE(product_display_name, item_description)) AS title,
-            ANY_VALUE(brand_name) AS brand,
-            ANY_VALUE(manufacturer_sku) AS manufacturer_sku,
-            MAX(item_current_price) AS current_retail
-        FROM `{LS_DATASET}.v_master_snapshot_latest` s CROSS JOIN latest
-        WHERE s.snapshot_date_local = latest.d
-          AND COALESCE(item_archived, FALSE) = FALSE
-          AND (
-            LOWER(COALESCE(product_display_name, item_description)) LIKE @like
-            OR LOWER(COALESCE(manufacturer_sku, '')) LIKE @like
-            OR CAST(item_id AS STRING) = @exact
-          )
-        GROUP BY item_id
-        ORDER BY MAX(sales_revenue_l90d) DESC
+            s.item_id, s.title, s.brand, s.manufacturer_sku, s.current_retail,
+            a.item_matrix_id, m.matrix_description,
+            a.attribute_1, a.attribute_2, a.attribute_3
+        FROM snap s
+        LEFT JOIN attrs a USING (item_id)
+        LEFT JOIN matrix m ON m.matrix_id = a.item_matrix_id
+        WHERE LOWER(COALESCE(s.title, '')) LIKE @like
+           OR LOWER(COALESCE(s.manufacturer_sku, '')) LIKE @like
+           OR LOWER(COALESCE(m.matrix_description, '')) LIKE @like
+           OR s.item_id = @exact
+        ORDER BY s.rev DESC, m.matrix_description, a.attribute_1
         LIMIT {int(limit)}
     """, params=[
         bigquery.ScalarQueryParameter("like", "STRING", like),
@@ -528,15 +677,29 @@ def get_item_observations(item_id: str, days: int = 120):
 # Change events (feature a) — batch loaded; ack is a plain UPDATE.
 # ---------------------------------------------------------------------------
 
-def get_change_events(days: int = 14, acknowledged=None, limit: int = 200):
+def get_change_events(days: int = 14, acknowledged=None, competitor_id=None,
+                      event_types=None, min_abs_pct=None, brand=None, limit: int = 200):
     ensure_pi_tables()
     where = "WHERE occurred_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)"
+    params = [bigquery.ScalarQueryParameter("days", "INT64", days)]
     if acknowledged is not None:
         where += f" AND COALESCE(acknowledged, FALSE) = {'TRUE' if acknowledged else 'FALSE'}"
+    if competitor_id:
+        where += " AND competitor_id = @cid"
+        params.append(bigquery.ScalarQueryParameter("cid", "STRING", str(competitor_id)))
+    if event_types:
+        where += " AND event_type IN UNNEST(@types)"
+        params.append(bigquery.ArrayQueryParameter("types", "STRING", [str(t) for t in event_types]))
+    if min_abs_pct is not None:
+        where += " AND ABS(COALESCE(pct_change, 0)) >= @min_pct"
+        params.append(bigquery.ScalarQueryParameter("min_pct", "FLOAT64", float(min_abs_pct)))
+    if brand:
+        where += " AND LOWER(COALESCE(item_brand, '')) = @brand"
+        params.append(bigquery.ScalarQueryParameter("brand", "STRING", str(brand).lower()))
     return _rows(f"""
         SELECT * FROM `{T_EVENTS}` {where}
         ORDER BY occurred_at DESC LIMIT {int(limit)}
-    """, params=[bigquery.ScalarQueryParameter("days", "INT64", days)])
+    """, params=params)
 
 
 def count_unacknowledged_events() -> int:
@@ -564,6 +727,134 @@ def acknowledge_events(event_ids: list):
         ]),
     ).result()
     invalidate_pi_caches()
+
+
+# ---------------------------------------------------------------------------
+# Product links (confirmed competitor-listing <-> item matches + pending
+# verification candidates). One row per match_key; write-precedence: rows a
+# human decided (decided_by set, or source in human/manual_url) are never
+# auto-overwritten.
+# ---------------------------------------------------------------------------
+
+def get_product_links(status=None, item_id=None, unverified_only=False, limit: int = 1000):
+    ensure_pi_tables()
+    where, params = [], []
+    if status:
+        where.append("status = @status")
+        params.append(bigquery.ScalarQueryParameter("status", "STRING", status))
+    if item_id:
+        where.append("item_id = @item_id")
+        params.append(bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)))
+    if unverified_only:
+        where.append("llm_verdict IS NULL")
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    return _rows(f"""
+        SELECT * FROM `{T_LINKS}` {clause}
+        ORDER BY fuzzy_score DESC, created_at DESC
+        LIMIT {int(limit)}
+    """, params=params)
+
+
+def get_link_match_keys() -> set:
+    """All match_keys with any row (any status) — the candidate generator skips
+    these so rejected links act as tombstones and the LLM is never re-asked."""
+    ensure_pi_tables()
+    rows = _rows(f"SELECT DISTINCT match_key FROM `{T_LINKS}`")
+    return {r["match_key"] for r in rows if r.get("match_key")}
+
+
+def insert_product_links(rows: list):
+    """Insert-only MERGE on match_key: existing rows (including tombstones and
+    human decisions) are never touched."""
+    if not rows:
+        return
+    ensure_pi_tables()
+    client = get_bq_client()
+    temp_table_id = f"{T_LINKS}_temp"
+    target_schema = client.get_table(T_LINKS).schema
+    row_keys = set(rows[0].keys())
+    job_config = bigquery.LoadJobConfig(
+        write_disposition="WRITE_TRUNCATE",
+        schema=[f for f in target_schema if f.name in row_keys],
+    )
+    client.load_table_from_json(rows, temp_table_id, job_config=job_config).result()
+    cols = ", ".join(rows[0].keys())
+    vals = ", ".join(f"S.{c}" for c in rows[0].keys())
+    client.query(f"""
+        MERGE `{T_LINKS}` T
+        USING (
+            SELECT * FROM `{temp_table_id}`
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY match_key ORDER BY fuzzy_score DESC) = 1
+        ) S
+        ON T.match_key = S.match_key
+        WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({vals})
+    """).result()
+    invalidate_pi_caches()
+
+
+def upsert_human_link(row: dict):
+    """Full upsert for human-created/decided links — overrides any prior row."""
+    _merge_upsert(
+        T_LINKS, [row], "match_key",
+        update_cols=["item_id", "competitor_id", "competitor_url", "competitor_sku",
+                     "competitor_title", "level", "status", "source", "confidence",
+                     "decided_by", "updated_at"],
+        insert_cols=list(row.keys()),
+    )
+    invalidate_pi_caches()
+
+
+def update_link_verdicts(rows: list):
+    """Update-only MERGE on link_id, applying LLM verdicts. Skips rows a human
+    has already decided."""
+    if not rows:
+        return
+    ensure_pi_tables()
+    client = get_bq_client()
+    temp_table_id = f"{T_LINKS}_verdicts_temp"
+    target_schema = client.get_table(T_LINKS).schema
+    row_keys = set(rows[0].keys())
+    job_config = bigquery.LoadJobConfig(
+        write_disposition="WRITE_TRUNCATE",
+        schema=[f for f in target_schema if f.name in row_keys],
+    )
+    client.load_table_from_json(rows, temp_table_id, job_config=job_config).result()
+    set_clause = ", ".join(f"T.{c} = S.{c}" for c in row_keys if c != "link_id")
+    client.query(f"""
+        MERGE `{T_LINKS}` T
+        USING `{temp_table_id}` S
+        ON T.link_id = S.link_id
+        WHEN MATCHED AND T.decided_by IS NULL AND T.source NOT IN ('human', 'manual_url')
+        THEN UPDATE SET {set_clause}
+    """).result()
+    invalidate_pi_caches()
+
+
+def decide_link(link_id: str, status: str, decided_by: str = "Dashboard"):
+    """Human confirm/reject from the review UI — permanent (never auto-overwritten)."""
+    ensure_pi_tables()
+    get_bq_client().query(
+        f"UPDATE `{T_LINKS}` SET status = @status, decided_by = @actor, "
+        "confidence = IF(@status = 'confirmed', 1.0, confidence), "
+        "updated_at = CURRENT_TIMESTAMP() WHERE link_id = @lid",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("status", "STRING", status),
+            bigquery.ScalarQueryParameter("actor", "STRING", decided_by),
+            bigquery.ScalarQueryParameter("lid", "STRING", str(link_id)),
+        ]),
+    ).result()
+    invalidate_pi_caches()
+
+
+def count_pending_links() -> int:
+    ensure_pi_tables()
+    cached = _cache_get("pending_links")
+    if cached is not None:
+        return cached
+    rows = _rows(f"SELECT COUNT(*) AS n FROM `{T_LINKS}` WHERE status = 'pending'")
+    n = rows[0]["n"] if rows else 0
+    _cache_set("pending_links", n)
+    return n
 
 
 # ---------------------------------------------------------------------------

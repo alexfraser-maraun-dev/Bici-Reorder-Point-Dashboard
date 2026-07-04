@@ -34,6 +34,9 @@ FLUSH_ROWS = int(os.getenv("PI_FLUSH_ROWS", "2000"))
 
 # Comparison-list seeding.
 TOP_REVENUE_COUNT = int(os.getenv("PI_TOP_REVENUE_COUNT", "100"))
+# Optional: restrict auto-seeding to items that have a UPC/EAN. Off by default —
+# competitor catalogs rarely expose barcodes, so this mostly shrinks coverage.
+REQUIRE_UPC = _flag("PI_REQUIRE_UPC")
 
 # Price-push floor: never suggest/allow (without explicit override) a price below
 # cost * (1 + this margin). MAP price and per-item overrides take precedence when set.
@@ -52,3 +55,11 @@ SCHEDULE_TIMEZONE = os.getenv("PI_SCHEDULE_TIMEZONE", "America/Vancouver")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 DIGEST_MODEL = os.getenv("PI_DIGEST_MODEL", "claude-haiku-4-5")
 DIGEST_MAX_TOKENS = int(os.getenv("PI_DIGEST_MAX_TOKENS", "1000"))
+
+# LLM match verification: near-miss fuzzy candidates are batched to a small
+# model after each scrape run. The per-run pair cap bounds cost (~10 requests
+# of ~20 pairs at the default).
+MATCH_MODEL = os.getenv("PI_MATCH_MODEL", "claude-haiku-4-5")
+MATCH_MAX_PAIRS_PER_RUN = int(os.getenv("PI_MATCH_MAX_PAIRS_PER_RUN", "200"))
+MATCH_BATCH_SIZE = int(os.getenv("PI_MATCH_BATCH_SIZE", "20"))
+MATCH_MAX_TOKENS = int(os.getenv("PI_MATCH_MAX_TOKENS", "2000"))

@@ -13,7 +13,12 @@ import {
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog'
 import { apiPost, useCompetitors, useTrackedUrls } from '@/lib/price-intel/hooks'
+import type { TrackedUrl } from '@/lib/price-intel/types'
+import { ItemSearchPicker } from './item-search-picker'
 import { ExternalLink, Globe, Link2, Plus, Trash2 } from 'lucide-react'
 
 const CONNECTOR_LABEL: Record<string, { label: string; tone: string }> = {
@@ -37,6 +42,19 @@ export function CompetitorManager() {
   const [newUrlLabel, setNewUrlLabel] = useState('')
   const [newUrlCompetitor, setNewUrlCompetitor] = useState<string>('none')
   const [saving, setSaving] = useState(false)
+  const [linkTarget, setLinkTarget] = useState<TrackedUrl | null>(null)
+
+  const linkItem = async (itemId: string, itemTitle: string | null) => {
+    if (!linkTarget) return
+    try {
+      await apiPost(`/api/price-intel/urls/${linkTarget.url_id}`, { item_id: itemId }, 'PUT')
+      toast.success(`Linked to ${itemTitle ?? itemId} — it now matches on every scrape`)
+      setLinkTarget(null)
+      await mutateUrls()
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to link item')
+    }
+  }
 
   const addCompetitor = async () => {
     if (!name.trim() || !baseUrl.trim()) {
@@ -211,6 +229,7 @@ export function CompetitorManager() {
                 <TableRow>
                   <TableHead>URL</TableHead>
                   <TableHead>Label</TableHead>
+                  <TableHead>Linked item</TableHead>
                   <TableHead>Last checked</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="w-10" />
@@ -227,6 +246,24 @@ export function CompetitorManager() {
                       </a>
                     </TableCell>
                     <TableCell className="text-sm">{u.label ?? '—'}</TableCell>
+                    <TableCell className="max-w-56">
+                      {u.item_id ? (
+                        <button className="block max-w-full text-left" title="Change linked item"
+                                onClick={() => setLinkTarget(u)}>
+                          <span className="block truncate text-sm font-medium">
+                            {u.item_title ?? u.item_id}
+                          </span>
+                          {u.item_brand && (
+                            <span className="block truncate text-xs text-muted-foreground">{u.item_brand}</span>
+                          )}
+                        </button>
+                      ) : (
+                        <Button variant="outline" size="sm" className="h-7 text-xs"
+                                onClick={() => setLinkTarget(u)}>
+                          <Link2 className="h-3.5 w-3.5" /> Link item
+                        </Button>
+                      )}
+                    </TableCell>
                     <TableCell className="text-sm text-muted-foreground">
                       {u.last_scraped_at ? new Date(u.last_scraped_at).toLocaleString() : 'never'}
                     </TableCell>
@@ -247,6 +284,20 @@ export function CompetitorManager() {
           )}
         </CardContent>
       </Card>
+
+      <Dialog open={linkTarget !== null} onOpenChange={(open) => !open && setLinkTarget(null)}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Link URL to a catalog item</DialogTitle>
+          </DialogHeader>
+          <p className="truncate text-xs text-muted-foreground">{linkTarget?.url}</p>
+          <ItemSearchPicker
+            actionLabel="Link"
+            placeholder="Search our catalog (name / SKU / id)…"
+            onSelect={(item) => linkItem(item.item_id, item.title)}
+          />
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

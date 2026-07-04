@@ -6,12 +6,15 @@
 import useSWR from 'swr'
 import type {
   ChangeEvent,
+  ChangeFeedFilters,
   Competitor,
   Digest,
+  ItemCompetitorPrice,
   ItemObservation,
   ItemSearchResult,
   PriceIntelSummary,
   PricePushPreview,
+  ProductLink,
   ScrapeRun,
   ScrapeStatus,
   TrackedProduct,
@@ -73,13 +76,36 @@ export function useTrackedUrls() {
   return { urls: data ?? [], error, isLoading, mutate }
 }
 
-export function useChangeFeed(days: number = 14, unacknowledgedOnly: boolean = false) {
-  const params = new URLSearchParams({ days: String(days) })
-  if (unacknowledgedOnly) params.set('acknowledged', 'false')
+export function useChangeFeed(filters: ChangeFeedFilters = {}) {
+  const params = new URLSearchParams({ days: String(filters.days ?? 14) })
+  if (filters.unacknowledgedOnly) params.set('acknowledged', 'false')
+  if (filters.competitorId) params.set('competitor_id', filters.competitorId)
+  if (filters.eventTypes?.length) params.set('event_type', filters.eventTypes.join(','))
+  if (filters.minPct != null && filters.minPct > 0) params.set('min_pct', String(filters.minPct))
+  if (filters.brand) params.set('brand', filters.brand)
   const { data, error, isLoading, mutate } = useSWR<ChangeEvent[]>(
     `${baseUrl()}/api/price-intel/changes?${params}`, fetcher, swrConfig
   )
   return { events: data ?? [], error, isLoading, mutate }
+}
+
+export function useProductLinks(status: string | null = 'pending') {
+  const params = status ? `?status=${encodeURIComponent(status)}` : ''
+  const { data, error, isLoading, mutate } = useSWR<ProductLink[]>(
+    `${baseUrl()}/api/price-intel/links${params}`, fetcher, swrConfig
+  )
+  return { links: data ?? [], error, isLoading, mutate }
+}
+
+// Lazy: pass null until the row is expanded so only open rows query.
+export function useItemCompetitorPrices(itemId: string | null) {
+  const { data, error, isLoading } = useSWR<ItemCompetitorPrice[]>(
+    itemId
+      ? `${baseUrl()}/api/price-intel/tracked/${encodeURIComponent(itemId)}/competitors`
+      : null,
+    fetcher, swrConfig
+  )
+  return { prices: data ?? [], error, isLoading }
 }
 
 // Polls while a run is active so the "Scrape now" button shows live progress.

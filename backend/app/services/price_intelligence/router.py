@@ -1,6 +1,7 @@
 """API routes for the Price Intelligence page. Mounted by main.py only when
 PRICE_INTEL_ENABLED is on, so none of this (or its imports) exists in a disabled
 deployment."""
+import uuid
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
@@ -50,6 +51,8 @@ def get_summary():
         "price_index_vs_market_min": round(sum(index_vals) / len(index_vals), 3) if index_vals else None,
         "unacknowledged_changes": repository.count_unacknowledged_events(),
         "map_tracked_count": sum(1 for t in active if t.get("is_map")),
+        "upc_tracked_count": sum(1 for t in active if t.get("upc_normalized")),
+        "pending_links": repository.count_pending_links(),
         "last_run": runs[0] if runs else None,
         "scrape_status": scrape_runner.get_status(),
     }
@@ -95,12 +98,67 @@ def list_tracked_urls():
     return repository.get_tracked_urls()
 
 
+def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None):
+    """Pins the item (so its market columns can display) and records a confirmed
+    manual_url link so match precedence is uniform with catalog links."""
+    from . import seeding
+    try:
+        seeding.add_manual_tracked_product(str(item_id))
+    except ValueError:
+        pass  # not in the snapshot (archived item) — the URL still tracks it
+    now = repository.utcnow_iso()
+    repository.upsert_human_link({
+        "link_id": str(uuid.uuid4()),
+        "item_id": str(item_id),
+        "competitor_id": competitor_id,
+        "match_key": f"url:{url}",
+        "competitor_url": url,
+        "competitor_sku": None,
+        "competitor_title": label,
+        "gtin": None,
+        "level": "variant",
+        "status": "confirmed",
+        "source": "manual_url",
+        "confidence": 1.0,
+        "fuzzy_score": None,
+        "llm_verdict": None,
+        "llm_reason": None,
+        "our_price": None,
+        "their_price": None,
+        "decided_by": "Dashboard",
+        "created_at": now,
+        "updated_at": now,
+    })
+
+
 @router.post("/urls")
-def create_tracked_url(payload: Dict[str, Any]):
+def create_tracked_url(payload: Dict[str, Any], background_tasks: BackgroundTasks):
     url = (payload.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="url must start with http(s)://")
-    return {"status": "success", "url": repository.upsert_tracked_url(payload)}
+    row = repository.upsert_tracked_url(payload)
+    if payload.get("item_id"):
+        background_tasks.add_task(
+            _link_url_to_item, url, str(payload["item_id"]),
+            payload.get("competitor_id"), payload.get("label"),
+        )
+    return {"status": "success", "url": row}
+
+
+@router.put("/urls/{url_id}")
+def update_tracked_url(url_id: str, payload: Dict[str, Any], background_tasks: BackgroundTasks):
+    """Links a tracked URL to an item (or updates label/competitor)."""
+    rows = [u for u in repository.get_tracked_urls() if u.get("url_id") == url_id]
+    if not rows:
+        raise HTTPException(status_code=404, detail="Tracked URL not found")
+    repository.update_tracked_url(url_id, payload)
+    if payload.get("item_id"):
+        background_tasks.add_task(
+            _link_url_to_item, rows[0]["url"], str(payload["item_id"]),
+            payload.get("competitor_id") or rows[0].get("competitor_id"),
+            payload.get("label") or rows[0].get("label"),
+        )
+    return {"status": "success"}
 
 
 @router.delete("/urls/{url_id}")
@@ -136,10 +194,30 @@ def pin_item(payload: Dict[str, Any]):
     return {"status": "success"}
 
 
+@router.post("/tracked/pin-matrix")
+def pin_matrix(payload: Dict[str, Any]):
+    """Pins every variant of a matrix ("pin all variants" in the search picker)."""
+    matrix_id = payload.get("item_matrix_id")
+    if not matrix_id:
+        raise HTTPException(status_code=400, detail="item_matrix_id is required")
+    from . import seeding
+    try:
+        affected = seeding.add_manual_tracked_products_for_matrix(str(matrix_id))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"status": "success", "affected": affected}
+
+
 @router.put("/tracked/{item_id}")
 def update_tracked(item_id: str, payload: Dict[str, Any]):
     repository.update_tracked_product(item_id, payload)
     return {"status": "success"}
+
+
+@router.get("/tracked/{item_id}/competitors")
+def item_competitor_prices(item_id: str, days: int = 45):
+    """Per-store latest-price breakdown behind the aggregated market columns."""
+    return repository.get_item_competitor_prices(item_id, days=days)
 
 
 @router.get("/items/search")
@@ -147,6 +225,23 @@ def search_items(q: str):
     if not q or len(q.strip()) < 2:
         return []
     return repository.search_snapshot_items(q.strip())
+
+
+# --- product links / match review ------------------------------------------------
+
+@router.get("/links")
+def list_links(status: Optional[str] = None, item_id: Optional[str] = None,
+               limit: int = 500):
+    return repository.get_product_links(status=status, item_id=item_id, limit=limit)
+
+
+@router.post("/links/{link_id}/decision")
+def decide_link(link_id: str, payload: Dict[str, Any]):
+    status = payload.get("status")
+    if status not in ("confirmed", "rejected"):
+        raise HTTPException(status_code=400, detail="status must be confirmed or rejected")
+    repository.decide_link(link_id, status, decided_by=payload.get("actor") or "Dashboard")
+    return {"status": "success"}
 
 
 # --- scraping ------------------------------------------------------------------
@@ -174,8 +269,15 @@ def list_runs():
 # --- change feed (feature a) ----------------------------------------------------
 
 @router.get("/changes")
-def list_changes(days: int = 14, acknowledged: Optional[bool] = None, limit: int = 200):
-    return repository.get_change_events(days=days, acknowledged=acknowledged, limit=limit)
+def list_changes(days: int = 14, acknowledged: Optional[bool] = None,
+                 competitor_id: Optional[str] = None, event_type: Optional[str] = None,
+                 min_pct: Optional[float] = None, brand: Optional[str] = None,
+                 limit: int = 200):
+    event_types = [t.strip() for t in event_type.split(",") if t.strip()] if event_type else None
+    return repository.get_change_events(
+        days=days, acknowledged=acknowledged, competitor_id=competitor_id,
+        event_types=event_types, min_abs_pct=min_pct, brand=brand, limit=limit,
+    )
 
 
 @router.post("/changes/ack")

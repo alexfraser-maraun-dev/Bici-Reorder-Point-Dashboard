@@ -1,14 +1,20 @@
 'use client'
 
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import { cn } from '@/lib/utils'
-import { apiPost, useChangeFeed, usePriceIntelSummary } from '@/lib/price-intel/hooks'
+import {
+  apiPost, useChangeFeed, useCompetitors, usePriceIntelSummary, useTrackedProducts,
+} from '@/lib/price-intel/hooks'
 import type { ChangeEvent, ChangeEventType } from '@/lib/price-intel/types'
 import {
   ArrowDownRight,
@@ -89,8 +95,35 @@ function EventRow({ event, onAck }: { event: ChangeEvent; onAck: (id: string) =>
 
 export function ChangeFeed() {
   const [unreadOnly, setUnreadOnly] = useState(false)
-  const { events, isLoading, mutate } = useChangeFeed(14, unreadOnly)
+  const [competitorId, setCompetitorId] = useState<string>('all')
+  const [brand, setBrand] = useState<string>('all')
+  const [activeTypes, setActiveTypes] = useState<Set<ChangeEventType>>(new Set())
+  const [minPct, setMinPct] = useState<string>('')
+  const { competitors } = useCompetitors()
+  const { products } = useTrackedProducts()
+  const { events, isLoading, mutate } = useChangeFeed({
+    days: 14,
+    unacknowledgedOnly: unreadOnly,
+    competitorId: competitorId === 'all' ? null : competitorId,
+    brand: brand === 'all' ? null : brand,
+    eventTypes: activeTypes.size > 0 ? [...activeTypes] : undefined,
+    minPct: minPct.trim() === '' ? null : Number(minPct) || null,
+  })
   const { mutate: mutateSummary } = usePriceIntelSummary()
+
+  const brands = useMemo(
+    () => [...new Set(products.map((p) => p.brand).filter((b): b is string => !!b))].sort(),
+    [products]
+  )
+
+  const toggleType = (type: ChangeEventType) => {
+    setActiveTypes((prev) => {
+      const next = new Set(prev)
+      if (next.has(type)) next.delete(type)
+      else next.add(type)
+      return next
+    })
+  }
 
   const ack = async (ids: string[]) => {
     try {
@@ -122,6 +155,52 @@ export function ChangeFeed() {
                 Mark all read
               </Button>
             )}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Select value={competitorId} onValueChange={setCompetitorId}>
+            <SelectTrigger className="h-8 w-44 text-xs">
+              <SelectValue placeholder="Competitor" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All competitors</SelectItem>
+              {competitors.filter((c) => c.enabled).map((c) => (
+                <SelectItem key={c.competitor_id} value={c.competitor_id}>{c.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={brand} onValueChange={setBrand}>
+            <SelectTrigger className="h-8 w-40 text-xs">
+              <SelectValue placeholder="Brand" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All brands</SelectItem>
+              {brands.map((b) => (
+                <SelectItem key={b} value={b}>{b}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <div className="flex items-center gap-1 text-xs text-muted-foreground">
+            <span>min</span>
+            <Input value={minPct} onChange={(e) => setMinPct(e.target.value)}
+                   placeholder="0" inputMode="decimal" className="h-8 w-14 text-xs" />
+            <span>% change</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-1">
+            {(Object.keys(EVENT_META) as ChangeEventType[]).map((type) => {
+              const meta = EVENT_META[type]
+              const active = activeTypes.has(type)
+              return (
+                <button key={type} onClick={() => toggleType(type)}
+                        title={active ? 'Click to remove filter' : `Only show ${meta.label.toLowerCase()}`}>
+                  <Badge variant="outline"
+                         className={cn('cursor-pointer', active ? meta.tone : 'text-muted-foreground opacity-60')}>
+                    {meta.label}
+                  </Badge>
+                </button>
+              )
+            })}
           </div>
         </div>
         {isLoading ? (

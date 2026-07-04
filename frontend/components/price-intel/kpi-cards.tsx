@@ -4,7 +4,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import type { PriceIntelSummary } from '@/lib/price-intel/types'
-import { ArrowDown, ArrowUp, Bell, Gauge, ShieldCheck, Target } from 'lucide-react'
+import { ArrowDown, ArrowUp, Barcode, Bell, Gauge, ShieldCheck, Target } from 'lucide-react'
 
 function fmtIndex(value: number | null | undefined): string {
   if (value == null) return '—'
@@ -17,8 +17,8 @@ export function PriceIntelKpiCards({ summary, isLoading }: {
 }) {
   if (isLoading || !summary) {
     return (
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-        {Array.from({ length: 6 }).map((_, i) => (
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-7">
+        {Array.from({ length: 7 }).map((_, i) => (
           <Skeleton key={i} className="h-[86px] rounded-xl" />
         ))}
       </div>
@@ -69,10 +69,17 @@ export function PriceIntelKpiCards({ summary, isLoading }: {
       icon: ShieldCheck,
       tone: 'text-violet-600 bg-violet-50',
     },
+    {
+      label: 'UPC coverage',
+      value: `${summary.upc_tracked_count}/${summary.tracked_count}`,
+      sub: 'tracked items with a barcode',
+      icon: Barcode,
+      tone: 'text-slate-600 bg-slate-100',
+    },
   ]
 
   return (
-    <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+    <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-7">
       {cards.map((card) => (
         <Card key={card.label}>
           <CardContent className="p-4">

@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from . import config, repository
 from .connectors import PageScraper, build_connector, detect_connector_type
-from .matcher import MatchIndex
+from .matcher import MatchIndex, build_match_key
 
 _scrape_lock = threading.Lock()
 _status_lock = threading.Lock()
@@ -75,6 +75,7 @@ def _build_events(prev_map, obs, competitor_name, item_lookup):
         "competitor_name": competitor_name,
         "item_id": obs.get("match_item_id"),
         "item_title": (item or {}).get("title") or obs.get("competitor_title"),
+        "item_brand": (item or {}).get("brand"),
         "url": obs.get("url"),
         "acknowledged_at": None,
         "notified": False,
@@ -147,6 +148,52 @@ def _run(run_id: str, trigger: str):
         prev_map = repository.get_latest_observation_map()
         brand_tokens = sorted({(r.get("brand") or "") for r in item_lookup.values()} - {""})
 
+        # Candidate links for LLM/human verification. Collection is generous
+        # (competitor catalogs surface thousands of same-brand near-misses);
+        # the flush step keeps only the best-scoring few per item, up to the
+        # per-run pair cap, so the LLM sees quality candidates first. Keys that
+        # already have a row (incl. rejections) are never re-proposed.
+        MAX_COLLECTED_CANDIDATES = 5000
+        CANDIDATES_PER_ITEM = 5
+        existing_link_keys = repository.get_link_match_keys()
+        pending_links, gtin_links = [], []
+
+        def _propose_link(match_key, candidate, competitor_id, product, item_id=None,
+                          method=None, confidence=None):
+            """Buffers a link row: confirmed for gtin matches, pending for fuzzy
+            candidates. Skips keys already decided/proposed."""
+            if match_key in existing_link_keys:
+                return
+            existing_link_keys.add(match_key)
+            is_gtin = method == "gtin"
+            if not is_gtin and len(pending_links) >= MAX_COLLECTED_CANDIDATES:
+                return
+            target_id = item_id or candidate["item_id"]
+            item = item_lookup.get(str(target_id)) or {}
+            row = {
+                "link_id": str(uuid.uuid4()),
+                "item_id": str(target_id),
+                "competitor_id": competitor_id,
+                "match_key": match_key,
+                "competitor_url": product.get("url"),
+                "competitor_sku": product.get("sku"),
+                "competitor_title": product.get("title"),
+                "gtin": product.get("gtin"),
+                "level": "variant" if is_gtin else candidate["level"],
+                "status": "confirmed" if is_gtin else "pending",
+                "source": "gtin" if is_gtin else "llm",
+                "confidence": confidence if is_gtin else None,
+                "fuzzy_score": None if is_gtin else candidate["fuzzy_score"],
+                "llm_verdict": None,
+                "llm_reason": None,
+                "our_price": item.get("current_retail"),
+                "their_price": product.get("price"),
+                "decided_by": None,
+                "created_at": _now_iso(),
+                "updated_at": _now_iso(),
+            }
+            (gtin_links if is_gtin else pending_links).append(row)
+
         competitors = [c for c in repository.get_competitors() if c.get("enabled")]
         urls = repository.get_tracked_urls(include_disabled=False)
         _set_status(competitors_total=len(competitors), urls_total=len(urls))
@@ -170,7 +217,8 @@ def _run(run_id: str, trigger: str):
 
                 obs_buffer, event_buffer = [], []
                 for product in connector.iter_products():
-                    item_id, method, confidence = index.match(product)
+                    match_key = build_match_key(cid, product)
+                    item_id, method, confidence, candidate = index.match(product, match_key)
                     observed_at = _now_iso()
                     diff_key = (
                         f"cat:{cid}:"
@@ -194,9 +242,18 @@ def _run(run_id: str, trigger: str):
                         "currency": product.get("currency"),
                         "in_stock": product.get("in_stock"),
                     }
-                    # Only persist rows that matched (or carry a GTIN we may match
-                    # later) — storing entire foreign catalogs nightly is noise.
-                    if item_id is None and not product.get("gtin"):
+                    if method == "gtin":
+                        # Persist the exact match as a confirmed link so future
+                        # runs match even if the barcode later disappears.
+                        _propose_link(match_key, None, cid, product,
+                                      item_id=item_id, method="gtin", confidence=1.0)
+                    elif item_id is None and candidate is not None:
+                        _propose_link(match_key, candidate, cid, product)
+                    # Persist rows that matched, carry a GTIN we may match later,
+                    # or belong to a tracked brand (so misses are diagnosable and
+                    # verifiable) — storing entire foreign catalogs is noise.
+                    if (item_id is None and not product.get("gtin")
+                            and not index.has_brand(product.get("brand"))):
                         continue
                     obs_buffer.append(obs)
                     if item_id is not None:
@@ -235,7 +292,9 @@ def _run(run_id: str, trigger: str):
                     item_id = str(url_row["item_id"]) if url_row.get("item_id") else None
                     method, confidence = ("manual_url", 1.0) if item_id else (None, 0.0)
                     if not item_id:
-                        item_id, method, confidence = index.match(parsed)
+                        item_id, method, confidence, _cand = index.match(
+                            parsed, f"url:{url}"
+                        )
                     obs = {
                         "observed_at": _now_iso(),
                         "run_id": run_id,
@@ -270,6 +329,31 @@ def _run(run_id: str, trigger: str):
         _set_status(observations=counters["observations"], changes=counters["changes"])
 
         repository.invalidate_pi_caches()
+
+        # --- match verification: flush candidate links, then LLM-verify ------
+        _set_status(phase="verifying matches")
+        try:
+            # Best candidates first: highest fuzzy score, at most a handful per
+            # item, capped at the per-run LLM budget. The rest are re-proposed
+            # on later nights (their match_keys were never written).
+            pending_links.sort(key=lambda r: r.get("fuzzy_score") or 0, reverse=True)
+            selected, per_item = [], {}
+            for row in pending_links:
+                if len(selected) >= config.MATCH_MAX_PAIRS_PER_RUN:
+                    break
+                n = per_item.get(row["item_id"], 0)
+                if n >= CANDIDATES_PER_ITEM:
+                    continue
+                per_item[row["item_id"]] = n + 1
+                selected.append(row)
+            repository.insert_product_links(gtin_links + selected)
+            if selected:
+                from . import match_verifier
+                stats = match_verifier.verify_candidates()
+                print(f"pi: match verification: {stats}")
+        except Exception as e:
+            errors.append(f"match verification: {e}")
+            print(f"pi: match verification failed: {e}")
 
         # --- LLM digest: best-effort, never fails the run --------------------
         _set_status(phase="generating digest")
