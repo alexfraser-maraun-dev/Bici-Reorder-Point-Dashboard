@@ -11,13 +11,21 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table'
 import { cn } from '@/lib/utils'
-import { apiPost, useItemCompetitorPrices, useTrackedProducts } from '@/lib/price-intel/hooks'
+import {
+  apiPost, useCompetitors, useItemCompetitorPrices, useTrackedProducts,
+} from '@/lib/price-intel/hooks'
 import type { ItemSearchResult, TrackedProduct } from '@/lib/price-intel/types'
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog'
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import { PricePushDialog } from './price-push-dialog'
 import { ItemSearchPicker } from './item-search-picker'
 import {
-  ChevronDown, ChevronRight, DollarSign, ExternalLink, EyeOff, Pin, PinOff,
-  RefreshCw, Search, ShieldCheck, Undo2,
+  ChevronDown, ChevronRight, DollarSign, ExternalLink, EyeOff, Link2, Pin,
+  PinOff, RefreshCw, Search, ShieldCheck, Undo2,
 } from 'lucide-react'
 
 const fmt = (v: number | null | undefined) => (v == null ? '—' : `$${Number(v).toFixed(2)}`)
@@ -119,6 +127,38 @@ export function TrackedProductsTable() {
   const [pushTarget, setPushTarget] = useState<TrackedProduct | null>(null)
   const [reseeding, setReseeding] = useState(false)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const { competitors } = useCompetitors()
+  const [overrideTarget, setOverrideTarget] = useState<TrackedProduct | null>(null)
+  const [overrideUrl, setOverrideUrl] = useState('')
+  const [overrideCompetitor, setOverrideCompetitor] = useState<string>('none')
+  const [savingOverride, setSavingOverride] = useState(false)
+
+  const saveOverride = async () => {
+    if (!overrideTarget) return
+    const url = overrideUrl.trim()
+    if (!/^https?:\/\//.test(url)) {
+      toast.error('Enter a full product URL (https://…)')
+      return
+    }
+    setSavingOverride(true)
+    try {
+      await apiPost('/api/price-intel/urls', {
+        url,
+        item_id: overrideTarget.item_id,
+        competitor_id: overrideCompetitor === 'none' ? null : overrideCompetitor,
+        label: overrideTarget.title,
+      })
+      toast.success('Match locked in — this URL is now the source of truth for this store')
+      setOverrideTarget(null)
+      setOverrideUrl('')
+      setOverrideCompetitor('none')
+      await mutate()
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to save match')
+    } finally {
+      setSavingOverride(false)
+    }
+  }
 
   const visible = useMemo(() => {
     const q = filter.trim().toLowerCase()
@@ -205,7 +245,7 @@ export function TrackedProductsTable() {
             <div className="flex items-center gap-2">
               <h3 className="text-sm font-semibold">Tracked products</h3>
               <span className="text-xs text-muted-foreground">
-                top-revenue auto-seed + pinned items
+                items tagged &lsquo;track&rsquo; in Lightspeed + pinned items
               </span>
             </div>
             <div className="flex flex-wrap items-center gap-2">
@@ -236,7 +276,7 @@ export function TrackedProductsTable() {
             <Skeleton className="h-64 rounded-lg" />
           ) : visible.length === 0 ? (
             <p className="py-8 text-center text-sm text-muted-foreground">
-              Nothing tracked yet — hit “Re-seed list” to pull the top-revenue SKUs.
+              Nothing tracked yet — tag items &lsquo;track&rsquo; in Lightspeed, then hit “Re-seed list”.
             </p>
           ) : (
             <Table>
@@ -295,6 +335,11 @@ export function TrackedProductsTable() {
                       <TableCell className="text-right tabular-nums">{p.competitor_count ?? 0}</TableCell>
                       <TableCell>
                         <div className="flex items-center justify-end gap-0.5">
+                          <Button variant="ghost" size="sm"
+                                  title="Link the competitor URL that truly matches this item"
+                                  onClick={() => setOverrideTarget(p)}>
+                            <Link2 className="h-4 w-4 text-muted-foreground" />
+                          </Button>
                           <Button variant="ghost" size="sm" title="Push price to Lightspeed"
                                   onClick={() => setPushTarget(p)} disabled={p.excluded}>
                             <DollarSign className="h-4 w-4" />
@@ -337,6 +382,42 @@ export function TrackedProductsTable() {
         onOpenChange={(open) => !open && setPushTarget(null)}
         onPushed={() => mutate()}
       />
+
+      <Dialog open={overrideTarget !== null}
+              onOpenChange={(open) => !open && setOverrideTarget(null)}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Link the true competitor match</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            Paste the competitor product page that matches{' '}
+            <span className="font-medium text-foreground">{overrideTarget?.title}</span>.
+            It becomes the permanent source of truth for that store — any wrong
+            auto-matches there are rejected, and future scrapes check this URL directly.
+          </p>
+          <div className="space-y-2">
+            <Input placeholder="https://store.example.com/products/…" value={overrideUrl}
+                   onChange={(e) => setOverrideUrl(e.target.value)}
+                   onKeyDown={(e) => e.key === 'Enter' && saveOverride()} />
+            <div className="flex items-center gap-2">
+              <Select value={overrideCompetitor} onValueChange={setOverrideCompetitor}>
+                <SelectTrigger className="w-56">
+                  <SelectValue placeholder="Competitor (optional)" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">Detect from URL</SelectItem>
+                  {competitors.filter((c) => c.enabled).map((c) => (
+                    <SelectItem key={c.competitor_id} value={c.competitor_id}>{c.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button size="sm" onClick={saveOverride} disabled={savingOverride}>
+                <Link2 className="h-4 w-4" /> Lock in match
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

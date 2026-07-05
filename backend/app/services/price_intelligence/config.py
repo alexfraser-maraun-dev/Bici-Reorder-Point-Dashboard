@@ -32,11 +32,20 @@ MAX_CATALOG_PAGES = int(os.getenv("PI_MAX_CATALOG_PAGES", "40"))
 MAX_HTML_PRODUCT_PAGES = int(os.getenv("PI_MAX_HTML_PRODUCT_PAGES", "300"))
 FLUSH_ROWS = int(os.getenv("PI_FLUSH_ROWS", "2000"))
 
-# Comparison-list seeding.
+# Comparison-list seeding. 'track_tag' seeds from items tagged (default) in
+# Lightspeed; 'top_revenue' is the old top-N-by-90d-revenue behavior. Untagged
+# items are archived (kept with all their history), never deleted.
+SEED_MODE = os.getenv("PI_SEED_MODE", "track_tag").strip().lower()
+TRACK_TAG = os.getenv("PI_TRACK_TAG", "track").strip().lower()
 TOP_REVENUE_COUNT = int(os.getenv("PI_TOP_REVENUE_COUNT", "100"))
 # Optional: restrict auto-seeding to items that have a UPC/EAN. Off by default —
 # competitor catalogs rarely expose barcodes, so this mostly shrinks coverage.
 REQUIRE_UPC = _flag("PI_REQUIRE_UPC")
+
+# Targeted scraping: nightly runs only re-check confirmed-link URLs unless some
+# active item activated within this window still has no confirmed match — only
+# then does a full catalog crawl (and its LLM verification) run.
+DISCOVERY_DAYS = int(os.getenv("PI_DISCOVERY_DAYS", "7"))
 
 # Price-push floor: never suggest/allow (without explicit override) a price below
 # cost * (1 + this margin). MAP price and per-item overrides take precedence when set.

@@ -99,13 +99,22 @@ def list_tracked_urls():
 
 
 def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None):
-    """Pins the item (so its market columns can display) and records a confirmed
-    manual_url link so match precedence is uniform with catalog links."""
+    """Records a confirmed manual_url link and tombstones any conflicting
+    auto-matches for the same item at the same store — the human-provided URL is
+    the truth. Items not already actively tracked get pinned so their market
+    data displays; items tracked via the 'track' tag are left tag-governed
+    (removing the tag still archives them)."""
+    from urllib.parse import urlparse
     from . import seeding
-    try:
-        seeding.add_manual_tracked_product(str(item_id))
-    except ValueError:
-        pass  # not in the snapshot (archived item) — the URL still tracks it
+    active_ids = {str(r["item_id"]) for r in repository.get_tracked_products()}
+    if str(item_id) not in active_ids:
+        try:
+            seeding.add_manual_tracked_product(str(item_id))
+        except ValueError:
+            pass  # not in the snapshot (archived in LS) — the URL still tracks it
+    domain = urlparse(url).netloc
+    if domain:
+        repository.reject_conflicting_links(str(item_id), domain)
     now = repository.utcnow_iso()
     repository.upsert_human_link({
         "link_id": str(uuid.uuid4()),
@@ -136,6 +145,14 @@ def create_tracked_url(payload: Dict[str, Any], background_tasks: BackgroundTask
     url = (payload.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="url must start with http(s)://")
+    if not payload.get("competitor_id"):
+        # Infer the competitor from the URL's domain when possible.
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.lower().removeprefix("www.")
+        for c in repository.get_competitors(include_disabled=False):
+            if domain and domain in c["base_url"].lower():
+                payload["competitor_id"] = c["competitor_id"]
+                break
     row = repository.upsert_tracked_url(payload)
     if payload.get("item_id"):
         background_tasks.add_task(
@@ -247,10 +264,12 @@ def decide_link(link_id: str, payload: Dict[str, Any]):
 # --- scraping ------------------------------------------------------------------
 
 @router.post("/scrape")
-def trigger_scrape(x_scrape_token: Optional[str] = Header(default=None)):
+def trigger_scrape(full: bool = False, x_scrape_token: Optional[str] = Header(default=None)):
+    """full=true forces a whole-catalog crawl; otherwise the run is targeted
+    (confirmed-link URLs only) unless new items still need catalog discovery."""
     if config.REQUIRE_SCRAPE_TOKEN and x_scrape_token != config.SCRAPE_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid scrape token")
-    run_id = scrape_runner.start_scrape(trigger="manual")
+    run_id = scrape_runner.start_scrape(trigger="manual", full=full)
     if run_id is None:
         raise HTTPException(status_code=409, detail="A scrape run is already in progress")
     return {"status": "started", "run_id": run_id}

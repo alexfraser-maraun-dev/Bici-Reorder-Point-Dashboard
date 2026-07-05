@@ -194,6 +194,10 @@ def ensure_pi_tables():
             "attribute_1": "STRING",
             "attribute_2": "STRING",
             "attribute_3": "STRING",
+            # archived = no longer tag-tracked; row (and all its observations,
+            # links, events) is retained and reactivates if the tag returns.
+            "archived": "BOOL",
+            "activated_at": "TIMESTAMP",
         })
         _ensure_columns(client, T_EVENTS, {"item_brand": "STRING"})
         _tables_ensured = True
@@ -450,9 +454,11 @@ def mark_url_scraped(url_id: str, status: str):
 # Tracked products (feature b)
 # ---------------------------------------------------------------------------
 
-def get_tracked_products(include_excluded: bool = True):
+def get_tracked_products(include_excluded: bool = True, include_archived: bool = False):
     ensure_pi_tables()
     rows = _rows(f"SELECT * FROM `{T_TRACKED}` ORDER BY revenue_rank")
+    if not include_archived:
+        rows = [r for r in rows if not r.get("archived")]
     if not include_excluded:
         rows = [r for r in rows if not r.get("excluded")]
     return rows
@@ -498,6 +504,7 @@ def get_tracked_products_with_market(days: int = 7):
                m.competitor_count, m.last_observed_at
         FROM `{T_TRACKED}` t
         LEFT JOIN market m ON m.group_key = COALESCE(t.item_matrix_id, t.item_id)
+        WHERE COALESCE(t.archived, FALSE) = FALSE
         ORDER BY t.revenue_rank
     """, params=[bigquery.ScalarQueryParameter("days", "INT64", days)])
     _cache_set(cache_key, rows)
@@ -841,6 +848,26 @@ def decide_link(link_id: str, status: str, decided_by: str = "Dashboard"):
             bigquery.ScalarQueryParameter("status", "STRING", status),
             bigquery.ScalarQueryParameter("actor", "STRING", decided_by),
             bigquery.ScalarQueryParameter("lid", "STRING", str(link_id)),
+        ]),
+    ).result()
+    invalidate_pi_caches()
+
+
+def reject_conflicting_links(item_id: str, domain: str, decided_by: str = "Dashboard"):
+    """When a human pins the true URL for an item at a store, tombstone any
+    auto-created (gtin/llm) links for the same item at the same domain so the
+    wrong match can't resurface."""
+    ensure_pi_tables()
+    get_bq_client().query(
+        f"UPDATE `{T_LINKS}` SET status = 'rejected', decided_by = @actor, "
+        "updated_at = CURRENT_TIMESTAMP() "
+        "WHERE item_id = @item_id AND source IN ('gtin', 'llm') "
+        "AND status IN ('confirmed', 'pending') "
+        "AND STRPOS(COALESCE(competitor_url, ''), @domain) > 0",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("actor", "STRING", decided_by),
+            bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
+            bigquery.ScalarQueryParameter("domain", "STRING", domain),
         ]),
     ).result()
     invalidate_pi_caches()

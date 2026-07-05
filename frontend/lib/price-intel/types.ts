@@ -107,6 +107,8 @@ export interface ScrapeStatus {
   competitors_total?: number
   urls_done?: number
   urls_total?: number
+  links_done?: number
+  links_total?: number
   observations?: number
   changes?: number
   errors?: string[]

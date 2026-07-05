@@ -111,7 +111,7 @@ class MatchIndex:
         self.brands = set()
         seen_matrices = set()
         for row in tracked_rows:
-            if row.get("excluded"):
+            if row.get("excluded") or row.get("archived"):
                 continue
             item_id = str(row["item_id"])
             self.items[item_id] = row

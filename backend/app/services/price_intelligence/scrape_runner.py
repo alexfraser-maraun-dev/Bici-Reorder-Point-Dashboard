@@ -14,7 +14,7 @@ one page of products plus the small diff/match dicts.
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from . import config, repository
@@ -38,8 +38,12 @@ def _set_status(**fields):
         _status.update(fields)
 
 
-def start_scrape(trigger: str = "manual"):
-    """Starts a run on a daemon thread. Returns run_id, or None if one is running."""
+def start_scrape(trigger: str = "manual", full: bool = False):
+    """Starts a run on a daemon thread. Returns run_id, or None if one is running.
+
+    full=True forces a whole-catalog crawl; otherwise the run is targeted
+    (confirmed-link URLs only) unless recently activated items still need
+    catalog discovery."""
     if not _scrape_lock.acquire(blocking=False):
         return None
     run_id = str(uuid.uuid4())
@@ -50,10 +54,38 @@ def start_scrape(trigger: str = "manual"):
             "phase": "starting", "started_at": repository.utcnow_iso(),
             "competitors_done": 0, "competitors_total": 0,
             "urls_done": 0, "urls_total": 0,
+            "links_done": 0, "links_total": 0,
             "observations": 0, "changes": 0, "errors": [],
         })
-    threading.Thread(target=_run, args=(run_id, trigger), daemon=True).start()
+    threading.Thread(target=_run, args=(run_id, trigger, full), daemon=True).start()
     return run_id
+
+
+def _needs_catalog_discovery(item_lookup: dict, confirmed_links: list, urls: list) -> list:
+    """Active items still inside the discovery window with no confirmed link and
+    no linked tracked URL — the trigger for a full catalog crawl."""
+    linked_items = {str(l["item_id"]) for l in confirmed_links if l.get("item_id")}
+    linked_items |= {str(u["item_id"]) for u in urls if u.get("item_id")}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=config.DISCOVERY_DAYS)
+    needy = []
+    for item_id, row in item_lookup.items():
+        if item_id in linked_items:
+            continue
+        activated = row.get("activated_at")
+        if activated is None:
+            needy.append(item_id)  # legacy row without a timestamp: keep hunting
+            continue
+        if isinstance(activated, str):
+            try:
+                activated = datetime.fromisoformat(activated.replace("Z", "+00:00"))
+            except ValueError:
+                needy.append(item_id)
+                continue
+        if activated.tzinfo is None:
+            activated = activated.replace(tzinfo=timezone.utc)
+        if activated >= cutoff:
+            needy.append(item_id)
+    return needy
 
 
 def _now_iso():
@@ -127,7 +159,7 @@ def _build_events(prev_map, obs, competitor_name, item_lookup):
     return events
 
 
-def _run(run_id: str, trigger: str):
+def _run(run_id: str, trigger: str, force_full: bool = False):
     started_at = _now_iso()
     counters = {"competitors_done": 0, "urls_done": 0, "observations": 0, "changes": 0}
     errors = []
@@ -198,8 +230,16 @@ def _run(run_id: str, trigger: str):
         urls = repository.get_tracked_urls(include_disabled=False)
         _set_status(competitors_total=len(competitors), urls_total=len(urls))
 
+        # --- full catalog crawl vs targeted (confirmed URLs only)? ----------
+        confirmed_links = repository.get_product_links(status="confirmed", limit=5000)
+        needy = _needs_catalog_discovery(item_lookup, confirmed_links, urls)
+        full_scan = force_full or bool(needy) or not (confirmed_links or urls)
+        print(f"pi: run mode = {'full catalog' if full_scan else 'targeted'} "
+              f"(forced={force_full}, items needing discovery={len(needy)}, "
+              f"confirmed links={len(confirmed_links)})")
+
         # --- catalog scrape, one competitor at a time -----------------------
-        for competitor in competitors:
+        for competitor in competitors if full_scan else []:
             cid = competitor["competitor_id"]
             _set_status(phase=f"scraping {competitor['name']}")
             comp_status = "success"
@@ -277,11 +317,66 @@ def _run(run_id: str, trigger: str):
             _set_status(competitors_done=counters["competitors_done"],
                         observations=counters["observations"], changes=counters["changes"])
 
+        # --- targeted mode: re-check each confirmed link's URL ---------------
+        scraper = PageScraper()
+        competitor_names = {c["competitor_id"]: c["name"] for c in repository.get_competitors()}
+        if not full_scan:
+            # Tracked-URL rows are scraped in their own phase below; skip links
+            # that would fetch the same page twice.
+            tracked_url_set = {u["url"] for u in urls}
+            link_targets = [
+                l for l in confirmed_links
+                if l.get("competitor_url") and l.get("item_id")
+                and str(l["item_id"]) in item_lookup
+                and l["competitor_url"] not in tracked_url_set
+            ]
+            _set_status(phase="scraping confirmed links", links_total=len(link_targets))
+            obs_buffer, event_buffer = [], []
+            links_done, per_competitor = 0, {}
+            for link in link_targets:
+                try:
+                    parsed = scraper.fetch(link["competitor_url"])
+                    if parsed is not None and parsed.get("price") is not None:
+                        obs = {
+                            "observed_at": _now_iso(),
+                            "run_id": run_id,
+                            "source": "link",
+                            "diff_key": f"link:{link['link_id']}",
+                            "competitor_id": link.get("competitor_id"),
+                            "url": link["competitor_url"],
+                            "competitor_title": parsed.get("title") or link.get("competitor_title"),
+                            "competitor_sku": parsed.get("sku") or link.get("competitor_sku"),
+                            "gtin": parsed.get("gtin") or link.get("gtin"),
+                            "match_item_id": str(link["item_id"]),
+                            "match_method": "link",
+                            "match_confidence": link.get("confidence"),
+                            "price": parsed.get("price"),
+                            "compare_at_price": parsed.get("compare_at_price"),
+                            "currency": parsed.get("currency"),
+                            "in_stock": parsed.get("in_stock"),
+                        }
+                        obs_buffer.append(obs)
+                        name = (competitor_names.get(link.get("competitor_id"))
+                                or urlparse_domain(link["competitor_url"]))
+                        event_buffer.extend(_build_events(prev_map, obs, name, item_lookup))
+                        cid = link.get("competitor_id")
+                        if cid:
+                            per_competitor[cid] = per_competitor.get(cid, 0) + 1
+                except Exception as e:
+                    errors.append(f"link {link['competitor_url']}: {e}")
+                links_done += 1
+                _set_status(links_done=links_done)
+            repository.load_rows(repository.T_OBSERVATIONS, obs_buffer)
+            counters["observations"] += len(obs_buffer)
+            repository.load_rows(repository.T_EVENTS, event_buffer)
+            counters["changes"] += sum(1 for e in event_buffer if not e["acknowledged"])
+            _set_status(observations=counters["observations"], changes=counters["changes"])
+            for cid, n in per_competitor.items():
+                repository.mark_competitor_scraped(cid, f"targeted ({n} links)")
+
         # --- tracked URLs (feature a) ---------------------------------------
         _set_status(phase="scraping tracked URLs")
-        scraper = PageScraper()
         obs_buffer, event_buffer = [], []
-        competitor_names = {c["competitor_id"]: c["name"] for c in repository.get_competitors()}
         for url_row in urls:
             url = url_row["url"]
             try:

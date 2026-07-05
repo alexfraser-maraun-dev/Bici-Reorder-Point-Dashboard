@@ -1,14 +1,18 @@
-"""Seeds pi_tracked_products from the top-revenue SKUs (feature b).
+"""Seeds pi_tracked_products (feature b).
 
-Source is the latest master-snapshot date (the view is a daily per-item+shop
-series — aggregating without the date filter inflates revenue by the number of
-snapshot dates) joined to item_history for UPC/EAN, which the snapshot lacks.
+Two modes (PI_SEED_MODE): 'track_tag' (default) tracks exactly the items tagged
+with the Lightspeed `track` item tag; 'top_revenue' is the legacy top-N-by-90d-
+revenue behavior. Source is the latest master-snapshot date (the view is a daily
+per-item+shop series — aggregating without the date filter inflates revenue by
+the number of snapshot dates) joined to item_history for UPC/EAN + matrix, which
+the snapshot lacks.
 
 The MERGE refreshes descriptive/market fields but never touches the manual
-controls (pinned / excluded / min_price_override / map_price). Auto-seeded rows
-that fall out of the top N are deleted unless pinned or excluded; manual rows are
-always kept. is_map comes from the Lightspeed `map` item tag (comma-separated in
-item_tags) — harmlessly false everywhere until that tagging effort lands.
+controls (pinned / excluded / min_price_override / map_price). Items that fall
+out of the seed set are ARCHIVED, never deleted — their observations, links, and
+events stay put, and removing/re-adding the tag toggles tracking with history
+intact (a reactivation restarts the discovery window via activated_at). is_map
+comes from the Lightspeed `map` item tag (comma-separated in item_tags).
 """
 from google.cloud import bigquery
 
@@ -17,7 +21,146 @@ from . import config, repository
 
 
 def refresh_tracked_products(top_n: int = None) -> int:
-    """Runs the seed query and MERGEs into pi_tracked_products. Returns the
+    if config.SEED_MODE == "track_tag":
+        return refresh_from_track_tag()
+    return refresh_from_top_revenue(top_n)
+
+
+def refresh_from_track_tag() -> int:
+    """Seeds from items carrying the `track` tag. Returns the number of tagged
+    items, or 0 (no-op) when none are found — an empty tag set is treated as a
+    sync glitch rather than an instruction to archive everything."""
+    repository.ensure_pi_tables()
+    client = get_bq_client()
+    tag_filter = (
+        "REGEXP_CONTAINS(LOWER(COALESCE(item_tags, '')), "
+        "CONCAT(r'(^|,)\\s*', @tag, r'\\s*(,|$)'))"
+    )
+    params = [bigquery.ScalarQueryParameter("tag", "STRING", config.TRACK_TAG)]
+
+    count_rows = [dict(r) for r in client.query(f"""
+        WITH latest AS (
+            SELECT MAX(snapshot_date_local) AS d
+            FROM `{LS_DATASET}.v_master_snapshot_latest`
+        )
+        SELECT COUNT(DISTINCT item_id) AS n
+        FROM `{LS_DATASET}.v_master_snapshot_latest` s CROSS JOIN latest
+        WHERE s.snapshot_date_local = latest.d AND {tag_filter}
+    """, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()]
+    tagged = count_rows[0]["n"] if count_rows else 0
+    if not tagged:
+        print(f"pi: no items carry the '{config.TRACK_TAG}' tag — keeping the "
+              "current tracked list unchanged")
+        return 0
+
+    seed_query = f"""
+        WITH latest AS (
+            SELECT MAX(snapshot_date_local) AS d
+            FROM `{LS_DATASET}.v_master_snapshot_latest`
+        ),
+        item_hist AS (
+            SELECT
+                CAST(id AS STRING) AS item_id,
+                COALESCE(NULLIF(upc, ''), NULLIF(ean, '')) AS raw_upc,
+                CAST(NULLIF(item_matrix_id, 0) AS STRING) AS item_matrix_id,
+                attribute_1, attribute_2, attribute_3
+            FROM `{LS_DATASET}.item_history`
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        matrix AS (
+            SELECT CAST(id AS STRING) AS matrix_id, description AS matrix_description
+            FROM `{LS_DATASET}.item_matrix_history`
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        snap AS (
+            SELECT
+                CAST(item_id AS STRING) AS item_id,
+                ANY_VALUE(COALESCE(product_display_name, item_description)) AS title,
+                ANY_VALUE(brand_name) AS brand,
+                ANY_VALUE(manufacturer_sku) AS sku,
+                ANY_VALUE(CAST(system_sku AS STRING)) AS system_sku,
+                MAX(item_current_price) AS current_retail,
+                MAX(COALESCE(item_default_cost, item_avg_cost)) AS current_cost,
+                SUM(COALESCE(sales_revenue_l90d, 0)) AS trailing_revenue_90d,
+                LOGICAL_OR(REGEXP_CONTAINS(
+                    LOWER(COALESCE(item_tags, '')), r'(^|,)\\s*map\\s*(,|$)'
+                )) AS is_map
+            FROM `{LS_DATASET}.v_master_snapshot_latest` s
+            CROSS JOIN latest
+            WHERE s.snapshot_date_local = latest.d
+              AND COALESCE(item_archived, FALSE) = FALSE
+              AND {tag_filter}
+            GROUP BY item_id
+        )
+        SELECT
+            s.item_id, s.title, s.brand, s.sku, s.system_sku,
+            NULLIF(LTRIM(REGEXP_REPLACE(COALESCE(u.raw_upc, ''), r'\\D', ''), '0'), '')
+                AS upc_normalized,
+            s.current_retail, s.current_cost, s.trailing_revenue_90d, s.is_map,
+            u.item_matrix_id, m.matrix_description,
+            u.attribute_1, u.attribute_2, u.attribute_3,
+            ROW_NUMBER() OVER (ORDER BY s.trailing_revenue_90d DESC) AS revenue_rank
+        FROM snap s
+        LEFT JOIN item_hist u USING (item_id)
+        LEFT JOIN matrix m ON m.matrix_id = u.item_matrix_id
+    """
+
+    merge_query = f"""
+        MERGE `{repository.T_TRACKED}` T
+        USING ({seed_query}) S
+        ON T.item_id = S.item_id
+        WHEN MATCHED THEN UPDATE SET
+            T.title = S.title,
+            T.brand = S.brand,
+            T.sku = S.sku,
+            T.system_sku = S.system_sku,
+            T.upc_normalized = S.upc_normalized,
+            T.current_retail = S.current_retail,
+            T.current_cost = S.current_cost,
+            T.trailing_revenue_90d = S.trailing_revenue_90d,
+            T.revenue_rank = S.revenue_rank,
+            T.is_map = S.is_map,
+            T.item_matrix_id = S.item_matrix_id,
+            T.matrix_description = S.matrix_description,
+            T.attribute_1 = S.attribute_1,
+            T.attribute_2 = S.attribute_2,
+            T.attribute_3 = S.attribute_3,
+            T.source = 'track_tag',
+            -- reactivation restarts the discovery window
+            T.activated_at = IF(COALESCE(T.archived, FALSE),
+                                CURRENT_TIMESTAMP(),
+                                COALESCE(T.activated_at, CURRENT_TIMESTAMP())),
+            T.archived = FALSE,
+            T.updated_at = CURRENT_TIMESTAMP()
+        WHEN NOT MATCHED THEN INSERT (
+            item_id, sku, system_sku, upc_normalized, brand, title, source,
+            pinned, excluded, revenue_rank, trailing_revenue_90d,
+            current_retail, current_cost, min_price_override, is_map, map_price,
+            item_matrix_id, matrix_description, attribute_1, attribute_2,
+            attribute_3, archived, activated_at, updated_at
+        ) VALUES (
+            S.item_id, S.sku, S.system_sku, S.upc_normalized, S.brand, S.title,
+            'track_tag', FALSE, FALSE, S.revenue_rank,
+            S.trailing_revenue_90d, S.current_retail, S.current_cost,
+            NULL, S.is_map, NULL, S.item_matrix_id, S.matrix_description,
+            S.attribute_1, S.attribute_2, S.attribute_3, FALSE,
+            CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+        )
+        WHEN NOT MATCHED BY SOURCE
+            AND T.source IN ('auto_top_revenue', 'track_tag')
+            AND COALESCE(T.pinned, FALSE) = FALSE
+            AND COALESCE(T.archived, FALSE) = FALSE
+        THEN UPDATE SET T.archived = TRUE, T.updated_at = CURRENT_TIMESTAMP()
+    """
+    client.query(
+        merge_query, job_config=bigquery.QueryJobConfig(query_parameters=params)
+    ).result()
+    repository.invalidate_pi_caches()
+    return tagged
+
+
+def refresh_from_top_revenue(top_n: int = None) -> int:
+    """Legacy mode: seeds from the top-N 90d-revenue items. Returns the
     number of source rows."""
     repository.ensure_pi_tables()
     top_n = top_n or config.TOP_REVENUE_COUNT
@@ -98,25 +241,31 @@ def refresh_tracked_products(top_n: int = None) -> int:
             T.attribute_1 = S.attribute_1,
             T.attribute_2 = S.attribute_2,
             T.attribute_3 = S.attribute_3,
+            T.activated_at = IF(COALESCE(T.archived, FALSE),
+                                CURRENT_TIMESTAMP(),
+                                COALESCE(T.activated_at, CURRENT_TIMESTAMP())),
+            T.archived = FALSE,
             T.updated_at = CURRENT_TIMESTAMP()
         WHEN NOT MATCHED THEN INSERT (
             item_id, sku, system_sku, upc_normalized, brand, title, source,
             pinned, excluded, revenue_rank, trailing_revenue_90d,
             current_retail, current_cost, min_price_override, is_map, map_price,
             item_matrix_id, matrix_description, attribute_1, attribute_2,
-            attribute_3, updated_at
+            attribute_3, archived, activated_at, updated_at
         ) VALUES (
             S.item_id, S.sku, S.system_sku, S.upc_normalized, S.brand, S.title,
             'auto_top_revenue', FALSE, FALSE, S.revenue_rank,
             S.trailing_revenue_90d, S.current_retail, S.current_cost,
             NULL, S.is_map, NULL, S.item_matrix_id, S.matrix_description,
-            S.attribute_1, S.attribute_2, S.attribute_3, CURRENT_TIMESTAMP()
+            S.attribute_1, S.attribute_2, S.attribute_3, FALSE,
+            CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
         )
         WHEN NOT MATCHED BY SOURCE
             AND T.source = 'auto_top_revenue'
             AND COALESCE(T.pinned, FALSE) = FALSE
             AND COALESCE(T.excluded, FALSE) = FALSE
-        THEN DELETE
+            AND COALESCE(T.archived, FALSE) = FALSE
+        THEN UPDATE SET T.archived = TRUE, T.updated_at = CURRENT_TIMESTAMP()
     """
     job_config = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ScalarQueryParameter("top_n", "INT64", int(top_n)),
@@ -191,19 +340,24 @@ def _manual_pin_merge(where_source: str, params: list) -> int:
             T.attribute_1 = S.attribute_1,
             T.attribute_2 = S.attribute_2,
             T.attribute_3 = S.attribute_3,
+            T.activated_at = IF(COALESCE(T.archived, FALSE),
+                                CURRENT_TIMESTAMP(),
+                                COALESCE(T.activated_at, CURRENT_TIMESTAMP())),
+            T.archived = FALSE,
             T.updated_at = CURRENT_TIMESTAMP()
         WHEN NOT MATCHED THEN INSERT (
             item_id, sku, system_sku, upc_normalized, brand, title, source,
             pinned, excluded, revenue_rank, trailing_revenue_90d,
             current_retail, current_cost, min_price_override, is_map, map_price,
             item_matrix_id, matrix_description, attribute_1, attribute_2,
-            attribute_3, updated_at
+            attribute_3, archived, activated_at, updated_at
         ) VALUES (
             S.item_id, S.sku, S.system_sku, S.upc_normalized, S.brand, S.title,
             'manual', TRUE, FALSE, NULL, S.trailing_revenue_90d,
             S.current_retail, S.current_cost, NULL, S.is_map, NULL,
             S.item_matrix_id, S.matrix_description, S.attribute_1,
-            S.attribute_2, S.attribute_3, CURRENT_TIMESTAMP()
+            S.attribute_2, S.attribute_3, FALSE, CURRENT_TIMESTAMP(),
+            CURRENT_TIMESTAMP()
         )
     """
     job_config = bigquery.QueryJobConfig(query_parameters=params)
