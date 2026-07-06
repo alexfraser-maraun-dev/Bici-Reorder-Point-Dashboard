@@ -175,6 +175,8 @@ export function MatchReview() {
             <TableBody>
               {links.map((link: ProductLink) => {
                 const busy = deciding.has(link.link_id)
+                const itemAttributes = [link.item_attribute_1, link.item_attribute_2, link.item_attribute_3]
+                  .filter((a): a is string => !!a && a.trim() !== '')
                 return (
                   <TableRow key={link.link_id} className={cn(busy && 'opacity-50')}>
                     <TableCell className="max-w-80 align-top">
@@ -183,8 +185,8 @@ export function MatchReview() {
                            rel="noopener noreferrer" title="Open in Lightspeed"
                            className="block whitespace-normal break-words text-sm font-medium leading-snug hover:underline">
                           {link.item_title ?? 'Untracked item'}
-                          {link.item_attribute_1 ? (
-                            <span className="font-normal text-muted-foreground"> — {link.item_attribute_1}</span>
+                          {itemAttributes.length > 0 ? (
+                            <span className="font-normal text-muted-foreground"> — {itemAttributes.join(' / ')}</span>
                           ) : null}
                         </a>
                       ) : (

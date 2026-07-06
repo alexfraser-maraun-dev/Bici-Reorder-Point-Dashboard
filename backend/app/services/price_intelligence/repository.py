@@ -761,10 +761,12 @@ def acknowledge_events(event_ids: list):
 # auto-overwritten.
 # ---------------------------------------------------------------------------
 
-def get_product_links(status=None, item_id=None, unverified_only=False, limit: int = 1000):
+def get_product_links(status=None, item_id=None, unverified_only=False,
+                      active_items_only=False, limit: int = 1000):
     """Links joined with the item's description so the UI never has to fall back
     to a raw item_id (links can reference archived items the /tracked payload
-    doesn't carry)."""
+    doesn't carry). active_items_only hides links whose item is archived —
+    they're frozen, not dead: unarchiving the item brings them straight back."""
     ensure_pi_tables()
     where, params = [], []
     if status:
@@ -775,11 +777,15 @@ def get_product_links(status=None, item_id=None, unverified_only=False, limit: i
         params.append(bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)))
     if unverified_only:
         where.append("l.llm_verdict IS NULL")
+    if active_items_only:
+        where.append("COALESCE(t.archived, FALSE) = FALSE")
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     return _rows(f"""
         SELECT l.*, t.title AS item_title, t.brand AS item_brand,
                t.matrix_description AS item_matrix_description,
                t.attribute_1 AS item_attribute_1,
+               t.attribute_2 AS item_attribute_2,
+               t.attribute_3 AS item_attribute_3,
                t.upc_normalized AS item_upc, t.system_sku AS item_system_sku
         FROM `{T_LINKS}` l
         LEFT JOIN `{T_TRACKED}` t ON t.item_id = l.item_id
@@ -906,7 +912,13 @@ def count_pending_links() -> int:
     cached = _cache_get("pending_links")
     if cached is not None:
         return cached
-    rows = _rows(f"SELECT COUNT(*) AS n FROM `{T_LINKS}` WHERE status = 'pending'")
+    # Mirrors the pending review queue: links frozen by item archival don't count.
+    rows = _rows(f"""
+        SELECT COUNT(*) AS n
+        FROM `{T_LINKS}` l
+        LEFT JOIN `{T_TRACKED}` t ON t.item_id = l.item_id
+        WHERE l.status = 'pending' AND COALESCE(t.archived, FALSE) = FALSE
+    """)
     n = rows[0]["n"] if rows else 0
     _cache_set("pending_links", n)
     return n

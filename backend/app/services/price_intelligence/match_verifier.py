@@ -152,8 +152,11 @@ def verify_candidates(max_pairs: int = None) -> dict:
         print("pi: ANTHROPIC_API_KEY not set; skipping match verification")
         return {"skipped": "no api key"}
     max_pairs = max_pairs or config.MATCH_MAX_PAIRS_PER_RUN
+    # active_items_only: links to archived items are frozen, not queued — they'd
+    # otherwise occupy the fetch window every run while being unverifiable.
     links = repository.get_product_links(
-        status="pending", unverified_only=True, limit=max_pairs
+        status="pending", unverified_only=True, active_items_only=True,
+        limit=max_pairs
     )
     if not links:
         return {"pairs": 0}

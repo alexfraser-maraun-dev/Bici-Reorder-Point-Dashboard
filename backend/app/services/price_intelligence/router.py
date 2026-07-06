@@ -298,7 +298,12 @@ def search_items(q: str):
 @router.get("/links")
 def list_links(status: Optional[str] = None, item_id: Optional[str] = None,
                limit: int = 500):
-    return repository.get_product_links(status=status, item_id=item_id, limit=limit)
+    # The pending queue is a to-do list: links frozen by their item's archival
+    # don't belong in it. Confirmed/rejected views keep full history.
+    return repository.get_product_links(
+        status=status, item_id=item_id,
+        active_items_only=(status == "pending"), limit=limit,
+    )
 
 
 @router.post("/links/{link_id}/decision")

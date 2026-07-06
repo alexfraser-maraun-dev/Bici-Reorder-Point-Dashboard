@@ -148,6 +148,9 @@ class MatchIndex:
                 link.get("status") == "confirmed"
                 and link.get("match_key")
                 and link.get("item_id")
+                # Links follow their item's lifecycle: an archived item's links
+                # are frozen (no matching, no events) until it's re-tracked.
+                and str(link["item_id"]) in self.items
             ):
                 confidence = float(link.get("confidence") or 0.9)
                 self.by_link[link["match_key"]] = (str(link["item_id"]), confidence)

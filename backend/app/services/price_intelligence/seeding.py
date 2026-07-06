@@ -232,7 +232,9 @@ def refresh_from_track_tag() -> int:
             CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
         )
         WHEN NOT MATCHED BY SOURCE
-            AND T.source IN ('auto_top_revenue', 'track_tag')
+            -- The tag is the source of truth for every unpinned row, whatever
+            -- created it: manual adds must be tagged (or pinned) to stay
+            -- tracked, or they'd sneak untagged items into the dashboard.
             AND COALESCE(T.pinned, FALSE) = FALSE
             AND COALESCE(T.archived, FALSE) = FALSE
         THEN UPDATE SET T.archived = TRUE, T.updated_at = CURRENT_TIMESTAMP()

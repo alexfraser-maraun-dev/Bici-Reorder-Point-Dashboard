@@ -226,6 +226,8 @@ export interface ProductLink {
   item_brand: string | null
   item_matrix_description: string | null
   item_attribute_1: string | null
+  item_attribute_2: string | null
+  item_attribute_3: string | null
   item_upc: string | null
   item_system_sku: string | null
 }
