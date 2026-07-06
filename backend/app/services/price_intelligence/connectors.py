@@ -272,6 +272,13 @@ class ShopifyJsonConnector:
                     variant_title = variant.get("title")
                     full_title = title if variant_title in (None, "Default Title") \
                         else f"{title} - {variant_title}"
+                    # Shopify's structured variant options (e.g. ["Anodized Black",
+                    # "58"]) — kept so the matcher can compare color/size against our
+                    # attribute_1/2/3 instead of leaning on fuzzy title text alone.
+                    options = [
+                        variant.get(k) for k in ("option1", "option2", "option3")
+                        if variant.get(k) and variant.get(k) != "Default Title"
+                    ]
                     yield {
                         "title": full_title,
                         "brand": brand,
@@ -282,6 +289,7 @@ class ShopifyJsonConnector:
                         "in_stock": bool(variant.get("available", True)),
                         "url": product_url,
                         "currency": None,
+                        "variant_options": options,
                     }
 
 

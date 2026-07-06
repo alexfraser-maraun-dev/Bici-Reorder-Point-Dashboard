@@ -211,13 +211,13 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
 
         def _propose_link(match_key, candidate, competitor_id, product, item_id=None,
                           method=None, confidence=None):
-            """Buffers a link row: confirmed for gtin matches, pending for fuzzy
-            candidates. Skips keys already decided/proposed."""
+            """Buffers a link row: confirmed for gtin / attr_exact matches, pending
+            for fuzzy candidates. Skips keys already decided/proposed."""
             if match_key in existing_link_keys:
                 return
             existing_link_keys.add(match_key)
-            is_gtin = method == "gtin"
-            if not is_gtin and len(pending_links) >= MAX_COLLECTED_CANDIDATES:
+            is_confirmed = method in ("gtin", "attr_exact")
+            if not is_confirmed and len(pending_links) >= MAX_COLLECTED_CANDIDATES:
                 return
             target_id = item_id or candidate["item_id"]
             item = item_lookup.get(str(target_id)) or {}
@@ -230,11 +230,11 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 "competitor_sku": product.get("sku"),
                 "competitor_title": product.get("title"),
                 "gtin": product.get("gtin"),
-                "level": "variant" if is_gtin else candidate["level"],
-                "status": "confirmed" if is_gtin else "pending",
-                "source": "gtin" if is_gtin else "llm",
-                "confidence": confidence if is_gtin else None,
-                "fuzzy_score": None if is_gtin else candidate["fuzzy_score"],
+                "level": "variant" if is_confirmed else candidate["level"],
+                "status": "confirmed" if is_confirmed else "pending",
+                "source": "gtin" if method == "gtin" else "attr" if method == "attr_exact" else "llm",
+                "confidence": confidence if is_confirmed else None,
+                "fuzzy_score": None if is_confirmed else candidate["fuzzy_score"],
                 "llm_verdict": None,
                 "llm_reason": None,
                 "our_price": item.get("current_retail"),
@@ -243,7 +243,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 "created_at": _now_iso(),
                 "updated_at": _now_iso(),
             }
-            (gtin_links if is_gtin else pending_links).append(row)
+            (gtin_links if is_confirmed else pending_links).append(row)
 
         competitors = [c for c in repository.get_competitors() if c.get("enabled")]
         urls = repository.get_tracked_urls(include_disabled=False)
@@ -306,6 +306,11 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                         # runs match even if the barcode later disappears.
                         _propose_link(match_key, None, cid, product,
                                       item_id=item_id, method="gtin", confidence=1.0)
+                    elif method == "attr_exact":
+                        # Color+size matched exactly one tracked variant and
+                        # PI_ATTR_AUTO_CONFIRM is on — persist as a confirmed link.
+                        _propose_link(match_key, None, cid, product,
+                                      item_id=item_id, method="attr_exact", confidence=confidence)
                     elif item_id is None and candidate is not None:
                         _propose_link(match_key, candidate, cid, product)
                     # Persist rows that matched, carry a GTIN we may match later,

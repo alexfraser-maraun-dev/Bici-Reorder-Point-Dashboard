@@ -18,10 +18,18 @@ from typing import Optional, Tuple
 
 from rapidfuzz import fuzz, process
 
-from . import repository
+from . import config, repository
 
 FUZZY_THRESHOLD = 90
 CANDIDATE_THRESHOLD = 60
+
+# Apparel letter sizes normalized to a canonical token so "Large" == "L".
+_LETTER_SIZES = {
+    "xxs": "xxs", "xs": "xs", "s": "s", "sm": "s", "small": "s",
+    "m": "m", "md": "m", "medium": "m", "l": "l", "lg": "l", "large": "l",
+    "xl": "xl", "xlarge": "xl", "xxl": "xxl", "2xl": "xxl", "xxxl": "xxxl",
+    "3xl": "xxxl", "os": "os", "onesize": "os",
+}
 
 # Storefront brand spellings that don't reduce to ours via folding/suffix-strip.
 BRAND_ALIASES = {
@@ -84,6 +92,35 @@ def strip_variant_tokens(title: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
+def _attr_tokens(value) -> set:
+    """Accent-folded word/number tokens of an attribute or option value."""
+    return set(re.findall(r"[a-z0-9]+", _fold(value)))
+
+
+def _canon_size(value):
+    """Classifies a variant option / attribute as a size. Returns ('num', [digits])
+    for numeric sizes ('58', '56cm', '700x28c'), ('letter', canon) for apparel
+    sizes ('Large' -> 'l'), or None when the value isn't a size (i.e. it's a color
+    or other descriptor)."""
+    folded = _fold(value)
+    if not folded:
+        return None
+    digits = re.findall(r"\d+", folded)
+    if digits:
+        return ("num", digits)
+    key = folded.replace("-", "").replace(" ", "")
+    if key in _LETTER_SIZES:
+        return ("letter", _LETTER_SIZES[key])
+    return None
+
+
+def _size_value_matches(a, b) -> bool:
+    """Two size values match when their digit sequences ('58' == '58cm') or their
+    canonical letter sizes ('Large' == 'L') agree."""
+    ca, cb = _canon_size(a), _canon_size(b)
+    return ca is not None and ca == cb
+
+
 def build_match_key(competitor_id, scraped: dict) -> str:
     """Stable identity for one scraped competitor listing — the key pi_product_links
     dedupes and re-attaches on. Prefers SKU (survives URL/handle renames)."""
@@ -108,6 +145,7 @@ class MatchIndex:
         self.model_titles = []  # model/matrix grain (one entry per matrix)
         self.model_items = []
         self.items = {}
+        self.variants_by_matrix = {}  # matrix_id -> tracked sibling rows
         self.brands = set()
         seen_matrices = set()
         for row in tracked_rows:
@@ -115,6 +153,9 @@ class MatchIndex:
                 continue
             item_id = str(row["item_id"])
             self.items[item_id] = row
+            mid = row.get("item_matrix_id")
+            if mid:
+                self.variants_by_matrix.setdefault(str(mid), []).append(row)
             upc = normalize_upc(row.get("upc_normalized"))
             if upc:
                 self.by_upc[upc] = item_id
@@ -165,6 +206,67 @@ class MatchIndex:
     def has_brand(self, brand) -> bool:
         normalized = _normalize_brand(brand)
         return bool(normalized) and normalized in self.brands
+
+    def _resolve_by_attributes(self, options, anchor_id):
+        """Given a competitor variant's structured options (e.g. ['Anodized Black',
+        '58']) and the model anchor we'd otherwise propose, decide which tracked
+        variant it really is by comparing color/size against our attribute_1/2/3.
+
+        Returns one of:
+          ("confirm", item_id)   - color AND size match exactly one tracked variant
+          ("candidate", item_id) - one dimension matches, the other is unknown
+          ("suppress", None)     - a dimension clearly conflicts (wrong color/size)
+                                   with every comparable tracked variant
+          (None, None)           - not enough structured signal; use fuzzy fallback
+        """
+        anchor = self.items.get(str(anchor_id))
+        if not anchor:
+            return (None, None)
+        matrix_id = anchor.get("item_matrix_id")
+        siblings = self.variants_by_matrix.get(str(matrix_id)) if matrix_id else None
+        if not siblings:
+            siblings = [anchor]
+
+        opt_sizes = [o for o in options if _canon_size(o)]
+        opt_colors = [o for o in options if o and not _canon_size(o)]
+        if not opt_sizes and not opt_colors:
+            return (None, None)
+
+        both, partial = [], []
+        size_comparable = size_hit = False
+        color_comparable = color_hit = False
+        for s in siblings:
+            attrs = [a for a in (s.get("attribute_1"), s.get("attribute_2"),
+                                 s.get("attribute_3")) if a and str(a).strip()]
+            s_sizes = [a for a in attrs if _canon_size(a)]
+            s_colors = [a for a in attrs if not _canon_size(a)]
+            size_state = None
+            if opt_sizes and s_sizes:
+                size_comparable = True
+                size_state = any(_size_value_matches(o, a)
+                                 for o in opt_sizes for a in s_sizes)
+                size_hit = size_hit or size_state
+            color_state = None
+            if opt_colors and s_colors:
+                color_comparable = True
+                color_state = any(_attr_tokens(o) & _attr_tokens(a)
+                                  for o in opt_colors for a in s_colors)
+                color_hit = color_hit or color_state
+            if size_state and color_state:
+                both.append(str(s["item_id"]))
+            elif (size_state and color_state is None) or (color_state and size_state is None):
+                partial.append(str(s["item_id"]))
+
+        if len(both) == 1:
+            return ("confirm", both[0])
+        if both or partial:
+            # Exact-but-ambiguous, or one dimension matched — let a human confirm.
+            return ("candidate", (both or partial)[0])
+        # No supported variant. Suppress only on a conflict we could actually see
+        # (a dimension was comparable and matched nothing) — ambiguity falls back.
+        if (size_comparable and not size_hit) or (color_comparable and not color_hit):
+            return ("suppress", None)
+        return (None, None)
 
     def match(self, scraped: dict, match_key: str = None):
         """Returns (item_id, method, confidence, candidate).
@@ -219,6 +321,22 @@ class MatchIndex:
             elif variant_best:
                 best = ("variant", self.title_items[variant_best[2]], variant_best[1])
             if best:
+                # Structured attribute pass (Shopify variants): route to the exact
+                # tracked variant, or suppress a clear color/size mismatch, before
+                # falling back to the fuzzy model/variant candidate.
+                options = scraped.get("variant_options")
+                if config.ATTR_MATCH_ENABLED and options:
+                    verdict, target = self._resolve_by_attributes(options, best[1])
+                    if verdict == "suppress":
+                        return None, None, 0.0, None
+                    if verdict == "confirm" and config.ATTR_AUTO_CONFIRM:
+                        return target, "attr_exact", 0.97, None
+                    if verdict in ("confirm", "candidate"):
+                        return None, None, 0.0, {
+                            "item_id": target,
+                            "fuzzy_score": round(float(best[2]), 1),
+                            "level": "variant",
+                        }
                 candidate = {
                     "item_id": best[1],
                     "fuzzy_score": round(float(best[2]), 1),

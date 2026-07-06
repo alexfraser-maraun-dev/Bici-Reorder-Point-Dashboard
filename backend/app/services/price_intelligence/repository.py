@@ -1033,7 +1033,7 @@ def reject_conflicting_links(item_id: str, domain: str, decided_by: str = "Dashb
     get_bq_client().query(
         f"UPDATE `{T_LINKS}` SET status = 'rejected', decided_by = @actor, "
         "updated_at = CURRENT_TIMESTAMP() "
-        "WHERE item_id = @item_id AND source IN ('gtin', 'llm') "
+        "WHERE item_id = @item_id AND source IN ('gtin', 'llm', 'attr') "
         "AND status IN ('confirmed', 'pending') "
         "AND STRPOS(COALESCE(competitor_url, ''), @domain) > 0",
         job_config=bigquery.QueryJobConfig(query_parameters=[

@@ -38,6 +38,8 @@ const MATCH_METHOD_LABEL: Record<string, string> = {
   brand_sku: 'brand+SKU',
   fuzzy_title: 'title match',
   manual_url: 'tracked URL',
+  attr_exact: 'color+size',
+  attr: 'color+size',
 }
 
 // Expanded-row panel: latest price per store for this item (and its matrix

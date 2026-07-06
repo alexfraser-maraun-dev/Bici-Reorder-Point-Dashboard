@@ -45,6 +45,7 @@ const SOURCE_LABEL: Record<string, string> = {
   human: 'confirmed by you',
   manual_url: 'tracked URL',
   serp: 'SERP found',
+  attr: 'color+size match',
 }
 
 export function MatchReview() {

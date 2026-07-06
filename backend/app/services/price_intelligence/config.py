@@ -85,3 +85,12 @@ MATCH_MODEL = os.getenv("PI_MATCH_MODEL", "claude-haiku-4-5")
 MATCH_MAX_PAIRS_PER_RUN = int(os.getenv("PI_MATCH_MAX_PAIRS_PER_RUN", "200"))
 MATCH_BATCH_SIZE = int(os.getenv("PI_MATCH_BATCH_SIZE", "20"))
 MATCH_MAX_TOKENS = int(os.getenv("PI_MATCH_MAX_TOKENS", "2000"))
+
+# Structured attribute matching (first-pass): compare a scraped variant's
+# color/size options against our attribute_1/2/3 before proposing a candidate.
+# Routes each competitor variant to the exact tracked variant it corresponds to,
+# and suppresses variants that clearly conflict (wrong color/size) so they never
+# reach the review queue. AUTO_CONFIRM off = exact color+size matches become
+# high-confidence candidates you approve; on = they're confirmed without review.
+ATTR_MATCH_ENABLED = os.getenv("PI_ATTR_MATCH_ENABLED", "true").lower() == "true"
+ATTR_AUTO_CONFIRM = os.getenv("PI_ATTR_AUTO_CONFIRM", "false").lower() == "true"
