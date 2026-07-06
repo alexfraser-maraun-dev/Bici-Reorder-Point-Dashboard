@@ -92,6 +92,21 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _item_display_title(item: dict) -> str:
+    """Our title plus variant attributes — matrix variants share the display
+    name ("Continental Grand Prix 5000 Tire"), so events would otherwise be
+    indistinguishable across sizes."""
+    title = (item or {}).get("title")
+    if not title:
+        return None
+    attrs = [
+        str(a).strip()
+        for a in (item.get("attribute_1"), item.get("attribute_2"), item.get("attribute_3"))
+        if a and str(a).strip()
+    ]
+    return f"{title} ({' / '.join(attrs)})" if attrs else title
+
+
 def _build_events(prev_map, obs, competitor_name, item_lookup):
     """Diffs one observation against the previous one for its diff_key and returns
     change-event rows. First sightings are logged pre-acknowledged so a new
@@ -106,7 +121,7 @@ def _build_events(prev_map, obs, competitor_name, item_lookup):
         "competitor_id": obs.get("competitor_id"),
         "competitor_name": competitor_name,
         "item_id": obs.get("match_item_id"),
-        "item_title": (item or {}).get("title") or obs.get("competitor_title"),
+        "item_title": _item_display_title(item) or obs.get("competitor_title"),
         "item_brand": (item or {}).get("brand"),
         "url": obs.get("url"),
         "acknowledged_at": None,
@@ -462,10 +477,12 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 per_item[row["item_id"]] = n + 1
                 selected.append(row)
             repository.insert_product_links(gtin_links + selected)
-            if selected or serp_pending:
-                from . import match_verifier
-                stats = match_verifier.verify_candidates()
-                print(f"pi: match verification: {stats}")
+            # Always run: pending-unverified rows can come from earlier runs
+            # (e.g. demoted links), not just this run's candidates. A clean
+            # backlog costs one query.
+            from . import match_verifier
+            stats = match_verifier.verify_candidates()
+            print(f"pi: match verification: {stats}")
         except Exception as e:
             errors.append(f"match verification: {e}")
             print(f"pi: match verification failed: {e}")
