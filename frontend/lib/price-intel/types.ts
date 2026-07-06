@@ -27,6 +27,8 @@ export interface TrackedUrl {
   // joined from pi_tracked_products when item_id is set
   item_title: string | null
   item_brand: string | null
+  item_upc: string | null
+  item_system_sku: string | null
 }
 
 export interface TrackedProduct {
@@ -186,6 +188,8 @@ export interface ItemSearchResult {
   title: string | null
   brand: string | null
   manufacturer_sku: string | null
+  system_sku: string | null
+  upc_normalized: string | null
   current_retail: number | null
   item_matrix_id: string | null
   matrix_description: string | null
@@ -222,6 +226,8 @@ export interface ProductLink {
   item_brand: string | null
   item_matrix_description: string | null
   item_attribute_1: string | null
+  item_upc: string | null
+  item_system_sku: string | null
 }
 
 export interface ItemCompetitorPrice {

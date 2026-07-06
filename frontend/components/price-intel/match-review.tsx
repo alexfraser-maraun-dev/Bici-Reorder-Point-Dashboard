@@ -22,6 +22,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
+import { itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
 import {
   apiPost, useCompetitors, usePriceIntelSummary, useProductLinks,
 } from '@/lib/price-intel/hooks'
@@ -175,34 +176,46 @@ export function MatchReview() {
                 const busy = deciding.has(link.link_id)
                 return (
                   <TableRow key={link.link_id} className={cn(busy && 'opacity-50')}>
-                    <TableCell className="max-w-64">
-                      <p className="truncate text-sm font-medium">
-                        {link.item_title ?? 'Untracked item'}
-                      </p>
-                      <p className="truncate text-xs text-muted-foreground">
-                        {link.item_brand}
-                        {link.item_matrix_description && link.item_matrix_description !== link.item_title
-                          ? ` · ${link.item_matrix_description}` : ''}
-                        {link.item_attribute_1 ? ` · ${link.item_attribute_1}` : ''}
+                    <TableCell className="max-w-80 align-top">
+                      {link.item_id ? (
+                        <a href={lightspeedItemUrl(link.item_id)} target="_blank"
+                           rel="noopener noreferrer" title="Open in Lightspeed"
+                           className="block whitespace-normal break-words text-sm font-medium leading-snug hover:underline">
+                          {link.item_title ?? 'Untracked item'}
+                          {link.item_attribute_1 ? (
+                            <span className="font-normal text-muted-foreground"> — {link.item_attribute_1}</span>
+                          ) : null}
+                        </a>
+                      ) : (
+                        <p className="whitespace-normal break-words text-sm font-medium leading-snug">
+                          {link.item_title ?? 'Untracked item'}
+                        </p>
+                      )}
+                      <p className="whitespace-normal break-words text-xs text-muted-foreground">
+                        {itemIdentity({
+                          brand: link.item_brand,
+                          upc: link.item_upc,
+                          systemSku: link.item_system_sku,
+                        })}
                       </p>
                     </TableCell>
-                    <TableCell className="max-w-72">
-                      <div className="flex items-center gap-1.5">
-                        <span className="truncate text-sm">
+                    <TableCell className="max-w-80 align-top">
+                      <div className="flex items-start gap-1.5">
+                        <span className="whitespace-normal break-words text-sm leading-snug">
                           {link.competitor_title
                             ?? link.competitor_url?.replace(/^https?:\/\//, '')
                             ?? 'competitor listing'}
                         </span>
                         {link.competitor_url && (
                           <a href={link.competitor_url} target="_blank" rel="noopener noreferrer"
-                             className="shrink-0 text-muted-foreground hover:text-foreground">
+                             className="mt-0.5 shrink-0 text-muted-foreground hover:text-foreground">
                             <ExternalLink className="h-3.5 w-3.5" />
                           </a>
                         )}
                       </div>
-                      <p className="truncate text-xs text-muted-foreground">
+                      <p className="whitespace-normal break-words text-xs text-muted-foreground">
                         {link.competitor_id
-                          ? competitorById.get(link.competitor_id) ?? link.competitor_id
+                          ? competitorById.get(link.competitor_id) ?? 'competitor'
                           : 'tracked URL'}
                         {link.competitor_sku ? ` · ${link.competitor_sku}` : ''}
                       </p>

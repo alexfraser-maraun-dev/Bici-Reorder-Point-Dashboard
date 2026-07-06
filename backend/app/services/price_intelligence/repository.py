@@ -372,7 +372,8 @@ def mark_competitor_scraped(competitor_id: str, status: str):
 def get_tracked_urls(include_disabled: bool = True):
     ensure_pi_tables()
     rows = _rows(f"""
-        SELECT u.*, t.title AS item_title, t.brand AS item_brand
+        SELECT u.*, t.title AS item_title, t.brand AS item_brand,
+               t.upc_normalized AS item_upc, t.system_sku AS item_system_sku
         FROM `{T_URLS}` u
         LEFT JOIN `{T_TRACKED}` t ON t.item_id = u.item_id
         ORDER BY u.created_at DESC
@@ -608,6 +609,7 @@ def search_snapshot_items(q: str, limit: int = 40):
             SELECT
                 CAST(id AS STRING) AS item_id,
                 CAST(NULLIF(item_matrix_id, 0) AS STRING) AS item_matrix_id,
+                COALESCE(NULLIF(upc, ''), NULLIF(ean, '')) AS raw_upc,
                 attribute_1, attribute_2, attribute_3
             FROM `{LS_DATASET}.item_history`
             QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_time DESC) = 1
@@ -623,6 +625,7 @@ def search_snapshot_items(q: str, limit: int = 40):
                 ANY_VALUE(COALESCE(product_display_name, item_description)) AS title,
                 ANY_VALUE(brand_name) AS brand,
                 ANY_VALUE(manufacturer_sku) AS manufacturer_sku,
+                ANY_VALUE(CAST(system_sku AS STRING)) AS system_sku,
                 MAX(item_current_price) AS current_retail,
                 MAX(COALESCE(sales_revenue_l90d, 0)) AS rev
             FROM `{LS_DATASET}.v_master_snapshot_latest` s CROSS JOIN latest
@@ -631,7 +634,10 @@ def search_snapshot_items(q: str, limit: int = 40):
             GROUP BY item_id
         )
         SELECT
-            s.item_id, s.title, s.brand, s.manufacturer_sku, s.current_retail,
+            s.item_id, s.title, s.brand, s.manufacturer_sku, s.system_sku,
+            s.current_retail,
+            NULLIF(LTRIM(REGEXP_REPLACE(COALESCE(a.raw_upc, ''), r'\\D', ''), '0'), '')
+                AS upc_normalized,
             a.item_matrix_id, m.matrix_description,
             a.attribute_1, a.attribute_2, a.attribute_3
         FROM snap s
@@ -761,7 +767,8 @@ def get_product_links(status=None, item_id=None, unverified_only=False, limit: i
     return _rows(f"""
         SELECT l.*, t.title AS item_title, t.brand AS item_brand,
                t.matrix_description AS item_matrix_description,
-               t.attribute_1 AS item_attribute_1
+               t.attribute_1 AS item_attribute_1,
+               t.upc_normalized AS item_upc, t.system_sku AS item_system_sku
         FROM `{T_LINKS}` l
         LEFT JOIN `{T_TRACKED}` t ON t.item_id = l.item_id
         {clause}

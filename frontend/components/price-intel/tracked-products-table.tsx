@@ -21,6 +21,7 @@ import {
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
+import { itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
 import { PricePushDialog } from './price-push-dialog'
 import { ItemSearchPicker } from './item-search-picker'
 import {
@@ -320,7 +321,11 @@ export function TrackedProductsTable() {
                               <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-violet-600" />
                             </span>
                           )}
-                          <span className="truncate font-medium">{p.title}</span>
+                          <a href={lightspeedItemUrl(p.item_id)} target="_blank"
+                             rel="noopener noreferrer" title="Open in Lightspeed"
+                             className="truncate font-medium hover:underline">
+                            {p.title}
+                          </a>
                           {attributes.map((a) => (
                             <Badge key={a} variant="outline" className="shrink-0 px-1.5 py-0 text-[11px]">
                               {a}
@@ -328,9 +333,7 @@ export function TrackedProductsTable() {
                           ))}
                         </div>
                         <p className="truncate text-xs text-muted-foreground">
-                          {p.brand}
-                          {p.sku ? ` · ${p.sku}` : ''}
-                          {p.upc_normalized ? ' · UPC' : ' · no UPC'}
+                          {itemIdentity({ brand: p.brand, upc: p.upc_normalized, systemSku: p.system_sku })}
                         </p>
                       </TableCell>
                       <TableCell className="text-right tabular-nums">{fmt(p.current_retail)}</TableCell>

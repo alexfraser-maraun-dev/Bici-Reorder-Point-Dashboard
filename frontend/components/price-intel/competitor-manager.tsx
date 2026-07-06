@@ -17,6 +17,7 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog'
 import { apiPost, useCompetitors, useTrackedUrls } from '@/lib/price-intel/hooks'
+import { itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
 import type { TrackedUrl } from '@/lib/price-intel/types'
 import { ItemSearchPicker } from './item-search-picker'
 import { ExternalLink, Globe, Link2, Plus, Trash2 } from 'lucide-react'
@@ -249,15 +250,17 @@ export function CompetitorManager() {
                     <TableCell className="text-sm">{u.label ?? '—'}</TableCell>
                     <TableCell className="max-w-56">
                       {u.item_id ? (
-                        <button className="block max-w-full text-left" title="Change linked item"
-                                onClick={() => setLinkTarget(u)}>
-                          <span className="block truncate text-sm font-medium">
+                        <div>
+                          <a href={lightspeedItemUrl(u.item_id)} target="_blank"
+                             rel="noopener noreferrer" title="Open in Lightspeed"
+                             className="block truncate text-sm font-medium hover:underline">
                             {u.item_title ?? u.label ?? 'tracked item'}
-                          </span>
-                          {u.item_brand && (
-                            <span className="block truncate text-xs text-muted-foreground">{u.item_brand}</span>
-                          )}
-                        </button>
+                          </a>
+                          <button className="block max-w-full truncate text-left text-xs text-muted-foreground"
+                                  title="Change linked item" onClick={() => setLinkTarget(u)}>
+                            {itemIdentity({ brand: u.item_brand, upc: u.item_upc, systemSku: u.item_system_sku })}
+                          </button>
+                        </div>
                       ) : (
                         <Button variant="outline" size="sm" className="h-7 text-xs"
                                 onClick={() => setLinkTarget(u)}>

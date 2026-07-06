@@ -11,6 +11,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { searchItems } from '@/lib/price-intel/hooks'
+import { itemIdentity } from '@/lib/price-intel/format'
 import type { ItemSearchResult } from '@/lib/price-intel/types'
 import { ChevronDown, ChevronRight, Layers, Search } from 'lucide-react'
 
@@ -62,8 +63,7 @@ function VariantRow({ item, actionLabel, onSelect }: {
           <Badge key={a} variant="outline" className="shrink-0 px-1.5 py-0 text-[11px]">{a}</Badge>
         ))}
         <span className="shrink-0 text-xs text-muted-foreground">
-          {item.brand}
-          {item.manufacturer_sku ? ` · ${item.manufacturer_sku}` : ''}
+          {itemIdentity({ brand: item.brand, upc: item.upc_normalized, systemSku: item.system_sku })}
         </span>
       </span>
       <span className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
