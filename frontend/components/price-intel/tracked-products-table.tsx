@@ -325,7 +325,8 @@ export function TrackedProductsTable() {
                           ))}
                         </div>
                         <p className="truncate text-xs text-muted-foreground">
-                          {p.brand} · {p.sku ?? p.item_id}
+                          {p.brand}
+                          {p.sku ? ` · ${p.sku}` : ''}
                           {p.upc_normalized ? ' · UPC' : ' · no UPC'}
                         </p>
                       </TableCell>

@@ -251,7 +251,7 @@ export function CompetitorManager() {
                         <button className="block max-w-full text-left" title="Change linked item"
                                 onClick={() => setLinkTarget(u)}>
                           <span className="block truncate text-sm font-medium">
-                            {u.item_title ?? u.item_id}
+                            {u.item_title ?? u.label ?? 'tracked item'}
                           </span>
                           {u.item_brand && (
                             <span className="block truncate text-xs text-muted-foreground">{u.item_brand}</span>

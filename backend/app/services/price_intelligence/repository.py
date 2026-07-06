@@ -744,20 +744,28 @@ def acknowledge_events(event_ids: list):
 # ---------------------------------------------------------------------------
 
 def get_product_links(status=None, item_id=None, unverified_only=False, limit: int = 1000):
+    """Links joined with the item's description so the UI never has to fall back
+    to a raw item_id (links can reference archived items the /tracked payload
+    doesn't carry)."""
     ensure_pi_tables()
     where, params = [], []
     if status:
-        where.append("status = @status")
+        where.append("l.status = @status")
         params.append(bigquery.ScalarQueryParameter("status", "STRING", status))
     if item_id:
-        where.append("item_id = @item_id")
+        where.append("l.item_id = @item_id")
         params.append(bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)))
     if unverified_only:
-        where.append("llm_verdict IS NULL")
+        where.append("l.llm_verdict IS NULL")
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     return _rows(f"""
-        SELECT * FROM `{T_LINKS}` {clause}
-        ORDER BY fuzzy_score DESC, created_at DESC
+        SELECT l.*, t.title AS item_title, t.brand AS item_brand,
+               t.matrix_description AS item_matrix_description,
+               t.attribute_1 AS item_attribute_1
+        FROM `{T_LINKS}` l
+        LEFT JOIN `{T_TRACKED}` t ON t.item_id = l.item_id
+        {clause}
+        ORDER BY l.fuzzy_score DESC, l.created_at DESC
         LIMIT {int(limit)}
     """, params=params)
 

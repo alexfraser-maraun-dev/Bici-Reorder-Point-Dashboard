@@ -217,6 +217,11 @@ export interface ProductLink {
   decided_by: string | null
   created_at: string | null
   updated_at: string | null
+  // joined from pi_tracked_products (available even for archived items)
+  item_title: string | null
+  item_brand: string | null
+  item_matrix_description: string | null
+  item_attribute_1: string | null
 }
 
 export interface ItemCompetitorPrice {

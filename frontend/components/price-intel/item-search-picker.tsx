@@ -62,7 +62,8 @@ function VariantRow({ item, actionLabel, onSelect }: {
           <Badge key={a} variant="outline" className="shrink-0 px-1.5 py-0 text-[11px]">{a}</Badge>
         ))}
         <span className="shrink-0 text-xs text-muted-foreground">
-          {item.brand} · {item.manufacturer_sku ?? item.item_id}
+          {item.brand}
+          {item.manufacturer_sku ? ` · ${item.manufacturer_sku}` : ''}
         </span>
       </span>
       <span className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">

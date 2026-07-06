@@ -10,7 +10,11 @@ import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog'
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table'
@@ -19,10 +23,10 @@ import {
 } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
 import {
-  apiPost, useCompetitors, usePriceIntelSummary, useProductLinks, useTrackedProducts,
+  apiPost, useCompetitors, usePriceIntelSummary, useProductLinks,
 } from '@/lib/price-intel/hooks'
 import type { ProductLink } from '@/lib/price-intel/types'
-import { Check, CheckCheck, ExternalLink, Layers, X } from 'lucide-react'
+import { Check, CheckCheck, ExternalLink, Layers, Link2, X } from 'lucide-react'
 
 const fmt = (v: number | null | undefined) => (v == null ? '—' : `$${Number(v).toFixed(2)}`)
 
@@ -44,19 +48,46 @@ const SOURCE_LABEL: Record<string, string> = {
 export function MatchReview() {
   const [statusFilter, setStatusFilter] = useState<'pending' | 'confirmed' | 'rejected'>('pending')
   const { links, isLoading, mutate } = useProductLinks(statusFilter)
-  const { products } = useTrackedProducts()
   const { competitors } = useCompetitors()
   const { mutate: mutateSummary } = usePriceIntelSummary()
   const [deciding, setDeciding] = useState<Set<string>>(new Set())
+  const [fixTarget, setFixTarget] = useState<ProductLink | null>(null)
+  const [fixUrl, setFixUrl] = useState('')
+  const [savingFix, setSavingFix] = useState(false)
 
-  const productById = useMemo(
-    () => new Map(products.map((p) => [p.item_id, p])),
-    [products]
-  )
   const competitorById = useMemo(
     () => new Map(competitors.map((c) => [c.competitor_id, c.name])),
     [competitors]
   )
+
+  // "This match is wrong — here's the right URL": records the pasted URL as
+  // the permanent truth for this item at that store and tombstones the
+  // conflicting auto-matches (including this one).
+  const saveCorrectUrl = async () => {
+    if (!fixTarget?.item_id) return
+    const url = fixUrl.trim()
+    if (!/^https?:\/\//.test(url)) {
+      toast.error('Enter a full product URL (https://…)')
+      return
+    }
+    setSavingFix(true)
+    try {
+      await apiPost('/api/price-intel/urls', {
+        url,
+        item_id: fixTarget.item_id,
+        competitor_id: fixTarget.competitor_id,
+        label: fixTarget.item_title,
+      })
+      toast.success('Correct URL locked in — conflicting auto-matches were rejected')
+      setFixTarget(null)
+      setFixUrl('')
+      await Promise.all([mutate(), mutateSummary()])
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to save URL')
+    } finally {
+      setSavingFix(false)
+    }
+  }
 
   const decide = async (linkIds: string[], status: 'confirmed' | 'rejected') => {
     setDeciding((prev) => new Set([...prev, ...linkIds]))
@@ -134,29 +165,32 @@ export function MatchReview() {
                 <TableHead>Competitor listing</TableHead>
                 <TableHead className="text-right">Prices</TableHead>
                 <TableHead>Signal</TableHead>
-                {statusFilter === 'pending' && <TableHead className="w-24 text-right">Decide</TableHead>}
+                <TableHead className="w-28 text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {links.map((link: ProductLink) => {
-                const item = link.item_id ? productById.get(link.item_id) : undefined
                 const busy = deciding.has(link.link_id)
                 return (
                   <TableRow key={link.link_id} className={cn(busy && 'opacity-50')}>
                     <TableCell className="max-w-64">
                       <p className="truncate text-sm font-medium">
-                        {item?.title ?? link.item_id ?? '—'}
+                        {link.item_title ?? 'Untracked item'}
                       </p>
                       <p className="truncate text-xs text-muted-foreground">
-                        {item?.brand}
-                        {item?.matrix_description && item.matrix_description !== item.title
-                          ? ` · ${item.matrix_description}` : ''}
-                        {item?.attribute_1 ? ` · ${item.attribute_1}` : ''}
+                        {link.item_brand}
+                        {link.item_matrix_description && link.item_matrix_description !== link.item_title
+                          ? ` · ${link.item_matrix_description}` : ''}
+                        {link.item_attribute_1 ? ` · ${link.item_attribute_1}` : ''}
                       </p>
                     </TableCell>
                     <TableCell className="max-w-72">
                       <div className="flex items-center gap-1.5">
-                        <span className="truncate text-sm">{link.competitor_title ?? link.match_key}</span>
+                        <span className="truncate text-sm">
+                          {link.competitor_title
+                            ?? link.competitor_url?.replace(/^https?:\/\//, '')
+                            ?? 'competitor listing'}
+                        </span>
                         {link.competitor_url && (
                           <a href={link.competitor_url} target="_blank" rel="noopener noreferrer"
                              className="shrink-0 text-muted-foreground hover:text-foreground">
@@ -207,21 +241,30 @@ export function MatchReview() {
                         </p>
                       )}
                     </TableCell>
-                    {statusFilter === 'pending' && (
-                      <TableCell>
-                        <div className="flex items-center justify-end gap-0.5">
-                          <Button variant="ghost" size="sm" title="Confirm match" disabled={busy}
-                                  onClick={() => decide([link.link_id], 'confirmed')}>
-                            <Check className="h-4 w-4 text-emerald-600" />
+                    <TableCell>
+                      <div className="flex items-center justify-end gap-0.5">
+                        {statusFilter === 'pending' && (
+                          <>
+                            <Button variant="ghost" size="sm" title="Confirm match" disabled={busy}
+                                    onClick={() => decide([link.link_id], 'confirmed')}>
+                              <Check className="h-4 w-4 text-emerald-600" />
+                            </Button>
+                            <Button variant="ghost" size="sm" title="Reject (never suggest again)"
+                                    disabled={busy}
+                                    onClick={() => decide([link.link_id], 'rejected')}>
+                              <X className="h-4 w-4 text-rose-600" />
+                            </Button>
+                          </>
+                        )}
+                        {link.item_id && statusFilter !== 'rejected' && (
+                          <Button variant="ghost" size="sm" disabled={busy}
+                                  title="Wrong match? Paste the correct competitor URL"
+                                  onClick={() => setFixTarget(link)}>
+                            <Link2 className="h-4 w-4 text-muted-foreground" />
                           </Button>
-                          <Button variant="ghost" size="sm" title="Reject (never suggest again)"
-                                  disabled={busy}
-                                  onClick={() => decide([link.link_id], 'rejected')}>
-                            <X className="h-4 w-4 text-rose-600" />
-                          </Button>
-                        </div>
-                      </TableCell>
-                    )}
+                        )}
+                      </div>
+                    </TableCell>
                   </TableRow>
                 )
               })}
@@ -229,6 +272,31 @@ export function MatchReview() {
           </Table>
         )}
       </CardContent>
+
+      <Dialog open={fixTarget !== null} onOpenChange={(open) => !open && setFixTarget(null)}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Paste the correct competitor URL</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            The right product page for{' '}
+            <span className="font-medium text-foreground">{fixTarget?.item_title ?? 'this item'}</span>
+            {fixTarget?.competitor_id
+              ? <> at <span className="font-medium text-foreground">{competitorById.get(fixTarget.competitor_id)}</span></>
+              : null}
+            . It becomes the permanent match — this suggestion and any other
+            auto-matches at that store are rejected.
+          </p>
+          <div className="flex items-center gap-2">
+            <Input placeholder="https://store.example.com/products/…" value={fixUrl}
+                   onChange={(e) => setFixUrl(e.target.value)}
+                   onKeyDown={(e) => e.key === 'Enter' && saveCorrectUrl()} />
+            <Button size="sm" onClick={saveCorrectUrl} disabled={savingFix}>
+              <Link2 className="h-4 w-4" /> Lock in
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </Card>
   )
 }
