@@ -59,7 +59,26 @@ export interface TrackedProduct {
   market_min: number | null
   market_median: number | null
   competitor_count: number | null
+  competitor_ids: string[] | null
   last_observed_at: string | null
+}
+
+// Change-point-compressed price history for the expandable chart.
+export interface PriceHistoryPoint {
+  observed_at: string
+  price: number | null
+  in_stock?: boolean | null
+}
+
+export interface PriceHistoryCompetitor {
+  competitor_id: string | null
+  competitor_name: string
+  points: PriceHistoryPoint[]
+}
+
+export interface ItemPriceHistory {
+  ours: PriceHistoryPoint[]
+  competitors: PriceHistoryCompetitor[]
 }
 
 export type ChangeEventType =

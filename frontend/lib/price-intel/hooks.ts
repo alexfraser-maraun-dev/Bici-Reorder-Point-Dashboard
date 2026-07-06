@@ -11,6 +11,7 @@ import type {
   Digest,
   ItemCompetitorPrice,
   ItemObservation,
+  ItemPriceHistory,
   ItemSearchResult,
   PriceIntelSummary,
   PricePushPreview,
@@ -137,6 +138,18 @@ export function useItemObservations(itemId: string | null) {
     fetcher, swrConfig
   )
   return { observations: data ?? [], error, isLoading }
+}
+
+// Lazy: change-point-compressed price history (our line + one per competitor).
+// Keyed on itemId so only expanded rows fetch; inherits the 5-min SWR dedup.
+export function useItemPriceHistory(itemId: string | null) {
+  const { data, error, isLoading } = useSWR<ItemPriceHistory>(
+    itemId
+      ? `${baseUrl()}/api/price-intel/tracked/${encodeURIComponent(itemId)}/price-history`
+      : null,
+    fetcher, swrConfig
+  )
+  return { history: data, error, isLoading }
 }
 
 export async function searchItems(q: string): Promise<ItemSearchResult[]> {

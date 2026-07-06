@@ -190,6 +190,10 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             errors.append(f"seeding: {e}")
             print(f"pi: seeding failed (continuing with existing list): {e}")
 
+        # Record our own price change-points (after the refresh updates
+        # current_retail) so the price-history chart has an "our price" line.
+        repository.record_our_price_snapshot()
+
         index = MatchIndex.load()
         item_lookup = index.items
         prev_map = repository.get_latest_observation_map()

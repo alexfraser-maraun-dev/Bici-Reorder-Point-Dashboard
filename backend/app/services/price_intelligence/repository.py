@@ -23,6 +23,7 @@ T_DIGESTS = f"{APP_DATASET}.pi_digests"
 T_PUSH_LOG = f"{APP_DATASET}.pi_price_push_log"
 T_RUNS = f"{APP_DATASET}.pi_scrape_runs"
 T_LINKS = f"{APP_DATASET}.pi_product_links"
+T_OUR_PRICE_HISTORY = f"{APP_DATASET}.pi_our_price_history"
 
 _tables_ensured = False
 _ensure_lock = threading.Lock()
@@ -185,6 +186,16 @@ def ensure_pi_tables():
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             )""",
+            # Forward-only history of OUR retail price, one row per item only when
+            # the price changes (change-points). Powers the price-history chart's
+            # "our price" line. Competitor history lives in pi_price_observations.
+            f"""CREATE TABLE IF NOT EXISTS `{T_OUR_PRICE_HISTORY}` (
+                item_id STRING NOT NULL,
+                observed_at TIMESTAMP NOT NULL,
+                price FLOAT64
+            )
+            PARTITION BY DATE(observed_at)
+            CLUSTER BY item_id""",
         ]
         for stmt in statements:
             client.query(stmt).result()
@@ -509,12 +520,13 @@ def get_tracked_products_with_market(days: int = 7):
                 MIN(price) AS market_min,
                 APPROX_QUANTILES(price, 2)[SAFE_OFFSET(1)] AS market_median,
                 COUNT(DISTINCT COALESCE(competitor_id, CONCAT('url:', url))) AS competitor_count,
+                ARRAY_AGG(DISTINCT competitor_id IGNORE NULLS) AS competitor_ids,
                 MAX(observed_at) AS last_observed_at
             FROM grouped
             GROUP BY group_key
         )
         SELECT t.*, m.market_min_in_stock, m.market_min, m.market_median,
-               m.competitor_count, m.last_observed_at
+               m.competitor_count, m.competitor_ids, m.last_observed_at
         FROM `{T_TRACKED}` t
         LEFT JOIN market m ON m.group_key = COALESCE(t.item_matrix_id, t.item_id)
         WHERE COALESCE(t.archived, FALSE) = FALSE
@@ -608,6 +620,34 @@ def update_tracked_current_retail(item_id: str, price: float):
         print(f"pi: failed to update tracked retail: {e}")
 
 
+def record_our_price_snapshot():
+    """Append one row per active tracked item to pi_our_price_history, but only
+    where current_retail differs (> $0.005) from that item's last recorded price —
+    forward-only change-points powering the chart's "our price" line. The first run
+    seeds every item's opening point; unchanged prices produce zero rows, so calling
+    it every scrape is cheap. INSERT...SELECT (DML, not streaming) keeps the table
+    small. Failures never abort a scrape."""
+    ensure_pi_tables()
+    try:
+        get_bq_client().query(f"""
+            INSERT INTO `{T_OUR_PRICE_HISTORY}` (item_id, observed_at, price)
+            WITH last_recorded AS (
+                SELECT item_id, price
+                FROM `{T_OUR_PRICE_HISTORY}`
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY item_id ORDER BY observed_at DESC) = 1
+            )
+            SELECT t.item_id, CURRENT_TIMESTAMP(), t.current_retail
+            FROM `{T_TRACKED}` t
+            LEFT JOIN last_recorded h ON h.item_id = t.item_id
+            WHERE t.current_retail IS NOT NULL
+              AND COALESCE(t.archived, FALSE) = FALSE
+              AND (h.price IS NULL OR ABS(h.price - t.current_retail) > 0.005)
+        """).result()
+    except Exception as e:
+        print(f"pi: failed to record our price snapshot: {e}")
+
+
 def search_snapshot_items(q: str, limit: int = 40):
     """Item search (for pinning) against the latest master snapshot, joined to
     item_history/item_matrix_history for matrix + variant attributes so the UI
@@ -696,6 +736,104 @@ def get_item_observations(item_id: str, days: int = 120):
         bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
         bigquery.ScalarQueryParameter("days", "INT64", days),
     ])
+
+
+def get_item_price_history(item_id: str, days: int = 120):
+    """Change-point-compressed price history for the expandable chart: our price
+    line + one line per competitor. Both series are reduced server-side (SQL LAG)
+    to only the points where the price actually changed, so the payload stays tiny
+    even over a long window (one item, lazy on expand). A price holds until the next
+    change (the client draws it as a step line).
+
+    Competitor series aggregate at the model/matrix grain (matrix siblings included,
+    like get_item_competitor_prices); when a competitor has multiple listings at one
+    snapshot we keep the in-stock, lowest price as the representative point."""
+    ensure_pi_tables()
+    ours = _rows(f"""
+        SELECT observed_at, price FROM (
+            SELECT observed_at, price,
+                   LAG(price) OVER (ORDER BY observed_at) AS prev_price
+            FROM `{T_OUR_PRICE_HISTORY}`
+            WHERE item_id = @item_id
+              AND observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+              AND price IS NOT NULL
+        )
+        WHERE prev_price IS NULL OR ABS(price - prev_price) > 0.005
+        ORDER BY observed_at
+    """, params=[
+        bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
+        bigquery.ScalarQueryParameter("days", "INT64", days),
+    ])
+
+    comp_rows = _rows(f"""
+        WITH me AS (
+            SELECT item_id, item_matrix_id FROM `{T_TRACKED}`
+            WHERE item_id = @item_id
+        ),
+        variants AS (
+            SELECT t.item_id FROM `{T_TRACKED}` t, me
+            WHERE t.item_id = me.item_id
+               OR (me.item_matrix_id IS NOT NULL AND t.item_matrix_id = me.item_matrix_id)
+        ),
+        obs AS (
+            SELECT
+                COALESCE(o.competitor_id, CONCAT('url:', o.url)) AS series_key,
+                o.competitor_id, o.url, o.observed_at, o.price, o.in_stock
+            FROM `{T_OBSERVATIONS}` o
+            JOIN variants v ON v.item_id = o.match_item_id
+            WHERE o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+              AND o.price IS NOT NULL
+        ),
+        per_time AS (
+            SELECT
+                series_key,
+                observed_at,
+                ANY_VALUE(competitor_id) AS competitor_id,
+                ANY_VALUE(url) AS url,
+                ARRAY_AGG(price ORDER BY IF(COALESCE(in_stock, FALSE), 0, 1), price
+                          LIMIT 1)[OFFSET(0)] AS price,
+                MAX(COALESCE(in_stock, FALSE)) AS in_stock
+            FROM obs
+            GROUP BY series_key, observed_at
+        ),
+        changed AS (
+            SELECT *,
+                   LAG(price) OVER (PARTITION BY series_key ORDER BY observed_at) AS prev_price
+            FROM per_time
+        )
+        SELECT c.series_key, c.competitor_id, comp.name AS competitor_name, c.url,
+               c.observed_at, c.price, c.in_stock
+        FROM changed c
+        LEFT JOIN `{T_COMPETITORS}` comp ON comp.competitor_id = c.competitor_id
+        WHERE c.prev_price IS NULL OR ABS(c.price - c.prev_price) > 0.005
+        ORDER BY c.series_key, c.observed_at
+    """, params=[
+        bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
+        bigquery.ScalarQueryParameter("days", "INT64", days),
+    ])
+
+    from urllib.parse import urlparse
+    series: dict = {}
+    for r in comp_rows:
+        key = r["series_key"]
+        s = series.get(key)
+        if s is None:
+            name = r.get("competitor_name")
+            if not name and r.get("url"):
+                name = urlparse(r["url"]).netloc
+            s = {
+                "competitor_id": r.get("competitor_id"),
+                "competitor_name": name or "Unknown store",
+                "points": [],
+            }
+            series[key] = s
+        s["points"].append({
+            "observed_at": r["observed_at"],
+            "price": r["price"],
+            "in_stock": r["in_stock"],
+        })
+    competitors = sorted(series.values(), key=lambda s: s["competitor_name"].lower())
+    return {"ours": ours, "competitors": competitors}
 
 
 # ---------------------------------------------------------------------------

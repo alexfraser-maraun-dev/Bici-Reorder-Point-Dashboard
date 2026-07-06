@@ -286,6 +286,13 @@ def item_competitor_prices(item_id: str, days: int = 45):
     return repository.get_item_competitor_prices(item_id, days=days)
 
 
+@router.get("/tracked/{item_id}/price-history")
+def item_price_history(item_id: str, days: int = 120):
+    """Change-point-compressed price history (our line + one per competitor) for the
+    expandable chart. Compressed server-side so the payload stays small."""
+    return repository.get_item_price_history(item_id, days=days)
+
+
 @router.get("/items/search")
 def search_items(q: str):
     if not q or len(q.strip()) < 2:

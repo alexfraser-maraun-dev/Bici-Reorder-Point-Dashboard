@@ -24,6 +24,7 @@ import {
 import { itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
 import { PricePushDialog } from './price-push-dialog'
 import { ItemSearchPicker } from './item-search-picker'
+import { PriceHistoryChart } from './price-history-chart'
 import {
   ChevronDown, ChevronRight, DollarSign, ExternalLink, EyeOff, Link2, Pin,
   PinOff, RefreshCw, Search, ShieldCheck, Undo2,
@@ -97,6 +98,17 @@ function CompetitorBreakdown({ itemId }: { itemId: string }) {
   )
 }
 
+type MarketPosition = 'cheaper' | 'parity' | 'pricier' | 'none'
+
+function marketPosition(product: TrackedProduct): MarketPosition {
+  const ours = product.current_retail
+  const market = product.market_min_in_stock
+  if (ours == null || market == null) return 'none'
+  const delta = ours - market
+  if (Math.abs(delta) <= 0.01) return 'parity'
+  return delta < 0 ? 'cheaper' : 'pricier'
+}
+
 function PositionBadge({ product }: { product: TrackedProduct }) {
   const ours = product.current_retail
   const market = product.market_min_in_stock
@@ -124,6 +136,9 @@ function PositionBadge({ product }: { product: TrackedProduct }) {
 export function TrackedProductsTable() {
   const { products, isLoading, mutate } = useTrackedProducts()
   const [filter, setFilter] = useState('')
+  const [competitorFilter, setCompetitorFilter] = useState<string>('all')
+  const [brandFilter, setBrandFilter] = useState<string>('all')
+  const [positionFilter, setPositionFilter] = useState<string>('all')
   const [showExcluded, setShowExcluded] = useState(false)
   const [pushTarget, setPushTarget] = useState<TrackedProduct | null>(null)
   const [reseeding, setReseeding] = useState(false)
@@ -164,6 +179,11 @@ export function TrackedProductsTable() {
     }
   }
 
+  const brands = useMemo(
+    () => [...new Set(products.map((p) => p.brand).filter((b): b is string => !!b))].sort(),
+    [products]
+  )
+
   const visible = useMemo(() => {
     const q = filter.trim().toLowerCase()
     return products
@@ -174,7 +194,10 @@ export function TrackedProductsTable() {
         (p.brand ?? '').toLowerCase().includes(q) ||
         (p.sku ?? '').toLowerCase().includes(q)
       )
-  }, [products, filter, showExcluded])
+      .filter((p) => competitorFilter === 'all' || (p.competitor_ids ?? []).includes(competitorFilter))
+      .filter((p) => brandFilter === 'all' || p.brand === brandFilter)
+      .filter((p) => positionFilter === 'all' || marketPosition(p) === positionFilter)
+  }, [products, filter, showExcluded, competitorFilter, brandFilter, positionFilter])
 
   const patch = async (itemId: string, fields: Record<string, unknown>, label: string) => {
     try {
@@ -267,6 +290,52 @@ export function TrackedProductsTable() {
                 Re-seed list
               </Button>
             </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <Select value={competitorFilter} onValueChange={setCompetitorFilter}>
+              <SelectTrigger className="h-8 w-44 text-xs">
+                <SelectValue placeholder="Competitor" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All competitors</SelectItem>
+                {competitors.filter((c) => c.enabled).map((c) => (
+                  <SelectItem key={c.competitor_id} value={c.competitor_id}>{c.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={brandFilter} onValueChange={setBrandFilter}>
+              <SelectTrigger className="h-8 w-40 text-xs">
+                <SelectValue placeholder="Brand" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All brands</SelectItem>
+                {brands.map((b) => (
+                  <SelectItem key={b} value={b}>{b}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={positionFilter} onValueChange={setPositionFilter}>
+              <SelectTrigger className="h-8 w-40 text-xs">
+                <SelectValue placeholder="Market position" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Any position</SelectItem>
+                <SelectItem value="cheaper">Cheaper than market</SelectItem>
+                <SelectItem value="parity">At parity</SelectItem>
+                <SelectItem value="pricier">Pricier than market</SelectItem>
+                <SelectItem value="none">No market data</SelectItem>
+              </SelectContent>
+            </Select>
+            {(competitorFilter !== 'all' || brandFilter !== 'all' || positionFilter !== 'all') && (
+              <Button variant="ghost" size="sm" className="h-8 text-xs text-muted-foreground"
+                      onClick={() => { setCompetitorFilter('all'); setBrandFilter('all'); setPositionFilter('all') }}>
+                Clear filters
+              </Button>
+            )}
+            <span className="text-xs text-muted-foreground">
+              {visible.length} of {products.length}
+            </span>
           </div>
 
           <ItemSearchPicker
@@ -370,8 +439,16 @@ export function TrackedProductsTable() {
                     </TableRow>,
                     isOpen ? (
                       <TableRow key={`${p.item_id}-detail`} className="hover:bg-transparent">
-                        <TableCell colSpan={8} className="bg-muted/20 py-2 pl-10">
-                          <CompetitorBreakdown itemId={p.item_id} />
+                        <TableCell colSpan={8} className="bg-muted/20 py-3 pl-10 pr-4">
+                          <div className="space-y-3">
+                            <div>
+                              <p className="mb-1 text-xs font-medium text-muted-foreground">
+                                Price history — our price vs. tracked competitors
+                              </p>
+                              <PriceHistoryChart itemId={p.item_id} />
+                            </div>
+                            <CompetitorBreakdown itemId={p.item_id} />
+                          </div>
                         </TableCell>
                       </TableRow>
                     ) : null,
