@@ -47,6 +47,19 @@ REQUIRE_UPC = _flag("PI_REQUIRE_UPC")
 # then does a full catalog crawl (and its LLM verification) run.
 DISCOVERY_DAYS = int(os.getenv("PI_DISCOVERY_DAYS", "7"))
 
+# SERP discovery (SerpApi, engine=google): finds candidate product URLs on
+# competitors we can't crawl (connector_type='unknown'). Only fires for items
+# inside the discovery window that still lack a confirmed link, so search spend
+# scales with newly tracked items, not catalog size or nightly cadence.
+SERP_ENABLED = _flag("PI_SERP_ENABLED")
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "")
+SERP_MAX_SEARCHES_PER_RUN = int(os.getenv("PI_SERP_MAX_SEARCHES_PER_RUN", "20"))
+# Top organic results per search that get fetched/parsed (storefront requests,
+# free — but each is a polite_get, so keep it small).
+SERP_RESULTS_PER_SEARCH = int(os.getenv("PI_SERP_RESULTS_PER_SEARCH", "3"))
+SERP_GL = os.getenv("PI_SERP_GL", "ca")
+SERP_HL = os.getenv("PI_SERP_HL", "en")
+
 # Price-push floor: never suggest/allow (without explicit override) a price below
 # cost * (1 + this margin). MAP price and per-item overrides take precedence when set.
 MARGIN_FLOOR_PCT = float(os.getenv("PI_MARGIN_FLOOR_PCT", "0.15"))

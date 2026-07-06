@@ -6,7 +6,9 @@ Tiered, cheapest first:
   2. shopify_html — product pages discovered via the products sitemap; JSON-LD on
      the page usually carries real GTINs. Costs one request per product, so the
      crawl is pre-filtered to tracked brands and capped.
-  3. (deferred) serp — paid GTIN lookup for bot-protected sites; env-gated stub.
+  3. serp_discovery.py — SerpApi Google search (site:-scoped) finds product URLs
+     on competitors with no crawlable catalog (connector_type='unknown');
+     env-gated (PI_SERP_ENABLED + SERPAPI_API_KEY), paid per search.
 Plus PageScraper: a single-URL scraper for user-registered tracked URLs
 (JSON-LD -> OpenGraph -> microdata price fallbacks).
 

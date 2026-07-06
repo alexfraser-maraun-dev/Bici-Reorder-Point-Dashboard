@@ -8,7 +8,7 @@ streaming write is the append-only price-push audit log, mirroring log_writeback
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from google.cloud import bigquery
 
@@ -249,6 +249,16 @@ def _table_schema(table_id: str):
     return _schema_cache[table_id]
 
 
+def _json_ready(rows: list):
+    """load_table_from_json can't serialize datetime/date — rows built from BQ
+    query results (e.g. a competitor row fed back into upsert_competitor) carry
+    them, so coerce to ISO strings in place before any load job."""
+    for row in rows:
+        for key, value in row.items():
+            if isinstance(value, (datetime, date)):
+                row[key] = value.isoformat()
+
+
 def load_rows(table_id: str, rows: list):
     """Batch-appends rows via a load job (immediately DML-safe, no streaming buffer).
 
@@ -261,6 +271,7 @@ def load_rows(table_id: str, rows: list):
     if not rows:
         return
     ensure_pi_tables()
+    _json_ready(rows)
     schema = _table_schema(table_id)
     string_fields = {f.name for f in schema if f.field_type == "STRING"}
     for row in rows:
@@ -277,6 +288,7 @@ def _merge_upsert(table_id: str, rows: list, key: str, update_cols: list, insert
     the target table's schema — autodetect would type ISO timestamp strings as
     STRING and the MERGE insert would then fail against TIMESTAMP columns."""
     ensure_pi_tables()
+    _json_ready(rows)
     client = get_bq_client()
     temp_table_id = f"{table_id}_temp"
     target_schema = client.get_table(table_id).schema
@@ -791,6 +803,7 @@ def insert_product_links(rows: list):
     if not rows:
         return
     ensure_pi_tables()
+    _json_ready(rows)
     client = get_bq_client()
     temp_table_id = f"{T_LINKS}_temp"
     target_schema = client.get_table(T_LINKS).schema

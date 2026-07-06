@@ -317,6 +317,26 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             _set_status(competitors_done=counters["competitors_done"],
                         observations=counters["observations"], changes=counters["changes"])
 
+        # --- SERP discovery: competitors with no crawlable catalog -----------
+        # Runs whenever items need discovery (same trigger as the full crawl);
+        # inserts links directly, so this run's verification pass sees them.
+        serp_pending = 0
+        if config.SERP_ENABLED and needy:
+            _set_status(phase="SERP discovery")
+            try:
+                from . import serp_discovery
+                serp_stats = serp_discovery.discover(
+                    needy, competitors, index, existing_link_keys
+                )
+                print(f"pi: serp discovery: {serp_stats}")
+                _set_status(serp=serp_stats)
+                serp_pending = serp_stats.get("pending", 0)
+                if serp_stats.get("aborted"):
+                    errors.append(f"serp discovery aborted: {serp_stats['aborted']}")
+            except Exception as e:
+                errors.append(f"serp discovery: {e}")
+                print(f"pi: serp discovery failed: {e}")
+
         # --- targeted mode: re-check each confirmed link's URL ---------------
         scraper = PageScraper()
         competitor_names = {c["competitor_id"]: c["name"] for c in repository.get_competitors()}
@@ -442,7 +462,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 per_item[row["item_id"]] = n + 1
                 selected.append(row)
             repository.insert_product_links(gtin_links + selected)
-            if selected:
+            if selected or serp_pending:
                 from . import match_verifier
                 stats = match_verifier.verify_candidates()
                 print(f"pi: match verification: {stats}")

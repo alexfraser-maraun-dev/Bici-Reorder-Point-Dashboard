@@ -44,6 +44,7 @@ const SOURCE_LABEL: Record<string, string> = {
   llm: 'LLM verified',
   human: 'confirmed by you',
   manual_url: 'tracked URL',
+  serp: 'SERP found',
 }
 
 export function MatchReview() {

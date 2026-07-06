@@ -22,8 +22,93 @@ from . import config, repository
 
 def refresh_tracked_products(top_n: int = None) -> int:
     if config.SEED_MODE == "track_tag":
-        return refresh_from_track_tag()
-    return refresh_from_top_revenue(top_n)
+        count = refresh_from_track_tag()
+    else:
+        count = refresh_from_top_revenue(top_n)
+    refresh_descriptive_fields()
+    return count
+
+
+def refresh_descriptive_fields() -> int:
+    """Refreshes descriptive/matrix/price fields for EVERY active tracked row,
+    whatever its source. The tag/revenue seeds only touch rows in their own seed
+    set, so manually added rows (search-picker pins, URL-override creations)
+    would otherwise keep whatever fields existed at creation time — including
+    NULL attributes on rows that predate the matrix columns. Never touches
+    manual controls, rank, archived, or activated_at."""
+    repository.ensure_pi_tables()
+    client = get_bq_client()
+    merge_query = f"""
+        MERGE `{repository.T_TRACKED}` T
+        USING (
+            WITH latest AS (
+                SELECT MAX(snapshot_date_local) AS d
+                FROM `{LS_DATASET}.v_master_snapshot_latest`
+            ),
+            item_hist AS (
+                SELECT
+                    CAST(id AS STRING) AS item_id,
+                    COALESCE(NULLIF(upc, ''), NULLIF(ean, '')) AS raw_upc,
+                    CAST(NULLIF(item_matrix_id, 0) AS STRING) AS item_matrix_id,
+                    attribute_1, attribute_2, attribute_3
+                FROM `{LS_DATASET}.item_history`
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_time DESC) = 1
+            ),
+            matrix AS (
+                SELECT CAST(id AS STRING) AS matrix_id, description AS matrix_description
+                FROM `{LS_DATASET}.item_matrix_history`
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_time DESC) = 1
+            ),
+            snap AS (
+                SELECT
+                    CAST(item_id AS STRING) AS item_id,
+                    ANY_VALUE(COALESCE(product_display_name, item_description)) AS title,
+                    ANY_VALUE(brand_name) AS brand,
+                    ANY_VALUE(manufacturer_sku) AS sku,
+                    ANY_VALUE(CAST(system_sku AS STRING)) AS system_sku,
+                    MAX(item_current_price) AS current_retail,
+                    MAX(COALESCE(item_default_cost, item_avg_cost)) AS current_cost,
+                    LOGICAL_OR(REGEXP_CONTAINS(
+                        LOWER(COALESCE(item_tags, '')), r'(^|,)\\s*map\\s*(,|$)'
+                    )) AS is_map
+                FROM `{LS_DATASET}.v_master_snapshot_latest` s
+                CROSS JOIN latest
+                WHERE s.snapshot_date_local = latest.d
+                  AND CAST(item_id AS STRING) IN (
+                      SELECT item_id FROM `{repository.T_TRACKED}`
+                      WHERE COALESCE(archived, FALSE) = FALSE
+                  )
+                GROUP BY item_id
+            )
+            SELECT
+                s.*, u.item_matrix_id, m.matrix_description,
+                u.attribute_1, u.attribute_2, u.attribute_3,
+                NULLIF(LTRIM(REGEXP_REPLACE(COALESCE(u.raw_upc, ''), r'\\D', ''), '0'), '')
+                    AS upc_normalized
+            FROM snap s
+            LEFT JOIN item_hist u USING (item_id)
+            LEFT JOIN matrix m ON m.matrix_id = u.item_matrix_id
+        ) S
+        ON T.item_id = S.item_id
+        WHEN MATCHED THEN UPDATE SET
+            T.title = S.title,
+            T.brand = S.brand,
+            T.sku = S.sku,
+            T.system_sku = S.system_sku,
+            T.upc_normalized = S.upc_normalized,
+            T.current_retail = S.current_retail,
+            T.current_cost = S.current_cost,
+            T.is_map = S.is_map,
+            T.item_matrix_id = S.item_matrix_id,
+            T.matrix_description = S.matrix_description,
+            T.attribute_1 = S.attribute_1,
+            T.attribute_2 = S.attribute_2,
+            T.attribute_3 = S.attribute_3,
+            T.updated_at = CURRENT_TIMESTAMP()
+    """
+    result = client.query(merge_query).result()
+    repository.invalidate_pi_caches()
+    return getattr(result, "num_dml_affected_rows", 0) or 0
 
 
 def refresh_from_track_tag() -> int:
