@@ -148,11 +148,14 @@ export function TrackedProductsTable() {
         competitor_id: overrideCompetitor === 'none' ? null : overrideCompetitor,
         label: overrideTarget.title,
       })
-      toast.success('Match locked in — this URL is now the source of truth for this store')
+      toast.success('Match locked in — fetching the competitor price now')
       setOverrideTarget(null)
       setOverrideUrl('')
       setOverrideCompetitor('none')
       await mutate()
+      // the first observation is fetched in a background task server-side —
+      // refresh again once it has landed so price/stores update without a reload
+      setTimeout(() => { void mutate() }, 12000)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to save match')
     } finally {

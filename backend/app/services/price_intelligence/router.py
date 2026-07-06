@@ -98,12 +98,15 @@ def list_tracked_urls():
     return repository.get_tracked_urls()
 
 
-def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None):
+def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None,
+                      url_id=None):
     """Records a confirmed manual_url link and tombstones any conflicting
     auto-matches for the same item at the same store — the human-provided URL is
     the truth. Items not already actively tracked get pinned so their market
     data displays; items tracked via the 'track' tag are left tag-governed
-    (removing the tag still archives them)."""
+    (removing the tag still archives them). Finishes by fetching the page once
+    so the price / market min / store count update immediately instead of after
+    the next nightly run."""
     from urllib.parse import urlparse
     from . import seeding
     active_ids = {str(r["item_id"]) for r in repository.get_tracked_products()}
@@ -139,6 +142,40 @@ def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None):
         "updated_at": now,
     })
 
+    # Immediate first observation (one polite request) so the dashboard's
+    # price / market min / Stores columns reflect the new match right away.
+    try:
+        from .connectors import PageScraper
+        parsed = PageScraper().fetch(url)
+        if parsed is not None and parsed.get("price") is not None:
+            repository.load_rows(repository.T_OBSERVATIONS, [{
+                "observed_at": repository.utcnow_iso(),
+                "run_id": f"manual-link-{uuid.uuid4()}",
+                "source": "url",
+                # same diff key the nightly tracked-URL phase uses, so change
+                # detection diffs against this baseline instead of re-alerting
+                "diff_key": f"url:{url}",
+                "competitor_id": competitor_id,
+                "url": url,
+                "competitor_title": parsed.get("title"),
+                "competitor_sku": parsed.get("sku"),
+                "gtin": parsed.get("gtin"),
+                "match_item_id": str(item_id),
+                "match_method": "manual_url",
+                "match_confidence": 1.0,
+                "price": parsed.get("price"),
+                "compare_at_price": parsed.get("compare_at_price"),
+                "currency": parsed.get("currency"),
+                "in_stock": parsed.get("in_stock"),
+            }])
+            if url_id:
+                repository.mark_url_scraped(url_id, "success")
+            repository.invalidate_pi_caches()
+        elif url_id:
+            repository.mark_url_scraped(url_id, "no_price")
+    except Exception as e:
+        print(f"pi: immediate fetch of manual URL failed (next run retries): {e}")
+
 
 @router.post("/urls")
 def create_tracked_url(payload: Dict[str, Any], background_tasks: BackgroundTasks):
@@ -153,11 +190,22 @@ def create_tracked_url(payload: Dict[str, Any], background_tasks: BackgroundTask
             if domain and domain in c["base_url"].lower():
                 payload["competitor_id"] = c["competitor_id"]
                 break
+    # Same URL registered again (e.g. correcting a match from another tab):
+    # update the existing row instead of creating a duplicate to scrape twice.
+    existing = next(
+        (u for u in repository.get_tracked_urls() if u["url"] == url and u.get("enabled")),
+        None,
+    )
+    if existing:
+        payload["url_id"] = existing["url_id"]
+        payload.setdefault("label", existing.get("label"))
+        payload.setdefault("competitor_id", existing.get("competitor_id"))
     row = repository.upsert_tracked_url(payload)
     if payload.get("item_id"):
         background_tasks.add_task(
             _link_url_to_item, url, str(payload["item_id"]),
             payload.get("competitor_id"), payload.get("label"),
+            row["url_id"],
         )
     return {"status": "success", "url": row}
 
@@ -174,6 +222,7 @@ def update_tracked_url(url_id: str, payload: Dict[str, Any], background_tasks: B
             _link_url_to_item, rows[0]["url"], str(payload["item_id"]),
             payload.get("competitor_id") or rows[0].get("competitor_id"),
             payload.get("label") or rows[0].get("label"),
+            url_id,
         )
     return {"status": "success"}
 

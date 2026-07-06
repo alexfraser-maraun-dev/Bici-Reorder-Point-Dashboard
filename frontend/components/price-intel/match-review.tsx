@@ -78,10 +78,12 @@ export function MatchReview() {
         competitor_id: fixTarget.competitor_id,
         label: fixTarget.item_title,
       })
-      toast.success('Correct URL locked in — conflicting auto-matches were rejected')
+      toast.success('Correct URL locked in — rejecting the wrong match and fetching the price')
       setFixTarget(null)
       setFixUrl('')
       await Promise.all([mutate(), mutateSummary()])
+      // rejection + first fetch happen in a background task server-side
+      setTimeout(() => { void mutate(); void mutateSummary() }, 6000)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to save URL')
     } finally {

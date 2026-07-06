@@ -48,9 +48,10 @@ export function CompetitorManager() {
     if (!linkTarget) return
     try {
       await apiPost(`/api/price-intel/urls/${linkTarget.url_id}`, { item_id: itemId }, 'PUT')
-      toast.success(`Linked to ${itemTitle ?? itemId} — it now matches on every scrape`)
+      toast.success(`Linked to ${itemTitle ?? itemId} — fetching its price now`)
       setLinkTarget(null)
       await mutateUrls()
+      setTimeout(() => { void mutateUrls() }, 12000)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to link item')
     }
