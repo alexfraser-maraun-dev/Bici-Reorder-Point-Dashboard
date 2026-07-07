@@ -170,6 +170,19 @@ def _build_events(prev_map, obs, competitor_name, item_lookup):
         if is_below and not was_below:
             event("map_violation", old_price, new_price)
 
+    # Undercut intel: a competitor crossed below OUR retail on an item we carry
+    # — we've lost the price. Same transition-only guard as MAP so a competitor
+    # who sits below us every night doesn't re-alert; a newly discovered listing
+    # already below us alerts once. Skipped for MAP-tagged items, where the
+    # map_violation above is the sharper signal for the same crossing.
+    our_price = item.get("current_retail") if item and not item.get("is_map") else None
+    if our_price and new_price is not None:
+        our_price = float(our_price)
+        was_below = old_price is not None and old_price < our_price - PRICE_EPSILON
+        is_below = new_price < our_price - PRICE_EPSILON
+        if is_below and not was_below:
+            event("undercut", old_price, new_price)
+
     # Update the in-memory prev map so re-observations within one run don't
     # duplicate events.
     prev_map[key] = {"price": new_price, "in_stock": obs.get("in_stock")}
@@ -531,6 +544,13 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             })
         except Exception as e:
             print(f"pi: failed to save run record: {e}")
+        # Slack dispatch: best-effort, in finally so a health alert still fires
+        # even when the run threw before the digest stage.
+        try:
+            from . import notify
+            notify.dispatch_run(run_id, status, counters, errors)
+        except Exception as e:
+            print(f"pi: slack dispatch failed: {e}")
         _set_status(status=status, phase="done", finished_at=finished_at,
                     errors=errors[:20])
         _scrape_lock.release()

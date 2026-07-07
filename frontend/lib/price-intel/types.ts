@@ -89,6 +89,7 @@ export type ChangeEventType =
   | 'new_match'
   | 'first_observation'
   | 'map_violation'
+  | 'undercut'
 
 export interface ChangeEvent {
   event_id: string

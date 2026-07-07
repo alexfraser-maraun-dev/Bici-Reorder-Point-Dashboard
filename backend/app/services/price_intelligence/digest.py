@@ -68,7 +68,7 @@ def build_digest_stats(run_id: str) -> dict:
         FROM `{repository.T_EVENTS}`
         WHERE run_id = @run_id
           AND event_type IN ('price_drop', 'price_increase', 'map_violation',
-                             'back_in_stock', 'out_of_stock')
+                             'undercut', 'back_in_stock', 'out_of_stock')
         ORDER BY ABS(COALESCE(pct_change, 0)) DESC
         LIMIT 15
     """)

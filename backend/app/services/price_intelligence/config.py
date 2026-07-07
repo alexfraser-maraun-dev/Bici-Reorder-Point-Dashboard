@@ -73,6 +73,14 @@ SCHEDULE_HOUR_LOCAL = int(os.getenv("PI_SCHEDULE_HOUR_LOCAL", "2"))
 SCHEDULE_MINUTE_LOCAL = int(os.getenv("PI_SCHEDULE_MINUTE_LOCAL", "30"))
 SCHEDULE_TIMEZONE = os.getenv("PI_SCHEDULE_TIMEZONE", "America/Vancouver")
 
+# Slack notifications (best-effort, posted after each run from the scrape thread).
+# Off until a webhook is set, so existing deployments are unaffected. The digest
+# and health alerts go to SLACK_WEBHOOK_URL; MAP/undercut priority pings go to
+# SLACK_ALERTS_WEBHOOK_URL, falling back to the main webhook when unset.
+SLACK_ENABLED = _flag("PI_SLACK_ENABLED")
+SLACK_WEBHOOK_URL = os.getenv("PI_SLACK_WEBHOOK_URL", "")
+SLACK_ALERTS_WEBHOOK_URL = os.getenv("PI_SLACK_ALERTS_WEBHOOK_URL", "")
+
 # LLM digest.
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 DIGEST_MODEL = os.getenv("PI_DIGEST_MODEL", "claude-haiku-4-5")

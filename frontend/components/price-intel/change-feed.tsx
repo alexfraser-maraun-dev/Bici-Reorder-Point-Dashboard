@@ -37,6 +37,7 @@ const EVENT_META: Record<ChangeEventType, { label: string; icon: typeof Check; t
   new_match: { label: 'New match', icon: Sparkles, tone: 'bg-violet-50 text-violet-700 border-violet-200' },
   first_observation: { label: 'First observation', icon: Eye, tone: 'bg-slate-100 text-slate-600 border-slate-200' },
   map_violation: { label: 'MAP violation', icon: ShieldAlert, tone: 'bg-amber-50 text-amber-800 border-amber-300' },
+  undercut: { label: 'Undercut', icon: ArrowDownRight, tone: 'bg-orange-50 text-orange-700 border-orange-300' },
 }
 
 const fmtPrice = (v: number | null) => (v == null ? '—' : `$${v.toFixed(2)}`)

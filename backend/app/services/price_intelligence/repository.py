@@ -920,10 +920,14 @@ def get_item_price_history(item_id: str, days: int = 120):
 # ---------------------------------------------------------------------------
 
 def get_change_events(days: int = 14, acknowledged=None, competitor_id=None,
-                      event_types=None, min_abs_pct=None, brand=None, limit: int = 200):
+                      event_types=None, min_abs_pct=None, brand=None, run_id=None,
+                      limit: int = 200):
     ensure_pi_tables()
     where = "WHERE occurred_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)"
     params = [bigquery.ScalarQueryParameter("days", "INT64", days)]
+    if run_id:
+        where += " AND run_id = @run_id"
+        params.append(bigquery.ScalarQueryParameter("run_id", "STRING", str(run_id)))
     if acknowledged is not None:
         where += f" AND COALESCE(acknowledged, FALSE) = {'TRUE' if acknowledged else 'FALSE'}"
     if competitor_id:
@@ -969,6 +973,21 @@ def acknowledge_events(event_ids: list):
         ]),
     ).result()
     invalidate_pi_caches()
+
+
+def mark_events_notified(event_ids: list):
+    """Stamp the reserved notified/notified_at columns after a Slack dispatch so
+    no future re-notify path double-sends. No-op on empty input."""
+    if not event_ids:
+        return
+    ensure_pi_tables()
+    get_bq_client().query(
+        f"UPDATE `{T_EVENTS}` SET notified = TRUE, notified_at = CURRENT_TIMESTAMP() "
+        "WHERE event_id IN UNNEST(@ids)",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("ids", "STRING", [str(e) for e in event_ids]),
+        ]),
+    ).result()
 
 
 # ---------------------------------------------------------------------------
@@ -1401,6 +1420,16 @@ def save_digest(row: dict):
 def get_latest_digest():
     ensure_pi_tables()
     rows = _rows(f"SELECT * FROM `{T_DIGESTS}` ORDER BY created_at DESC LIMIT 1")
+    return rows[0] if rows else None
+
+
+def get_digest_for_run(run_id: str):
+    ensure_pi_tables()
+    rows = _rows(
+        f"SELECT * FROM `{T_DIGESTS}` WHERE run_id = @run_id "
+        "ORDER BY created_at DESC LIMIT 1",
+        params=[bigquery.ScalarQueryParameter("run_id", "STRING", str(run_id))],
+    )
     return rows[0] if rows else None
 
 
