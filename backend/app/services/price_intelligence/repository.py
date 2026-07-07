@@ -957,6 +957,52 @@ def get_rejected_match_keys() -> set:
     return {r["match_key"] for r in rows if r.get("match_key")}
 
 
+def backfill_url_competitor_ids(apply: bool = False) -> dict:
+    """Associate URL-based rows that have a NULL competitor_id with the registered
+    competitor that shares their domain. Fixes the case where a store was added both
+    as a competitor AND as a tracked URL, so it stops appearing as two separate
+    'stores' on an item. Dry-run by default. Only touches pi_ tables:
+    pi_tracked_urls, pi_price_observations, pi_product_links (matched to
+    pi_competitors by NET.REG_DOMAIN)."""
+    ensure_pi_tables()
+
+    def _count(table, urlcol):
+        rows = _rows(f"""
+            SELECT COUNT(*) AS n
+            FROM `{table}` t JOIN `{T_COMPETITORS}` c
+              ON NET.REG_DOMAIN(t.{urlcol}) = NET.REG_DOMAIN(c.base_url)
+            WHERE t.competitor_id IS NULL AND t.{urlcol} IS NOT NULL
+              AND NET.REG_DOMAIN(t.{urlcol}) IS NOT NULL
+        """)
+        return rows[0]["n"] if rows else 0
+
+    counts = {
+        "pi_tracked_urls": _count(T_URLS, "url"),
+        "pi_price_observations": _count(T_OBSERVATIONS, "url"),
+        "pi_product_links": _count(T_LINKS, "competitor_url"),
+    }
+    report = {"applied": apply, "would_update": counts}
+    if not apply:
+        return report
+
+    client = get_bq_client()
+
+    def _apply(table, urlcol, extra=""):
+        client.query(f"""
+            UPDATE `{table}` t SET competitor_id = c.competitor_id{extra}
+            FROM `{T_COMPETITORS}` c
+            WHERE t.competitor_id IS NULL AND t.{urlcol} IS NOT NULL
+              AND NET.REG_DOMAIN(t.{urlcol}) = NET.REG_DOMAIN(c.base_url)
+              AND NET.REG_DOMAIN(t.{urlcol}) IS NOT NULL
+        """).result()
+
+    _apply(T_URLS, "url")
+    _apply(T_OBSERVATIONS, "url")
+    _apply(T_LINKS, "competitor_url", extra=", updated_at = CURRENT_TIMESTAMP()")
+    invalidate_pi_caches()
+    return report
+
+
 def reject_competitor_listing(item_id: str, competitor_id, url, decided_by: str = "Dashboard"):
     """Reject one competitor listing for one item — the manual escape hatch for a
     stuck match (e.g. a fuzzy title auto-match that has no reviewable link row).

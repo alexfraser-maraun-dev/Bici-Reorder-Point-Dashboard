@@ -11,14 +11,26 @@ import { MatchReview } from '@/components/price-intel/match-review'
 import {
   usePriceIntelSummary, useTrackedProducts, useChangeFeed, useProductLinks,
 } from '@/lib/price-intel/hooks'
+import { isMapViolation } from '@/lib/price-intel/format'
 import { Badge } from '@/components/ui/badge'
 import { Bell, GitMerge, Globe, Sparkles, Table2 } from 'lucide-react'
+import { useMemo, useState } from 'react'
 
 export function PriceIntelligenceContent() {
   const { summary, isLoading, mutate: mutateSummary } = usePriceIntelSummary()
-  const { mutate: mutateTracked } = useTrackedProducts()
+  const { products, mutate: mutateTracked } = useTrackedProducts()
   const { mutate: mutateChanges } = useChangeFeed()
   const { mutate: mutateLinks } = useProductLinks('pending')
+  const [tab, setTab] = useState('tracked')
+  const [quickFilter, setQuickFilter] = useState<string | null>(null)
+
+  const mapViolations = useMemo(() => products.filter(isMapViolation).length, [products])
+
+  const onKpiSelect = (key: string) => {
+    if (key === 'changes') { setTab('changes'); return }
+    setQuickFilter(key)
+    setTab('tracked')
+  }
 
   const refreshAll = () => {
     void mutateSummary()
@@ -42,9 +54,10 @@ export function PriceIntelligenceContent() {
         <ScrapeStatusButton onRunFinished={refreshAll} />
       </div>
 
-      <PriceIntelKpiCards summary={summary} isLoading={isLoading} />
+      <PriceIntelKpiCards summary={summary} isLoading={isLoading}
+                          mapViolations={mapViolations} onSelect={onKpiSelect} />
 
-      <Tabs defaultValue="tracked" className="w-full">
+      <Tabs value={tab} onValueChange={setTab} className="w-full">
         <TabsList>
           <TabsTrigger value="tracked" className="gap-1.5">
             <Table2 className="h-4 w-4" /> Tracked Products
@@ -74,7 +87,8 @@ export function PriceIntelligenceContent() {
         </TabsList>
 
         <TabsContent value="tracked" className="mt-4">
-          <TrackedProductsTable />
+          <TrackedProductsTable quickFilter={quickFilter}
+                                onClearQuickFilter={() => setQuickFilter(null)} />
         </TabsContent>
         <TabsContent value="changes" className="mt-4">
           <ChangeFeed />

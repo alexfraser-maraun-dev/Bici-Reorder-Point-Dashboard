@@ -62,7 +62,9 @@ function EventRow({ event, ourPrice, onAck }: {
   return (
     <div className={cn(
       'flex items-center gap-3 rounded-lg border px-3 py-2',
-      event.acknowledged ? 'opacity-60' : 'bg-card'
+      event.event_type === 'map_violation' && !event.acknowledged
+        && 'border-amber-300 bg-amber-50 ring-1 ring-amber-200',
+      event.acknowledged ? 'opacity-60' : event.event_type !== 'map_violation' && 'bg-card'
     )}>
       <Badge variant="outline" className={cn('shrink-0 gap-1', meta.tone)}>
         <Icon className="h-3 w-3" />

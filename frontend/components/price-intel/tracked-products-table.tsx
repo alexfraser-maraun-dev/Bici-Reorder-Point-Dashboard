@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -21,13 +21,14 @@ import {
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
-import { itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
+import { isMapViolation, mapFloor, itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
 import { PricePushDialog } from './price-push-dialog'
 import { ItemSearchPicker } from './item-search-picker'
 import { PriceHistoryChart } from './price-history-chart'
 import {
-  Ban, ChevronDown, ChevronRight, DollarSign, ExternalLink, EyeOff, Link2, Pin,
-  PinOff, RefreshCw, Search, ShieldCheck, Undo2,
+  ArrowDown, ArrowUp, ArrowUpDown, Ban, ChevronDown, ChevronRight, DollarSign,
+  ExternalLink, EyeOff, Link2, Pin, PinOff, RefreshCw, Search, ShieldAlert,
+  ShieldCheck, Undo2,
 } from 'lucide-react'
 
 const fmt = (v: number | null | undefined) => (v == null ? '—' : `$${Number(v).toFixed(2)}`)
@@ -157,13 +158,31 @@ function PositionBadge({ product }: { product: TrackedProduct }) {
   )
 }
 
-export function TrackedProductsTable() {
+type SortKey = 'title' | 'rank' | 'our' | 'market' | 'stores'
+
+export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
+  quickFilter?: string | null
+  onClearQuickFilter?: () => void
+} = {}) {
   const { products, isLoading, mutate } = useTrackedProducts()
   const [filter, setFilter] = useState('')
   const [competitorFilter, setCompetitorFilter] = useState<string>('all')
   const [brandFilter, setBrandFilter] = useState<string>('all')
   const [positionFilter, setPositionFilter] = useState<string>('all')
+  const [mapFilter, setMapFilter] = useState<'all' | 'tagged' | 'violations'>('all')
+  const [sortKey, setSortKey] = useState<SortKey>('title')
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
   const [showExcluded, setShowExcluded] = useState(false)
+
+  // A KPI tile click drives the table's filters (e.g. "MAP violations" tile).
+  useEffect(() => {
+    if (!quickFilter) return
+    if (quickFilter === 'map') { setMapFilter('tagged'); setPositionFilter('all') }
+    else if (quickFilter === 'violations') { setMapFilter('violations'); setPositionFilter('all') }
+    else if (['cheaper', 'parity', 'pricier'].includes(quickFilter)) {
+      setPositionFilter(quickFilter); setMapFilter('all')
+    }
+  }, [quickFilter])
   const [pushTarget, setPushTarget] = useState<TrackedProduct | null>(null)
   const [reseeding, setReseeding] = useState(false)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
@@ -210,6 +229,17 @@ export function TrackedProductsTable() {
 
   const visible = useMemo(() => {
     const q = filter.trim().toLowerCase()
+    const dir = sortDir === 'asc' ? 1 : -1
+    const num = (v: number | null | undefined) => (v == null ? -Infinity : v)
+    const cmp = (a: TrackedProduct, b: TrackedProduct): number => {
+      switch (sortKey) {
+        case 'title': return (a.title ?? '').localeCompare(b.title ?? '')
+        case 'rank': return num(a.revenue_rank) - num(b.revenue_rank)
+        case 'our': return num(a.current_retail) - num(b.current_retail)
+        case 'market': return num(a.market_min_in_stock) - num(b.market_min_in_stock)
+        case 'stores': return num(a.competitor_count) - num(b.competitor_count)
+      }
+    }
     return products
       .filter((p) => (showExcluded ? true : !p.excluded))
       .filter((p) =>
@@ -221,7 +251,26 @@ export function TrackedProductsTable() {
       .filter((p) => competitorFilter === 'all' || (p.competitor_ids ?? []).includes(competitorFilter))
       .filter((p) => brandFilter === 'all' || p.brand === brandFilter)
       .filter((p) => positionFilter === 'all' || marketPosition(p) === positionFilter)
-  }, [products, filter, showExcluded, competitorFilter, brandFilter, positionFilter])
+      .filter((p) => mapFilter === 'all'
+        || (mapFilter === 'tagged' && p.is_map)
+        || (mapFilter === 'violations' && isMapViolation(p)))
+      .sort((a, b) => cmp(a, b) * dir)
+  }, [products, filter, showExcluded, competitorFilter, brandFilter, positionFilter,
+      mapFilter, sortKey, sortDir])
+
+  const toggleSort = (key: SortKey) => {
+    if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
+    else { setSortKey(key); setSortDir(key === 'title' ? 'asc' : 'desc') }
+  }
+  const SortHead = ({ k, label, className }: { k: SortKey; label: string; className?: string }) => (
+    <button onClick={() => toggleSort(k)}
+            className={cn('inline-flex items-center gap-1 hover:text-foreground', className)}>
+      {label}
+      {sortKey === k
+        ? (sortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />)
+        : <ArrowUpDown className="h-3 w-3 opacity-40" />}
+    </button>
+  )
 
   const patch = async (itemId: string, fields: Record<string, unknown>, label: string) => {
     try {
@@ -351,9 +400,22 @@ export function TrackedProductsTable() {
                 <SelectItem value="none">No market data</SelectItem>
               </SelectContent>
             </Select>
-            {(competitorFilter !== 'all' || brandFilter !== 'all' || positionFilter !== 'all') && (
+            <Select value={mapFilter} onValueChange={(v) => setMapFilter(v as typeof mapFilter)}>
+              <SelectTrigger className="h-8 w-40 text-xs">
+                <SelectValue placeholder="MAP" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All items</SelectItem>
+                <SelectItem value="tagged">MAP-tagged</SelectItem>
+                <SelectItem value="violations">MAP violations</SelectItem>
+              </SelectContent>
+            </Select>
+            {(competitorFilter !== 'all' || brandFilter !== 'all' || positionFilter !== 'all' || mapFilter !== 'all') && (
               <Button variant="ghost" size="sm" className="h-8 text-xs text-muted-foreground"
-                      onClick={() => { setCompetitorFilter('all'); setBrandFilter('all'); setPositionFilter('all') }}>
+                      onClick={() => {
+                        setCompetitorFilter('all'); setBrandFilter('all')
+                        setPositionFilter('all'); setMapFilter('all'); onClearQuickFilter?.()
+                      }}>
                 Clear filters
               </Button>
             )}
@@ -380,12 +442,12 @@ export function TrackedProductsTable() {
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-6" />
-                  <TableHead className="w-8">#</TableHead>
-                  <TableHead>Product</TableHead>
-                  <TableHead className="text-right">Our price</TableHead>
-                  <TableHead className="text-right">Market min</TableHead>
+                  <TableHead className="w-8"><SortHead k="rank" label="#" /></TableHead>
+                  <TableHead><SortHead k="title" label="Product" /></TableHead>
+                  <TableHead className="text-right"><SortHead k="our" label="Our price" className="justify-end" /></TableHead>
+                  <TableHead className="text-right"><SortHead k="market" label="Market min" className="justify-end" /></TableHead>
                   <TableHead>Position</TableHead>
-                  <TableHead className="text-right">Stores</TableHead>
+                  <TableHead className="text-right"><SortHead k="stores" label="Stores" className="justify-end" /></TableHead>
                   <TableHead className="w-32 text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
@@ -424,6 +486,13 @@ export function TrackedProductsTable() {
                               {a}
                             </Badge>
                           ))}
+                          {isMapViolation(p) && (
+                            <Badge variant="outline"
+                                   title={`Competitor at ${fmt(p.market_min_in_stock)} is below our price ${fmt(mapFloor(p))}`}
+                                   className="shrink-0 gap-1 border-amber-300 bg-amber-50 px-1.5 py-0 text-[11px] font-semibold text-amber-800">
+                              <ShieldAlert className="h-3 w-3" /> MAP violation
+                            </Badge>
+                          )}
                         </div>
                         <p className="truncate text-xs text-muted-foreground">
                           {itemIdentity({ brand: p.brand, upc: p.upc_normalized, systemSku: p.system_sku })}

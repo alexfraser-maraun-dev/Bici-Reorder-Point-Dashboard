@@ -323,6 +323,13 @@ def list_links(status: Optional[str] = None, item_id: Optional[str] = None,
     )
 
 
+@router.post("/competitors/backfill-url-links")
+def backfill_url_links(apply: bool = False):
+    """Associate NULL-competitor URL rows (tracked URLs, their observations, manual
+    links) with the registered competitor sharing their domain. Dry-run unless apply=true."""
+    return repository.backfill_url_competitor_ids(apply=apply)
+
+
 @router.post("/links/cleanup")
 def cleanup_links(apply: bool = False):
     """One-off hygiene: reject color/size-mismatched links and enforce one

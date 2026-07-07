@@ -1,7 +1,9 @@
 """Lightspeed price push with server-side guards (feature c).
 
-The floor is the highest of: MAP price (when the item is MAP-tagged), the
-per-item manual override, and cost * (1 + margin floor). The server re-validates
+The floor is the highest of: the MAP floor (for MAP-tagged items this is our own
+retail price, i.e. we won't advertise a MAP item below its current price; an
+explicit map_price override wins if set), the per-item manual override, and
+cost * (1 + margin floor). The server re-validates
 on push — the preview verdict from the client is never trusted — and a push that
 moves price more than MAX_PUSH_CHANGE_PCT is rejected outright as a fat-finger
 guard. Every attempt is audit-logged to pi_price_push_log.
@@ -12,8 +14,11 @@ from . import config, repository
 def compute_floor(item: dict):
     """Returns (floor_price or None, floor_source)."""
     candidates = []
-    if item.get("is_map") and item.get("map_price"):
-        candidates.append((float(item["map_price"]), "map_price"))
+    if item.get("is_map"):
+        # MAP == our default price for tagged items (map_price override wins).
+        map_floor = item.get("map_price") or item.get("current_retail")
+        if map_floor:
+            candidates.append((float(map_floor), "map_price"))
     if item.get("min_price_override"):
         candidates.append((float(item["min_price_override"]), "min_price_override"))
     if item.get("current_cost"):

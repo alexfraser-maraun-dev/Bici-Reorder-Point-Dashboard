@@ -159,12 +159,14 @@ def _build_events(prev_map, obs, competitor_name, item_lookup):
         if prev_stock is not None and new_stock is not None and prev_stock != new_stock:
             event("back_in_stock" if new_stock else "out_of_stock", old_price, new_price)
 
-    # MAP intel: flag a competitor advertising below our MAP price, on the
-    # transition only (first sighting below, or a move from >= MAP to < MAP).
-    if item and item.get("is_map") and item.get("map_price") and new_price is not None:
-        map_price = float(item["map_price"])
-        was_below = old_price is not None and old_price < map_price - PRICE_EPSILON
-        is_below = new_price < map_price - PRICE_EPSILON
+    # MAP intel: flag a competitor advertising below our MAP floor, on the
+    # transition only (first sighting below, or a move from >= floor to < floor).
+    # MAP == our retail price for tagged items (map_price override wins if set).
+    map_floor = (item.get("map_price") or item.get("current_retail")) if item and item.get("is_map") else None
+    if map_floor and new_price is not None:
+        map_floor = float(map_floor)
+        was_below = old_price is not None and old_price < map_floor - PRICE_EPSILON
+        is_below = new_price < map_floor - PRICE_EPSILON
         if is_below and not was_below:
             event("map_violation", old_price, new_price)
 
