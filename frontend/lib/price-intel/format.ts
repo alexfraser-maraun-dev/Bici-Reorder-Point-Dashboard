@@ -5,7 +5,9 @@
 export const lightspeedItemUrl = (itemId: string) =>
   `https://us.merchantos.com/?name=item.views.item&form_name=view&id=${encodeURIComponent(itemId)}&tab=details`
 
-// Consistent identifier sub-line: brand · UPC <value> · ID <system id>.
+// Consistent identifier sub-line: brand · UPC <value> · System ID <system sku>.
+// "System ID" is the Lightspeed system SKU — the identifier the user actually
+// searches on in LS (not the internal item_id, which only appears in the URL).
 // Missing UPC is called out (coverage matters); missing pieces are omitted.
 export function itemIdentity(parts: {
   brand?: string | null
@@ -15,6 +17,6 @@ export function itemIdentity(parts: {
   return [
     parts.brand,
     parts.upc ? `UPC ${parts.upc}` : 'no UPC',
-    parts.systemSku ? `ID ${parts.systemSku}` : null,
+    parts.systemSku ? `System ID ${parts.systemSku}` : null,
   ].filter(Boolean).join(' · ')
 }

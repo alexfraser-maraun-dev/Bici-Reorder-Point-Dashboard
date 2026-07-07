@@ -121,6 +121,49 @@ def _size_value_matches(a, b) -> bool:
     return ca is not None and ca == cb
 
 
+def _color_match(a, b) -> bool:
+    """Whether two color values plausibly refer to the same color. Shares a word
+    token, OR one alnum-only spelling contains the other so spacing/camelCase
+    variants agree ('blackSeries' == 'Black Series', 'Green' ~ 'Steel Green').
+    Deliberately lenient: a false 'match' just keeps a link for human review;
+    a false 'mismatch' would wrongly tombstone a real match."""
+    if _attr_tokens(a) & _attr_tokens(b):
+        return True
+    ca = re.sub(r"[^a-z0-9]", "", _fold(a))
+    cb = re.sub(r"[^a-z0-9]", "", _fold(b))
+    return bool(ca) and bool(cb) and (ca in cb or cb in ca)
+
+
+def parse_variant_options(competitor_title):
+    """Best-effort recovery of a competitor variant's options from its title, e.g.
+    'Factor Monza Force - Steel Green / 58' -> ['Steel Green', '58']. Returns []
+    when the title has no ' - Option / Option' tail (nothing to compare)."""
+    if not competitor_title or " - " not in competitor_title:
+        return []
+    tail = competitor_title.rsplit(" - ", 1)[1]
+    return [p.strip() for p in tail.split("/") if p.strip()]
+
+
+def attributes_conflict(options, attrs) -> bool:
+    """True when a competitor variant's options clearly conflict (size or color)
+    with our item's attributes — the same conservative rule the matcher uses to
+    suppress. Only fires on a comparable dimension that matches nothing; missing
+    or unparseable data is never a conflict."""
+    opts = [o for o in (options or []) if o and str(o).strip()]
+    attrs = [a for a in (attrs or []) if a and str(a).strip()]
+    if not opts or not attrs:
+        return False
+    o_sz = [o for o in opts if _canon_size(o)]
+    o_col = [o for o in opts if not _canon_size(o)]
+    a_sz = [a for a in attrs if _canon_size(a)]
+    a_col = [a for a in attrs if not _canon_size(a)]
+    if o_sz and a_sz and not any(_size_value_matches(o, a) for o in o_sz for a in a_sz):
+        return True
+    if o_col and a_col and not any(_color_match(o, a) for o in o_col for a in a_col):
+        return True
+    return False
+
+
 def build_match_key(competitor_id, scraped: dict) -> str:
     """Stable identity for one scraped competitor listing — the key pi_product_links
     dedupes and re-attaches on. Prefers SKU (survives URL/handle renames)."""
@@ -249,7 +292,7 @@ class MatchIndex:
             color_state = None
             if opt_colors and s_colors:
                 color_comparable = True
-                color_state = any(_attr_tokens(o) & _attr_tokens(a)
+                color_state = any(_color_match(o, a)
                                   for o in opt_colors for a in s_colors)
                 color_hit = color_hit or color_state
             if size_state and color_state:

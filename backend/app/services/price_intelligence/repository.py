@@ -1025,6 +1025,126 @@ def decide_link(link_id: str, status: str, decided_by: str = "Dashboard"):
     invalidate_pi_caches()
 
 
+def confirm_link(link_id: str, decided_by: str = "Dashboard") -> dict:
+    """Guarded confirm — the single choke point for both single-row and bulk
+    confirms. Enforces the invariant that one of our items links to exactly one
+    competitor variant per store:
+      - a competitor variant whose color/size conflicts with the item is rejected
+        (it's the wrong variant, not ours);
+      - if the item already has a confirmed link at that store, the confirm is
+        skipped (stays pending) so a human resolves the duplicate deliberately.
+    Returns {status: confirmed|rejected|skipped|error, reason}."""
+    from .matcher import parse_variant_options, attributes_conflict
+    ensure_pi_tables()
+    rows = _rows(f"""
+        SELECT l.item_id, l.competitor_id, l.competitor_title,
+               t.attribute_1 AS a1, t.attribute_2 AS a2, t.attribute_3 AS a3
+        FROM `{T_LINKS}` l LEFT JOIN `{T_TRACKED}` t ON t.item_id = l.item_id
+        WHERE l.link_id = @lid
+    """, params=[bigquery.ScalarQueryParameter("lid", "STRING", str(link_id))])
+    if not rows:
+        return {"status": "error", "reason": "link not found"}
+    l = rows[0]
+    if attributes_conflict(parse_variant_options(l.get("competitor_title")),
+                           [l.get("a1"), l.get("a2"), l.get("a3")]):
+        decide_link(link_id, "rejected", decided_by=decided_by)
+        return {"status": "rejected", "reason": "color/size mismatch with the item"}
+    dupe = _rows(f"""
+        SELECT link_id FROM `{T_LINKS}`
+        WHERE item_id = @iid AND COALESCE(competitor_id, '') = @cid
+          AND status = 'confirmed' AND link_id != @lid
+        LIMIT 1
+    """, params=[
+        bigquery.ScalarQueryParameter("iid", "STRING", str(l["item_id"])),
+        bigquery.ScalarQueryParameter("cid", "STRING", str(l.get("competitor_id") or "")),
+        bigquery.ScalarQueryParameter("lid", "STRING", str(link_id)),
+    ])
+    if dupe:
+        return {"status": "skipped", "reason": "item already has a confirmed link at this store"}
+    decide_link(link_id, "confirmed", decided_by=decided_by)
+    return {"status": "confirmed"}
+
+
+def cleanup_mismatched_links(apply: bool = False) -> dict:
+    """One-off hygiene sweep (dry-run by default). Rejects links whose competitor
+    color/size conflicts with the item's attributes (both confirmed and pending),
+    then enforces one confirmed link per (item_id, competitor) by keeping the best
+    survivor and rejecting the rest. When applying, also nulls match_item_id on the
+    observations those wrong CONFIRMED links attributed, so market columns + the
+    price-history chart correct immediately. Returns a report."""
+    from collections import defaultdict
+    from .matcher import parse_variant_options, attributes_conflict
+    ensure_pi_tables()
+    confirmed = get_product_links(status="confirmed", limit=5000)
+    pending = get_product_links(status="pending", limit=5000)
+
+    def attrs(l):
+        return [l.get("item_attribute_1"), l.get("item_attribute_2"), l.get("item_attribute_3")]
+
+    attr_reject = [
+        l for l in confirmed + pending
+        if attributes_conflict(parse_variant_options(l.get("competitor_title")), attrs(l))
+    ]
+    attr_ids = {l["link_id"] for l in attr_reject}
+
+    surviving = [l for l in confirmed if l["link_id"] not in attr_ids]
+    by_pair = defaultdict(list)
+    for l in surviving:
+        by_pair[(l.get("item_id"), l.get("competitor_id"))].append(l)
+
+    def rank(l):
+        return (l.get("llm_verdict") == "same_variant",
+                l.get("source") in ("gtin", "manual_url", "human", "attr"),
+                l.get("confidence") or 0, l.get("fuzzy_score") or 0)
+
+    dupe_reject = []
+    for links in by_pair.values():
+        if len(links) > 1:
+            keep = sorted(links, key=rank, reverse=True)[0]
+            dupe_reject += [l for l in links if l["link_id"] != keep["link_id"]]
+
+    reject_ids = attr_ids | {l["link_id"] for l in dupe_reject}
+    obs_targets = [l for l in confirmed
+                   if l["link_id"] in reject_ids and l.get("competitor_url")]
+
+    report = {
+        "applied": apply,
+        "attr_reject_confirmed": sum(1 for l in attr_reject if l["status"] == "confirmed"),
+        "attr_reject_pending": sum(1 for l in attr_reject if l["status"] == "pending"),
+        "dupe_reject_confirmed": len(dupe_reject),
+        "total_links_rejected": len(reject_ids),
+        "observation_listings_reattributed": len(obs_targets),
+        "samples": [
+            {"status": l["status"], "item_id": l.get("item_id"), "attrs": attrs(l),
+             "competitor_title": l.get("competitor_title")}
+            for l in (attr_reject + dupe_reject)[:12]
+        ],
+    }
+    if not apply:
+        return report
+
+    client = get_bq_client()
+    if reject_ids:
+        client.query(
+            f"UPDATE `{T_LINKS}` SET status='rejected', decided_by='cleanup', "
+            "updated_at=CURRENT_TIMESTAMP() WHERE link_id IN UNNEST(@ids)",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("ids", "STRING", list(reject_ids))]),
+        ).result()
+    if obs_targets:
+        keys = [f"{l['item_id']}|{l.get('competitor_id') or ''}|{l['competitor_url']}"
+                for l in obs_targets]
+        client.query(
+            f"UPDATE `{T_OBSERVATIONS}` SET match_item_id = NULL "
+            "WHERE match_item_id IS NOT NULL AND CONCAT(CAST(match_item_id AS STRING), '|', "
+            "COALESCE(competitor_id,''), '|', COALESCE(url,'')) IN UNNEST(@keys)",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("keys", "STRING", keys)]),
+        ).result()
+    invalidate_pi_caches()
+    return report
+
+
 def reject_conflicting_links(item_id: str, domain: str, decided_by: str = "Dashboard"):
     """When a human pins the true URL for an item at a store, tombstone any
     auto-created (gtin/llm) links for the same item at the same domain so the

@@ -97,14 +97,26 @@ export function MatchReview() {
   const decide = async (linkIds: string[], status: 'confirmed' | 'rejected') => {
     setDeciding((prev) => new Set([...prev, ...linkIds]))
     try {
-      await Promise.all(
+      // The confirm endpoint is guarded: it may reject (color/size mismatch) or
+      // skip (item already linked at that store), so tally the real outcomes.
+      const results = await Promise.all(
         linkIds.map((id) => apiPost(`/api/price-intel/links/${id}/decision`, { status }))
       )
-      toast.success(
-        linkIds.length === 1
-          ? status === 'confirmed' ? 'Match confirmed' : 'Match rejected'
-          : `${linkIds.length} matches ${status}`
-      )
+      if (status === 'rejected') {
+        toast.success(linkIds.length === 1 ? 'Match rejected' : `${linkIds.length} matches rejected`)
+      } else {
+        const tally = results.reduce((acc: Record<string, number>, r) => {
+          const s = (r?.status as string) || 'confirmed'
+          acc[s] = (acc[s] ?? 0) + 1
+          return acc
+        }, {})
+        const parts = [
+          tally.confirmed && `${tally.confirmed} confirmed`,
+          tally.skipped && `${tally.skipped} skipped (already linked)`,
+          tally.rejected && `${tally.rejected} rejected (mismatch)`,
+        ].filter(Boolean)
+        toast.success(parts.join(' · ') || 'Done')
+      }
       await Promise.all([mutate(), mutateSummary()])
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to save decision')
@@ -117,10 +129,12 @@ export function MatchReview() {
     }
   }
 
-  // "Confirm all high-confidence": pending rows the LLM called same_model but
-  // couldn't anchor to one variant, with a strong fuzzy score.
+  // "Confirm all high-confidence": pending rows the LLM judged the *same variant*
+  // (identical color + size) with a strong fuzzy score. same_model rows are a
+  // DIFFERENT variant, so they're never bulk-confirmed; the backend also rejects
+  // any color/size mismatch and enforces one confirmed link per (item, store).
   const highConfidence = links.filter(
-    (l) => l.status === 'pending' && l.llm_verdict === 'same_model' && (l.fuzzy_score ?? 0) >= 80
+    (l) => l.status === 'pending' && l.llm_verdict === 'same_variant' && (l.fuzzy_score ?? 0) >= 80
   )
 
   return (

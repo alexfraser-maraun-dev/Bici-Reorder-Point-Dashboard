@@ -313,13 +313,24 @@ def list_links(status: Optional[str] = None, item_id: Optional[str] = None,
     )
 
 
+@router.post("/links/cleanup")
+def cleanup_links(apply: bool = False):
+    """One-off hygiene: reject color/size-mismatched links and enforce one
+    confirmed link per (item, store). Dry-run unless apply=true."""
+    return repository.cleanup_mismatched_links(apply=apply)
+
+
 @router.post("/links/{link_id}/decision")
 def decide_link(link_id: str, payload: Dict[str, Any]):
     status = payload.get("status")
     if status not in ("confirmed", "rejected"):
         raise HTTPException(status_code=400, detail="status must be confirmed or rejected")
-    repository.decide_link(link_id, status, decided_by=payload.get("actor") or "Dashboard")
-    return {"status": "success"}
+    actor = payload.get("actor") or "Dashboard"
+    if status == "confirmed":
+        # Guarded: enforces attribute match + one confirmed link per (item, store).
+        return repository.confirm_link(link_id, decided_by=actor)
+    repository.decide_link(link_id, status, decided_by=actor)
+    return {"status": "rejected"}
 
 
 # --- scraping ------------------------------------------------------------------
