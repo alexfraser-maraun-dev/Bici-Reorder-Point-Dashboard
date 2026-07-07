@@ -18,7 +18,7 @@ caller swallows failures so scrape data is never lost.
 import json
 import re
 
-from . import config, repository
+from . import config, matcher, repository
 
 _anthropic_client = None
 
@@ -177,7 +177,13 @@ def verify_candidates(max_pairs: int = None) -> dict:
         if l.get("item_id")
     }
 
-    def _claim_pair(item_id: str, competitor_id, update: dict) -> bool:
+    # Within one run, several candidates can claim the same (item, competitor).
+    # The best attribute (color+size) match wins the slot; a lower-scoring one that
+    # already claimed it is demoted back to pending. A pre-existing confirmed link
+    # (prior run / human) always blocks — change it with reject-and-replace.
+    claimed_in_run = {}  # pair -> (update_dict, score)
+
+    def _claim_pair(item_id: str, competitor_id, update: dict, link: dict, item: dict) -> bool:
         pair = (str(item_id), competitor_id)
         if pair in confirmed_pairs:
             update["status"] = "pending"
@@ -186,7 +192,25 @@ def verify_candidates(max_pairs: int = None) -> dict:
                 "[item already has a confirmed link at this store]"
             ).strip()[:300]
             return False
-        confirmed_pairs.add(pair)
+        score = matcher.attribute_match_score(
+            matcher.parse_variant_options(link.get("competitor_title")),
+            [item.get("attribute_1"), item.get("attribute_2"), item.get("attribute_3")],
+        )
+        prev = claimed_in_run.get(pair)
+        if prev is not None and score <= prev[1]:
+            update["status"] = "pending"
+            update["llm_reason"] = (
+                f"{update.get('llm_reason') or ''} [a closer variant match won this store]"
+            ).strip()[:300]
+            return False
+        if prev is not None:
+            prev[0]["status"] = "pending"
+            prev[0]["llm_reason"] = (
+                f"{prev[0].get('llm_reason') or ''} [superseded by a closer variant match]"
+            ).strip()[:300]
+            stats["confirmed"] -= 1
+            stats["pending"] += 1
+        claimed_in_run[pair] = (update, score)
         return True
 
     client = _get_anthropic_client()
@@ -250,7 +274,7 @@ def verify_candidates(max_pairs: int = None) -> dict:
             }
             if verdict == "same_variant":
                 update.update(status="confirmed", level="variant", confidence=0.95)
-                if _claim_pair(link["item_id"], link.get("competitor_id"), update):
+                if _claim_pair(link["item_id"], link.get("competitor_id"), update, link, item):
                     stats["confirmed"] += 1
                 else:
                     stats["pending"] += 1
@@ -261,7 +285,8 @@ def verify_candidates(max_pairs: int = None) -> dict:
                 update.update(item_id=anchor_id, level="model")
                 if resolved:
                     update.update(status="confirmed", confidence=0.85)
-                    if _claim_pair(anchor_id, link.get("competitor_id"), update):
+                    anchor_item = by_id.get(str(anchor_id), item)
+                    if _claim_pair(anchor_id, link.get("competitor_id"), update, link, anchor_item):
                         stats["confirmed"] += 1
                     else:
                         stats["pending"] += 1

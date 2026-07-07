@@ -503,7 +503,13 @@ def get_tracked_products_with_market(days: int = 7):
         return cached
     rows = _rows(f"""
         WITH latest AS (
-            SELECT * FROM `{T_OBSERVATIONS}`
+            SELECT o.*,
+                   -- digit signature of the listing's size (last '-' segment only,
+                   -- so the model number e.g. '5000' doesn't pollute the size match)
+                   (SELECT STRING_AGG(d, ',' ORDER BY d) FROM UNNEST(REGEXP_EXTRACT_ALL(
+                       LOWER(ARRAY_REVERSE(SPLIT(COALESCE(o.competitor_title, ''), ' - '))[SAFE_OFFSET(0)]),
+                       r'[0-9]+')) d) AS comp_size_sig
+            FROM `{T_OBSERVATIONS}` o
             WHERE observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND match_item_id IS NOT NULL AND price IS NOT NULL
             QUALIFY ROW_NUMBER() OVER (PARTITION BY diff_key ORDER BY observed_at DESC) = 1
@@ -513,7 +519,17 @@ def get_tracked_products_with_market(days: int = 7):
             FROM latest l
             JOIN `{T_TRACKED}` t ON t.item_id = l.match_item_id
         ),
-        market AS (
+        -- one representative per (matrix, store): freshest in-stock, then cheapest,
+        -- so a stale listing can't undercut the current price (mirrors the breakdown).
+        store_rep AS (
+            SELECT * FROM grouped
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY group_key, COALESCE(competitor_id, CONCAT('url:', url))
+                ORDER BY IF(COALESCE(in_stock, FALSE), 1, 0) DESC, observed_at DESC, price ASC
+            ) = 1
+        ),
+        -- fallback: pool the whole matrix (sizes share MSRP for bikes)
+        matrix_market AS (
             SELECT
                 group_key,
                 MIN(IF(in_stock, price, NULL)) AS market_min_in_stock,
@@ -522,14 +538,52 @@ def get_tracked_products_with_market(days: int = 7):
                 COUNT(DISTINCT COALESCE(competitor_id, CONCAT('url:', url))) AS competitor_count,
                 ARRAY_AGG(DISTINCT competitor_id IGNORE NULLS) AS competitor_ids,
                 MAX(observed_at) AS last_observed_at
-            FROM grouped
+            FROM store_rep
             GROUP BY group_key
+        ),
+        tracked_active AS (
+            SELECT *, COALESCE(item_matrix_id, item_id) AS group_key,
+                   (SELECT STRING_AGG(d, ',' ORDER BY d) FROM UNNEST(REGEXP_EXTRACT_ALL(
+                       LOWER(CONCAT(COALESCE(attribute_1,''),' ',COALESCE(attribute_2,''),' ',
+                       COALESCE(attribute_3,''))), r'[0-9]+')) d) AS item_size_sig
+            FROM `{T_TRACKED}` WHERE COALESCE(archived, FALSE) = FALSE
+        ),
+        -- preferred: competitor listings whose size signature matches this item's,
+        -- so market data stays size-accurate for matrices priced per size (tires);
+        -- reduced to the freshest representative per (item, store).
+        item_rep AS (
+            SELECT t.item_id, g.competitor_id, g.url, g.in_stock, g.price, g.observed_at
+            FROM tracked_active t
+            JOIN grouped g
+              ON g.group_key = t.group_key AND g.comp_size_sig = t.item_size_sig
+            WHERE t.item_size_sig IS NOT NULL AND t.item_size_sig != ''
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY t.item_id, COALESCE(g.competitor_id, CONCAT('url:', g.url))
+                ORDER BY IF(COALESCE(g.in_stock, FALSE), 1, 0) DESC, g.observed_at DESC, g.price ASC
+            ) = 1
+        ),
+        item_market AS (
+            SELECT
+                item_id,
+                MIN(IF(in_stock, price, NULL)) AS market_min_in_stock,
+                MIN(price) AS market_min,
+                APPROX_QUANTILES(price, 2)[SAFE_OFFSET(1)] AS market_median,
+                COUNT(DISTINCT COALESCE(competitor_id, CONCAT('url:', url))) AS competitor_count,
+                ARRAY_AGG(DISTINCT competitor_id IGNORE NULLS) AS competitor_ids,
+                MAX(observed_at) AS last_observed_at
+            FROM item_rep
+            GROUP BY item_id
         )
-        SELECT t.*, m.market_min_in_stock, m.market_min, m.market_median,
-               m.competitor_count, m.competitor_ids, m.last_observed_at
-        FROM `{T_TRACKED}` t
-        LEFT JOIN market m ON m.group_key = COALESCE(t.item_matrix_id, t.item_id)
-        WHERE COALESCE(t.archived, FALSE) = FALSE
+        SELECT t.* EXCEPT(group_key, item_size_sig),
+               COALESCE(im.market_min_in_stock, mm.market_min_in_stock) AS market_min_in_stock,
+               COALESCE(im.market_min, mm.market_min) AS market_min,
+               COALESCE(im.market_median, mm.market_median) AS market_median,
+               COALESCE(im.competitor_count, mm.competitor_count) AS competitor_count,
+               COALESCE(im.competitor_ids, mm.competitor_ids) AS competitor_ids,
+               COALESCE(im.last_observed_at, mm.last_observed_at) AS last_observed_at
+        FROM tracked_active t
+        LEFT JOIN item_market im ON im.item_id = t.item_id
+        LEFT JOIN matrix_market mm ON mm.group_key = t.group_key
         ORDER BY t.revenue_rank
     """, params=[bigquery.ScalarQueryParameter("days", "INT64", days)])
     _cache_set(cache_key, rows)
@@ -537,14 +591,16 @@ def get_tracked_products_with_market(days: int = 7):
 
 
 def get_item_competitor_prices(item_id: str, days: int = 45):
-    """Latest price per competitor (or tracked URL) for one item, including its
-    matrix siblings' matches — the per-store breakdown behind the market columns.
-    Rows with NULL competitor_id get the URL's domain as a pseudo-name."""
+    """One representative price per competitor for an item — the per-store breakdown.
+    Includes matrix-sibling matches, but keeps it size-accurate: for each store we
+    prefer a listing whose size matches this item (falling back to size-unknown, then
+    any), and among those the freshest in-stock, then cheapest — so a stale or wrong-
+    size sibling can't undercut the real price. NULL competitor_id → URL host name."""
     ensure_pi_tables()
     rows = _rows(f"""
         WITH me AS (
-            SELECT item_id, item_matrix_id FROM `{T_TRACKED}`
-            WHERE item_id = @item_id
+            SELECT item_id, item_matrix_id, attribute_1, attribute_2, attribute_3
+            FROM `{T_TRACKED}` WHERE item_id = @item_id
         ),
         variants AS (
             SELECT t.item_id FROM `{T_TRACKED}` t, me
@@ -557,29 +613,45 @@ def get_item_competitor_prices(item_id: str, days: int = 45):
             WHERE o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND o.price IS NOT NULL
             QUALIFY ROW_NUMBER() OVER (PARTITION BY o.diff_key ORDER BY o.observed_at DESC) = 1
-        ),
-        per_store AS (
-            SELECT * FROM latest
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY COALESCE(competitor_id, CONCAT('url:', url))
-                ORDER BY IF(COALESCE(in_stock, FALSE), 0, 1), price
-            ) = 1
         )
-        SELECT p.competitor_id, c.name AS competitor_name, p.source, p.url,
-               p.competitor_title, p.price, p.compare_at_price, p.in_stock,
-               p.observed_at, p.match_method, p.match_confidence
-        FROM per_store p
-        LEFT JOIN `{T_COMPETITORS}` c ON c.competitor_id = p.competitor_id
-        ORDER BY p.price
+        SELECT l.competitor_id, c.name AS competitor_name, l.source, l.url,
+               l.competitor_title, l.price, l.compare_at_price, l.in_stock,
+               l.observed_at, l.match_method, l.match_confidence,
+               me.attribute_1 AS it_a1, me.attribute_2 AS it_a2, me.attribute_3 AS it_a3
+        FROM latest l
+        LEFT JOIN `{T_COMPETITORS}` c ON c.competitor_id = l.competitor_id
+        CROSS JOIN me
     """, params=[
         bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
         bigquery.ScalarQueryParameter("days", "INT64", days),
     ])
     from urllib.parse import urlparse
-    for row in rows:
-        if not row.get("competitor_name") and row.get("url"):
-            row["competitor_name"] = urlparse(row["url"]).netloc
-    return rows
+    from .matcher import size_matches_item
+
+    # group latest-per-listing rows by store, pick the best representative
+    stores: dict = {}
+    for r in rows:
+        r["_size"] = size_matches_item(
+            r.get("competitor_title"), [r.get("it_a1"), r.get("it_a2"), r.get("it_a3")])
+        key = r.get("competitor_id") or f"url:{r.get('url')}"
+        stores.setdefault(key, []).append(r)
+
+    out = []
+    for group in stores.values():
+        pool = ([r for r in group if r["_size"] is True]
+                or [r for r in group if r["_size"] is None] or group)
+        best = sorted(pool, key=lambda r: (
+            1 if r.get("in_stock") else 0,
+            r.get("observed_at") or "",
+            -(r.get("price") or 0.0),
+        ), reverse=True)[0]
+        if not best.get("competitor_name") and best.get("url"):
+            best["competitor_name"] = urlparse(best["url"]).netloc
+        for k in ("_size", "it_a1", "it_a2", "it_a3"):
+            best.pop(k, None)
+        out.append(best)
+    out.sort(key=lambda r: r.get("price") or 0.0)
+    return out
 
 
 def update_tracked_product(item_id: str, fields: dict):
@@ -1150,15 +1222,17 @@ def decide_link(link_id: str, status: str, decided_by: str = "Dashboard"):
     invalidate_pi_caches()
 
 
-def confirm_link(link_id: str, decided_by: str = "Dashboard") -> dict:
+def confirm_link(link_id: str, decided_by: str = "Dashboard", replace: bool = False) -> dict:
     """Guarded confirm — the single choke point for both single-row and bulk
     confirms. Enforces the invariant that one of our items links to exactly one
     competitor variant per store:
       - a competitor variant whose color/size conflicts with the item is rejected
         (it's the wrong variant, not ours);
       - if the item already has a confirmed link at that store, the confirm is
-        skipped (stays pending) so a human resolves the duplicate deliberately.
-    Returns {status: confirmed|rejected|skipped|error, reason}."""
+        skipped unless replace=True, in which case the existing confirmed link(s)
+        at that store are rejected first and this one takes over (the override
+        path from the Matching tab).
+    Returns {status: confirmed|rejected|skipped|error, reason, can_replace?, replaced?}."""
     from .matcher import parse_variant_options, attributes_conflict
     ensure_pi_tables()
     rows = _rows(f"""
@@ -1174,20 +1248,29 @@ def confirm_link(link_id: str, decided_by: str = "Dashboard") -> dict:
                            [l.get("a1"), l.get("a2"), l.get("a3")]):
         decide_link(link_id, "rejected", decided_by=decided_by)
         return {"status": "rejected", "reason": "color/size mismatch with the item"}
-    dupe = _rows(f"""
+    dupes = _rows(f"""
         SELECT link_id FROM `{T_LINKS}`
         WHERE item_id = @iid AND COALESCE(competitor_id, '') = @cid
           AND status = 'confirmed' AND link_id != @lid
-        LIMIT 1
     """, params=[
         bigquery.ScalarQueryParameter("iid", "STRING", str(l["item_id"])),
         bigquery.ScalarQueryParameter("cid", "STRING", str(l.get("competitor_id") or "")),
         bigquery.ScalarQueryParameter("lid", "STRING", str(link_id)),
     ])
-    if dupe:
-        return {"status": "skipped", "reason": "item already has a confirmed link at this store"}
+    if dupes:
+        if not replace:
+            return {"status": "skipped", "can_replace": True,
+                    "reason": "item already has a confirmed link at this store"}
+        get_bq_client().query(
+            f"UPDATE `{T_LINKS}` SET status = 'rejected', decided_by = @actor, "
+            "updated_at = CURRENT_TIMESTAMP() WHERE link_id IN UNNEST(@ids)",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("actor", "STRING", decided_by),
+                bigquery.ArrayQueryParameter("ids", "STRING", [d["link_id"] for d in dupes]),
+            ]),
+        ).result()
     decide_link(link_id, "confirmed", decided_by=decided_by)
-    return {"status": "confirmed"}
+    return {"status": "confirmed", "replaced": len(dupes)}
 
 
 def cleanup_mismatched_links(apply: bool = False) -> dict:

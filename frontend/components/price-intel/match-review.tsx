@@ -99,9 +99,17 @@ export function MatchReview() {
     try {
       // The confirm endpoint is guarded: it may reject (color/size mismatch) or
       // skip (item already linked at that store), so tally the real outcomes.
-      const results = await Promise.all(
+      let results = await Promise.all(
         linkIds.map((id) => apiPost(`/api/price-intel/links/${id}/decision`, { status }))
       )
+      // Single confirm blocked by an existing match at that store → offer to override.
+      if (status === 'confirmed' && linkIds.length === 1 && results[0]?.status === 'skipped'
+          && results[0]?.can_replace) {
+        if (window.confirm('This item is already matched to another listing at this store. Reject that one and use this match instead?')) {
+          results = [await apiPost(`/api/price-intel/links/${linkIds[0]}/decision`,
+            { status, replace: true })]
+        }
+      }
       if (status === 'rejected') {
         toast.success(linkIds.length === 1 ? 'Match rejected' : `${linkIds.length} matches rejected`)
       } else {

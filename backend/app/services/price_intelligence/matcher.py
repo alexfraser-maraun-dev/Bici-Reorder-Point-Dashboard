@@ -134,6 +134,35 @@ def _color_match(a, b) -> bool:
     return bool(ca) and bool(cb) and (ca in cb or cb in ca)
 
 
+def attribute_match_score(options, attrs) -> float:
+    """How well a competitor variant's options agree with our item's attributes.
+    +1 per matching dimension (size/color); an exact color set beats a partial
+    overlap (so 'Black' outranks 'Black & Transparent' for our 'Black' item); a
+    hard conflict is penalized. Used to pick the best of several 'same variant'
+    candidates competing for one (item, competitor) slot."""
+    opts = [o for o in (options or []) if o and str(o).strip()]
+    attrs = [a for a in (attrs or []) if a and str(a).strip()]
+    if not opts or not attrs:
+        return 0.0
+    o_sz = [o for o in opts if _canon_size(o)]
+    o_col = [o for o in opts if not _canon_size(o)]
+    a_sz = [a for a in attrs if _canon_size(a)]
+    a_col = [a for a in attrs if not _canon_size(a)]
+    score = 0.0
+    if o_sz and a_sz:
+        score += 1.0 if any(_size_value_matches(o, a) for o in o_sz for a in a_sz) else -2.0
+    if o_col and a_col:
+        ot = set().union(*[_attr_tokens(o) for o in o_col])
+        at = set().union(*[_attr_tokens(a) for a in a_col])
+        if ot == at:
+            score += 1.0        # exact color
+        elif ot & at:
+            score += 0.5        # overlaps but carries extra/missing color words
+        else:
+            score -= 2.0        # different color
+    return score
+
+
 def parse_variant_options(competitor_title):
     """Best-effort recovery of a competitor variant's options from its title, e.g.
     'Factor Monza Force - Steel Green / 58' -> ['Steel Green', '58']. Returns []
@@ -173,6 +202,19 @@ def _model_codes(title) -> set:
         t for t in re.findall(r"[a-z0-9]+", _fold(title))
         if re.search(r"[a-z]", t) and re.search(r"\d", t)
     }
+
+
+def size_matches_item(competitor_title, item_attrs):
+    """Whether a competitor listing's size matches the item's size: True/False, or
+    None when either side has no parseable size (can't tell). Used to keep a matrix's
+    market data size-accurate for products whose sizes are priced differently (tires)."""
+    a_sz = [a for a in (item_attrs or []) if a and _canon_size(a)]
+    if not a_sz:
+        return None
+    o_sz = [o for o in parse_variant_options(competitor_title) if _canon_size(o)]
+    if not o_sz:
+        return None
+    return any(_size_value_matches(o, a) for o in o_sz for a in a_sz)
 
 
 def build_match_key(competitor_id, scraped: dict) -> str:

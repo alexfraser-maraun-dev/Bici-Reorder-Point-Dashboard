@@ -345,7 +345,8 @@ def decide_link(link_id: str, payload: Dict[str, Any]):
     actor = payload.get("actor") or "Dashboard"
     if status == "confirmed":
         # Guarded: enforces attribute match + one confirmed link per (item, store).
-        return repository.confirm_link(link_id, decided_by=actor)
+        # replace=true rejects the existing match at that store and takes over.
+        return repository.confirm_link(link_id, decided_by=actor, replace=bool(payload.get("replace")))
     repository.decide_link(link_id, status, decided_by=actor)
     return {"status": "rejected"}
 
