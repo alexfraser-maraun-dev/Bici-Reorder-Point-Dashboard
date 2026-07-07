@@ -26,7 +26,7 @@ import { PricePushDialog } from './price-push-dialog'
 import { ItemSearchPicker } from './item-search-picker'
 import { PriceHistoryChart } from './price-history-chart'
 import {
-  ChevronDown, ChevronRight, DollarSign, ExternalLink, EyeOff, Link2, Pin,
+  Ban, ChevronDown, ChevronRight, DollarSign, ExternalLink, EyeOff, Link2, Pin,
   PinOff, RefreshCw, Search, ShieldCheck, Undo2,
 } from 'lucide-react'
 
@@ -44,8 +44,24 @@ const MATCH_METHOD_LABEL: Record<string, string> = {
 
 // Expanded-row panel: latest price per store for this item (and its matrix
 // siblings — sizes share MSRP). Lazy: only fetches while expanded.
-function CompetitorBreakdown({ itemId }: { itemId: string }) {
-  const { prices, isLoading } = useItemCompetitorPrices(itemId)
+function CompetitorBreakdown({ itemId, onRejected }: {
+  itemId: string; onRejected?: () => void
+}) {
+  const { prices, isLoading, mutate } = useItemCompetitorPrices(itemId)
+
+  const reject = async (competitorId: string | null, url: string | null, name: string) => {
+    if (!window.confirm(`Reject ${name} as a match for this item? It won't re-match on future scrapes.`)) return
+    try {
+      await apiPost(`/api/price-intel/tracked/${itemId}/reject-competitor`,
+        { competitor_id: competitorId, url })
+      toast.success(`Rejected ${name} — it won't re-match`)
+      await mutate()
+      onRejected?.()
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to reject match')
+    }
+  }
+
   if (isLoading) return <Skeleton className="h-16 rounded-md" />
   if (prices.length === 0) {
     return (
@@ -94,6 +110,12 @@ function CompetitorBreakdown({ itemId }: { itemId: string }) {
               <ExternalLink className="h-3.5 w-3.5" />
             </a>
           )}
+          <button
+            onClick={() => reject(p.competitor_id, p.url, p.competitor_name ?? 'this listing')}
+            className="shrink-0 text-muted-foreground hover:text-rose-600"
+            title="Wrong match? Reject this listing so it won't re-match">
+            <Ban className="h-3.5 w-3.5" />
+          </button>
         </div>
       ))}
     </div>
@@ -449,7 +471,7 @@ export function TrackedProductsTable() {
                               </p>
                               <PriceHistoryChart itemId={p.item_id} />
                             </div>
-                            <CompetitorBreakdown itemId={p.item_id} />
+                            <CompetitorBreakdown itemId={p.item_id} onRejected={() => mutate()} />
                           </div>
                         </TableCell>
                       </TableRow>

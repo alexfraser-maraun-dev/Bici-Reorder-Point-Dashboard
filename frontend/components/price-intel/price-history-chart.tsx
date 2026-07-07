@@ -25,7 +25,7 @@ const OUR_KEY = 'ours'
 export function PriceHistoryChart({ itemId }: { itemId: string }) {
   const { history, isLoading } = useItemPriceHistory(itemId)
 
-  const { data, config, series } = useMemo(() => {
+  const { data, config, series, span } = useMemo(() => {
     const cfg: ChartConfig = {}
     const seriesKeys: { key: string; color: string }[] = []
     const byTs = new Map<number, Record<string, number | null>>()
@@ -52,7 +52,19 @@ export function PriceHistoryChart({ itemId }: { itemId: string }) {
     }
 
     const rows = [...byTs.values()].sort((a, b) => (a.ts as number) - (b.ts as number))
-    return { data: rows, config: cfg, series: seriesKeys }
+    // Carry each series' last known value forward to the right edge, so a price
+    // that hasn't changed (a single change-point) still draws as a flat line
+    // instead of a lone dot.
+    if (rows.length) {
+      const lastRow = rows[rows.length - 1]
+      for (const { key } of seriesKeys) {
+        let lastVal: number | null = null
+        for (const r of rows) if (r[key] != null) lastVal = r[key]
+        if (lastVal != null && lastRow[key] == null) lastRow[key] = lastVal
+      }
+    }
+    const span = rows.length ? (rows[rows.length - 1].ts as number) - (rows[0].ts as number) : 0
+    return { data: rows, config: cfg, series: seriesKeys, span }
   }, [history])
 
   if (isLoading) return <Skeleton className="h-52 rounded-md" />
@@ -64,8 +76,16 @@ export function PriceHistoryChart({ itemId }: { itemId: string }) {
     )
   }
 
+  // Within ~2 days, points cluster on one date — show the time so intraday
+  // snapshots are distinguishable; over longer ranges show the date.
+  const intraday = span < 2 * 24 * 60 * 60 * 1000
   const fmtDate = (ts: number) =>
-    new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+    new Date(ts).toLocaleString(undefined, intraday
+      ? { hour: 'numeric', minute: '2-digit' }
+      : { month: 'short', day: 'numeric' })
+  const fmtFull = (ts: number) =>
+    new Date(ts).toLocaleString(undefined,
+      { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
 
   return (
     <ChartContainer config={config} className="aspect-auto h-52 w-full">
@@ -93,11 +113,7 @@ export function PriceHistoryChart({ itemId }: { itemId: string }) {
           content={
             <ChartTooltipContent
               labelFormatter={(_, payload) =>
-                payload?.[0] != null
-                  ? new Date(payload[0].payload.ts).toLocaleDateString(undefined, {
-                      year: 'numeric', month: 'short', day: 'numeric',
-                    })
-                  : ''
+                payload?.[0] != null ? fmtFull(payload[0].payload.ts) : ''
               }
               formatter={(value, name, item) => (
                 <span className="flex w-full items-center justify-between gap-3">

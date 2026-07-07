@@ -164,6 +164,17 @@ def attributes_conflict(options, attrs) -> bool:
     return False
 
 
+def _model_codes(title) -> set:
+    """Alphanumeric model-code tokens (letter+digit mixes like 'dx1000', 'sl8',
+    'gp5000') — the tokens fuzzy title-similarity can't tell apart ('dx1000' vs
+    'd1000' score ~identical). Used to block a fuzzy auto-match when the codes
+    conflict. Pure-digit tokens (sizes, years) are excluded on purpose."""
+    return {
+        t for t in re.findall(r"[a-z0-9]+", _fold(title))
+        if re.search(r"[a-z]", t) and re.search(r"\d", t)
+    }
+
+
 def build_match_key(competitor_id, scraped: dict) -> str:
     """Stable identity for one scraped competitor listing — the key pi_product_links
     dedupes and re-attaches on. Prefers SKU (survives URL/handle renames)."""
@@ -179,10 +190,14 @@ class MatchIndex:
     """In-memory index over pi_tracked_products + confirmed pi_product_links
     (a few hundred rows each)."""
 
-    def __init__(self, tracked_rows: list, links: list = None):
+    def __init__(self, tracked_rows: list, links: list = None,
+                 rejected_keys: set = None):
         self.by_upc = {}
         self.by_brand_sku = {}
         self.by_link = {}
+        # Match keys a human rejected — never auto-match or re-propose them,
+        # so a wrong fuzzy/UPC match stays gone instead of returning each scrape.
+        self.rejected_keys = rejected_keys or set()
         self.titles = []       # parallel lists for rapidfuzz (variant grain)
         self.title_items = []
         self.model_titles = []  # model/matrix grain (one entry per matrix)
@@ -244,6 +259,7 @@ class MatchIndex:
         return cls(
             repository.get_tracked_products(include_excluded=True),
             links=repository.get_product_links(status="confirmed", limit=5000),
+            rejected_keys=repository.get_rejected_match_keys(),
         )
 
     def has_brand(self, brand) -> bool:
@@ -317,6 +333,10 @@ class MatchIndex:
         candidate is None on a match; on a miss within a tracked brand it is the
         best sub-threshold fuzzy hit: {item_id, fuzzy_score, level}.
         """
+        if match_key and match_key in self.rejected_keys:
+            # A human rejected this listing — never re-match it (auto or candidate).
+            return None, None, 0.0, None
+
         if match_key and match_key in self.by_link:
             item_id, confidence = self.by_link[match_key]
             return item_id, "link", confidence, None
@@ -344,7 +364,12 @@ class MatchIndex:
             )
         if variant_best and variant_best[1] >= FUZZY_THRESHOLD:
             _, score, idx = variant_best
-            return self.title_items[idx], "fuzzy_title", round(score / 100 * 0.8, 3), None
+            # Model-code guard: don't silently auto-match when the titles carry
+            # conflicting model codes (our "DX1000" vs their "D1000") — the tokens
+            # fuzzy scoring can't distinguish. Demote to a review candidate instead.
+            sc, tc = _model_codes(title), _model_codes(self.titles[idx])
+            if not (sc and tc and sc.isdisjoint(tc)):
+                return self.title_items[idx], "fuzzy_title", round(score / 100 * 0.8, 3), None
 
         # No auto-match: surface the best near-miss (variant or model grain) as
         # a verification candidate. Model hits are never auto-matched — sizes

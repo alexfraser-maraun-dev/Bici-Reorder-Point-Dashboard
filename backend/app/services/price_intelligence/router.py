@@ -286,6 +286,16 @@ def item_competitor_prices(item_id: str, days: int = 45):
     return repository.get_item_competitor_prices(item_id, days=days)
 
 
+@router.post("/tracked/{item_id}/reject-competitor")
+def reject_competitor(item_id: str, payload: Dict[str, Any]):
+    """Reject one competitor listing for this item (escape hatch for a stuck match).
+    Tombstones the listing so it won't re-match, and clears its observations."""
+    return repository.reject_competitor_listing(
+        item_id, payload.get("competitor_id"), payload.get("url"),
+        decided_by=payload.get("actor") or "Dashboard",
+    )
+
+
 @router.get("/tracked/{item_id}/price-history")
 def item_price_history(item_id: str, days: int = 120):
     """Change-point-compressed price history (our line + one per competitor) for the

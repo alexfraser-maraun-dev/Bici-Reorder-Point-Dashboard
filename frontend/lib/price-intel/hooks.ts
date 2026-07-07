@@ -100,13 +100,13 @@ export function useProductLinks(status: string | null = 'pending') {
 
 // Lazy: pass null until the row is expanded so only open rows query.
 export function useItemCompetitorPrices(itemId: string | null) {
-  const { data, error, isLoading } = useSWR<ItemCompetitorPrice[]>(
+  const { data, error, isLoading, mutate } = useSWR<ItemCompetitorPrice[]>(
     itemId
       ? `${baseUrl()}/api/price-intel/tracked/${encodeURIComponent(itemId)}/competitors`
       : null,
     fetcher, swrConfig
   )
-  return { prices: data ?? [], error, isLoading }
+  return { prices: data ?? [], error, isLoading, mutate }
 }
 
 // Polls while a run is active so the "Scrape now" button shows live progress.

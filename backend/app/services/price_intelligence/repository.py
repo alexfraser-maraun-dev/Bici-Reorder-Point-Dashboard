@@ -752,13 +752,14 @@ def get_item_price_history(item_id: str, days: int = 120):
     ours = _rows(f"""
         SELECT observed_at, price FROM (
             SELECT observed_at, price,
-                   LAG(price) OVER (ORDER BY observed_at) AS prev_price
+                   LAG(price) OVER (ORDER BY observed_at) AS prev_price,
+                   MAX(observed_at) OVER () AS last_at
             FROM `{T_OUR_PRICE_HISTORY}`
             WHERE item_id = @item_id
               AND observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND price IS NOT NULL
         )
-        WHERE prev_price IS NULL OR ABS(price - prev_price) > 0.005
+        WHERE prev_price IS NULL OR ABS(price - prev_price) > 0.005 OR observed_at = last_at
         ORDER BY observed_at
     """, params=[
         bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
@@ -778,34 +779,40 @@ def get_item_price_history(item_id: str, days: int = 120):
         obs AS (
             SELECT
                 COALESCE(o.competitor_id, CONCAT('url:', o.url)) AS series_key,
-                o.competitor_id, o.url, o.observed_at, o.price, o.in_stock
+                o.competitor_id, o.url, o.run_id, o.observed_at, o.price, o.in_stock
             FROM `{T_OBSERVATIONS}` o
             JOIN variants v ON v.item_id = o.match_item_id
             WHERE o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND o.price IS NOT NULL
         ),
-        per_time AS (
+        per_run AS (
+            -- One representative point per competitor per scrape: prefer an
+            -- in-stock listing, then the lowest price. Grouping by run_id (not
+            -- the microsecond-exact observed_at) collapses a store's multiple
+            -- listings for the item into a single effective price.
             SELECT
                 series_key,
-                observed_at,
                 ANY_VALUE(competitor_id) AS competitor_id,
                 ANY_VALUE(url) AS url,
+                MIN(observed_at) AS observed_at,
                 ARRAY_AGG(price ORDER BY IF(COALESCE(in_stock, FALSE), 0, 1), price
                           LIMIT 1)[OFFSET(0)] AS price,
                 MAX(COALESCE(in_stock, FALSE)) AS in_stock
             FROM obs
-            GROUP BY series_key, observed_at
+            GROUP BY series_key, run_id
         ),
         changed AS (
             SELECT *,
-                   LAG(price) OVER (PARTITION BY series_key ORDER BY observed_at) AS prev_price
-            FROM per_time
+                   LAG(price) OVER (PARTITION BY series_key ORDER BY observed_at) AS prev_price,
+                   MAX(observed_at) OVER (PARTITION BY series_key) AS last_at
+            FROM per_run
         )
         SELECT c.series_key, c.competitor_id, comp.name AS competitor_name, c.url,
                c.observed_at, c.price, c.in_stock
         FROM changed c
         LEFT JOIN `{T_COMPETITORS}` comp ON comp.competitor_id = c.competitor_id
         WHERE c.prev_price IS NULL OR ABS(c.price - c.prev_price) > 0.005
+           OR c.observed_at = c.last_at
         ORDER BY c.series_key, c.observed_at
     """, params=[
         bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
@@ -939,6 +946,78 @@ def get_link_match_keys() -> set:
     ensure_pi_tables()
     rows = _rows(f"SELECT DISTINCT match_key FROM `{T_LINKS}`")
     return {r["match_key"] for r in rows if r.get("match_key")}
+
+
+def get_rejected_match_keys() -> set:
+    """Match keys a human rejected — the matcher skips these so a rejected listing
+    (incl. a fuzzy/UPC auto-match) never returns on the next scrape."""
+    ensure_pi_tables()
+    rows = _rows(f"SELECT DISTINCT match_key FROM `{T_LINKS}` "
+                 "WHERE status = 'rejected' AND match_key IS NOT NULL")
+    return {r["match_key"] for r in rows if r.get("match_key")}
+
+
+def reject_competitor_listing(item_id: str, competitor_id, url, decided_by: str = "Dashboard"):
+    """Reject one competitor listing for one item — the manual escape hatch for a
+    stuck match (e.g. a fuzzy title auto-match that has no reviewable link row).
+    Reconstructs the listing's match_key from its latest observation (SKU-preferred,
+    matching what the scraper writes), tombstones it, and nulls match_item_id on that
+    listing's observations so it drops from the market/history immediately."""
+    from .matcher import build_match_key
+    ensure_pi_tables()
+    cid = str(competitor_id) if competitor_id else None
+    url = url or ""
+    cid_clause = "competitor_id = @cid" if cid else "competitor_id IS NULL"
+    params = [
+        bigquery.ScalarQueryParameter("iid", "STRING", str(item_id)),
+        bigquery.ScalarQueryParameter("url", "STRING", url),
+    ]
+    if cid:
+        params.append(bigquery.ScalarQueryParameter("cid", "STRING", cid))
+    obs = _rows(f"""
+        SELECT competitor_id, competitor_sku, url, competitor_title
+        FROM `{T_OBSERVATIONS}`
+        WHERE match_item_id = @iid AND COALESCE(url, '') = @url AND {cid_clause}
+        ORDER BY observed_at DESC LIMIT 1
+    """, params=params)
+    if not obs:
+        return {"status": "error", "reason": "no observation found for that listing"}
+    o = obs[0]
+    key_cid = o.get("competitor_id") or cid or ""
+    match_key = build_match_key(key_cid, {
+        "sku": o.get("competitor_sku"), "url": o.get("url"),
+        "title": o.get("competitor_title"),
+    })
+    client = get_bq_client()
+    job = client.query(
+        f"UPDATE `{T_LINKS}` SET status = 'rejected', decided_by = @actor, "
+        "updated_at = CURRENT_TIMESTAMP() WHERE match_key = @mk",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("actor", "STRING", decided_by),
+            bigquery.ScalarQueryParameter("mk", "STRING", match_key),
+        ]),
+    )
+    job.result()
+    if not job.num_dml_affected_rows:
+        now = utcnow_iso()
+        insert_product_links([{
+            "link_id": str(uuid.uuid4()), "item_id": str(item_id),
+            "competitor_id": cid, "match_key": match_key,
+            "competitor_url": o.get("url"), "competitor_sku": o.get("competitor_sku"),
+            "competitor_title": o.get("competitor_title"), "gtin": None,
+            "level": "variant", "status": "rejected", "source": "human",
+            "confidence": None, "fuzzy_score": None, "llm_verdict": None,
+            "llm_reason": "rejected from tracked-products breakdown", "our_price": None,
+            "their_price": None, "decided_by": decided_by,
+            "created_at": now, "updated_at": now,
+        }])
+    client.query(
+        f"UPDATE `{T_OBSERVATIONS}` SET match_item_id = NULL "
+        f"WHERE match_item_id = @iid AND COALESCE(url, '') = @url AND {cid_clause}",
+        job_config=bigquery.QueryJobConfig(query_parameters=params),
+    ).result()
+    invalidate_pi_caches()
+    return {"status": "rejected", "match_key": match_key}
 
 
 def insert_product_links(rows: list):

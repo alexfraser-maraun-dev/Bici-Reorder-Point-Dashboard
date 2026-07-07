@@ -41,7 +41,22 @@ const EVENT_META: Record<ChangeEventType, { label: string; icon: typeof Check; t
 
 const fmtPrice = (v: number | null) => (v == null ? '—' : `$${v.toFixed(2)}`)
 
-function EventRow({ event, onAck }: { event: ChangeEvent; onAck: (id: string) => void }) {
+// Our price vs this competitor's (new) price — the relation to our catalog.
+function PositionPill({ ours, theirs }: { ours: number | null; theirs: number | null }) {
+  if (ours == null || theirs == null) return null
+  const delta = ours - theirs
+  if (Math.abs(delta) <= 0.01) {
+    return <Badge variant="outline" className="border-sky-200 bg-sky-50 px-1.5 py-0 text-[11px] text-sky-700">at parity</Badge>
+  }
+  if (delta < 0) {
+    return <Badge variant="outline" className="border-emerald-200 bg-emerald-50 px-1.5 py-0 text-[11px] text-emerald-700">{fmtPrice(Math.abs(delta))} cheaper</Badge>
+  }
+  return <Badge variant="outline" className="border-rose-200 bg-rose-50 px-1.5 py-0 text-[11px] text-rose-700">{fmtPrice(delta)} pricier</Badge>
+}
+
+function EventRow({ event, ourPrice, onAck }: {
+  event: ChangeEvent; ourPrice: number | null; onAck: (id: string) => void
+}) {
   const meta = EVENT_META[event.event_type] ?? EVENT_META.first_observation
   const Icon = meta.icon
   return (
@@ -64,17 +79,27 @@ function EventRow({ event, onAck }: { event: ChangeEvent; onAck: (id: string) =>
         </p>
       </div>
       <div className="shrink-0 text-right text-sm tabular-nums">
-        {event.old_price != null && (
-          <span className="text-muted-foreground line-through">{fmtPrice(event.old_price)}</span>
-        )}{' '}
-        <span className="font-semibold">{fmtPrice(event.new_price)}</span>
-        {event.pct_change != null && (
-          <span className={cn(
-            'ml-1 text-xs',
-            event.pct_change < 0 ? 'text-emerald-600' : 'text-rose-600'
-          )}>
-            {event.pct_change > 0 ? '+' : ''}{event.pct_change.toFixed(1)}%
-          </span>
+        <div>
+          <span className="mr-1 text-[11px] text-muted-foreground">them</span>
+          {event.old_price != null && event.old_price !== event.new_price && (
+            <span className="text-muted-foreground line-through">{fmtPrice(event.old_price)}</span>
+          )}{' '}
+          <span className="font-semibold">{fmtPrice(event.new_price)}</span>
+          {event.pct_change != null && (
+            <span className={cn(
+              'ml-1 text-xs',
+              event.pct_change < 0 ? 'text-emerald-600' : 'text-rose-600'
+            )}>
+              {event.pct_change > 0 ? '+' : ''}{event.pct_change.toFixed(1)}%
+            </span>
+          )}
+        </div>
+        {event.item_id && (
+          <div className="flex items-center justify-end gap-1.5">
+            <span className="text-[11px] text-muted-foreground">us</span>
+            <span className="font-medium">{fmtPrice(ourPrice)}</span>
+            <PositionPill ours={ourPrice} theirs={event.new_price} />
+          </div>
         )}
       </div>
       {event.url && (
@@ -113,6 +138,12 @@ export function ChangeFeed() {
 
   const brands = useMemo(
     () => [...new Set(products.map((p) => p.brand).filter((b): b is string => !!b))].sort(),
+    [products]
+  )
+
+  // our current retail per item, so each change reads against our catalog
+  const ourPriceById = useMemo(
+    () => new Map(products.map((p) => [p.item_id, p.current_retail])),
     [products]
   )
 
@@ -214,7 +245,9 @@ export function ChangeFeed() {
         ) : (
           <div className="space-y-2">
             {events.map((event) => (
-              <EventRow key={event.event_id} event={event} onAck={(id) => ack([id])} />
+              <EventRow key={event.event_id} event={event}
+                        ourPrice={event.item_id ? ourPriceById.get(event.item_id) ?? null : null}
+                        onAck={(id) => ack([id])} />
             ))}
           </div>
         )}
