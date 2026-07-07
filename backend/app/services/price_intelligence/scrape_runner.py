@@ -379,7 +379,9 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             links_done, per_competitor = 0, {}
             for link in link_targets:
                 try:
-                    parsed = scraper.fetch(link["competitor_url"])
+                    # Pass the known SKU so Shopify variant resolution works even for
+                    # older links stored as the base (non-?variant) product URL.
+                    parsed = scraper.fetch(link["competitor_url"], sku=link.get("competitor_sku"))
                     if parsed is not None and parsed.get("price") is not None:
                         obs = {
                             "observed_at": _now_iso(),

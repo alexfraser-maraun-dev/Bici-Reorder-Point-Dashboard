@@ -23,7 +23,7 @@ import threading
 import time
 import urllib.robotparser
 from typing import Dict, Iterator, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -225,10 +225,65 @@ def parse_product_page(html: str, url: str) -> Optional[dict]:
     }
 
 
+def _shopify_variant(url: str, sku: Optional[str] = None) -> Optional[dict]:
+    """Resolve a *specific* Shopify variant's price/stock from /products/<handle>.js.
+
+    A Shopify PDP's HTML/JSON-LD only ever reflects the default variant — the
+    `?variant=<id>` switch is client-side — so parsing the page returns the landing
+    variant's price, not the one we matched. The .js endpoint lists every variant
+    (id/sku/price-in-cents/available/barcode); we pick by the URL's ?variant id, or
+    by the known SKU (for older links stored as the base URL). Returns None when the
+    URL isn't a Shopify product page, the endpoint is unavailable, or the variant
+    can't be identified — callers fall back to generic HTML parsing."""
+    m = re.search(r"/products/([^/?#]+)", url or "")
+    if not m:
+        return None
+    parsed = urlparse(url)
+    handle = m.group(1)
+    variant_id = (parse_qs(parsed.query).get("variant") or [None])[0]
+    resp = polite_get(f"{parsed.scheme}://{parsed.netloc}/products/{handle}.js")
+    if resp is None or resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    variants = data.get("variants") or []
+    if not variants:
+        return None
+    chosen = None
+    if variant_id:
+        chosen = next((v for v in variants if str(v.get("id")) == str(variant_id)), None)
+    if chosen is None and sku:
+        chosen = next((v for v in variants if str(v.get("sku") or "") == str(sku)), None)
+    if chosen is None and len(variants) == 1:
+        chosen = variants[0]
+    if chosen is None:
+        return None  # ambiguous (base URL, no id/sku) — let HTML fallback decide
+    cents = lambda c: round(c / 100.0, 2) if isinstance(c, (int, float)) else None
+    pub = chosen.get("public_title") or chosen.get("title")
+    title = data.get("title")
+    return {
+        "title": f"{title} - {pub}" if pub and pub != "Default Title" else title,
+        "brand": data.get("vendor"),
+        "sku": chosen.get("sku"),
+        "gtin": str(chosen["barcode"]) if chosen.get("barcode") else None,
+        "price": cents(chosen.get("price")),
+        "compare_at_price": cents(chosen.get("compare_at_price")),
+        "in_stock": bool(chosen.get("available", True)),
+        "currency": data.get("currency"),
+    }
+
+
 class PageScraper:
     """Scrapes one registered product URL (feature a)."""
 
-    def fetch(self, url: str) -> Optional[dict]:
+    def fetch(self, url: str, sku: Optional[str] = None) -> Optional[dict]:
+        # Shopify: resolve the exact variant via .js first (the PDP HTML only shows
+        # the default variant's price); otherwise fall back to generic page parsing.
+        variant = _shopify_variant(url, sku=sku)
+        if variant is not None and variant.get("price") is not None:
+            return variant
         resp = polite_get(url)
         if resp is None:
             return None
@@ -279,6 +334,12 @@ class ShopifyJsonConnector:
                         variant.get(k) for k in ("option1", "option2", "option3")
                         if variant.get(k) and variant.get(k) != "Default Title"
                     ]
+                    # Variant-qualified URL so the confirmed link points at the exact
+                    # variant, and targeted re-scrapes resolve its price via .js
+                    # instead of landing on the default variant.
+                    vid = variant.get("id")
+                    variant_url = (f"{product_url}?variant={vid}"
+                                   if product_url and vid else product_url)
                     yield {
                         "title": full_title,
                         "brand": brand,
@@ -287,7 +348,8 @@ class ShopifyJsonConnector:
                         "price": _to_price(variant.get("price")),
                         "compare_at_price": _to_price(variant.get("compare_at_price")),
                         "in_stock": bool(variant.get("available", True)),
-                        "url": product_url,
+                        "url": variant_url,
+                        "variant_id": str(vid) if vid else None,
                         "currency": None,
                         "variant_options": options,
                     }
