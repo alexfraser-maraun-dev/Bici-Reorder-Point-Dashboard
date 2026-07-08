@@ -1372,6 +1372,76 @@ def cleanup_mismatched_links(apply: bool = False) -> dict:
     return report
 
 
+def sweep_domain_for_item(item_id: str, url: str, decided_by: str = "Dashboard") -> dict:
+    """Make a pinned manual URL the SOLE match for an item at a store. Beyond
+    tombstoning conflicting link rows (any source), this also handles fuzzy
+    'title match' listings that have NO link row: it reconstructs their match_key
+    so the matcher won't re-match them, and nulls their observations so they drop
+    from the market/history. The incoming url:{url} link is left intact."""
+    from .matcher import build_match_key
+    ensure_pi_tables()
+    keep_key = f"url:{url}"
+    client = get_bq_client()
+    dom_params = [
+        bigquery.ScalarQueryParameter("iid", "STRING", str(item_id)),
+        bigquery.ScalarQueryParameter("url", "STRING", url),
+    ]
+    # 1) reject every OTHER link row for this item at this registrable domain
+    client.query(
+        f"UPDATE `{T_LINKS}` SET status = 'rejected', decided_by = @actor, "
+        "updated_at = CURRENT_TIMESTAMP() "
+        "WHERE item_id = @iid AND status IN ('confirmed', 'pending') "
+        "AND competitor_url IS NOT NULL "
+        "AND NET.REG_DOMAIN(competitor_url) = NET.REG_DOMAIN(@url) "
+        "AND match_key != @keep",
+        job_config=bigquery.QueryJobConfig(query_parameters=dom_params + [
+            bigquery.ScalarQueryParameter("actor", "STRING", decided_by),
+            bigquery.ScalarQueryParameter("keep", "STRING", keep_key),
+        ]),
+    ).result()
+    # 2) tombstone fuzzy listings (attributed to the item at the domain, no link row)
+    listings = _rows(f"""
+        SELECT competitor_id, url AS o_url, competitor_sku, competitor_title
+        FROM `{T_OBSERVATIONS}`
+        WHERE match_item_id = @iid AND url IS NOT NULL
+          AND NET.REG_DOMAIN(url) = NET.REG_DOMAIN(@url) AND url != @url
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY COALESCE(competitor_id, ''), url ORDER BY observed_at DESC) = 1
+    """, params=dom_params)
+    existing = get_link_match_keys()
+    now = utcnow_iso()
+    tombstones = []
+    for r in listings:
+        cid = r.get("competitor_id") or ""
+        mk = build_match_key(cid, {"sku": r.get("competitor_sku"), "url": r.get("o_url"),
+                                   "title": r.get("competitor_title")})
+        if mk in existing or mk == keep_key:
+            continue
+        existing.add(mk)
+        tombstones.append({
+            "link_id": str(uuid.uuid4()), "item_id": str(item_id),
+            "competitor_id": r.get("competitor_id"), "match_key": mk,
+            "competitor_url": r.get("o_url"), "competitor_sku": r.get("competitor_sku"),
+            "competitor_title": r.get("competitor_title"), "gtin": None,
+            "level": "variant", "status": "rejected", "source": "human",
+            "confidence": None, "fuzzy_score": None, "llm_verdict": None,
+            "llm_reason": "superseded by a pinned URL at this store", "our_price": None,
+            "their_price": None, "decided_by": decided_by,
+            "created_at": now, "updated_at": now,
+        })
+    if tombstones:
+        insert_product_links(tombstones)
+    # 3) null the observations of every OTHER listing at the domain
+    client.query(
+        f"UPDATE `{T_OBSERVATIONS}` SET match_item_id = NULL "
+        "WHERE match_item_id = @iid AND url IS NOT NULL "
+        "AND NET.REG_DOMAIN(url) = NET.REG_DOMAIN(@url) AND url != @url",
+        job_config=bigquery.QueryJobConfig(query_parameters=dom_params),
+    ).result()
+    invalidate_pi_caches()
+    return {"listings_swept": len(listings), "tombstoned": len(tombstones)}
+
+
 def reject_conflicting_links(item_id: str, domain: str, decided_by: str = "Dashboard"):
     """When a human pins the true URL for an item at a store, tombstone any
     auto-created (gtin/llm) links for the same item at the same domain so the

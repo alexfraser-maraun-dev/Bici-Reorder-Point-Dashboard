@@ -115,9 +115,9 @@ def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None,
             seeding.add_manual_tracked_product(str(item_id))
         except ValueError:
             pass  # not in the snapshot (archived in LS) — the URL still tracks it
-    domain = urlparse(url).netloc
-    if domain:
-        repository.reject_conflicting_links(str(item_id), domain)
+    # Make this URL the sole match at its store: reject other link rows AND sweep
+    # bare fuzzy 'title match' listings (no link row) so nothing stale lingers.
+    repository.sweep_domain_for_item(str(item_id), url)
     now = repository.utcnow_iso()
     repository.upsert_human_link({
         "link_id": str(uuid.uuid4()),
