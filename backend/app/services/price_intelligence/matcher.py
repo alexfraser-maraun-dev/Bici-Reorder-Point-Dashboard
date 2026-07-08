@@ -372,8 +372,11 @@ class MatchIndex:
     def match(self, scraped: dict, match_key: str = None):
         """Returns (item_id, method, confidence, candidate).
 
-        candidate is None on a match; on a miss within a tracked brand it is the
-        best sub-threshold fuzzy hit: {item_id, fuzzy_score, level}.
+        Confirmed links always match. The other tiers (GTIN / brand+SKU /
+        fuzzy>=90 / attr-exact) auto-match only when PI_AUTO_CONFIRM is on;
+        otherwise every hit comes back as a *proposal* candidate
+        {item_id, method, confidence, fuzzy_score, level} for the Matching
+        queue — observations stay unmatched until a human confirms the link.
         """
         if match_key and match_key in self.rejected_keys:
             # A human rejected this listing — never re-match it (auto or candidate).
@@ -385,12 +388,22 @@ class MatchIndex:
 
         gtin = normalize_upc(scraped.get("gtin"))
         if gtin and gtin in self.by_upc:
-            return self.by_upc[gtin], "gtin", 1.0, None
+            if config.AUTO_CONFIRM:
+                return self.by_upc[gtin], "gtin", 1.0, None
+            return None, None, 0.0, {
+                "item_id": self.by_upc[gtin], "method": "gtin",
+                "confidence": 1.0, "fuzzy_score": None, "level": "variant",
+            }
 
         brand = _normalize_brand(scraped.get("brand"))
         sku = _normalize_sku(scraped.get("sku"))
         if brand and sku and (brand, sku) in self.by_brand_sku:
-            return self.by_brand_sku[(brand, sku)], "brand_sku", 0.9, None
+            if config.AUTO_CONFIRM:
+                return self.by_brand_sku[(brand, sku)], "brand_sku", 0.9, None
+            return None, None, 0.0, {
+                "item_id": self.by_brand_sku[(brand, sku)], "method": "brand_sku",
+                "confidence": 0.9, "fuzzy_score": None, "level": "variant",
+            }
 
         title = _fold(scraped.get("title"))
         # Only fuzzy-match within a known brand: cross-brand title collisions
@@ -411,7 +424,13 @@ class MatchIndex:
             # fuzzy scoring can't distinguish. Demote to a review candidate instead.
             sc, tc = _model_codes(title), _model_codes(self.titles[idx])
             if not (sc and tc and sc.isdisjoint(tc)):
-                return self.title_items[idx], "fuzzy_title", round(score / 100 * 0.8, 3), None
+                if config.AUTO_CONFIRM:
+                    return self.title_items[idx], "fuzzy_title", round(score / 100 * 0.8, 3), None
+                return None, None, 0.0, {
+                    "item_id": self.title_items[idx], "method": "fuzzy_title",
+                    "confidence": round(score / 100 * 0.8, 3),
+                    "fuzzy_score": round(float(score), 1), "level": "variant",
+                }
 
         # No auto-match: surface the best near-miss (variant or model grain) as
         # a verification candidate. Model hits are never auto-matched — sizes
@@ -439,11 +458,13 @@ class MatchIndex:
                     verdict, target = self._resolve_by_attributes(options, best[1])
                     if verdict == "suppress":
                         return None, None, 0.0, None
-                    if verdict == "confirm" and config.ATTR_AUTO_CONFIRM:
+                    if verdict == "confirm" and config.ATTR_AUTO_CONFIRM and config.AUTO_CONFIRM:
                         return target, "attr_exact", 0.97, None
                     if verdict in ("confirm", "candidate"):
                         return None, None, 0.0, {
                             "item_id": target,
+                            "method": "attr",
+                            "confidence": 0.97 if verdict == "confirm" else None,
                             "fuzzy_score": round(float(best[2]), 1),
                             "level": "variant",
                         }

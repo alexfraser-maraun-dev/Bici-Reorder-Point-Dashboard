@@ -1,15 +1,18 @@
 """LLM verification of pending product-link candidates.
 
-After each scrape run, near-miss fuzzy candidates (pi_product_links rows with
+After each scrape run, pending proposals (pi_product_links rows with
 status='pending', no verdict yet) are batched to a small model that decides
 whether each competitor listing is the same product as our catalog item.
 Verdicts write back to the links table:
-  same_variant -> confirmed (variant, 0.95)
-  same_model   -> confirmed (model, 0.85) when the target variant is unambiguous
-                  (single tracked variant of the matrix, or the extracted size
-                  matches one variant's attributes); otherwise stays pending for
-                  human review with the verdict attached
-  different    -> rejected (tombstone: the match_key is never re-proposed)
+  same_variant -> confirmed (variant, 0.95) when PI_AUTO_CONFIRM is on;
+                  otherwise stays pending with the verdict as triage annotation
+  same_model   -> re-anchored to the size-matched tracked variant; confirmed
+                  (model, 0.85) only when PI_AUTO_CONFIRM is on AND the anchor
+                  is unambiguous; otherwise pending for human review
+  different    -> rejected (tombstone: the match_key is never re-proposed) —
+                  auto-reject stays on in manual mode to keep the queue clean,
+                  except gtin-sourced proposals (a barcode/LLM conflict goes
+                  to a human, not a tombstone)
   uncertain    -> stays pending for human review
 
 Mirrors digest.py: lazy client, ANTHROPIC_API_KEY guard, best-effort — the
@@ -273,8 +276,13 @@ def verify_candidates(max_pairs: int = None) -> dict:
                 "updated_at": now,
             }
             if verdict == "same_variant":
-                update.update(status="confirmed", level="variant", confidence=0.95)
-                if _claim_pair(link["item_id"], link.get("competitor_id"), update, link, item):
+                update.update(level="variant")
+                if not config.AUTO_CONFIRM:
+                    # Manual-review mode: the verdict is triage annotation only —
+                    # the human confirms from the Matching queue.
+                    stats["pending"] += 1
+                elif _claim_pair(link["item_id"], link.get("competitor_id"), update, link, item):
+                    update.update(status="confirmed", confidence=0.95)
                     stats["confirmed"] += 1
                 else:
                     stats["pending"] += 1
@@ -282,19 +290,27 @@ def verify_candidates(max_pairs: int = None) -> dict:
                 anchor_id, resolved = _resolve_model_anchor(
                     item, result.get("competitor_size"), tracked_by_matrix
                 )
+                # Re-anchoring to the size-matched variant is useful triage even
+                # when the confirm itself waits for a human.
                 update.update(item_id=anchor_id, level="model")
-                if resolved:
+                if not (config.AUTO_CONFIRM and resolved):
+                    stats["pending"] += 1
+                else:
                     update.update(status="confirmed", confidence=0.85)
                     anchor_item = by_id.get(str(anchor_id), item)
                     if _claim_pair(anchor_id, link.get("competitor_id"), update, link, anchor_item):
                         stats["confirmed"] += 1
                     else:
+                        update.update(status="pending")
                         stats["pending"] += 1
-                else:
-                    stats["pending"] += 1
             elif verdict == "different":
-                update.update(status="rejected")
-                stats["rejected"] += 1
+                if link.get("source") == "gtin":
+                    # Barcode says same product, LLM says different — a real
+                    # conflict worth human eyes, not an auto-tombstone.
+                    stats["pending"] += 1
+                else:
+                    update.update(status="rejected")
+                    stats["rejected"] += 1
             else:
                 stats["pending"] += 1
             updates.append(update)

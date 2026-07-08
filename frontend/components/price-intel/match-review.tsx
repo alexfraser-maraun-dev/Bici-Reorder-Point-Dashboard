@@ -269,11 +269,11 @@ export function MatchReview() {
                             {link.llm_verdict.replace('_', ' ')}
                           </Badge>
                         )}
-                        {statusFilter !== 'pending' && (
-                          <Badge variant="outline" className="text-muted-foreground">
-                            {SOURCE_LABEL[link.source] ?? link.source}
-                          </Badge>
-                        )}
+                        <Badge variant="outline" className="text-muted-foreground">
+                          {statusFilter === 'pending' && link.source === 'llm'
+                            ? 'fuzzy candidate'
+                            : SOURCE_LABEL[link.source] ?? link.source}
+                        </Badge>
                       </div>
                       {link.llm_reason && (
                         <p className="mt-0.5 max-w-56 truncate text-xs text-muted-foreground"

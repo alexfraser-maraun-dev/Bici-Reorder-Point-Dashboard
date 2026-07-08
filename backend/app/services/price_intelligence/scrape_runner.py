@@ -226,30 +226,41 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
 
         def _propose_link(match_key, candidate, competitor_id, product, item_id=None,
                           method=None, confidence=None):
-            """Buffers a link row: confirmed for gtin / attr_exact matches, pending
-            for fuzzy candidates. Skips keys already decided/proposed."""
+            """Buffers a link row. Confirmed only for auto-confirmed matches
+            (item_id set: gtin/attr_exact with PI_AUTO_CONFIRM on); everything
+            else — including gtin/brand+SKU/fuzzy hits in manual-review mode —
+            is a pending proposal for the Matching queue. Skips keys already
+            decided/proposed and (item, competitor) pairs that already hold a
+            confirmed link: a decided pair never gets further proposals."""
             if match_key in existing_link_keys:
                 return
+            method = method or (candidate or {}).get("method")
+            confidence = confidence if confidence is not None \
+                else (candidate or {}).get("confidence")
+            target_id = str(item_id or candidate["item_id"])
+            if (target_id, competitor_id) in confirmed_pairs:
+                return
             existing_link_keys.add(match_key)
-            is_confirmed = method in ("gtin", "attr_exact")
+            is_confirmed = item_id is not None and method in ("gtin", "attr_exact")
             if not is_confirmed and len(pending_links) >= MAX_COLLECTED_CANDIDATES:
                 return
-            target_id = item_id or candidate["item_id"]
-            item = item_lookup.get(str(target_id)) or {}
+            item = item_lookup.get(target_id) or {}
             row = {
                 "link_id": str(uuid.uuid4()),
-                "item_id": str(target_id),
+                "item_id": target_id,
                 "competitor_id": competitor_id,
                 "match_key": match_key,
                 "competitor_url": product.get("url"),
                 "competitor_sku": product.get("sku"),
                 "competitor_title": product.get("title"),
                 "gtin": product.get("gtin"),
-                "level": "variant" if is_confirmed else candidate["level"],
+                "level": "variant" if is_confirmed else (candidate or {}).get("level", "variant"),
                 "status": "confirmed" if is_confirmed else "pending",
-                "source": "gtin" if method == "gtin" else "attr" if method == "attr_exact" else "llm",
-                "confidence": confidence if is_confirmed else None,
-                "fuzzy_score": None if is_confirmed else candidate["fuzzy_score"],
+                "source": ("gtin" if method == "gtin"
+                           else "attr" if method in ("attr", "attr_exact")
+                           else "llm"),
+                "confidence": confidence,
+                "fuzzy_score": None if is_confirmed else (candidate or {}).get("fuzzy_score"),
                 "llm_verdict": None,
                 "llm_reason": None,
                 "our_price": item.get("current_retail"),
@@ -258,7 +269,11 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 "created_at": _now_iso(),
                 "updated_at": _now_iso(),
             }
-            (gtin_links if is_confirmed else pending_links).append(row)
+            if is_confirmed:
+                confirmed_pairs.add((target_id, competitor_id))
+                gtin_links.append(row)
+            else:
+                pending_links.append(row)
 
         competitors = [c for c in repository.get_competitors() if c.get("enabled")]
         urls = repository.get_tracked_urls(include_disabled=False)
@@ -266,6 +281,12 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
 
         # --- full catalog crawl vs targeted (confirmed URLs only)? ----------
         confirmed_links = repository.get_product_links(status="confirmed", limit=5000)
+        # Decided (item, competitor) pairs: _propose_link never proposes into
+        # a pair that already holds a confirmed link.
+        confirmed_pairs = {
+            (str(l["item_id"]), l.get("competitor_id"))
+            for l in confirmed_links if l.get("item_id")
+        }
         needy = _needs_catalog_discovery(item_lookup, confirmed_links, urls)
         full_scan = force_full or bool(needy) or not (confirmed_links or urls)
         print(f"pi: run mode = {'full catalog' if full_scan else 'targeted'} "
@@ -489,10 +510,14 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         # --- match verification: flush candidate links, then LLM-verify ------
         _set_status(phase="verifying matches")
         try:
-            # Best candidates first: highest fuzzy score, at most a handful per
-            # item, capped at the per-run LLM budget. The rest are re-proposed
-            # on later nights (their match_keys were never written).
-            pending_links.sort(key=lambda r: r.get("fuzzy_score") or 0, reverse=True)
+            # Best candidates first: exact-signal proposals (gtin 1.0, attr 0.97,
+            # brand+SKU 0.9) outrank fuzzy ones, at most a handful per item,
+            # capped at the per-run LLM budget. The rest are re-proposed on
+            # later nights (their match_keys were never written).
+            pending_links.sort(
+                key=lambda r: r.get("confidence") or (r.get("fuzzy_score") or 0) / 100,
+                reverse=True,
+            )
             selected, per_item = [], {}
             for row in pending_links:
                 if len(selected) >= config.MATCH_MAX_PAIRS_PER_RUN:

@@ -6,7 +6,10 @@ Tiered, cheapest first:
   2. shopify_html — product pages discovered via the products sitemap; JSON-LD on
      the page usually carries real GTINs. Costs one request per product, so the
      crawl is pre-filtered to tracked brands and capped.
-  3. serp_discovery.py — SerpApi Google search (site:-scoped) finds product URLs
+  3. sitemap_html — the same sitemap-walk for non-Shopify stores (Magento,
+     headless storefronts): sitemaps from robots.txt + /sitemap.xml, one level
+     of index nesting, brand-slug filtered, parse_product_page per page.
+  4. serp_discovery.py — SerpApi Google search (site:-scoped) finds product URLs
      on competitors with no crawlable catalog (connector_type='unknown');
      env-gated (PI_SERP_ENABLED + SERPAPI_API_KEY), paid per search.
 Plus PageScraper: a single-URL scraper for user-registered tracked URLs
@@ -21,6 +24,7 @@ import json
 import re
 import threading
 import time
+import unicodedata
 import urllib.robotparser
 from typing import Dict, Iterator, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -355,6 +359,22 @@ class ShopifyJsonConnector:
                     }
 
 
+def _brand_slug_tokens(brands) -> list:
+    """Brand names -> URL-slug tokens, accent-folded ("Cervélo" must match a
+    "cervelo-soloist" slug). Each brand yields its hyphenated and squashed forms."""
+    tokens = set()
+    for brand in brands or []:
+        if not brand:
+            continue
+        folded = unicodedata.normalize("NFKD", str(brand))
+        folded = "".join(c for c in folded if not unicodedata.combining(c)).strip().lower()
+        if not folded:
+            continue
+        tokens.add(folded.replace(" ", "-"))
+        tokens.add(folded.replace(" ", ""))
+    return sorted(tokens)
+
+
 class ShopifyHtmlConnector:
     """Fallback for stores that block /products.json: walk the products sitemap and
     parse each product page's JSON-LD (which usually includes a real GTIN).
@@ -366,7 +386,7 @@ class ShopifyHtmlConnector:
 
     def __init__(self, base_url: str, brand_tokens=None):
         self.base_url = base_url.rstrip("/")
-        self.brand_tokens = [b.lower().replace(" ", "-") for b in (brand_tokens or []) if b]
+        self.brand_tokens = _brand_slug_tokens(brand_tokens)
 
     def _product_urls(self) -> Iterator[str]:
         resp = polite_get(f"{self.base_url}/sitemap.xml")
@@ -401,9 +421,94 @@ class ShopifyHtmlConnector:
                 yield parsed
 
 
+class GenericSitemapConnector:
+    """Catalog crawl for non-Shopify stores (Magento, headless storefronts, ...)
+    via their public sitemaps: robots.txt `Sitemap:` lines + /sitemap.xml, one
+    level of <sitemapindex> nesting. Page URLs are filtered to tracked-brand
+    slugs and parsed with parse_product_page, so it behaves exactly like the
+    shopify_html crawl — one request per candidate page, capped."""
+
+    connector_type = "sitemap_html"
+
+    # Path segments that are never product detail pages.
+    NON_PRODUCT_RE = re.compile(
+        r"/(collections?|categor(y|ies)|cms|blogs?|pages?|news|apps)(/|$)"
+    )
+    MAX_SITEMAP_FETCHES = 15
+
+    def __init__(self, base_url: str, brand_tokens=None):
+        self.base_url = base_url.rstrip("/")
+        self.brand_tokens = _brand_slug_tokens(brand_tokens)
+
+    def _sitemap_sources(self) -> list:
+        """Sitemap URLs from robots.txt plus the conventional /sitemap.xml.
+        Prefers product-hinting filenames, and _en_ over _fr_ duplicates."""
+        sources = []
+        resp = polite_get(f"{self.base_url}/robots.txt", respect_robots=False)
+        if resp is not None and resp.status_code == 200:
+            sources = re.findall(r"(?im)^\s*sitemap:\s*(\S+)", resp.text)
+        sources.append(f"{self.base_url}/sitemap.xml")
+        # De-dupe, keep order.
+        seen, ordered = set(), []
+        for url in sources:
+            if url not in seen:
+                seen.add(url)
+                ordered.append(url)
+        product_maps = [u for u in ordered if "product" in u.lower()]
+        maps = product_maps or ordered
+        if any("_en" in u.lower() for u in maps):
+            maps = [u for u in maps if "_fr" not in u.lower()]
+        return maps
+
+    def _iter_page_urls(self) -> Iterator[str]:
+        fetches = 0
+        queue = self._sitemap_sources()
+        seen_pages = set()
+        while queue and fetches < self.MAX_SITEMAP_FETCHES:
+            sitemap_url = queue.pop(0)
+            resp = polite_get(sitemap_url.strip())
+            fetches += 1
+            if resp is None or resp.status_code != 200 or "<" not in resp.text[:200]:
+                continue
+            locs = re.findall(r"<loc>([^<]+)</loc>", resp.text)
+            if "<sitemapindex" in resp.text:
+                # One level of nesting: children go on the queue (product-
+                # hinting first so the fetch budget is spent well).
+                locs.sort(key=lambda u: "product" not in u.lower())
+                queue.extend(locs)
+                continue
+            for loc in locs:
+                loc = loc.strip()
+                if loc in seen_pages:
+                    continue
+                seen_pages.add(loc)
+                yield loc
+
+    def iter_products(self) -> Iterator[dict]:
+        fetched = 0
+        for url in self._iter_page_urls():
+            if fetched >= config.MAX_HTML_PRODUCT_PAGES:
+                return
+            path = urlparse(url).path.lower()
+            if not path or path == "/" or self.NON_PRODUCT_RE.search(path):
+                continue
+            if self.brand_tokens and not any(tok in path for tok in self.brand_tokens):
+                continue
+            resp = polite_get(url)
+            if resp is None or resp.status_code != 200:
+                continue
+            fetched += 1
+            parsed = parse_product_page(resp.text, url)
+            if parsed and parsed.get("price") is not None:
+                parsed["url"] = url
+                parsed.setdefault("compare_at_price", None)
+                yield parsed
+
+
 def detect_connector_type(base_url: str) -> str:
-    """Probes a competitor site: open /products.json -> shopify_json; a products
-    sitemap -> shopify_html; otherwise unknown (tracked-URL-only)."""
+    """Probes a competitor site: open /products.json -> shopify_json; a Shopify
+    products sitemap -> shopify_html; any other usable sitemap -> sitemap_html;
+    otherwise unknown (tracked-URL/SERP only)."""
     base = base_url.rstrip("/")
     resp = polite_get(f"{base}/products.json?limit=1")
     if resp is not None and resp.status_code == 200:
@@ -415,6 +520,10 @@ def detect_connector_type(base_url: str) -> str:
     resp = polite_get(f"{base}/sitemap.xml")
     if resp is not None and resp.status_code == 200 and "sitemap_products" in resp.text:
         return "shopify_html"
+    # Non-Shopify: usable if any sitemap yields at least one page URL.
+    probe = GenericSitemapConnector(base)
+    for _ in probe._iter_page_urls():
+        return "sitemap_html"
     return "unknown"
 
 
@@ -425,4 +534,6 @@ def build_connector(competitor: dict, brand_tokens=None):
         return ShopifyJsonConnector(base_url)
     if ctype == "shopify_html":
         return ShopifyHtmlConnector(base_url, brand_tokens=brand_tokens)
+    if ctype == "sitemap_html":
+        return GenericSitemapConnector(base_url, brand_tokens=brand_tokens)
     return None

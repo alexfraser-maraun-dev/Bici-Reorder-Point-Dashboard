@@ -180,6 +180,79 @@ def _post_health(status, counters, errors):
                              "blocks": [slack.section("\n".join(lines))]}])
 
 
+def send_test() -> dict:
+    """Fire a representative digest + one MAP ping + one undercut ping through the
+    real Slack client so a user can confirm their webhooks/env before a scrape.
+    Self-contained (no BigQuery). Returns a per-message success report."""
+    if not (config.SLACK_ENABLED and config.SLACK_WEBHOOK_URL):
+        return {
+            "sent": False,
+            "reason": "Slack disabled or PI_SLACK_WEBHOOK_URL unset "
+                      "(need PI_SLACK_ENABLED=1 and PI_SLACK_WEBHOOK_URL).",
+        }
+    alerts_hook = config.SLACK_ALERTS_WEBHOOK_URL or config.SLACK_WEBHOOK_URL
+
+    undercut_ok = slack.post_alert(
+        alerts_hook, fallback="Undercut test",
+        title="🔻 Undercut — Competitor Bikes Inc",
+        body="\n".join([
+            "*Sample Road Bike 54cm — Acme*",
+            "Their price: *$1,799.00*  (was $1,999.00 (-10.0%)) — below our retail",
+            "Our price: $1,899.00",
+            "<https://example.com/listing|View listing>",
+        ]),
+        color="#e8710a",
+    )
+    map_ok = slack.post_alert(
+        alerts_hook, fallback="MAP violation test",
+        title="⚠️ MAP violation — Competitor Bikes Inc",
+        body="\n".join([
+            "*Sample Helmet M — Acme*",
+            "Their price: *$89.00*  (was $109.00 (-18.3%)) — below our MAP",
+            "Our price: $109.00",
+        ]),
+        color="#d21f3c",
+    )
+
+    digest_md = (
+        "## Market position\n"
+        "We're **cheapest** on 3 of 5 sampled items; pricier on 1.\n\n"
+        "## Notable competitor moves\n"
+        "- Competitor Bikes Inc dropped the Sample Road Bike to $1,799.\n\n"
+        "## Suggested actions\n"
+        "- Review the Sample Road Bike (we're $100 above market).\n\n"
+        "_This is a test message from the price-intel notification flow._"
+    )
+    blocks = [
+        slack.header(f"🗞️ Price intel — {datetime.now().strftime('%b %-d')} (test)"),
+        slack.section(slack.to_mrkdwn(digest_md)),
+        slack.divider(),
+        slack.section("\n".join([
+            "*Notable moves* (matched items)",
+            "🔻 *Sample Road Bike 54cm — Acme* — Competitor Bikes Inc: "
+            "$1,999.00 → $1,799.00 (-10.0%)",
+            "🔺 *Sample Tire — Acme* — Other Store: $59.00 → $64.00 (+8.5%)",
+        ])),
+        slack.divider(),
+        slack.section("\n".join([
+            "*Stock changes*",
+            "🚫 *Sample Wheelset — Acme* — Competitor Bikes Inc out of stock",
+        ])),
+    ]
+    digest_ok = slack.post(config.SLACK_WEBHOOK_URL, text="Price intel digest (test)",
+                           blocks=blocks)
+
+    return {
+        "sent": True,
+        "alerts_webhook": "alerts" if config.SLACK_ALERTS_WEBHOOK_URL else "main (fallback)",
+        "results": {
+            "undercut_ping": undercut_ok,
+            "map_ping": map_ok,
+            "digest": digest_ok,
+        },
+    }
+
+
 def _our_price_lookup(item_ids) -> dict:
     ids = {str(i) for i in item_ids if i}
     if not ids:

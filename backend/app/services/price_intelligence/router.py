@@ -431,6 +431,19 @@ def regenerate_digest(background_tasks: BackgroundTasks):
     return {"status": "started", "run_id": runs[0]["run_id"]}
 
 
+# --- Slack notifications -----------------------------------------------------------
+
+@router.post("/notify/test")
+def notify_test():
+    """Send a sample digest + MAP/undercut pings to the configured Slack webhooks
+    so you can confirm setup before a real scrape runs."""
+    from . import notify
+    result = notify.send_test()
+    if not result.get("sent"):
+        raise HTTPException(status_code=400, detail=result.get("reason", "Slack not configured"))
+    return result
+
+
 # --- price push (feature c) --------------------------------------------------------
 
 @router.post("/push-price/preview")

@@ -47,6 +47,14 @@ REQUIRE_UPC = _flag("PI_REQUIRE_UPC")
 # then does a full catalog crawl (and its LLM verification) run.
 DISCOVERY_DAYS = int(os.getenv("PI_DISCOVERY_DAYS", "7"))
 
+# Match confirmation policy. Off (default): every proposed link — UPC/GTIN,
+# brand+SKU, fuzzy, LLM-verified, SERP — lands in the Matching queue as
+# 'pending' and only a human confirms; observations only match via already-
+# confirmed links. The LLM verifier still annotates pending rows and still
+# auto-rejects clear non-matches. On: restores automatic confirmation
+# (gtin links + LLM same_variant/resolved same_model).
+AUTO_CONFIRM = _flag("PI_AUTO_CONFIRM")
+
 # SERP discovery (SerpApi, engine=google): finds candidate product URLs on
 # competitors we can't crawl (connector_type='unknown'). Only fires for items
 # inside the discovery window that still lack a confirmed link, so search spend
