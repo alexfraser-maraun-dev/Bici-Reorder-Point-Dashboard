@@ -55,6 +55,7 @@ def get_summary():
         "pending_links": repository.count_pending_links(),
         "last_run": runs[0] if runs else None,
         "scrape_status": scrape_runner.get_status(),
+        "scrape_health": repository.get_scrape_health(),
     }
 
 

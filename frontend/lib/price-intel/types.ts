@@ -162,6 +162,30 @@ export interface PriceIntelSummary {
   pending_links: number
   last_run: ScrapeRun | null
   scrape_status: ScrapeStatus
+  scrape_health: ScrapeHealth
+}
+
+export interface ScrapeHealthCompetitor {
+  competitor_id: string | null
+  name: string | null
+  connector_type: string | null
+  status: string | null
+  bucket: 'ok' | 'empty' | 'no_matches' | 'failed' | 'skipped' | 'unknown'
+  last_scraped_at: string | null
+}
+
+export interface ScrapeHealth {
+  overall: 'healthy' | 'degraded' | 'failed' | 'running' | 'never' | string
+  last_run: ScrapeRun | null
+  counts: {
+    total: number
+    ok: number
+    empty: number
+    no_matches: number
+    failed: number
+    skipped: number
+  }
+  competitors: ScrapeHealthCompetitor[]
 }
 
 export interface ItemObservation {

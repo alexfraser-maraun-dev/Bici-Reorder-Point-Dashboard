@@ -93,6 +93,9 @@ SLACK_ALERTS_WEBHOOK_URL = os.getenv("PI_SLACK_ALERTS_WEBHOOK_URL", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 DIGEST_MODEL = os.getenv("PI_DIGEST_MODEL", "claude-haiku-4-5")
 DIGEST_MAX_TOKENS = int(os.getenv("PI_DIGEST_MAX_TOKENS", "1000"))
+# Volume-vs-margin guardrail the digest reasons with: aim to sit just under the
+# next-lowest competitor, never recommend pricing more than this % below it.
+DIGEST_UNDERCUT_TARGET_PCT = float(os.getenv("PI_DIGEST_UNDERCUT_TARGET_PCT", "5"))
 
 # LLM match verification: near-miss fuzzy candidates are batched to a small
 # model after each scrape run. The per-run pair cap bounds cost (~10 requests

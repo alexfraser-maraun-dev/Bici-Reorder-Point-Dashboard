@@ -1575,6 +1575,67 @@ def get_scrape_runs(limit: int = 30):
     return _rows(f"SELECT * FROM `{T_RUNS}` ORDER BY started_at DESC LIMIT {int(limit)}")
 
 
+def _scrape_status_bucket(status: str) -> str:
+    """Collapse a competitor's last_scrape_status into a health bucket."""
+    s = (status or "").lower()
+    if not s:
+        return "unknown"
+    if s.startswith("failed") or "error" in s:
+        return "failed"
+    if s == "skipped_no_connector":
+        return "skipped"
+    if s == "success_no_products":
+        return "empty"       # connector returned nothing (bad sitemap / blocked)
+    if s == "success_no_matches":
+        return "no_matches"  # products found, none in a tracked brand
+    if s.startswith("success"):
+        return "ok"
+    return "unknown"
+
+
+def get_scrape_health() -> dict:
+    """Compact health overview of the most recent scrape for the UI: the last run
+    row plus a per-competitor breakdown bucketed by last_scrape_status, and an
+    overall rollup. Enabled competitors only (disabled ones aren't scraped)."""
+    runs = get_scrape_runs(limit=1)
+    run = runs[0] if runs else None
+    competitors = [c for c in get_competitors() if c.get("enabled")]
+    per, counts = [], {}
+    for c in competitors:
+        bucket = _scrape_status_bucket(c.get("last_scrape_status"))
+        counts[bucket] = counts.get(bucket, 0) + 1
+        per.append({
+            "competitor_id": c.get("competitor_id"),
+            "name": c.get("name"),
+            "connector_type": c.get("connector_type"),
+            "status": c.get("last_scrape_status"),
+            "bucket": bucket,
+            "last_scraped_at": c.get("last_scraped_at"),
+        })
+    per.sort(key=lambda p: ({"failed": 0, "empty": 1, "no_matches": 2,
+                             "skipped": 3, "unknown": 4, "ok": 5}.get(p["bucket"], 6),
+                            p["name"] or ""))
+    run_status = (run or {}).get("status")
+    if run_status == "running":
+        overall = "running"
+    elif counts.get("failed") or run_status == "failed":
+        overall = "failed"
+    elif run_status == "partial" or counts.get("empty"):
+        overall = "degraded"
+    elif run_status in ("success", "partial") or counts.get("ok"):
+        overall = "healthy"
+    else:
+        overall = run_status or "never"
+    return {
+        "overall": overall,
+        "last_run": run,
+        "counts": {"total": len(per), "ok": counts.get("ok", 0),
+                   "empty": counts.get("empty", 0), "no_matches": counts.get("no_matches", 0),
+                   "failed": counts.get("failed", 0), "skipped": counts.get("skipped", 0)},
+        "competitors": per,
+    }
+
+
 def has_successful_run_on(local_date_str: str, timezone_name: str) -> bool:
     """True if a success/partial run already started on the given local date —
     the scheduler's double-run guard across restarts."""

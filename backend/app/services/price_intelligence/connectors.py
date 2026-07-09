@@ -375,6 +375,30 @@ def _brand_slug_tokens(brands) -> list:
     return sorted(tokens)
 
 
+def _fold_slug(value) -> str:
+    folded = unicodedata.normalize("NFKD", str(value or ""))
+    return "".join(c for c in folded if not unicodedata.combining(c)).strip().lower()
+
+
+def _slug_brand(path: str, brand_names) -> Optional[str]:
+    """The tracked brand a product URL slug begins with, or None. CMS storefronts
+    (SmartEtailing, etc.) frequently omit the brand from page markup but keep it in
+    the URL ('/product/continental-gp5000-...'); recovering it lets those products
+    clear the brand-gated persistence and participate in matching. A trailing
+    separator is required so a short brand ("poc") can't match inside a word
+    ("pocket"); longest brand first so a multi-word name wins over a bare prefix."""
+    slug = _fold_slug(str(path).rsplit("/", 1)[-1])
+    if not slug:
+        return None
+    for brand in sorted((b for b in (brand_names or []) if b), key=len, reverse=True):
+        folded = _fold_slug(brand)
+        for form in (folded.replace(" ", "-"), folded.replace(" ", "")):
+            if form and (slug == form or slug.startswith(form + "-")
+                         or slug.startswith(form + "_")):
+                return brand
+    return None
+
+
 class ShopifyHtmlConnector:
     """Fallback for stores that block /products.json: walk the products sitemap and
     parse each product page's JSON-LD (which usually includes a real GTIN).
@@ -386,6 +410,7 @@ class ShopifyHtmlConnector:
 
     def __init__(self, base_url: str, brand_tokens=None):
         self.base_url = base_url.rstrip("/")
+        self._brand_names = [b for b in (brand_tokens or []) if b]
         self.brand_tokens = _brand_slug_tokens(brand_tokens)
 
     def _product_urls(self) -> Iterator[str]:
@@ -416,6 +441,8 @@ class ShopifyHtmlConnector:
             fetched += 1
             parsed = parse_product_page(resp.text, url)
             if parsed and parsed.get("price") is not None:
+                if not parsed.get("brand"):
+                    parsed["brand"] = _slug_brand(slug, self._brand_names)
                 parsed["url"] = url
                 parsed.setdefault("compare_at_price", None)
                 yield parsed
@@ -438,6 +465,7 @@ class GenericSitemapConnector:
 
     def __init__(self, base_url: str, brand_tokens=None):
         self.base_url = base_url.rstrip("/")
+        self._brand_names = [b for b in (brand_tokens or []) if b]
         self.brand_tokens = _brand_slug_tokens(brand_tokens)
 
     def _sitemap_sources(self) -> list:
@@ -500,6 +528,8 @@ class GenericSitemapConnector:
             fetched += 1
             parsed = parse_product_page(resp.text, url)
             if parsed and parsed.get("price") is not None:
+                if not parsed.get("brand"):
+                    parsed["brand"] = _slug_brand(path, self._brand_names)
                 parsed["url"] = url
                 parsed.setdefault("compare_at_price", None)
                 yield parsed

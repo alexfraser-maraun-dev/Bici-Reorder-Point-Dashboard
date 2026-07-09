@@ -21,9 +21,11 @@ _MAX_PRIORITY_PINGS = 15
 _MAX_DIGEST_MOVES = 15
 _MAX_STOCK_LINES = 10
 
+# Event types that fire their own priority ping. Undercut events are still
+# generated (they show in the change feed and give the digest context), but they
+# no longer ping — only MAP violations do.
 _ALERT_META = {
     "map_violation": ("⚠️ MAP violation", "below our MAP", "#d21f3c"),
-    "undercut": ("🔻 Undercut", "below our retail", "#e8710a"),
 }
 
 
@@ -100,7 +102,7 @@ def _post_priority_pings(events, webhook) -> list:
 
     overflow = len(priority) - _MAX_PRIORITY_PINGS
     if overflow > 0:
-        slack.post(webhook, text=f"…and *{overflow}* more MAP/undercut alerts this run.")
+        slack.post(webhook, text=f"…and *{overflow}* more MAP alerts this run.")
         sent += [e["event_id"] for e in priority[_MAX_PRIORITY_PINGS:]]
     return sent
 
@@ -192,17 +194,6 @@ def send_test() -> dict:
         }
     alerts_hook = config.SLACK_ALERTS_WEBHOOK_URL or config.SLACK_WEBHOOK_URL
 
-    undercut_ok = slack.post_alert(
-        alerts_hook, fallback="Undercut test",
-        title="🔻 Undercut — Competitor Bikes Inc",
-        body="\n".join([
-            "*Sample Road Bike 54cm — Acme*",
-            "Their price: *$1,799.00*  (was $1,999.00 (-10.0%)) — below our retail",
-            "Our price: $1,899.00",
-            "<https://example.com/listing|View listing>",
-        ]),
-        color="#e8710a",
-    )
     map_ok = slack.post_alert(
         alerts_hook, fallback="MAP violation test",
         title="⚠️ MAP violation — Competitor Bikes Inc",
@@ -246,7 +237,6 @@ def send_test() -> dict:
         "sent": True,
         "alerts_webhook": "alerts" if config.SLACK_ALERTS_WEBHOOK_URL else "main (fallback)",
         "results": {
-            "undercut_ping": undercut_ok,
             "map_ping": map_ok,
             "digest": digest_ok,
         },

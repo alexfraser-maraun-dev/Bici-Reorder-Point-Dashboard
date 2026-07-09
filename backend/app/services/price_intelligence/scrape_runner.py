@@ -311,7 +311,10 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                     continue
 
                 obs_buffer, event_buffer = [], []
+                obs_before = counters["observations"]
+                products_seen = 0
                 for product in connector.iter_products():
+                    products_seen += 1
                     match_key = build_match_key(cid, product)
                     item_id, method, confidence, candidate = index.match(product, match_key)
                     observed_at = _now_iso()
@@ -368,6 +371,15 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 counters["observations"] += len(obs_buffer)
                 repository.load_rows(repository.T_EVENTS, event_buffer)
                 counters["changes"] += sum(1 for e in event_buffer if not e["acknowledged"])
+                # Distinguish a healthy crawl from silent failures: a connector that
+                # yields nothing (bad sitemap / blocked) vs one that yields products
+                # but persists none (no tracked-brand overlap) — both looked like
+                # plain "success" before and hid, e.g., the Oak Bay 0-result crawl.
+                obs_added = counters["observations"] - obs_before
+                if products_seen == 0:
+                    comp_status = "success_no_products"
+                elif obs_added == 0:
+                    comp_status = "success_no_matches"
             except Exception as e:
                 comp_status = f"failed: {e}"
                 errors.append(f"{competitor['name']}: {e}")

@@ -3,6 +3,7 @@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { PriceIntelKpiCards } from '@/components/price-intel/kpi-cards'
 import { ScrapeStatusButton } from '@/components/price-intel/scrape-status-button'
+import { ScrapeHealthPill } from '@/components/price-intel/scrape-health'
 import { TrackedProductsTable } from '@/components/price-intel/tracked-products-table'
 import { ChangeFeed } from '@/components/price-intel/change-feed'
 import { CompetitorManager } from '@/components/price-intel/competitor-manager'
@@ -51,7 +52,10 @@ export function PriceIntelligenceContent() {
             Competitor prices for your top-revenue and pinned products, scraped nightly.
           </p>
         </div>
-        <ScrapeStatusButton onRunFinished={refreshAll} />
+        <div className="flex flex-wrap items-center gap-3">
+          <ScrapeHealthPill health={summary?.scrape_health} />
+          <ScrapeStatusButton onRunFinished={refreshAll} />
+        </div>
       </div>
 
       <PriceIntelKpiCards summary={summary} isLoading={isLoading}
