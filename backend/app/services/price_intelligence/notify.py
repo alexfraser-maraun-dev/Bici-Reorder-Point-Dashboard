@@ -19,7 +19,6 @@ from . import config, repository
 # one summary line.
 _MAX_PRIORITY_PINGS = 15
 _MAX_DIGEST_MOVES = 15
-_MAX_STOCK_LINES = 10
 
 # Event types that fire their own priority ping. Undercut events are still
 # generated (they show in the change feed and give the digest context), but they
@@ -117,9 +116,10 @@ def _post_digest(run_id, events) -> list:
 
     moves = [e for e in events if e.get("event_type") in ("price_drop", "price_increase")]
     moves.sort(key=lambda e: abs(e.get("pct_change") or 0), reverse=True)
-    stock = [e for e in events if e.get("event_type") in ("out_of_stock", "back_in_stock")]
+    # Competitor stock changes (out_of_stock/back_in_stock) are intentionally kept
+    # out of Slack; they still land in the change feed.
 
-    if not digest_md and not moves and not stock:
+    if not digest_md and not moves:
         return []
 
     blocks = [slack.header(f"🗞️ Price intel — {datetime.now().strftime('%b %-d')}")]
@@ -142,25 +142,9 @@ def _post_digest(run_id, events) -> list:
         blocks.append(slack.section("\n".join(lines)))
         move_ids = [e["event_id"] for e in moves]
 
-    stock_ids = []
-    if stock:
-        blocks.append(slack.divider())
-        lines = ["*Stock changes*"]
-        for e in stock[:_MAX_STOCK_LINES]:
-            emoji = "📦" if e["event_type"] == "back_in_stock" else "🚫"
-            verb = "back in stock" if e["event_type"] == "back_in_stock" else "out of stock"
-            lines.append(
-                f"{emoji} *{_title(e.get('item_title'), e.get('item_brand'))}* — "
-                f"{e.get('competitor_name') or 'Competitor'} {verb}"
-            )
-        if len(stock) > _MAX_STOCK_LINES:
-            lines.append(f"_…and {len(stock) - _MAX_STOCK_LINES} more._")
-        blocks.append(slack.section("\n".join(lines)))
-        stock_ids = [e["event_id"] for e in stock]
-
     fallback = "Price intel digest"
     if slack.post(config.SLACK_WEBHOOK_URL, text=fallback, blocks=blocks):
-        return move_ids + stock_ids
+        return move_ids
     return []
 
 
@@ -223,11 +207,6 @@ def send_test() -> dict:
             "🔻 *Sample Road Bike 54cm — Acme* — Competitor Bikes Inc: "
             "$1,999.00 → $1,799.00 (-10.0%)",
             "🔺 *Sample Tire — Acme* — Other Store: $59.00 → $64.00 (+8.5%)",
-        ])),
-        slack.divider(),
-        slack.section("\n".join([
-            "*Stock changes*",
-            "🚫 *Sample Wheelset — Acme* — Competitor Bikes Inc out of stock",
         ])),
     ]
     digest_ok = slack.post(config.SLACK_WEBHOOK_URL, text="Price intel digest (test)",
