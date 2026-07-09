@@ -73,6 +73,25 @@ def _normalize_sku(value) -> Optional[str]:
     return cleaned or None
 
 
+# Shopify puts a variant's *title* in the SKU slot when the merchant leaves the
+# SKU blank — "Default Title" for single-variant products, or the bare option
+# value ("Standard", "One Size"). These are not real SKUs: trusting one as a
+# listing's identity collapses a store's entire SKU-less catalog onto a single
+# match_key, so every product there then matches whatever that key was linked to
+# (the Enroute "one item -> the whole catalog" fan-out). Normalized forms, to
+# compare against _normalize_sku output. Extend as new sentinels surface.
+_PLACEHOLDER_SKUS = {"defaulttitle", "standard", "onesize", "singleset"}
+
+
+def _identifying_sku(value) -> Optional[str]:
+    """The SKU usable as a listing's identity, or None for Shopify's blank-SKU
+    sentinels (variant titles, not SKUs — see _PLACEHOLDER_SKUS)."""
+    sku = _normalize_sku(value)
+    if sku is None or sku in _PLACEHOLDER_SKUS:
+        return None
+    return sku
+
+
 def _normalize_brand(value) -> Optional[str]:
     folded = _fold(value)
     if not folded:
@@ -219,9 +238,11 @@ def size_matches_item(competitor_title, item_attrs):
 
 def build_match_key(competitor_id, scraped: dict) -> str:
     """Stable identity for one scraped competitor listing — the key pi_product_links
-    dedupes and re-attaches on. Prefers SKU (survives URL/handle renames)."""
+    dedupes and re-attaches on. Prefers a real SKU (survives URL/handle renames),
+    but ignores Shopify's blank-SKU sentinels (_identifying_sku) so a whole
+    catalog's SKU-less listings don't collapse onto one key and fan out."""
     ident = (
-        _normalize_sku(scraped.get("sku"))
+        _identifying_sku(scraped.get("sku"))
         or scraped.get("url")
         or _fold(scraped.get("title"))
     )

@@ -1095,51 +1095,93 @@ def backfill_url_competitor_ids(apply: bool = False) -> dict:
 
 
 def reject_competitor_listing(item_id: str, competitor_id, url, decided_by: str = "Dashboard"):
-    """Reject one competitor listing for one item — the manual escape hatch for a
-    stuck match (e.g. a fuzzy title auto-match that has no reviewable link row).
-    Reconstructs the listing's match_key from its latest observation (SKU-preferred,
-    matching what the scraper writes), tombstones it, and nulls match_item_id on that
-    listing's observations so it drops from the market/history immediately."""
+    """Reject one competitor listing for one item — the "Ban" escape hatch on the
+    tracked-products breakdown. A listing can reach an item through three separate
+    surfaces, and a durable ban has to close all of them or the next scrape re-adds
+    it:
+      1. a confirmed/pending link row (manual_url pin keyed url:{url}, or a
+         gtin/attr/llm link keyed {cid}:{sku}) -> the targeted-link loop re-attaches
+         it every run;
+      2. a pi_tracked_urls pin -> the tracked-URL phase re-scrapes it every run;
+      3. no link row at all (a fuzzy/catalog auto-match) -> the matcher re-matches
+         it every run unless its match_key is tombstoned.
+    We key steps 1 & 2 on (item, url) rather than competitor: a URL is store-unique,
+    so this also works when the listing was pinned under the wrong competitor (the
+    exact case the old SKU-key-only reject silently failed on — it rebuilt a
+    {cid}:{sku} key that never matched a url:{url} pin, and never touched the
+    tracked-URL row). Then nulls match_item_id on the listing's observations so it
+    drops from the market/history immediately."""
     from .matcher import build_match_key
     ensure_pi_tables()
+    iid = str(item_id)
     cid = str(competitor_id) if competitor_id else None
     url = url or ""
-    cid_clause = "competitor_id = @cid" if cid else "competitor_id IS NULL"
-    params = [
-        bigquery.ScalarQueryParameter("iid", "STRING", str(item_id)),
-        bigquery.ScalarQueryParameter("url", "STRING", url),
-    ]
-    if cid:
-        params.append(bigquery.ScalarQueryParameter("cid", "STRING", cid))
+    client = get_bq_client()
+
+    def _exec(sql, params):
+        job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params))
+        job.result()
+        return job.num_dml_affected_rows or 0
+
+    # Freshest observation for this listing (item + url), used to rebuild the
+    # matcher's match_key. Not filtered on competitor — a URL belongs to one store,
+    # so bans of a mislabeled-competitor listing must still find it.
     obs = _rows(f"""
         SELECT competitor_id, competitor_sku, url, competitor_title
         FROM `{T_OBSERVATIONS}`
-        WHERE match_item_id = @iid AND COALESCE(url, '') = @url AND {cid_clause}
+        WHERE match_item_id = @iid AND COALESCE(url, '') = @url
         ORDER BY observed_at DESC LIMIT 1
-    """, params=params)
+    """, params=[
+        bigquery.ScalarQueryParameter("iid", "STRING", iid),
+        bigquery.ScalarQueryParameter("url", "STRING", url),
+    ])
     if not obs:
         return {"status": "error", "reason": "no observation found for that listing"}
     o = obs[0]
+
+    id_url_params = [
+        bigquery.ScalarQueryParameter("iid", "STRING", iid),
+        bigquery.ScalarQueryParameter("url", "STRING", url),
+        bigquery.ScalarQueryParameter("actor", "STRING", decided_by),
+    ]
+
+    # 1) Reject any confirmed/pending link at this URL (any match_key scheme).
+    links_rejected = 0
+    if url:
+        links_rejected = _exec(
+            f"UPDATE `{T_LINKS}` SET status = 'rejected', decided_by = @actor, "
+            "updated_at = CURRENT_TIMESTAMP() "
+            "WHERE item_id = @iid AND COALESCE(competitor_url, '') = @url "
+            "AND status IN ('confirmed', 'pending')", id_url_params)
+
+    # 2) Disable any tracked-URL pin at this URL so the URL phase stops re-scraping.
+    urls_disabled = 0
+    if url:
+        urls_disabled = _exec(
+            f"UPDATE `{T_URLS}` SET enabled = FALSE "
+            "WHERE item_id = @iid AND url = @url AND COALESCE(enabled, TRUE) = TRUE",
+            [bigquery.ScalarQueryParameter("iid", "STRING", iid),
+             bigquery.ScalarQueryParameter("url", "STRING", url)])
+
+    # 3) Tombstone the matcher's match_key (the no-link fuzzy/catalog path). Rebuild
+    #    exactly what the scraper writes (SKU-preferred) so rejected_keys blocks it.
     key_cid = o.get("competitor_id") or cid or ""
     match_key = build_match_key(key_cid, {
         "sku": o.get("competitor_sku"), "url": o.get("url"),
         "title": o.get("competitor_title"),
     })
-    client = get_bq_client()
-    job = client.query(
-        f"UPDATE `{T_LINKS}` SET status = 'rejected', decided_by = @actor, "
-        "updated_at = CURRENT_TIMESTAMP() WHERE match_key = @mk",
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("actor", "STRING", decided_by),
-            bigquery.ScalarQueryParameter("mk", "STRING", match_key),
-        ]),
-    )
-    job.result()
-    if not job.num_dml_affected_rows:
+    existing = _rows(f"SELECT status FROM `{T_LINKS}` WHERE match_key = @mk LIMIT 1",
+                     params=[bigquery.ScalarQueryParameter("mk", "STRING", match_key)])
+    if existing:
+        _exec(f"UPDATE `{T_LINKS}` SET status = 'rejected', decided_by = @actor, "
+              "updated_at = CURRENT_TIMESTAMP() WHERE match_key = @mk AND status != 'rejected'",
+              [bigquery.ScalarQueryParameter("mk", "STRING", match_key),
+               bigquery.ScalarQueryParameter("actor", "STRING", decided_by)])
+    else:
         now = utcnow_iso()
         insert_product_links([{
-            "link_id": str(uuid.uuid4()), "item_id": str(item_id),
-            "competitor_id": cid, "match_key": match_key,
+            "link_id": str(uuid.uuid4()), "item_id": iid,
+            "competitor_id": key_cid or cid, "match_key": match_key,
             "competitor_url": o.get("url"), "competitor_sku": o.get("competitor_sku"),
             "competitor_title": o.get("competitor_title"), "gtin": None,
             "level": "variant", "status": "rejected", "source": "human",
@@ -1148,13 +1190,18 @@ def reject_competitor_listing(item_id: str, competitor_id, url, decided_by: str 
             "their_price": None, "decided_by": decided_by,
             "created_at": now, "updated_at": now,
         }])
-    client.query(
+
+    # 4) Drop the listing from market/history now (all observations at this URL).
+    obs_cleared = _exec(
         f"UPDATE `{T_OBSERVATIONS}` SET match_item_id = NULL "
-        f"WHERE match_item_id = @iid AND COALESCE(url, '') = @url AND {cid_clause}",
-        job_config=bigquery.QueryJobConfig(query_parameters=params),
-    ).result()
+        "WHERE match_item_id = @iid AND COALESCE(url, '') = @url",
+        [bigquery.ScalarQueryParameter("iid", "STRING", iid),
+         bigquery.ScalarQueryParameter("url", "STRING", url)])
+
     invalidate_pi_caches()
-    return {"status": "rejected", "match_key": match_key}
+    return {"status": "rejected", "match_key": match_key,
+            "links_rejected": links_rejected, "tracked_urls_disabled": urls_disabled,
+            "observations_cleared": obs_cleared}
 
 
 def insert_product_links(rows: list):
