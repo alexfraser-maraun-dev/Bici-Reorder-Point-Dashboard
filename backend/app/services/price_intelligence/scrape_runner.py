@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from . import config, repository
 from .connectors import PageScraper, build_connector, detect_connector_type
-from .matcher import MatchIndex, build_match_key
+from .matcher import MatchIndex, build_match_key, _identifying_sku
 
 _scrape_lock = threading.Lock()
 _status_lock = threading.Lock()
@@ -318,9 +318,14 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                     match_key = build_match_key(cid, product)
                     item_id, method, confidence, candidate = index.match(product, match_key)
                     observed_at = _now_iso()
+                    # Identity for price diffing over time. Route the SKU through
+                    # _identifying_sku so Shopify's blank-SKU placeholders
+                    # ("Default Title", etc.) fall through to the unique URL —
+                    # otherwise a store's whole SKU-less catalog collapses onto one
+                    # diff_key and cross-contaminates prices (phantom moves).
                     diff_key = (
                         f"cat:{cid}:"
-                        f"{product.get('gtin') or product.get('sku') or product.get('url') or product.get('title')}"
+                        f"{product.get('gtin') or _identifying_sku(product.get('sku')) or product.get('url') or product.get('title')}"
                     )
                     obs = {
                         "observed_at": observed_at,
