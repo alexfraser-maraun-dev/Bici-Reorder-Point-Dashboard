@@ -1339,6 +1339,44 @@ def confirm_link(link_id: str, decided_by: str = "Dashboard", replace: bool = Fa
     return {"status": "confirmed", "replaced": len(dupes)}
 
 
+def fetch_and_record_link(link_id: str):
+    """Immediately fetch a just-confirmed link's URL and record an observation, so
+    a match confirmed in the Matching tab shows in Tracked Products within seconds
+    instead of waiting for the next scrape. Mirrors the nightly targeted-link path
+    (diff_key = link:{id}, source='link'), incl. Shopify variant resolution by SKU."""
+    from .connectors import PageScraper
+    ensure_pi_tables()
+    rows = _rows(f"""
+        SELECT link_id, item_id, competitor_id, competitor_url, competitor_sku,
+               competitor_title, gtin, confidence
+        FROM `{T_LINKS}` WHERE link_id = @lid AND status = 'confirmed'
+    """, params=[bigquery.ScalarQueryParameter("lid", "STRING", str(link_id))])
+    if not rows:
+        return
+    l = rows[0]
+    url, item_id = l.get("competitor_url"), l.get("item_id")
+    if not url or not item_id:
+        return
+    try:
+        parsed = PageScraper().fetch(url, sku=l.get("competitor_sku"))
+        if parsed and parsed.get("price") is not None:
+            load_rows(T_OBSERVATIONS, [{
+                "observed_at": utcnow_iso(), "run_id": f"confirm-{uuid.uuid4()}",
+                "source": "link", "diff_key": f"link:{l['link_id']}",
+                "competitor_id": l.get("competitor_id"), "url": url,
+                "competitor_title": parsed.get("title") or l.get("competitor_title"),
+                "competitor_sku": parsed.get("sku") or l.get("competitor_sku"),
+                "gtin": parsed.get("gtin") or l.get("gtin"),
+                "match_item_id": str(item_id), "match_method": "link",
+                "match_confidence": l.get("confidence") or 1.0,
+                "price": parsed.get("price"), "compare_at_price": parsed.get("compare_at_price"),
+                "currency": parsed.get("currency"), "in_stock": parsed.get("in_stock"),
+            }])
+            invalidate_pi_caches()
+    except Exception as e:
+        print(f"pi: immediate fetch of confirmed link {link_id} failed (next scrape retries): {e}")
+
+
 def cleanup_mismatched_links(apply: bool = False) -> dict:
     """One-off hygiene sweep (dry-run by default). Rejects links whose competitor
     color/size conflicts with the item's attributes (both confirmed and pending),

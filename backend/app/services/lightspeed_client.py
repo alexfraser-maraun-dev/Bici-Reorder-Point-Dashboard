@@ -581,21 +581,65 @@ class LightspeedClient:
             }
         return out
 
-    def get_workorders_by_sale_ids(self, sale_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
+    def get_workorders_by_sale_line_ids(self, sale_line_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
         """
-        Resolves which sales are attached to service workorders, keyed by saleID:
-          { saleID: { "workorder_id", "status", "eta_out" } }
-        A special order raised from the service bench carries its Workorder via
-        SaleLine.saleID -> Workorder.saleID. Sales with no workorder simply have no entry.
-        Failures (including a token without the workorder scope) degrade to {} so the
-        dashboard just shows no workorder badge.
+        Resolves which special orders are attached to service workorders, keyed by the SO's
+        saleLineID:
+          { saleLineID: { "workorder_id", "status", "eta_out" } }
+
+        The join is WorkorderItem.saleLineID == SpecialOrder.saleLineID (the part line a
+        workorder-raised SO hangs off). It must NOT go through Workorder.saleID: a
+        workorder's sale stays saleID=0 until the workorder is invoiced, so a sale-level
+        join misses every in-flight workorder (verified live: SO 44690 / WO 35409).
+
+        `status` is the human name resolved via /WorkorderStatus.json (the Workorder row
+        itself only carries workorderStatusID). Failures (including a token without the
+        workorder scope) degrade to {} so the dashboard just shows no workorder badge.
         """
-        unique_ids = sorted({str(s) for s in sale_ids if s and str(s) != "0"})
-        return self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_workorder_chunk)
+        unique_ids = sorted({str(s) for s in sale_line_ids if s and str(s) != "0"})
+        if not unique_ids:
+            return {}
+        line_map = self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_workorder_item_chunk)
+        if not line_map:
+            return {}
+        wo_ids = sorted({v["workorder_id"] for v in line_map.values()})
+        detail_map = self._fetch_in_chunks(wo_ids, chunk_size, self._fetch_workorder_chunk)
+        status_names = self._fetch_workorder_status_names()
+        out: Dict[str, Dict[str, Any]] = {}
+        for sale_line_id, link in line_map.items():
+            detail = detail_map.get(link["workorder_id"], {})
+            out[sale_line_id] = {
+                "workorder_id": link["workorder_id"],
+                "status": status_names.get(detail.get("status_id")),
+                "eta_out": detail.get("eta_out"),
+            }
+        return out
+
+    def _fetch_workorder_item_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
+        """saleLineID -> {workorder_id} via the WorkorderItem part lines."""
+        params = {
+            "saleLineID": f"IN,[{','.join(chunk)}]",
+            "limit": "100",
+        }
+        out: Dict[str, Dict[str, Any]] = {}
+        response = self._legacy_request("GET", "/WorkorderItem.json", params=params)
+        if response is None or response.status_code != 200:
+            if response is not None:
+                print(f"Error fetching workorder items: {response.status_code} {response.text[:300]}")
+            return out
+        for wi in self._as_list(response.json().get("WorkorderItem")):
+            sale_line_id = str(wi.get("saleLineID"))
+            wo_id = wi.get("workorderID")
+            # Keep the first workorder per sale line — one linked WO is enough for the badge.
+            if sale_line_id in out or not wo_id or str(wo_id) == "0":
+                continue
+            out[sale_line_id] = {"workorder_id": str(wo_id)}
+        return out
 
     def _fetch_workorder_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
+        """workorderID -> {status_id, eta_out} details for the linked workorders."""
         params = {
-            "saleID": f"IN,[{','.join(chunk)}]",
+            "workorderID": f"IN,[{','.join(chunk)}]",
             "limit": "100",
         }
         out: Dict[str, Dict[str, Any]] = {}
@@ -605,14 +649,19 @@ class LightspeedClient:
                 print(f"Error fetching workorders: {response.status_code} {response.text[:300]}")
             return out
         for wo in self._as_list(response.json().get("Workorder")):
-            sale_id = str(wo.get("saleID"))
-            # A sale could carry several workorders; keep the first returned —
-            # one linked WO is enough for the badge/deep link.
-            if sale_id in out:
-                continue
-            out[sale_id] = {
-                "workorder_id": str(wo.get("workorderID")) if wo.get("workorderID") else None,
-                "status": wo.get("status"),
+            out[str(wo.get("workorderID"))] = {
+                "status_id": str(wo.get("workorderStatusID")) if wo.get("workorderStatusID") else None,
                 "eta_out": wo.get("etaOut") or None,
             }
         return out
+
+    def _fetch_workorder_status_names(self) -> Dict[str, str]:
+        """{workorderStatusID: name} from the (small) WorkorderStatus table; {} on failure."""
+        response = self._legacy_request("GET", "/WorkorderStatus.json", params={"limit": "100"})
+        if response is None or response.status_code != 200:
+            return {}
+        return {
+            str(s.get("workorderStatusID")): s.get("name")
+            for s in self._as_list(response.json().get("WorkorderStatus"))
+            if s.get("workorderStatusID") and s.get("name")
+        }

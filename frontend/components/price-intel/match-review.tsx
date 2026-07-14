@@ -6,6 +6,7 @@
 // tombstone (the pair is never proposed again).
 
 import { useMemo, useState } from 'react'
+import { mutate as globalMutate } from 'swr'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -126,6 +127,13 @@ export function MatchReview() {
         toast.success(parts.join(' · ') || 'Done')
       }
       await Promise.all([mutate(), mutateSummary()])
+      // A confirm kicks off an immediate price fetch server-side; refresh the
+      // Tracked Products data once it has landed so the new match shows there.
+      if (status === 'confirmed') {
+        setTimeout(() => {
+          void globalMutate((k) => typeof k === 'string' && k.includes('/api/price-intel/tracked'))
+        }, 6000)
+      }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to save decision')
     } finally {

@@ -339,7 +339,7 @@ def cleanup_links(apply: bool = False):
 
 
 @router.post("/links/{link_id}/decision")
-def decide_link(link_id: str, payload: Dict[str, Any]):
+def decide_link(link_id: str, payload: Dict[str, Any], background_tasks: BackgroundTasks):
     status = payload.get("status")
     if status not in ("confirmed", "rejected"):
         raise HTTPException(status_code=400, detail="status must be confirmed or rejected")
@@ -347,7 +347,12 @@ def decide_link(link_id: str, payload: Dict[str, Any]):
     if status == "confirmed":
         # Guarded: enforces attribute match + one confirmed link per (item, store).
         # replace=true rejects the existing match at that store and takes over.
-        return repository.confirm_link(link_id, decided_by=actor, replace=bool(payload.get("replace")))
+        result = repository.confirm_link(link_id, decided_by=actor, replace=bool(payload.get("replace")))
+        # Fetch a first price immediately so the match shows in Tracked Products
+        # within seconds instead of waiting for the next scrape.
+        if result.get("status") == "confirmed":
+            background_tasks.add_task(repository.fetch_and_record_link, link_id)
+        return result
     repository.decide_link(link_id, status, decided_by=actor)
     return {"status": "rejected"}
 

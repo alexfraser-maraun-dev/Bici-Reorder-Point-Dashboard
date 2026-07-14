@@ -27,16 +27,15 @@ def main():
               f"status={sample.get('status')} "
               f"orderID={(sample.get('OrderLine') or {}).get('orderID')}")
 
-    # 2. Workorder linkage probe: SaleLine.saleID -> Workorder.
-    sale_ids = [
-        (so.get("SaleLine") or {}).get("saleID")
+    # 2. Workorder linkage probe: SpecialOrder.saleLineID -> WorkorderItem -> Workorder.
+    sale_line_ids = [
+        so.get("saleLineID") or (so.get("SaleLine") or {}).get("saleLineID")
         for so in raw
-        if (so.get("SaleLine") or {}).get("saleID")
     ]
-    wo_map = client.get_workorders_by_sale_ids(sale_ids)
-    print(f"Workorder probe: {len(set(sale_ids))} sales -> {len(wo_map)} with workorders.")
-    for sid, wo in list(wo_map.items())[:3]:
-        print(f"  saleID={sid} -> WO #{wo['workorder_id']} status={wo.get('status')}")
+    wo_map = client.get_workorders_by_sale_line_ids(sale_line_ids)
+    print(f"Workorder probe: {len(set(filter(None, sale_line_ids)))} sale lines -> {len(wo_map)} with workorders.")
+    for slid, wo in list(wo_map.items())[:3]:
+        print(f"  saleLineID={slid} -> WO #{wo['workorder_id']} status={wo.get('status')}")
 
     # 3. Full normalized dashboard payload.
     result = get_special_order_dashboard(client)

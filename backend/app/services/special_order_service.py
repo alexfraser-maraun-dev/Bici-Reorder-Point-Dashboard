@@ -266,10 +266,10 @@ def _normalize(
     contacted = _coerce_bool(so.get("contacted"))
 
     # Service-bench linkage: an SO raised from a workorder reaches its Workorder via
-    # SaleLine.saleID. Empty map (fetch failed / no scope) just means no badge.
-    sale_id = sale_line.get("saleID")
-    workorder = (sourcing_ctx or {}).get("workorder_map", {}).get(str(sale_id)) if sale_id else None
-    workorder = workorder or {}
+    # WorkorderItem.saleLineID (see get_workorders_by_sale_line_ids — the sale-level join
+    # misses un-invoiced workorders). Empty map (fetch failed / no scope) just means no badge.
+    sale_line_id = so.get("saleLineID") or sale_line.get("saleLineID")
+    workorder = (sourcing_ctx or {}).get("workorder_map", {}).get(str(sale_line_id)) or {}
     workorder_id = workorder.get("workorder_id")
 
     # True creation time comes from the linked SaleLine (createTime). Fall back to the
@@ -596,11 +596,14 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
     ]
     customer_ids = [so.get("customerID") for so in sos_to_resolve]
     item_ids = [_raw_so_item_id(so) for so in sos_to_resolve]
-    sale_ids = [(so.get("SaleLine") or {}).get("saleID") for so in sos_to_resolve]
+    sale_line_ids = [
+        so.get("saleLineID") or (so.get("SaleLine") or {}).get("saleLineID")
+        for so in sos_to_resolve
+    ]
     with ThreadPoolExecutor(max_workers=7) as executor:
         order_future = executor.submit(client.get_orders_by_ids, order_ids)
         customer_future = executor.submit(client.get_customers_by_ids, customer_ids)
-        workorder_future = executor.submit(_safe, lambda: client.get_workorders_by_sale_ids(sale_ids), {})
+        workorder_future = executor.submit(_safe, lambda: client.get_workorders_by_sale_line_ids(sale_line_ids), {})
         brand_future = executor.submit(_safe, lambda: bigquery_sync.fetch_item_brands(item_ids), {})
         sourcing_future = executor.submit(_safe, bigquery_sync.fetch_brand_vendor_sourcing, {})
         leadtime_future = executor.submit(_safe, bigquery_sync.build_lead_time_lookup, ({}, {}))
