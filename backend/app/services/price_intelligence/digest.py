@@ -11,13 +11,13 @@ import uuid
 from google.cloud import bigquery
 
 from app.services.bigquery_sync import get_bq_client
-from . import config, repository
+from . import config, repository, settings
 
 _anthropic_client = None
 
 _TARGET_PCT = int(config.DIGEST_UNDERCUT_TARGET_PCT)
 
-SYSTEM_PROMPT = (
+DEFAULT_SYSTEM_PROMPT = (
     "You are a pricing analyst for Bici, a bicycle retailer in British Columbia. "
     "Given last night's competitor price data as JSON, write a concise markdown "
     "digest with these sections: (1) a one-line market position summary, "
@@ -46,6 +46,13 @@ SYSTEM_PROMPT = (
     "Under 350 words. Prices are CAD. Do not invent data — only reference what is "
     "in the JSON."
 )
+
+
+def system_prompt() -> str:
+    """Effective digest prompt: the admin-console override when one is saved,
+    otherwise the default above. A blank override also means default."""
+    custom = (settings.get("digest_prompt") or "").strip()
+    return custom or DEFAULT_SYSTEM_PROMPT
 
 
 def _get_anthropic_client():
@@ -195,7 +202,7 @@ def generate_digest(run_id: str) -> dict:
     message = client.messages.create(
         model=config.DIGEST_MODEL,
         max_tokens=config.DIGEST_MAX_TOKENS,
-        system=SYSTEM_PROMPT,
+        system=system_prompt(),
         messages=[{"role": "user", "content": json.dumps(stats, default=str)}],
     )
     digest_md = "".join(block.text for block in message.content if block.type == "text")

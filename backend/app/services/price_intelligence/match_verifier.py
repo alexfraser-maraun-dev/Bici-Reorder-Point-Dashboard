@@ -21,7 +21,7 @@ caller swallows failures so scrape data is never lost.
 import json
 import re
 
-from . import config, matcher, repository
+from . import config, matcher, repository, settings
 
 _anthropic_client = None
 
@@ -277,7 +277,7 @@ def verify_candidates(max_pairs: int = None) -> dict:
             }
             if verdict == "same_variant":
                 update.update(level="variant")
-                if not config.AUTO_CONFIRM:
+                if not settings.get("auto_confirm"):
                     # Manual-review mode: the verdict is triage annotation only —
                     # the human confirms from the Matching queue.
                     stats["pending"] += 1
@@ -293,7 +293,7 @@ def verify_candidates(max_pairs: int = None) -> dict:
                 # Re-anchoring to the size-matched variant is useful triage even
                 # when the confirm itself waits for a human.
                 update.update(item_id=anchor_id, level="model")
-                if not (config.AUTO_CONFIRM and resolved):
+                if not (settings.get("auto_confirm") and resolved):
                     stats["pending"] += 1
                 else:
                     update.update(status="confirmed", confidence=0.85)

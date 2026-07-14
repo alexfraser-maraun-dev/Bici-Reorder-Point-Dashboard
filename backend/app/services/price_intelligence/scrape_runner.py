@@ -610,26 +610,33 @@ _scheduler_started = False
 
 
 def start_scheduler():
-    """Starts the nightly-scrape daemon thread once per process."""
+    """Starts the nightly-scrape daemon thread once per process. The thread
+    always runs; each tick reads the effective enabled/time settings so the
+    admin console can enable, disable, or retime the nightly run without a
+    redeploy (settings default to the PI_SCHEDULE_* env vars)."""
     global _scheduler_started
-    if _scheduler_started or not config.SCHEDULE_ENABLED:
+    if _scheduler_started:
         return
     _scheduler_started = True
     threading.Thread(target=_scheduler_loop, daemon=True).start()
 
 
 def _scheduler_loop():
-    tz = ZoneInfo(config.SCHEDULE_TIMEZONE)
+    from . import settings
     while True:
         try:
-            now = datetime.now(tz)
-            due = (now.hour, now.minute) >= (config.SCHEDULE_HOUR_LOCAL, config.SCHEDULE_MINUTE_LOCAL)
-            if due and get_status().get("status") != "running":
-                today = now.strftime("%Y-%m-%d")
-                # BQ-backed guard so restarts/redeploys can't double-run a night.
-                if not repository.has_successful_run_on(today, config.SCHEDULE_TIMEZONE):
-                    print(f"pi: scheduler firing nightly scrape for {today}")
-                    start_scrape(trigger="scheduled")
+            if settings.get("schedule_enabled"):
+                tz_name = settings.get("schedule_timezone")
+                now = datetime.now(ZoneInfo(tz_name))
+                due = (now.hour, now.minute) >= (
+                    settings.get("schedule_hour"), settings.get("schedule_minute")
+                )
+                if due and get_status().get("status") != "running":
+                    today = now.strftime("%Y-%m-%d")
+                    # BQ-backed guard so restarts/redeploys can't double-run a night.
+                    if not repository.has_successful_run_on(today, tz_name):
+                        print(f"pi: scheduler firing nightly scrape for {today}")
+                        start_scrape(trigger="scheduled")
         except Exception as e:
             print(f"pi: scheduler tick failed: {e}")
         time.sleep(60)

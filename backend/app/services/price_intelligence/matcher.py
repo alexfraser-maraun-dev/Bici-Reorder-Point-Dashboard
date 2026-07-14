@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 
 from rapidfuzz import fuzz, process
 
-from . import config, repository
+from . import config, repository, settings
 
 FUZZY_THRESHOLD = 90
 CANDIDATE_THRESHOLD = 60
@@ -407,9 +407,12 @@ class MatchIndex:
             item_id, confidence = self.by_link[match_key]
             return item_id, "link", confidence, None
 
+        # Runtime-editable via the admin console; defaults to PI_AUTO_CONFIRM.
+        auto_confirm = settings.get("auto_confirm")
+
         gtin = normalize_upc(scraped.get("gtin"))
         if gtin and gtin in self.by_upc:
-            if config.AUTO_CONFIRM:
+            if auto_confirm:
                 return self.by_upc[gtin], "gtin", 1.0, None
             return None, None, 0.0, {
                 "item_id": self.by_upc[gtin], "method": "gtin",
@@ -419,7 +422,7 @@ class MatchIndex:
         brand = _normalize_brand(scraped.get("brand"))
         sku = _normalize_sku(scraped.get("sku"))
         if brand and sku and (brand, sku) in self.by_brand_sku:
-            if config.AUTO_CONFIRM:
+            if auto_confirm:
                 return self.by_brand_sku[(brand, sku)], "brand_sku", 0.9, None
             return None, None, 0.0, {
                 "item_id": self.by_brand_sku[(brand, sku)], "method": "brand_sku",
@@ -445,7 +448,7 @@ class MatchIndex:
             # fuzzy scoring can't distinguish. Demote to a review candidate instead.
             sc, tc = _model_codes(title), _model_codes(self.titles[idx])
             if not (sc and tc and sc.isdisjoint(tc)):
-                if config.AUTO_CONFIRM:
+                if auto_confirm:
                     return self.title_items[idx], "fuzzy_title", round(score / 100 * 0.8, 3), None
                 return None, None, 0.0, {
                     "item_id": self.title_items[idx], "method": "fuzzy_title",
@@ -479,7 +482,7 @@ class MatchIndex:
                     verdict, target = self._resolve_by_attributes(options, best[1])
                     if verdict == "suppress":
                         return None, None, 0.0, None
-                    if verdict == "confirm" and config.ATTR_AUTO_CONFIRM and config.AUTO_CONFIRM:
+                    if verdict == "confirm" and config.ATTR_AUTO_CONFIRM and auto_confirm:
                         return target, "attr_exact", 0.97, None
                     if verdict in ("confirm", "candidate"):
                         return None, None, 0.0, {

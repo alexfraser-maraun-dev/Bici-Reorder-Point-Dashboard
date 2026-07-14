@@ -5,6 +5,7 @@ rows go through batch load jobs, never streaming inserts, so later DML (ack
 UPDATEs, retention deletes) is never blocked by a streaming buffer. The only
 streaming write is the append-only price-push audit log, mirroring log_writeback.
 """
+import json
 import threading
 import time
 import uuid
@@ -24,6 +25,7 @@ T_PUSH_LOG = f"{APP_DATASET}.pi_price_push_log"
 T_RUNS = f"{APP_DATASET}.pi_scrape_runs"
 T_LINKS = f"{APP_DATASET}.pi_product_links"
 T_OUR_PRICE_HISTORY = f"{APP_DATASET}.pi_our_price_history"
+T_SETTINGS = f"{APP_DATASET}.pi_settings"
 
 _tables_ensured = False
 _ensure_lock = threading.Lock()
@@ -196,6 +198,14 @@ def ensure_pi_tables():
             )
             PARTITION BY DATE(observed_at)
             CLUSTER BY item_id""",
+            # Runtime overrides for the admin console (settings.py). One row per
+            # setting key; absence of a row means "use the env-var default".
+            f"""CREATE TABLE IF NOT EXISTS `{T_SETTINGS}` (
+                setting_key STRING NOT NULL,
+                value_json STRING,
+                updated_at TIMESTAMP,
+                updated_by STRING
+            )""",
         ]
         for stmt in statements:
             client.query(stmt).result()
@@ -319,6 +329,55 @@ def _merge_upsert(table_id: str, rows: list, key: str, update_cols: list, insert
         WHEN MATCHED THEN UPDATE SET {set_clause}
         WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({vals})
     """).result()
+
+
+# ---------------------------------------------------------------------------
+# Admin settings (runtime overrides; see settings.py for the registry)
+# ---------------------------------------------------------------------------
+
+def get_settings_overrides() -> dict:
+    """All stored setting overrides, {key: parsed JSON value}. Cached with the
+    standard TTL; writes below invalidate immediately, so the in-process
+    scheduler and scrape threads pick up console changes on their next read."""
+    ensure_pi_tables()
+    cached = _cache_get("pi_settings")
+    if cached is not None:
+        return cached
+    out = {}
+    for r in _rows(f"SELECT setting_key, value_json FROM `{T_SETTINGS}`"):
+        try:
+            out[r["setting_key"]] = json.loads(r["value_json"])
+        except (TypeError, ValueError):
+            pass  # unreadable row: behave as if the override doesn't exist
+    _cache_set("pi_settings", out)
+    return out
+
+
+def upsert_setting(key: str, value, updated_by: str = "Dashboard"):
+    row = {
+        "setting_key": key,
+        "value_json": json.dumps(value),
+        "updated_at": utcnow_iso(),
+        "updated_by": updated_by,
+    }
+    _merge_upsert(
+        T_SETTINGS, [row], "setting_key",
+        update_cols=["value_json", "updated_at", "updated_by"],
+        insert_cols=list(row.keys()),
+    )
+    _caches.pop("pi_settings", None)
+
+
+def delete_setting(key: str):
+    """Clears an override so the setting reverts to its env-var default."""
+    ensure_pi_tables()
+    get_bq_client().query(
+        f"DELETE FROM `{T_SETTINGS}` WHERE setting_key = @key",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("key", "STRING", key),
+        ]),
+    ).result()
+    _caches.pop("pi_settings", None)
 
 
 # ---------------------------------------------------------------------------

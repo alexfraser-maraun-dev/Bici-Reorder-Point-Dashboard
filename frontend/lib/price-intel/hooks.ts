@@ -5,6 +5,7 @@
 
 import useSWR from 'swr'
 import type {
+  AdminSetting,
   ChangeEvent,
   ChangeFeedFilters,
   Competitor,
@@ -150,6 +151,20 @@ export function useItemPriceHistory(itemId: string | null) {
     fetcher, swrConfig
   )
   return { history: data, error, isLoading }
+}
+
+export function usePriceIntelSettings() {
+  const { data, error, isLoading, mutate } = useSWR<{ settings: AdminSetting[] }>(
+    `${baseUrl()}/api/price-intel/settings`, fetcher, swrConfig
+  )
+  return { settings: data?.settings ?? [], error, isLoading, mutate }
+}
+
+// value null clears the override (revert to the env-var default).
+export async function updatePriceIntelSettings(
+  changes: Record<string, string | number | boolean | null>
+): Promise<{ settings: AdminSetting[] }> {
+  return apiPost('/api/price-intel/settings', { changes }, 'PUT')
 }
 
 export async function searchItems(q: string): Promise<ItemSearchResult[]> {

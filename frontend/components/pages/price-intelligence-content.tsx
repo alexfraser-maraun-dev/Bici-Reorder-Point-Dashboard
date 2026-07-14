@@ -9,12 +9,13 @@ import { ChangeFeed } from '@/components/price-intel/change-feed'
 import { CompetitorManager } from '@/components/price-intel/competitor-manager'
 import { DigestCard } from '@/components/price-intel/digest-card'
 import { MatchReview } from '@/components/price-intel/match-review'
+import { AdminConsole } from '@/components/price-intel/admin-console'
 import {
   usePriceIntelSummary, useTrackedProducts, useChangeFeed, useProductLinks,
 } from '@/lib/price-intel/hooks'
 import { isMapViolation } from '@/lib/price-intel/format'
 import { Badge } from '@/components/ui/badge'
-import { Bell, GitMerge, Globe, Sparkles, Table2 } from 'lucide-react'
+import { Bell, GitMerge, Globe, Settings2, Sparkles, Table2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 
 export function PriceIntelligenceContent() {
@@ -88,6 +89,9 @@ export function PriceIntelligenceContent() {
           <TabsTrigger value="digest" className="gap-1.5">
             <Sparkles className="h-4 w-4" /> Digest
           </TabsTrigger>
+          <TabsTrigger value="admin" className="gap-1.5">
+            <Settings2 className="h-4 w-4" /> Admin
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="tracked" className="mt-4">
@@ -105,6 +109,9 @@ export function PriceIntelligenceContent() {
         </TabsContent>
         <TabsContent value="digest" className="mt-4">
           <DigestCard />
+        </TabsContent>
+        <TabsContent value="admin" className="mt-4">
+          <AdminConsole />
         </TabsContent>
       </Tabs>
     </div>

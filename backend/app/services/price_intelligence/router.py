@@ -19,11 +19,38 @@ def health():
         checks["bq_tables"] = "ok"
     except Exception as e:
         checks["bq_tables"] = f"error: {e}"
+    from . import settings as pi_settings
     checks["schedule"] = (
-        f"{config.SCHEDULE_HOUR_LOCAL:02d}:{config.SCHEDULE_MINUTE_LOCAL:02d} "
-        f"{config.SCHEDULE_TIMEZONE}" if config.SCHEDULE_ENABLED else "disabled"
+        f"{pi_settings.get('schedule_hour'):02d}:{pi_settings.get('schedule_minute'):02d} "
+        f"{pi_settings.get('schedule_timezone')}"
+        if pi_settings.get("schedule_enabled") else "disabled"
     )
     return {"status": "ok", "checks": checks}
+
+
+# --- admin console settings --------------------------------------------------
+
+@router.get("/settings")
+def get_settings():
+    """Effective settings + env defaults for the Admin tab. Secret values
+    (Slack webhooks) are masked."""
+    from . import settings as pi_settings
+    return {"settings": pi_settings.describe()}
+
+
+@router.put("/settings")
+def update_settings(payload: Dict[str, Any]):
+    """Partial update: {"changes": {key: value | null}}. null clears the
+    override so the setting reverts to its env-var default."""
+    from . import settings as pi_settings
+    changes = payload.get("changes") or {}
+    if not isinstance(changes, dict) or not changes:
+        raise HTTPException(status_code=400, detail="changes is required")
+    try:
+        pi_settings.update(changes, actor=payload.get("actor") or "Dashboard")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {"status": "success", "settings": pi_settings.describe()}
 
 
 @router.get("/summary")

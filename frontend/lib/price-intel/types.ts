@@ -289,3 +289,13 @@ export interface ItemCompetitorPrice {
   match_method: string | null
   match_confidence: number | null
 }
+
+// Admin console: one row per runtime setting. Secret values (Slack webhooks)
+// arrive masked ("••••abcdef") — the console only ever sends new values.
+export interface AdminSetting {
+  key: string
+  value: string | number | boolean | null
+  default: string | number | boolean | null
+  overridden: boolean
+  secret: boolean
+}

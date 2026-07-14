@@ -12,13 +12,12 @@ so notification problems never affect scrape data.
 from datetime import datetime
 
 from app.services.notifications import slack
-from . import config, repository
+from . import repository, settings
 
 # Individual priority pings are capped so an initial competitor-onboarding night
 # (many first-sighting undercuts) can't flood the channel; the rest roll up into
-# one summary line.
-_MAX_PRIORITY_PINGS = 15
-_MAX_DIGEST_MOVES = 15
+# one summary line. Caps, webhooks, and per-message toggles are all runtime
+# settings (admin console), defaulting to the PI_SLACK_* env vars.
 
 # Event types that fire their own priority ping. Undercut events are still
 # generated (they show in the change feed and give the digest context), but they
@@ -44,15 +43,21 @@ def _title(item_title, item_brand) -> str:
     return f"{title} — {item_brand}" if item_brand else title
 
 
+def _hooks():
+    """(main webhook, alerts webhook) from effective settings; alerts falls back
+    to main, mirroring the original env-var behavior."""
+    main = settings.get("slack_webhook_url")
+    return main, (settings.get("slack_alerts_webhook_url") or main)
+
+
 def dispatch_run(run_id: str, status: str, counters: dict, errors: list):
-    if not (config.SLACK_ENABLED and config.SLACK_WEBHOOK_URL):
+    main_hook, alerts_hook = _hooks()
+    if not (settings.get("slack_enabled") and main_hook):
         return
 
-    alerts_hook = config.SLACK_ALERTS_WEBHOOK_URL or config.SLACK_WEBHOOK_URL
-
     # Health alert first — it must fire even if the run failed before events landed.
-    if status in ("failed", "partial"):
-        _post_health(status, counters, errors)
+    if status in ("failed", "partial") and settings.get("slack_health_alerts"):
+        _post_health(status, counters, errors, main_hook)
 
     events = []
     try:
@@ -61,8 +66,10 @@ def dispatch_run(run_id: str, status: str, counters: dict, errors: list):
         print(f"pi: notify could not load events for {run_id}: {e}")
 
     notified_ids = []
-    notified_ids += _post_priority_pings(events, alerts_hook)
-    notified_ids += _post_digest(run_id, events)
+    if settings.get("slack_map_pings"):
+        notified_ids += _post_priority_pings(events, alerts_hook)
+    if settings.get("slack_send_digest"):
+        notified_ids += _post_digest(run_id, events, main_hook)
 
     if notified_ids:
         try:
@@ -72,6 +79,7 @@ def dispatch_run(run_id: str, status: str, counters: dict, errors: list):
 
 
 def _post_priority_pings(events, webhook) -> list:
+    max_pings = settings.get("slack_max_priority_pings")
     priority = [e for e in events if e.get("event_type") in _ALERT_META]
     if not priority:
         return []
@@ -80,7 +88,7 @@ def _post_priority_pings(events, webhook) -> list:
 
     our_prices = _our_price_lookup([e.get("item_id") for e in priority])
     sent = []
-    for e in priority[:_MAX_PRIORITY_PINGS]:
+    for e in priority[:max_pings]:
         label, relation, color = _ALERT_META[e["event_type"]]
         title = f"{label} — {e.get('competitor_name') or 'Competitor'}"
         our = our_prices.get(str(e.get("item_id")))
@@ -99,14 +107,15 @@ def _post_priority_pings(events, webhook) -> list:
                             body="\n".join(lines), color=color):
             sent.append(e["event_id"])
 
-    overflow = len(priority) - _MAX_PRIORITY_PINGS
+    overflow = len(priority) - max_pings
     if overflow > 0:
         slack.post(webhook, text=f"…and *{overflow}* more MAP alerts this run.")
-        sent += [e["event_id"] for e in priority[_MAX_PRIORITY_PINGS:]]
+        sent += [e["event_id"] for e in priority[max_pings:]]
     return sent
 
 
-def _post_digest(run_id, events) -> list:
+def _post_digest(run_id, events, webhook) -> list:
+    max_moves = settings.get("slack_max_digest_moves")
     digest_md = ""
     try:
         row = repository.get_digest_for_run(run_id)
@@ -130,25 +139,25 @@ def _post_digest(run_id, events) -> list:
     if moves:
         blocks.append(slack.divider())
         lines = ["*Notable moves* (matched items)"]
-        for e in moves[:_MAX_DIGEST_MOVES]:
+        for e in moves[:max_moves]:
             arrow = "🔻" if e["event_type"] == "price_drop" else "🔺"
             lines.append(
                 f"{arrow} *{_title(e.get('item_title'), e.get('item_brand'))}* — "
                 f"{e.get('competitor_name') or 'Competitor'}: "
                 f"{_fmt(e.get('old_price'))} → {_fmt(e.get('new_price'))}{_pct(e.get('pct_change'))}"
             )
-        if len(moves) > _MAX_DIGEST_MOVES:
-            lines.append(f"_…and {len(moves) - _MAX_DIGEST_MOVES} more._")
+        if len(moves) > max_moves:
+            lines.append(f"_…and {len(moves) - max_moves} more._")
         blocks.append(slack.section("\n".join(lines)))
         move_ids = [e["event_id"] for e in moves]
 
     fallback = "Price intel digest"
-    if slack.post(config.SLACK_WEBHOOK_URL, text=fallback, blocks=blocks):
+    if slack.post(webhook, text=fallback, blocks=blocks):
         return move_ids
     return []
 
 
-def _post_health(status, counters, errors):
+def _post_health(status, counters, errors, webhook):
     label = "❌ Scrape failed" if status == "failed" else "⚠️ Scrape partial"
     counters = counters or {}
     lines = [
@@ -161,7 +170,7 @@ def _post_health(status, counters, errors):
     if errors:
         shown = "; ".join(str(x) for x in errors[:5])
         lines.append(f"Errors: {shown[:800]}")
-    slack.post(config.SLACK_WEBHOOK_URL, text=label,
+    slack.post(webhook, text=label,
                attachments=[{"color": "#d21f3c", "fallback": label,
                              "blocks": [slack.section("\n".join(lines))]}])
 
@@ -170,13 +179,13 @@ def send_test() -> dict:
     """Fire a representative digest + one MAP ping + one undercut ping through the
     real Slack client so a user can confirm their webhooks/env before a scrape.
     Self-contained (no BigQuery). Returns a per-message success report."""
-    if not (config.SLACK_ENABLED and config.SLACK_WEBHOOK_URL):
+    main_hook, alerts_hook = _hooks()
+    if not (settings.get("slack_enabled") and main_hook):
         return {
             "sent": False,
-            "reason": "Slack disabled or PI_SLACK_WEBHOOK_URL unset "
-                      "(need PI_SLACK_ENABLED=1 and PI_SLACK_WEBHOOK_URL).",
+            "reason": "Slack disabled or no webhook configured — enable Slack and "
+                      "set a webhook URL in the Admin tab (or via PI_SLACK_* env vars).",
         }
-    alerts_hook = config.SLACK_ALERTS_WEBHOOK_URL or config.SLACK_WEBHOOK_URL
 
     map_ok = slack.post_alert(
         alerts_hook, fallback="MAP violation test",
@@ -209,12 +218,12 @@ def send_test() -> dict:
             "🔺 *Sample Tire — Acme* — Other Store: $59.00 → $64.00 (+8.5%)",
         ])),
     ]
-    digest_ok = slack.post(config.SLACK_WEBHOOK_URL, text="Price intel digest (test)",
+    digest_ok = slack.post(main_hook, text="Price intel digest (test)",
                            blocks=blocks)
 
     return {
         "sent": True,
-        "alerts_webhook": "alerts" if config.SLACK_ALERTS_WEBHOOK_URL else "main (fallback)",
+        "alerts_webhook": "alerts" if settings.get("slack_alerts_webhook_url") else "main (fallback)",
         "results": {
             "map_ping": map_ok,
             "digest": digest_ok,
