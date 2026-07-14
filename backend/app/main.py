@@ -958,52 +958,128 @@ def get_special_orders(background_tasks: BackgroundTasks, refresh: bool = False)
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _refresh_special_orders_after_write() -> None:
+    """After a write that only changes the Shopify/matching side (ETA edit, manual
+    match/unmatch): rebuild the cached dashboard payload cheaply by re-running matching over
+    the last full walk's normalized rows — no Lightspeed re-walk. Falls back to just marking
+    the cache stale (so the old bug of serving a pre-write payload can't recur silently)."""
+    from app.services import special_order_service
+
+    fresh = None
+    try:
+        fresh = special_order_service.re_enrich_dashboard()
+    except Exception as e:
+        print(f"Fast special-order re-enrich failed: {e}")
+    if fresh is not None:
+        fresh["fetched_at"] = datetime.utcnow().isoformat() + "Z"
+        _special_orders_cache["data"] = fresh
+        _special_orders_cache["fetched_at"] = time.time()
+    else:
+        _special_orders_cache["data"] = None
+        _special_orders_cache["fetched_at"] = 0.0
+
+
 @app.post("/api/special-orders/eta")
 def update_special_order_eta(payload: Dict[str, Any]):
     """
     Writes the customer-promised ETA back to Shopify (the `custom.special_order_eta` order
-    metafield) via the Admin API, then busts the special-order caches so the change is live on
-    the next read. Body: { shopify_order_id, eta (YYYY-MM-DD), updated_by? }.
+    metafield) via the Admin API, then rebuilds the special-order cache so the change is live
+    on the next read. A null/empty `eta` CLEARS the metafield (removes the promise date).
+    Body: { shopify_order_id, eta (YYYY-MM-DD or null), updated_by? }.
     """
     from app.services import special_order_service
     from app.services.shopify_client import ShopifyClient
     from app.services.bigquery_sync import log_shopify_eta_writeback
 
     order_id = str(payload.get("shopify_order_id") or "").strip()
-    eta = payload.get("eta")
+    eta = payload.get("eta") or None
     if not order_id:
         raise HTTPException(status_code=400, detail="shopify_order_id is required")
-    if not eta:
-        raise HTTPException(status_code=400, detail="eta is required")
-    try:
-        datetime.strptime(eta, "%Y-%m-%d")
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="eta must be an ISO date (YYYY-MM-DD)")
+    if eta is not None:
+        try:
+            datetime.strptime(eta, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="eta must be an ISO date (YYYY-MM-DD)")
 
+    triggered_by = payload.get("updated_by") or ("UI_Manual_Clear" if eta is None else "UI_Manual_Edit")
     try:
-        ShopifyClient().set_order_eta(order_id, eta)
+        if eta is None:
+            ShopifyClient().delete_order_eta(order_id)
+        else:
+            ShopifyClient().set_order_eta(order_id, eta)
     except Exception as e:
         log_shopify_eta_writeback({
             "shopify_order_id": order_id,
             "new_eta": eta,
-            "triggered_by": payload.get("updated_by") or "UI_Manual_Edit",
+            "triggered_by": triggered_by,
             "status": "failed",
             "error_message": str(e),
             "created_at": datetime.utcnow().isoformat(),
         })
         raise HTTPException(status_code=502, detail=f"Shopify update failed: {e}")
 
-    # Read and write now share one source of truth: drop the Shopify pull cache and the
-    # special-orders response cache so the next GET re-pulls the just-written value live.
+    # Read and write share one source of truth: drop the Shopify pull cache, then rebuild the
+    # response payload from the cached Lightspeed rows so the next GET is both fresh AND cheap.
     special_order_service.invalidate_shopify_cache()
-    _special_orders_cache["fetched_at"] = 0.0
+    _refresh_special_orders_after_write()
 
     log_shopify_eta_writeback({
         "shopify_order_id": order_id,
         "new_eta": eta,
-        "triggered_by": payload.get("updated_by") or "UI_Manual_Edit",
+        "triggered_by": triggered_by,
         "status": "success",
         "error_message": None,
         "created_at": datetime.utcnow().isoformat(),
     })
     return {"status": "success", "shopify_order_id": order_id, "eta": eta}
+
+
+def _so_override_request(payload: Dict[str, Any], action: str) -> Dict[str, Any]:
+    """Shared body for the manual match/unmatch endpoints: persist the override, then
+    rebuild the cached dashboard so the pairing is live on the next read."""
+    from app.services.bigquery_sync import save_so_match_override
+
+    special_order_id = str(payload.get("special_order_id") or "").strip()
+    shopify_order_id = str(payload.get("shopify_order_id") or "").strip()
+    if not special_order_id:
+        raise HTTPException(status_code=400, detail="special_order_id is required")
+    if not shopify_order_id:
+        raise HTTPException(status_code=400, detail="shopify_order_id is required")
+
+    try:
+        save_so_match_override(
+            special_order_id,
+            shopify_order_id,
+            action,
+            created_by=payload.get("updated_by") or "UI_Manual_Match",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to save match override: {e}")
+
+    _refresh_special_orders_after_write()
+    return {
+        "status": "success",
+        "action": action,
+        "special_order_id": special_order_id,
+        "shopify_order_id": shopify_order_id,
+    }
+
+
+@app.post("/api/special-orders/match")
+def match_special_order_manual(payload: Dict[str, Any]):
+    """
+    Manually links an LS special order to a Shopify order (overrides auto-matching; the
+    newest link for an SO supersedes older ones). Body: { special_order_id,
+    shopify_order_id, updated_by? }.
+    """
+    return _so_override_request(payload, "link")
+
+
+@app.post("/api/special-orders/unmatch")
+def unmatch_special_order_manual(payload: Dict[str, Any]):
+    """
+    Manually forbids an LS SO <-> Shopify order pairing (undoes a manual or automatic
+    match; auto-matching will never propose that pair again). Body: { special_order_id,
+    shopify_order_id, updated_by? }.
+    """
+    return _so_override_request(payload, "unlink")

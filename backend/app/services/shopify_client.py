@@ -177,6 +177,9 @@ class ShopifyClient:
 
     # ------------------------------------------------------------------ read
 
+    # phone + shippingAddress give the matcher extra identity signals (both are part of the
+    # orders scope, unlike `customer { … }` which would need read_customers and could fail the
+    # whole query on a scope gap).
     _OPEN_SO_QUERY = """
     query OpenSpecialOrders($cursor: String, $lineItems: Int!) {
       orders(first: %d, after: $cursor, query: "tag:SO", sortKey: CREATED_AT, reverse: true) {
@@ -185,6 +188,8 @@ class ShopifyClient:
           id
           name
           email
+          phone
+          shippingAddress { name phone }
           displayFulfillmentStatus
           displayFinancialStatus
           createdAt
@@ -204,9 +209,10 @@ class ShopifyClient:
         tagged `SO` (not fulfilled, not refunded/voided/cancelled/closed/test), one row per
         (order x line SKU), with the `custom.special_order_eta` metafield as `eta`.
 
-        Returns the identical row shape so downstream matching/flagging is unchanged:
-            {order_id, order_name, email, fulfillment_status, financial_status,
-             created_at, eta, sku}
+        Returns the identical row shape so downstream matching/flagging is unchanged
+        (plus the phone / customer-name identity signals the tiered matcher uses):
+            {order_id, order_name, email, phone, customer_name, fulfillment_status,
+             financial_status, created_at, eta, sku}
 
         Returns [] on any failure (missing config, transport, GraphQL errors) so the
         Lightspeed-based special-order triage never breaks when Shopify is unavailable —
@@ -236,10 +242,13 @@ class ShopifyClient:
                     order_name = o.get("name")
                     email = (o.get("email") or "").strip().lower() or None
                     eta = (o.get("metafield") or {}).get("value")
+                    ship = o.get("shippingAddress") or {}
                     base = {
                         "order_id": order_id,
                         "order_name": order_name,
                         "email": email,
+                        "phone": o.get("phone") or ship.get("phone"),
+                        "customer_name": ship.get("name"),
                         "fulfillment_status": o.get("displayFulfillmentStatus"),
                         "financial_status": o.get("displayFinancialStatus"),
                         "created_at": o.get("createdAt"),
@@ -302,3 +311,35 @@ class ShopifyClient:
             raise RuntimeError(f"Shopify rejected the ETA update: {user_errors}")
         metafields = result.get("metafields") or []
         return metafields[0] if metafields else {}
+
+    _DELETE_ETA_MUTATION = """
+    mutation DeleteOrderEta($metafields: [MetafieldIdentifierInput!]!) {
+      metafieldsDelete(metafields: $metafields) {
+        deletedMetafields { ownerId key }
+        userErrors { field message }
+      }
+    }
+    """
+
+    def delete_order_eta(self, order_id: str) -> None:
+        """
+        Removes the `custom.special_order_eta` metafield from a Shopify order (the "clear ETA"
+        path). Deleting an already-absent metafield is a no-op on Shopify's side, so this is
+        idempotent. Raises RuntimeError on GraphQL/user errors.
+        """
+        if not str(order_id or "").strip():
+            raise ValueError("order_id is required")
+        variables = {
+            "metafields": [
+                {
+                    "ownerId": f"gid://shopify/Order/{order_id}",
+                    "namespace": _ETA_NAMESPACE,
+                    "key": _ETA_KEY,
+                }
+            ]
+        }
+        data = self._graphql(self._DELETE_ETA_MUTATION, variables)
+        result = data.get("metafieldsDelete") or {}
+        user_errors = result.get("userErrors") or []
+        if user_errors:
+            raise RuntimeError(f"Shopify rejected the ETA delete: {user_errors}")

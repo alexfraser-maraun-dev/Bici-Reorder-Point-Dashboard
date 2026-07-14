@@ -271,11 +271,11 @@ export async function saveBrandSourcingRule(rule: {
 }
 
 // Writes the customer-promised ETA back to Shopify (the custom.special_order_eta order
-// metafield). The backend busts its caches on success, so the caller should refetch the
-// dashboard to pull the now-live value. `shopify_order_id` is the numeric Shopify order id.
+// metafield); `eta: null` clears it. The backend rebuilds its dashboard cache on success, so
+// the caller only needs a plain revalidate (no forced Lightspeed re-walk) to see the value.
 export async function updateShopifyEta(input: {
   shopify_order_id: string
-  eta: string
+  eta: string | null
   updated_by?: string
 }) {
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
@@ -290,6 +290,32 @@ export async function updateShopifyEta(input: {
   }
   return res.json()
 }
+
+// Manually links / unlinks an LS special order and a Shopify order (persisted override;
+// unlink also forbids auto-matching from re-proposing the pair). The backend rebuilds its
+// dashboard cache on success — follow with a plain revalidate.
+async function postSoMatchOverride(
+  path: 'match' | 'unmatch',
+  input: { special_order_id: string; shopify_order_id: string; updated_by?: string }
+) {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const res = await fetch(`${baseUrl}/api/special-orders/${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || `Failed to ${path} the special order`)
+  }
+  return res.json()
+}
+
+export const matchSpecialOrder = (input: { special_order_id: string; shopify_order_id: string; updated_by?: string }) =>
+  postSoMatchOverride('match', input)
+
+export const unmatchSpecialOrder = (input: { special_order_id: string; shopify_order_id: string; updated_by?: string }) =>
+  postSoMatchOverride('unmatch', input)
 
 // ---------------------------------------------------------------------------
 // Purchase Orders
@@ -459,6 +485,13 @@ export function useSpecialOrders() {
     }
   }
 
+  // Plain re-GET (serves the backend's cache). Enough after ETA/match writes, since the
+  // backend rebuilds its cached payload as part of the POST — no Lightspeed re-walk needed.
+  const revalidate = async () => {
+    const fresh = await fetcher(url)
+    await mutate(fresh, { revalidate: false })
+  }
+
   return {
     orders: data?.orders ?? [],
     summary: data?.summary,
@@ -468,5 +501,6 @@ export function useSpecialOrders() {
     isRefreshing,
     error,
     refetch,
+    revalidate,
   }
 }

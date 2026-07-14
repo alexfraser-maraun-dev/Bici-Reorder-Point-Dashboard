@@ -249,8 +249,26 @@ export type SpecialOrderFlag =
   | 'no_eta'           // ordered, no date to judge against
   | 'ready_not_called' // received but customer not yet contacted
 
-// Whether a live LS SO was matched to a Shopify `SO`-tagged order (by customer email + SKU).
+// Whether a live LS SO was matched to a Shopify `SO`-tagged order.
 export type ShopifyMatch = 'matched' | 'ambiguous' | 'none'
+
+// Which identity tier produced a match (or made it ambiguous). 'manual' = a human linked it.
+export type ShopifyMatchBasis =
+  | 'email_sku'
+  | 'phone_sku'
+  | 'name_sku'
+  | 'sku_only'
+  | 'sku_conflict' // single SKU-level candidate but the identity signals disagree
+  | 'manual'
+
+// A candidate Shopify order behind an 'ambiguous' match — enough to resolve it by hand.
+export interface ShopifyCandidate {
+  order_id: string
+  order_name: string | null
+  customer_email: string | null
+  shopify_expected_date: string | null
+  created_at: string | null
+}
 
 // The triage tile axis: the Shopify inbound stage and the cross-cutting Recommended Action tile
 // sit left of the four LS procurement stages. Both are "overlay" tiles — a single order can appear
@@ -268,6 +286,9 @@ export interface ShopifyOnlyOrder {
   financial_status: string | null
   skus: string[]
   shopify_order_url: string | null
+  // True when some LS SO could plausibly claim this order (an ambiguous candidate) —
+  // shown as "Possible match" instead of "Unmatched".
+  ambiguous_candidate?: boolean
 }
 
 // A vendor that can supply a SKU's brand, with its median lead time to the SO's store.
@@ -320,16 +341,24 @@ export interface SpecialOrder {
   // Customer (Shopify) identity + matched promise date
   customer_email: string | null
   shopify_match: ShopifyMatch
+  shopify_match_basis: ShopifyMatchBasis | null
   shopify_order_id: string | null
   shopify_order_name: string | null
   shopify_order_url: string | null
   shopify_expected_date: string | null   // the customer-promised ETA from Shopify
+  shopify_candidates: ShopifyCandidate[] // ambiguous only: the orders it could be
+  // Attached service workorder (when the SO was raised from the bench)
+  workorder_id: string | null
+  workorder_status: string | null
+  workorder_url: string | null
   // Deep links into Lightspeed
   ls_item_url: string | null
   ls_customer_url: string | null
   ls_order_url: string | null
   // Client-only: 'shopify' marks a Shopify-only (Unmatched) pseudo-row in the unified table.
   kind?: 'ls' | 'shopify'
+  // Client-only, shopify pseudo-rows: carried over from ShopifyOnlyOrder ("Possible match").
+  ambiguous_candidate?: boolean
 }
 
 export interface SpecialOrderSummary {

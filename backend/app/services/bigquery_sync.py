@@ -4,6 +4,7 @@ import os
 import json
 import time
 import statistics
+from datetime import datetime
 
 # Initialize BigQuery client lazily to avoid startup crashes
 _client = None
@@ -76,6 +77,81 @@ def log_shopify_eta_writeback(log_data: dict):
             print(f"BigQuery Shopify ETA Log Errors: {errors}")
     except Exception as e:
         print(f"Failed to log Shopify ETA writeback to BigQuery: {e}")
+
+# --- Special-order <-> Shopify manual match overrides -----------------------------------
+# Append-only log of human link/unlink decisions. The *latest* row per (SO, Shopify order)
+# pair wins; a newer 'link' for an SO supersedes any older link for that SO (an SO points at
+# one Shopify order at a time). Written via load jobs (immediately queryable, no streaming
+# buffer) since these are rare, human-paced writes.
+
+_SO_OVERRIDES_TABLE = f"{APP_DATASET}.so_match_overrides"
+_so_overrides_ensured = False
+
+def ensure_so_match_overrides_table():
+    global _so_overrides_ensured
+    if _so_overrides_ensured:
+        return
+    client = get_bq_client()
+    client.query(f"""
+        CREATE TABLE IF NOT EXISTS `{_SO_OVERRIDES_TABLE}` (
+            special_order_id STRING NOT NULL,
+            shopify_order_id STRING NOT NULL,
+            action STRING NOT NULL,  -- 'link' | 'unlink'
+            created_at TIMESTAMP,
+            created_by STRING
+        )
+    """).result()
+    _so_overrides_ensured = True
+
+def save_so_match_override(special_order_id: str, shopify_order_id: str, action: str, created_by: str = None):
+    """Appends one link/unlink decision. Raises on failure so the API can surface it —
+    a silently-dropped override would be worse than an error."""
+    if action not in ("link", "unlink"):
+        raise ValueError(f"invalid override action: {action}")
+    ensure_so_match_overrides_table()
+    client = get_bq_client()
+    append = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
+    row = {
+        "special_order_id": str(special_order_id),
+        "shopify_order_id": str(shopify_order_id),
+        "action": action,
+        "created_at": datetime.utcnow().isoformat(),
+        "created_by": created_by,
+    }
+    client.load_table_from_json([row], _SO_OVERRIDES_TABLE, job_config=append).result()
+
+def fetch_so_match_overrides() -> dict:
+    """
+    Folds the override log into its effective state:
+      { "links":   { special_order_id: shopify_order_id },   # forced matches
+        "blocked": { (special_order_id, shopify_order_id) } } # forbidden pairs
+    Empty state (and no error) when the table doesn't exist yet or the query fails, so the
+    dashboard degrades to pure auto-matching.
+    """
+    empty = {"links": {}, "blocked": set()}
+    try:
+        client = get_bq_client()
+        rows = client.query(f"""
+            SELECT special_order_id, shopify_order_id, action
+            FROM `{_SO_OVERRIDES_TABLE}`
+            ORDER BY created_at ASC
+        """).result()
+    except Exception as e:
+        print(f"so_match_overrides fetch failed (treating as empty): {e}")
+        return empty
+    links: dict = {}
+    blocked: set = set()
+    for r in rows:
+        so, oid, action = str(r["special_order_id"]), str(r["shopify_order_id"]), r["action"]
+        if action == "link":
+            links[so] = oid
+            blocked.discard((so, oid))
+        elif action == "unlink":
+            blocked.add((so, oid))
+            if links.get(so) == oid:
+                del links[so]
+    return {"links": links, "blocked": blocked}
+
 
 def get_recommendation_runs(limit: int = 50):
     """Fetches historical runs from BigQuery."""

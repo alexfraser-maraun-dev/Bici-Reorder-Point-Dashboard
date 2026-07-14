@@ -580,3 +580,39 @@ class LightspeedClient:
                 "email": email,
             }
         return out
+
+    def get_workorders_by_sale_ids(self, sale_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
+        """
+        Resolves which sales are attached to service workorders, keyed by saleID:
+          { saleID: { "workorder_id", "status", "eta_out" } }
+        A special order raised from the service bench carries its Workorder via
+        SaleLine.saleID -> Workorder.saleID. Sales with no workorder simply have no entry.
+        Failures (including a token without the workorder scope) degrade to {} so the
+        dashboard just shows no workorder badge.
+        """
+        unique_ids = sorted({str(s) for s in sale_ids if s and str(s) != "0"})
+        return self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_workorder_chunk)
+
+    def _fetch_workorder_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
+        params = {
+            "saleID": f"IN,[{','.join(chunk)}]",
+            "limit": "100",
+        }
+        out: Dict[str, Dict[str, Any]] = {}
+        response = self._legacy_request("GET", "/Workorder.json", params=params)
+        if response is None or response.status_code != 200:
+            if response is not None:
+                print(f"Error fetching workorders: {response.status_code} {response.text[:300]}")
+            return out
+        for wo in self._as_list(response.json().get("Workorder")):
+            sale_id = str(wo.get("saleID"))
+            # A sale could carry several workorders; keep the first returned —
+            # one linked WO is enough for the badge/deep link.
+            if sale_id in out:
+                continue
+            out[sale_id] = {
+                "workorder_id": str(wo.get("workorderID")) if wo.get("workorderID") else None,
+                "status": wo.get("status"),
+                "eta_out": wo.get("etaOut") or None,
+            }
+        return out

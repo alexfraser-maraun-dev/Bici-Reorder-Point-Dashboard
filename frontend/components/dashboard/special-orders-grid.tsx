@@ -13,9 +13,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import { updateShopifyEta } from '@/lib/hooks'
-import type { SpecialOrder, AvailableVendor } from '@/lib/types'
+import type { SpecialOrder, ShopifyOnlyOrder, AvailableVendor } from '@/lib/types'
 import {
   StageBadge,
   FlagBadge,
@@ -31,7 +38,18 @@ import {
   ArrowUpNarrowWide,
   Copy,
   Check,
+  Link2,
+  Unlink,
+  Wrench,
+  X,
 } from 'lucide-react'
+
+// Manual match/unmatch plumbing threaded down from the page: both resolve once the backend
+// has persisted the override and rebuilt its cache (the page then revalidates).
+export interface MatchActions {
+  onMatch: (specialOrderId: string, shopifyOrderId: string) => Promise<void>
+  onUnmatch: (specialOrderId: string, shopifyOrderId: string) => Promise<void>
+}
 
 type SortKey =
   | 'special_order_id'
@@ -64,16 +82,29 @@ const SORT_OPTIONS: { key: SortKey; label: string }[] = [
   { key: 'special_order_id', label: 'SO #' },
 ]
 
+// Mirrors the backend's _FLAG_RANK so "Flag / priority" sorts by severity, not alphabetically.
+const FLAG_SORT_RANK: Record<SpecialOrder['flag'], number> = {
+  critical: 6,
+  overdue_mid: 5,
+  overdue: 4,
+  no_eta: 3,
+  ready_not_called: 1,
+  none: 0,
+}
+
 function compare(a: SpecialOrder, b: SpecialOrder, key: SortKey, dir: SortDir): number {
-  const av = a[key]
-  const bv = b[key]
+  const av: unknown = key === 'flag' ? FLAG_SORT_RANK[a.flag] : a[key]
+  const bv: unknown = key === 'flag' ? FLAG_SORT_RANK[b.flag] : b[key]
 
-  let result = 0
-  if (av === null || av === undefined) result = 1
-  else if (bv === null || bv === undefined) result = -1
-  else if (typeof av === 'number' && typeof bv === 'number') result = av - bv
-  else result = String(av).localeCompare(String(bv))
+  // Rows with no value always sink to the bottom, whichever direction is picked.
+  const aNull = av === null || av === undefined || av === ''
+  const bNull = bv === null || bv === undefined || bv === ''
+  if (aNull && bNull) return 0
+  if (aNull) return 1
+  if (bNull) return -1
 
+  const result =
+    typeof av === 'number' && typeof bv === 'number' ? av - bv : String(av).localeCompare(String(bv))
   return dir === 'asc' ? result : -result
 }
 
@@ -148,10 +179,17 @@ function Field({ label, value }: { label: string; value: React.ReactNode }) {
   )
 }
 
-// The Shopify ETA, rendered as an always-editable native date box. Picking a (complete) new
-// date writes it straight back to the Shopify order metafield (create or update) and calls
-// onSaved (a dashboard refetch) to pull the now-live value. When the order has no Shopify id to
-// attach the metafield to (an unmatched LS SO) it renders read-only.
+// Sanity bounds for a customer-promised ETA year. A native date input emits *complete*
+// intermediate values while the year segment is being typed ("0002-07-13"), so anything
+// outside this window is treated as still-in-progress input, never saved.
+const ETA_YEAR_MIN = 2020
+const ETA_YEAR_MAX = 2040
+
+// The Shopify ETA, rendered as an always-editable native date box. Edits are committed on
+// blur / Enter (NOT on every change — see ETA_YEAR bounds above), written straight back to
+// the Shopify order metafield, then onSaved (a dashboard revalidate) pulls the live value.
+// Escape reverts; the ✕ clears the ETA (deletes the metafield). When the order has no
+// Shopify id to attach the metafield to (an unmatched LS SO) it renders read-only.
 function EditableEta({
   orderId,
   value,
@@ -185,16 +223,29 @@ function EditableEta({
     )
   }
 
-  const handleChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const next = e.target.value
-    setVal(next)
-    // Ignore partial/cleared input (native date input emits these mid-edit). No clear support.
-    if (next.length !== 10 || next === savedRef.current) return
+  // next === null clears the ETA; a string must be a complete, sane date to be written.
+  const commit = async (next: string | null) => {
+    if (next !== null) {
+      if (next.length !== 10) {
+        setVal(savedRef.current)
+        return
+      }
+      const year = Number(next.slice(0, 4))
+      if (year < ETA_YEAR_MIN || year > ETA_YEAR_MAX) {
+        toast.error(`ETA year ${year} looks wrong — not saved.`)
+        setVal(savedRef.current)
+        return
+      }
+      if (next === savedRef.current) return
+    } else if (savedRef.current === '') {
+      return // nothing to clear
+    }
     setSaving(true)
     try {
       await updateShopifyEta({ shopify_order_id: orderId, eta: next })
-      savedRef.current = next
-      toast.success('Shopify ETA updated.')
+      savedRef.current = next ?? ''
+      setVal(next ?? '')
+      toast.success(next ? 'Shopify ETA updated.' : 'Shopify ETA cleared.')
       await onSaved?.()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to update ETA.')
@@ -209,11 +260,32 @@ function EditableEta({
       <Input
         type="date"
         value={val}
-        onChange={handleChange}
+        onChange={(e) => setVal(e.target.value)} // draft only — nothing hits the network here
+        onBlur={() => {
+          // An emptied box on blur is treated as "abandoned edit", not a clear — clearing
+          // is the explicit ✕ so a stray keyboard Delete can't silently drop the promise date.
+          if (val === '') setVal(savedRef.current)
+          else void commit(val)
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') e.currentTarget.blur()
+          if (e.key === 'Escape') setVal(savedRef.current)
+        }}
         disabled={saving}
         aria-label="Shopify ETA"
         className="h-7 w-[9.5rem] px-2 text-sm"
       />
+      {savedRef.current !== '' && !saving && (
+        <button
+          type="button"
+          title="Clear ETA"
+          aria-label="Clear Shopify ETA"
+          onClick={() => void commit(null)}
+          className="text-muted-foreground hover:text-foreground"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      )}
       {ambiguous && <ShopifyMatchBadge match="ambiguous" />}
     </span>
   )
@@ -255,6 +327,226 @@ function LightspeedLink({ url, label, icon: Icon }: { url: string | null; label:
   )
 }
 
+// One pickable row inside the match dialog.
+interface PickerItem {
+  key: string
+  title: string
+  subtitle?: string | null
+  meta?: string | null
+  candidate?: boolean // true = one of the ambiguous match's likely candidates (listed first)
+}
+
+// The manual-match picker: a searchable list of link targets. Likely candidates (from an
+// ambiguous match) are grouped on top. `onPick` persists the link; the dialog closes on
+// success and stays open (with a toast from the caller) on failure.
+function MatchPickerDialog({
+  open,
+  onOpenChange,
+  title,
+  description,
+  items,
+  onPick,
+  footerAction,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  title: string
+  description: string
+  items: PickerItem[]
+  onPick: (key: string) => Promise<void>
+  footerAction?: { label: string; onClick: () => Promise<void> }
+}) {
+  const [term, setTerm] = useState('')
+  const [busyKey, setBusyKey] = useState<string | null>(null)
+
+  const filtered = useMemo(() => {
+    const t = term.trim().toLowerCase()
+    const hits = t
+      ? items.filter((i) => [i.title, i.subtitle, i.meta].some((v) => v && v.toLowerCase().includes(t)))
+      : items
+    // Candidates first, then the rest, both in given order.
+    return [...hits.filter((i) => i.candidate), ...hits.filter((i) => !i.candidate)]
+  }, [items, term])
+
+  const pick = async (key: string) => {
+    setBusyKey(key)
+    try {
+      await onPick(key)
+      onOpenChange(false)
+    } finally {
+      setBusyKey(null)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => { if (!busyKey) onOpenChange(o) }}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
+        </DialogHeader>
+        <Input
+          placeholder="Filter by order #, customer, SKU…"
+          value={term}
+          onChange={(e) => setTerm(e.target.value)}
+          className="h-8"
+        />
+        <div className="flex max-h-72 flex-col gap-1 overflow-y-auto pr-1">
+          {filtered.length === 0 && (
+            <div className="text-muted-foreground py-6 text-center text-sm">No matches.</div>
+          )}
+          {filtered.map((i) => (
+            <button
+              key={i.key}
+              type="button"
+              disabled={busyKey !== null}
+              onClick={() => void pick(i.key)}
+              className={cn(
+                'flex items-center gap-3 rounded-md border px-3 py-2 text-left transition-colors hover:bg-muted/60 disabled:opacity-50',
+                i.candidate && 'border-amber-300 bg-amber-50/60'
+              )}
+            >
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="truncate text-sm font-medium">{i.title}</span>
+                  {i.candidate && (
+                    <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
+                      Likely candidate
+                    </span>
+                  )}
+                </div>
+                {i.subtitle && <div className="text-muted-foreground truncate text-xs">{i.subtitle}</div>}
+                {i.meta && <div className="text-muted-foreground truncate text-xs">{i.meta}</div>}
+              </div>
+              <Link2 className={cn('h-4 w-4 shrink-0 opacity-60', busyKey === i.key && 'animate-pulse')} />
+            </button>
+          ))}
+        </div>
+        {footerAction && (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={busyKey !== null}
+            onClick={async () => {
+              setBusyKey('__footer__')
+              try {
+                await footerAction.onClick()
+                onOpenChange(false)
+              } finally {
+                setBusyKey(null)
+              }
+            }}
+          >
+            {footerAction.label}
+          </Button>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// Header-line match controls for an LS row: unlink when matched, resolve when ambiguous,
+// link when unmatched. All three funnel through the same persisted-override endpoints.
+function LsMatchControls({
+  order,
+  unmatchedShopify,
+  actions,
+}: {
+  order: SpecialOrder
+  unmatchedShopify: ShopifyOnlyOrder[]
+  actions: MatchActions
+}) {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const soId = String(order.special_order_id)
+
+  if (order.shopify_match === 'matched' && order.shopify_order_id) {
+    return (
+      <Button
+        variant="ghost"
+        size="sm"
+        disabled={busy}
+        title={`Unlink Shopify order ${order.shopify_order_name ?? ''} from this SO`}
+        className="h-6 shrink-0 gap-1 px-1.5 text-[11px] text-muted-foreground"
+        onClick={async () => {
+          setBusy(true)
+          try {
+            await actions.onUnmatch(soId, order.shopify_order_id!)
+          } finally {
+            setBusy(false)
+          }
+        }}
+      >
+        <Unlink className="h-3 w-3" />
+        Unlink
+      </Button>
+    )
+  }
+
+  // Ambiguous: resolve among candidates (plus any other unmatched order). Unmatched ('none'):
+  // free link against the unmatched population. (`?? []` tolerates a payload from a backend
+  // that predates the candidates field, e.g. mid-deploy.)
+  const shopifyCandidates = order.shopify_candidates ?? []
+  const candidateIds = new Set(shopifyCandidates.map((c) => c.order_id))
+  const items: PickerItem[] = [
+    ...shopifyCandidates.map((c) => ({
+      key: c.order_id,
+      title: c.order_name ?? `Order ${c.order_id}`,
+      subtitle: c.customer_email,
+      meta: c.shopify_expected_date ? `ETA ${c.shopify_expected_date}` : null,
+      candidate: true,
+    })),
+    ...unmatchedShopify
+      .filter((u) => !candidateIds.has(u.order_id))
+      .map((u) => ({
+        key: u.order_id,
+        title: u.order_name ?? `Order ${u.order_id}`,
+        subtitle: [u.customer_email, u.skus.join(', ')].filter(Boolean).join(' · ') || null,
+        meta: u.shopify_expected_date ? `ETA ${u.shopify_expected_date}` : null,
+      })),
+  ]
+  if (items.length === 0) return null
+
+  const ambiguous = order.shopify_match === 'ambiguous'
+  return (
+    <>
+      <Button
+        variant={ambiguous ? 'outline' : 'ghost'}
+        size="sm"
+        className={cn('h-6 shrink-0 gap-1 px-1.5 text-[11px]', !ambiguous && 'text-muted-foreground')}
+        onClick={() => setOpen(true)}
+      >
+        <Link2 className="h-3 w-3" />
+        {ambiguous ? 'Resolve…' : 'Link Shopify…'}
+      </Button>
+      <MatchPickerDialog
+        open={open}
+        onOpenChange={setOpen}
+        title={`Link SO #${soId} to a Shopify order`}
+        description={
+          ambiguous
+            ? 'Several Shopify orders could be this special order — pick the right one (it sticks).'
+            : 'Pick the Shopify order this special order fulfils. The link is remembered.'
+        }
+        items={items}
+        onPick={(shopifyOrderId) => actions.onMatch(soId, shopifyOrderId)}
+        footerAction={
+          ambiguous
+            ? {
+                label: 'None of these — stop suggesting them',
+                onClick: async () => {
+                  for (const c of shopifyCandidates) {
+                    await actions.onUnmatch(soId, c.order_id)
+                  }
+                },
+              }
+            : undefined
+        }
+      />
+    </>
+  )
+}
+
 // The flag accent stripe colour (left edge), mirroring the old row background coding.
 const ACCENT: Partial<Record<SpecialOrder['flag'], string>> = {
   overdue: 'bg-red-300',
@@ -262,16 +554,54 @@ const ACCENT: Partial<Record<SpecialOrder['flag'], string>> = {
   critical: 'bg-red-600',
 }
 
-// A Shopify-only ("Unmatched") pseudo-row — full-width horizontal row, simpler content.
-function ShopifyOnlyRow({ order, onEtaSaved }: { order: SpecialOrder; onEtaSaved?: () => void | Promise<void> }) {
+// A Shopify-only ("Unmatched" / "Possible match") pseudo-row — full-width horizontal row.
+function ShopifyOnlyRow({
+  order,
+  onEtaSaved,
+  lsUnmatched,
+  actions,
+}: {
+  order: SpecialOrder
+  onEtaSaved?: () => void | Promise<void>
+  lsUnmatched: SpecialOrder[]
+  actions?: MatchActions
+}) {
+  const [linkOpen, setLinkOpen] = useState(false)
+  const possible = order.ambiguous_candidate === true
   return (
     <Card className="flex-row gap-0 overflow-hidden p-0">
-      <div className="w-1 shrink-0 self-stretch bg-violet-400" />
+      <div className={cn('w-1 shrink-0 self-stretch', possible ? 'bg-amber-400' : 'bg-violet-400')} />
       <div className="flex min-w-0 flex-1 flex-col gap-3 px-4 py-3">
         <div className="flex flex-wrap items-center gap-2">
           <span className="font-mono text-sm font-medium">{order.shopify_order_name ?? order.special_order_id}</span>
           <StageBadge stage="shopify" />
-          <ShopifyMatchBadge match="none" />
+          <ShopifyMatchBadge match="none" possible={possible} />
+          {actions && lsUnmatched.length > 0 && (
+            <>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 gap-1 px-1.5 text-[11px] text-muted-foreground"
+                onClick={() => setLinkOpen(true)}
+              >
+                <Link2 className="h-3 w-3" />
+                Link to SO…
+              </Button>
+              <MatchPickerDialog
+                open={linkOpen}
+                onOpenChange={setLinkOpen}
+                title={`Link ${order.shopify_order_name ?? 'this Shopify order'} to an LS special order`}
+                description="Pick the Lightspeed special order that fulfils this Shopify order. The link is remembered."
+                items={lsUnmatched.map((o) => ({
+                  key: String(o.special_order_id),
+                  title: `SO #${o.special_order_id}${o.description ? ` — ${o.description}` : ''}`,
+                  subtitle: [o.customer_name, o.customer_email].filter(Boolean).join(' · ') || null,
+                  meta: [o.system_sku, o.store].filter(Boolean).join(' · ') || null,
+                }))}
+                onPick={(soId) => actions.onMatch(soId, order.shopify_order_id!)}
+              />
+            </>
+          )}
         </div>
         <div className="grid grid-cols-2 gap-x-5 gap-y-2 sm:grid-cols-4">
           <Field label="Customer" value={order.customer_email} />
@@ -304,8 +634,21 @@ function ShopifyOnlyRow({ order, onEtaSaved }: { order: SpecialOrder; onEtaSaved
   )
 }
 
-function SpecialOrderRow({ order, onEtaSaved }: { order: SpecialOrder; onEtaSaved?: () => void | Promise<void> }) {
-  if (order.kind === 'shopify') return <ShopifyOnlyRow order={order} onEtaSaved={onEtaSaved} />
+function SpecialOrderRow({
+  order,
+  onEtaSaved,
+  lsUnmatched,
+  unmatchedShopify,
+  actions,
+}: {
+  order: SpecialOrder
+  onEtaSaved?: () => void | Promise<void>
+  lsUnmatched: SpecialOrder[]
+  unmatchedShopify: ShopifyOnlyOrder[]
+  actions?: MatchActions
+}) {
+  if (order.kind === 'shopify')
+    return <ShopifyOnlyRow order={order} onEtaSaved={onEtaSaved} lsUnmatched={lsUnmatched} actions={actions} />
 
   const hasShopify = order.shopify_match === 'matched' || order.shopify_match === 'ambiguous'
 
@@ -316,11 +659,32 @@ function SpecialOrderRow({ order, onEtaSaved }: { order: SpecialOrder; onEtaSave
 
       {/* Main content */}
       <div className="flex min-w-0 flex-1 flex-col gap-3 px-4 py-3">
-        {/* Header line: identity + product + badges + Shopify indicator */}
+        {/* Header line: identity + product + badges + workorder + Shopify indicator */}
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0 font-mono text-sm font-medium">SO #{order.special_order_id}</span>
           <StageBadge stage={order.procurement_stage} />
           <FlagBadge stage={order.procurement_stage} flag={order.flag} daysOverdue={order.days_overdue} />
+          {order.workorder_id &&
+            (order.workorder_url ? (
+              <a
+                href={order.workorder_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={`Attached workorder${order.workorder_status ? ` — ${order.workorder_status}` : ''}`}
+                className="inline-flex shrink-0 items-center gap-1 rounded border border-cyan-200 bg-cyan-50 px-1.5 py-0.5 text-[10px] font-medium text-cyan-700 hover:bg-cyan-100"
+              >
+                <Wrench className="h-3 w-3" />
+                WO #{order.workorder_id}
+              </a>
+            ) : (
+              <span
+                title={`Attached workorder${order.workorder_status ? ` — ${order.workorder_status}` : ''}`}
+                className="inline-flex shrink-0 items-center gap-1 rounded border border-cyan-200 bg-cyan-50 px-1.5 py-0.5 text-[10px] font-medium text-cyan-700"
+              >
+                <Wrench className="h-3 w-3" />
+                WO #{order.workorder_id}
+              </span>
+            ))}
           <span className="min-w-0 flex-1 truncate text-sm font-medium" title={order.description ?? ''}>
             {order.description ?? 'Special order'}
           </span>
@@ -333,16 +697,17 @@ function SpecialOrderRow({ order, onEtaSaved }: { order: SpecialOrder; onEtaSave
                 className="inline-flex shrink-0 items-center gap-1.5"
                 title={`Shopify order ${order.shopify_order_name ?? ''}`}
               >
-                <ShopifyMatchBadge match={order.shopify_match} />
+                <ShopifyMatchBadge match={order.shopify_match} basis={order.shopify_match_basis} />
                 {order.shopify_order_name && (
                   <span className="font-mono text-xs text-blue-600 underline">{order.shopify_order_name}</span>
                 )}
               </a>
             ) : (
               <span className="shrink-0">
-                <ShopifyMatchBadge match={order.shopify_match} />
+                <ShopifyMatchBadge match={order.shopify_match} basis={order.shopify_match_basis} />
               </span>
             ))}
+          {actions && <LsMatchControls order={order} unmatchedShopify={unmatchedShopify} actions={actions} />}
         </div>
 
         {/* Fields grouped into logical clusters that read left-to-right:
@@ -432,6 +797,7 @@ function SpecialOrderRow({ order, onEtaSaved }: { order: SpecialOrder; onEtaSave
         <LightspeedLink url={order.ls_item_url} label="Product" icon={Package} />
         <LightspeedLink url={order.ls_customer_url} label="Customer" icon={User} />
         <LightspeedLink url={order.ls_order_url} label="Purchase order" icon={FileText} />
+        <LightspeedLink url={order.workorder_url} label={`Workorder #${order.workorder_id ?? ''}`} icon={Wrench} />
       </div>
     </Card>
   )
@@ -442,9 +808,21 @@ interface Props {
   isLoading?: boolean
   // Called after an ETA is written to Shopify, so the parent can refetch the live value.
   onEtaSaved?: () => void | Promise<void>
+  // Link targets for the manual match dialogs — the FULL (unfiltered) populations, so a
+  // filtered-out row can still be picked as a link target.
+  lsUnmatched?: SpecialOrder[]
+  unmatchedShopify?: ShopifyOnlyOrder[]
+  matchActions?: MatchActions
 }
 
-export function SpecialOrdersGrid({ orders, isLoading, onEtaSaved }: Props) {
+export function SpecialOrdersGrid({
+  orders,
+  isLoading,
+  onEtaSaved,
+  lsUnmatched = [],
+  unmatchedShopify = [],
+  matchActions,
+}: Props) {
   // Default to the parent's server-side ordering (flag severity); only re-sort once the user picks.
   const [sortKey, setSortKey] = useState<SortKey | 'default'>('default')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
@@ -506,7 +884,14 @@ export function SpecialOrdersGrid({ orders, isLoading, onEtaSaved }: Props) {
 
       <div className="flex flex-col gap-3">
         {sorted.map((o) => (
-          <SpecialOrderRow key={`${o.kind ?? 'ls'}-${o.special_order_id}`} order={o} onEtaSaved={onEtaSaved} />
+          <SpecialOrderRow
+            key={`${o.kind ?? 'ls'}-${o.special_order_id}`}
+            order={o}
+            onEtaSaved={onEtaSaved}
+            lsUnmatched={lsUnmatched}
+            unmatchedShopify={unmatchedShopify}
+            actions={matchActions}
+          />
         ))}
       </div>
     </div>

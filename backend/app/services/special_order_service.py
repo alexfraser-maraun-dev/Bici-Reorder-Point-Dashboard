@@ -27,6 +27,7 @@ Only ORDERED special orders can be overdue: an unplaced PO's expected date is sp
 so lateness is judged solely against placed POs. See `_compute_stage_and_flag`.
 """
 
+import copy
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -264,6 +265,13 @@ def _normalize(
     status = so.get("status") or "Unknown"
     contacted = _coerce_bool(so.get("contacted"))
 
+    # Service-bench linkage: an SO raised from a workorder reaches its Workorder via
+    # SaleLine.saleID. Empty map (fetch failed / no scope) just means no badge.
+    sale_id = sale_line.get("saleID")
+    workorder = (sourcing_ctx or {}).get("workorder_map", {}).get(str(sale_id)) if sale_id else None
+    workorder = workorder or {}
+    workorder_id = workorder.get("workorder_id")
+
     # True creation time comes from the linked SaleLine (createTime). Fall back to the
     # SpecialOrder's timeStamp (last-modified) when the SaleLine/createTime is absent.
     created_raw = sale_line.get("createTime") or so.get("timeStamp")
@@ -315,10 +323,12 @@ def _normalize(
         "customer_email": customer.get("email"),
         # Shopify enrichment (filled in by the dashboard merge; defaults for safety).
         "shopify_match": "none",
+        "shopify_match_basis": None,
         "shopify_order_id": None,
         "shopify_order_name": None,
         "shopify_order_url": None,
         "shopify_expected_date": None,
+        "shopify_candidates": [],
         # Item / product
         "item_id": item_id,
         "system_sku": item.get("systemSku"),
@@ -343,11 +353,17 @@ def _normalize(
         "flag": triage["flag"],
         "days_overdue": triage["days_overdue"],
         "is_overdue": triage["flag"] in _OVERDUE_FLAGS,
+        # Attached service workorder (via SaleLine.saleID), when the SO came off the bench.
+        "workorder_id": workorder_id,
+        "workorder_status": workorder.get("status"),
         # Deep links into Lightspeed
         "ls_item_url": _ls_url("item.views.item", item_id),
         "ls_customer_url": _ls_url("customer.views.customer", customer_id),
         # PO deep link: the Retail web UI purchase-order view (confirmed against the live UI).
         "ls_order_url": _ls_url("purchase.views.purchase", order_id, extra="&tab=main"),
+        # Workorder deep link follows the same merchantOS pattern (workbench module);
+        # unconfirmed against the live UI — same caveat as the customer view.
+        "workorder_url": _ls_url("workbench.views.workorder", workorder_id),
     }
 
 
@@ -416,23 +432,29 @@ def _shopify_order_url(order_id: Optional[str]) -> Optional[str]:
 
 
 def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> None:
-    """Writes one LS SO's Shopify match (ETA + order link) onto it and re-buckets its flag,
-    preferring the Shopify ETA as the classification date when present (a blown customer promise
-    outranks the PO timeline)."""
+    """Writes one LS SO's Shopify match (ETA + order link) onto it and re-buckets its flag.
+    For the ordered stage the Shopify ETA is preferred over the PO date as the classification
+    date (the customer promise is the date that matters); the pre-order and received stages
+    stay age-/contact-driven — `_compute_flag` ignores dates for them."""
     o["shopify_match"] = m["shopify_match"]
+    o["shopify_match_basis"] = m.get("shopify_match_basis")
     o["shopify_order_id"] = m["shopify_order_id"]
     o["shopify_order_name"] = m["shopify_order_name"]
     o["shopify_expected_date"] = m["shopify_expected_date"]
     o["shopify_order_url"] = _shopify_order_url(m["shopify_order_id"])
+    o["shopify_candidates"] = m.get("shopify_candidates") or []
 
     shopify_eta = _parse_ls_date(m["shopify_expected_date"])
     po_eta = _parse_ls_date(o.get("expected_date"))
     stage = o["procurement_stage"]
-    classification_date = shopify_eta or (po_eta if stage == "ordered" else None)
+    classification_date = (shopify_eta or po_eta) if stage == "ordered" else None
     fl = _compute_flag(stage, classification_date, o.get("days_since_creation"), o.get("contacted", False), today)
     o["flag"] = fl["flag"]
     o["days_overdue"] = fl["days_overdue"]
     o["is_overdue"] = fl["flag"] in _OVERDUE_FLAGS
+
+
+_EMPTY_OVERRIDES = {"links": {}, "blocked": set()}
 
 
 def _enrich_with_shopify(
@@ -440,6 +462,7 @@ def _enrich_with_shopify(
     orders: List[Dict[str, Any]],
     completed_orders: List[Dict[str, Any]],
     today: date,
+    overrides: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Matches LS SOs to Shopify `SO`-tagged orders and returns the Shopify-only ("Unmatched")
@@ -449,29 +472,63 @@ def _enrich_with_shopify(
     surface under "Matched, received" rather than a false "Unmatched". `completed_orders` is
     appended to `orders` in place for the ones that adopt something.
 
+    `overrides` carries the human decisions: `links` (SO -> Shopify order forced matches,
+    basis 'manual') and `blocked` (SO, order) pairs invisible to auto-matching.
+
+    Only DEFINITE matches consume a Shopify order. An ambiguous SO's candidates still
+    surface in the returned Shopify-only population (marked `ambiguous_candidate`) so an
+    order is never silently hidden just because two SOs could plausibly claim it.
+
     Never raises: with no Shopify data, every SO simply stays unmatched / PO-classified.
     """
     if not index["orders"]:
         return []
-    consumed: set = set()
+    ov = overrides or _EMPTY_OVERRIDES
+    links: Dict[str, str] = ov.get("links") or {}
+    blocked_by_so: Dict[str, set] = {}
+    for so_id, oid in ov.get("blocked") or set():
+        blocked_by_so.setdefault(so_id, set()).add(oid)
+
+    consumed: set = set()        # definitively claimed -> excluded from "Unmatched"
+    ambiguous_ids: set = set()   # candidates of some ambiguous SO -> "possible match"
+
+    def resolve(o: Dict[str, Any]) -> Dict[str, Any]:
+        so_id = str(o.get("special_order_id"))
+        manual_oid = links.get(so_id)
+        if manual_oid and manual_oid in index["orders"]:
+            return shopify_match.manual_match(index, manual_oid)
+        # A manual link whose Shopify order has since closed simply lapses to auto-matching.
+        return shopify_match.match_special_order(
+            o.get("customer_email"),
+            o.get("system_sku"),
+            index,
+            customer_phone=o.get("customer_phone"),
+            customer_name=o.get("customer_name"),
+            blocked=frozenset(blocked_by_so.get(so_id, set())),
+        )
 
     for o in orders:
-        m = shopify_match.match_special_order(o.get("customer_email"), o.get("system_sku"), index)
-        consumed |= m.get("_candidates", set())
+        m = resolve(o)
+        if m["shopify_match"] == "matched":
+            consumed |= m["_candidates"]
+        elif m["shopify_match"] == "ambiguous":
+            ambiguous_ids |= m["_candidates"]
         _apply_shopify_match(o, m, today)
 
     for co in completed_orders:
-        m = shopify_match.match_special_order(co.get("customer_email"), co.get("system_sku"), index)
-        # Only keep a completed SO if it claims a Shopify order no open SO already did.
-        if not (m.get("_candidates", set()) - consumed):
+        m = resolve(co)
+        # A completed SO only joins the display when it DEFINITELY claims a Shopify order
+        # no open SO already did; ambiguous completed SOs would just add noise.
+        if m["shopify_match"] != "matched" or m["_candidates"] <= consumed:
             continue
-        consumed |= m.get("_candidates", set())
+        consumed |= m["_candidates"]
         _apply_shopify_match(co, m, today)
         orders.append(co)
 
     unmatched = shopify_match.shopify_only_orders(index, consumed)
     for u in unmatched:
         u["shopify_order_url"] = _shopify_order_url(u["order_id"])
+        u["ambiguous_candidate"] = u["order_id"] in ambiguous_ids
     return unmatched
 
 
@@ -484,6 +541,23 @@ def _raw_so_item_id(so: Dict[str, Any]) -> Optional[str]:
     """The item itemID off a raw SpecialOrder dict, used to resolve the SKU's brand."""
     item_id = ((so.get("SaleLine") or {}).get("Item") or {}).get("itemID")
     return str(item_id) if item_id is not None else None
+
+
+def _sort_orders(orders: List[Dict[str, Any]]) -> None:
+    """Flagged items first, ranked by flag severity, then most-overdue / oldest within that."""
+    orders.sort(
+        key=lambda o: (
+            -_FLAG_RANK.get(o["flag"], 0),
+            -(o["days_overdue"] or 0),
+            -(o["days_since_creation"] or 0),
+        )
+    )
+
+
+# Snapshot of the last full build's normalized-but-unenriched rows, so a Shopify-side write
+# (ETA edit, manual match/unmatch) can rebuild the dashboard by re-running just the Shopify
+# pull + matching over these rows instead of paying the whole Lightspeed walk again.
+_pre_enrichment: Dict[str, Any] = {"orders": None, "completed": None}
 
 
 def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Dict[str, Any]:
@@ -511,9 +585,10 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
     # recency window into a handful before we pay for customer/PO resolution.
     completed_candidates = [so for so in completed_all if _raw_so_system_sku(so) in candidate_skus]
 
-    # PO + customer lookups cover both the open SOs and the completed candidates. The brand->vendor
-    # sourcing map and the lead-time lookup are independent of Lightspeed, so fan them all out
-    # together; each sourcing fetch degrades to empty (no "Available from") rather than failing.
+    # PO + customer + workorder lookups cover both the open SOs and the completed candidates.
+    # The brand->vendor sourcing map, lead times, and manual match overrides are independent of
+    # Lightspeed, so fan them all out together; each auxiliary fetch degrades to empty rather
+    # than failing the dashboard.
     sos_to_resolve = special_orders + completed_candidates
     order_ids = [
         (so.get("OrderLine") or {}).get("orderID") or so.get("orderID")
@@ -521,38 +596,63 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
     ]
     customer_ids = [so.get("customerID") for so in sos_to_resolve]
     item_ids = [_raw_so_item_id(so) for so in sos_to_resolve]
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    sale_ids = [(so.get("SaleLine") or {}).get("saleID") for so in sos_to_resolve]
+    with ThreadPoolExecutor(max_workers=7) as executor:
         order_future = executor.submit(client.get_orders_by_ids, order_ids)
         customer_future = executor.submit(client.get_customers_by_ids, customer_ids)
+        workorder_future = executor.submit(_safe, lambda: client.get_workorders_by_sale_ids(sale_ids), {})
         brand_future = executor.submit(_safe, lambda: bigquery_sync.fetch_item_brands(item_ids), {})
         sourcing_future = executor.submit(_safe, bigquery_sync.fetch_brand_vendor_sourcing, {})
         leadtime_future = executor.submit(_safe, bigquery_sync.build_lead_time_lookup, ({}, {}))
+        overrides_future = executor.submit(_safe, bigquery_sync.fetch_so_match_overrides, _EMPTY_OVERRIDES)
         order_map = order_future.result()
         customer_map = customer_future.result()
+        workorder_map = workorder_future.result()
         brand_map = brand_future.result()
         sourcing_map = sourcing_future.result()
         lt_by_vendor_loc, lt_by_vendor = leadtime_future.result()
+        overrides = overrides_future.result()
 
     sourcing_ctx = {
         "brand_map": brand_map,
         "sourcing_map": sourcing_map,
         "lt_by_vendor_loc": lt_by_vendor_loc,
         "lt_by_vendor": lt_by_vendor,
+        "workorder_map": workorder_map,
     }
     orders = [_normalize(so, order_map, customer_map, shop_names, today, sourcing_ctx) for so in special_orders]
     completed_orders = [_normalize(so, order_map, customer_map, shop_names, today, sourcing_ctx) for so in completed_candidates]
 
+    # Snapshot the pre-enrichment rows for the cheap post-write rebuild (re_enrich_dashboard).
+    _pre_enrichment["orders"] = copy.deepcopy(orders)
+    _pre_enrichment["completed"] = copy.deepcopy(completed_orders)
+
     # Enrich with the Shopify ETA; matched-completed SOs are appended to `orders`, and the
     # genuinely-orphaned Shopify orders come back as the "Unmatched" population.
-    shopify_only = _enrich_with_shopify(index, orders, completed_orders, today)
+    shopify_only = _enrich_with_shopify(index, orders, completed_orders, today, overrides)
 
-    # Flagged items first, ranked by flag severity, then most-overdue / oldest within that.
-    orders.sort(
-        key=lambda o: (
-            -_FLAG_RANK.get(o["flag"], 0),
-            -(o["days_overdue"] or 0),
-            -(o["days_since_creation"] or 0),
-        )
-    )
+    _sort_orders(orders)
+    return {"orders": orders, "summary": _summarize(orders), "shopify_only": shopify_only}
 
+
+def re_enrich_dashboard() -> Optional[Dict[str, Any]]:
+    """
+    Cheap rebuild after a Shopify-side write (ETA edit, manual match/unmatch): re-runs the
+    Shopify pull + matching + flag re-bucketing over the last full build's normalized
+    Lightspeed rows, skipping the expensive Lightspeed walk entirely. The caller should have
+    invalidated `_shopify_cache` first if the write changed Shopify data.
+
+    Returns the fresh dashboard payload, or None when no prior full build exists (cold
+    process) — the caller then falls back to a full rebuild.
+    """
+    pre_orders = _pre_enrichment.get("orders")
+    if pre_orders is None:
+        return None
+    today = date.today()
+    orders = copy.deepcopy(pre_orders)
+    completed_orders = copy.deepcopy(_pre_enrichment.get("completed") or [])
+    index = shopify_match.build_shopify_index(_shopify_rows())
+    overrides = _safe(bigquery_sync.fetch_so_match_overrides, _EMPTY_OVERRIDES)
+    shopify_only = _enrich_with_shopify(index, orders, completed_orders, today, overrides)
+    _sort_orders(orders)
     return {"orders": orders, "summary": _summarize(orders), "shopify_only": shopify_only}

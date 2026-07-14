@@ -14,8 +14,10 @@ export interface SubTriage {
 
 // The sub-triages under each stage, in display order. The flag value an SO carries maps
 // 1:1 onto a sub key here; a healthy (flag === 'none') SO maps to 'healthy'.
-// Overdue/critical can now appear in any non-received stage, since a present Shopify ETA
-// (customer-promised date) drives the bucket even before the SO is ordered in Lightspeed.
+// Two regimes (mirrors _compute_flag in special_order_service.py): the pre-order stages
+// (open_pool / unordered_po) are AGE-driven — days sitting in stage, after a 5-day grace —
+// while the ordered stage is DATE-driven, judged against the Shopify ETA (customer promise)
+// when present, else the PO's expected date.
 export const STAGE_SUBTRIAGES: Record<ProcurementStage, SubTriage[]> = {
   open_pool: [
     { key: 'critical', label: 'Open Order 12d+', tone: 'danger' },

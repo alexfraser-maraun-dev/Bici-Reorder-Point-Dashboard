@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { useSpecialOrders } from '@/lib/hooks'
+import { useSpecialOrders, matchSpecialOrder, unmatchSpecialOrder } from '@/lib/hooks'
 import type { SpecialOrder, ShopifyOnlyOrder, TriageStage, SpecialOrderFlag } from '@/lib/types'
 import { STAGE_SUBTRIAGES, subKeyForOrder, type TriageTone } from '@/lib/special-order-triage'
 import { Card, CardContent } from '@/components/ui/card'
@@ -28,6 +28,7 @@ import {
   PackageCheck,
   RefreshCw,
   Search,
+  AlertTriangle,
 } from 'lucide-react'
 
 // "Live SOs": hide special orders created more than this many days ago (likely abandoned).
@@ -130,19 +131,26 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
     days_overdue: null,
     is_overdue: false,
     shopify_match: 'none',
+    shopify_match_basis: null,
     shopify_order_id: o.order_id,
     shopify_order_name: o.order_name,
     shopify_order_url: o.shopify_order_url,
     shopify_expected_date: o.shopify_expected_date,
+    shopify_candidates: [],
+    workorder_id: null,
+    workorder_status: null,
+    workorder_url: null,
     ls_item_url: null,
     ls_customer_url: null,
     ls_order_url: null,
     kind: 'shopify',
+    ambiguous_candidate: o.ambiguous_candidate === true,
   }
 }
 
 export function SpecialOrdersContent() {
-  const { orders, shopifyOnly, isLoading, isRefreshing, refetch, fetchedAt } = useSpecialOrders()
+  const { orders, shopifyOnly, isLoading, isRefreshing, refetch, revalidate, fetchedAt, error } =
+    useSpecialOrders()
 
   const handleSync = async () => {
     try {
@@ -151,6 +159,31 @@ export function SpecialOrdersContent() {
     } catch {
       toast.error('Sync failed. Lightspeed may be unavailable — try again.')
     }
+  }
+
+  // Manual match/unmatch: persist the override, then pull the rebuilt payload (the backend
+  // re-matches over its cached Lightspeed rows — cheap, no full re-walk).
+  const matchActions = {
+    onMatch: async (specialOrderId: string, shopifyOrderId: string) => {
+      try {
+        await matchSpecialOrder({ special_order_id: specialOrderId, shopify_order_id: shopifyOrderId })
+        toast.success(`Linked SO #${specialOrderId} to the Shopify order.`)
+        await revalidate()
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : 'Failed to link the orders.')
+        throw err
+      }
+    },
+    onUnmatch: async (specialOrderId: string, shopifyOrderId: string) => {
+      try {
+        await unmatchSpecialOrder({ special_order_id: specialOrderId, shopify_order_id: shopifyOrderId })
+        toast.success(`Unlinked SO #${specialOrderId} from the Shopify order.`)
+        await revalidate()
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : 'Failed to unlink the orders.')
+        throw err
+      }
+    },
   }
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [search, setSearch] = useState('')
@@ -163,6 +196,11 @@ export function SpecialOrdersContent() {
     () => [...orders, ...shopifyOnly.map(shopifyRow)],
     [orders, shopifyOnly]
   )
+
+  // Link targets for the manual match dialogs — full populations, ignoring the page filters.
+  // Ambiguous SOs are included: linking a "possible match" Shopify order to its ambiguous LS
+  // counterpart is the main way an ambiguity gets resolved from the Shopify side.
+  const lsUnmatched = useMemo(() => orders.filter((o) => o.shopify_match !== 'matched'), [orders])
 
   const stores = useMemo(() => {
     const names = new Set<string>()
@@ -178,7 +216,7 @@ export function SpecialOrdersContent() {
       if (storeFilter !== 'all' && o.store !== storeFilter) return false
       if (liveOnly && o.days_since_creation !== null && o.days_since_creation > LIVE_SO_MAX_DAYS) return false
       if (!term) return true
-      return [o.customer_name, o.customer_email, o.description, o.system_sku, o.upc, o.brand, o.vendor_name, o.order_id, o.special_order_id, o.shopify_order_name,
+      return [o.customer_name, o.customer_email, o.description, o.system_sku, o.upc, o.brand, o.vendor_name, o.order_id, o.special_order_id, o.shopify_order_name, o.workorder_id,
         ...o.available_vendors.map((v) => v.vendor_name)]
         .some((v) => v && String(v).toLowerCase().includes(term))
     })
@@ -257,6 +295,25 @@ export function SpecialOrdersContent() {
           {isRefreshing ? 'Syncing…' : 'Sync'}
         </Button>
       </div>
+
+      {/* Load failures must never masquerade as "no special orders" — surface them. */}
+      {error && (
+        <Card className="border-red-300 bg-red-50 py-3 dark:border-red-900 dark:bg-red-950/30">
+          <CardContent className="flex flex-wrap items-center gap-3 px-4 py-0">
+            <AlertTriangle className="h-4 w-4 shrink-0 text-red-600" />
+            <div className="min-w-0 flex-1 text-sm text-red-800 dark:text-red-300">
+              Couldn&apos;t load special orders from the server.
+              {orders.length > 0 || shopifyOnly.length > 0
+                ? ' Showing the last successfully loaded data.'
+                : ' Lightspeed or the backend may be unavailable.'}
+            </div>
+            <Button variant="outline" size="sm" onClick={handleSync} disabled={isRefreshing} className="gap-2">
+              <RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} />
+              Retry
+            </Button>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Triage tiles: Shopify inbound (leftmost) + the four LS procurement stages. */}
       {isLoading ? (
@@ -365,7 +422,14 @@ export function SpecialOrdersContent() {
         )}
       </div>
 
-      <SpecialOrdersGrid orders={filtered} isLoading={isLoading} onEtaSaved={refetch} />
+      <SpecialOrdersGrid
+        orders={filtered}
+        isLoading={isLoading}
+        onEtaSaved={revalidate}
+        lsUnmatched={lsUnmatched}
+        unmatchedShopify={shopifyOnly}
+        matchActions={matchActions}
+      />
     </div>
   )
 }

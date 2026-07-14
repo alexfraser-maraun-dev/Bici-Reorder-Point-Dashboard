@@ -2,7 +2,7 @@
 
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
-import type { ProcurementStage, SpecialOrderFlag, ShopifyMatch, TriageStage } from '@/lib/types'
+import type { ProcurementStage, SpecialOrderFlag, ShopifyMatch, ShopifyMatchBasis, TriageStage } from '@/lib/types'
 import { subTriageLabel } from '@/lib/special-order-triage'
 import {
   AlertTriangle,
@@ -47,20 +47,47 @@ export function StageBadge({ stage }: { stage: TriageStage }) {
   )
 }
 
+// Human wording for how a match was made — shown as a hover title on the badge.
+const BASIS_LABEL: Record<ShopifyMatchBasis, string> = {
+  email_sku: 'Matched by customer email + SKU',
+  phone_sku: 'Matched by customer phone + SKU',
+  name_sku: 'Matched by customer name + SKU',
+  sku_only: 'Matched by SKU alone (no identity info to compare)',
+  sku_conflict: 'Same SKU, but the customer details disagree — needs a human decision',
+  manual: 'Linked manually',
+}
+
 // Shopify match status — used in the Flag cell for Shopify-only ("Unmatched") rows and as a
-// small hint on matched/ambiguous LS rows.
-export function ShopifyMatchBadge({ match }: { match: ShopifyMatch | 'unmatched' }) {
+// small hint on matched/ambiguous LS rows. `possible` softens Unmatched for Shopify orders
+// that are candidates of an ambiguous LS SO.
+export function ShopifyMatchBadge({
+  match,
+  basis,
+  possible,
+}: {
+  match: ShopifyMatch | 'unmatched'
+  basis?: ShopifyMatchBasis | null
+  possible?: boolean
+}) {
+  const title = basis ? BASIS_LABEL[basis] : undefined
   if (match === 'matched') {
     return (
-      <Badge variant="outline" className="gap-1 border-violet-200 bg-violet-100 text-[10px] font-medium text-violet-700">
-        <Link2 className="h-3 w-3" />Matched
+      <Badge variant="outline" title={title} className="gap-1 border-violet-200 bg-violet-100 text-[10px] font-medium text-violet-700">
+        <Link2 className="h-3 w-3" />{basis === 'manual' ? 'Linked' : 'Matched'}
       </Badge>
     )
   }
   if (match === 'ambiguous') {
     return (
-      <Badge variant="outline" className="gap-1 border-amber-200 bg-amber-100 text-[10px] font-medium text-amber-700">
+      <Badge variant="outline" title={title} className="gap-1 border-amber-200 bg-amber-100 text-[10px] font-medium text-amber-700">
         <CircleHelp className="h-3 w-3" />Ambiguous
+      </Badge>
+    )
+  }
+  if (possible) {
+    return (
+      <Badge variant="outline" title="One or more LS special orders could plausibly claim this order" className="gap-1 border-amber-200 bg-amber-50 text-[10px] font-medium text-amber-700">
+        <CircleHelp className="h-3 w-3" />Possible match
       </Badge>
     )
   }
