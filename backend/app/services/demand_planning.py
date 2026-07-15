@@ -19,6 +19,16 @@ ASSUMPTION_VERSION = "balanced-p90-v1"
 DEFAULT_HORIZON_WEEKS = 52
 QUANTILES = (0.50, 0.80, 0.90, 0.95)
 
+MODEL_LEGEND = {
+    "auto": "Backtests eligible models for this SKU-location and keeps the lowest-error baseline or challenger.",
+    "current_velocity": "A transparent blend of the latest 4, 8 and 13 weeks; responsive but not seasonal.",
+    "seasonal_naive": "Repeats the same week from the prior year when enough history exists.",
+    "hierarchical_seasonal": "Local demand level and damped trend shaped by the most trustworthy category-location seasonality.",
+    "tsb": "Intermittent-demand model that separately estimates demand occurrence and positive demand size.",
+    "ets_damped": "Exponentially smoothed local level and damped trend for dense products with long history.",
+}
+SUPPORTED_MODEL_OVERRIDES = set(MODEL_LEGEND) - {"auto"}
+
 
 def _nonnegative(values: Sequence[float]) -> List[float]:
     return [max(0.0, float(value or 0.0)) for value in values]
@@ -289,7 +299,8 @@ def rolling_backtest(
 
 
 def select_champion(
-    series: Sequence[float], category_profile: Optional[Dict[int, float]] = None
+    series: Sequence[float], category_profile: Optional[Dict[int, float]] = None,
+    forced_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     values = _nonnegative(series)
     classification = classify_demand(values)
@@ -304,12 +315,27 @@ def select_champion(
     if len(values) >= 104 and classification["demand_class"] in {"smooth", "erratic"}:
         candidates["ets_damped"] = ets_damped_forecast
 
+    requested_model = (forced_model or "auto").strip().lower()
+    if requested_model not in MODEL_LEGEND:
+        raise ValueError(f"Unsupported forecast model: {requested_model}")
+    # A buyer may deliberately compare models even when the automatic eligibility
+    # rules would not select them. The model implementations retain their safe
+    # history-length fallbacks.
+    if requested_model == "tsb":
+        candidates["tsb"] = intermittent_tsb_forecast
+    elif requested_model == "ets_damped":
+        candidates["ets_damped"] = ets_damped_forecast
+
     results = {name: rolling_backtest(values, fn) for name, fn in candidates.items()}
     viable = [
         (result["metrics"]["wape"], result["metrics"]["inventory_cost"], abs(result["metrics"]["bias"]), name)
         for name, result in results.items() if result["cutoffs"]
     ]
-    champion = min(viable)[3] if viable else "current_velocity"
+    champion = (
+        requested_model
+        if requested_model != "auto"
+        else (min(viable)[3] if viable else "current_velocity")
+    )
     return {
         "champion": champion,
         "classification": classification,
@@ -370,7 +396,13 @@ def project_inventory_and_order(
     review_period_weeks: int = 4,
     case_pack: int = 1,
     moq: int = 0,
+    service_quantile: float = 0.90,
 ) -> Dict[str, Any]:
+    service_quantile = min(0.95, max(0.50, float(service_quantile)))
+    service_key = f"p{int(round(service_quantile * 100))}"
+    if service_key not in {"p50", "p80", "p90", "p95"}:
+        service_key = "p90"
+        service_quantile = 0.90
     receipts_by_week: Dict[date, float] = {}
     for receipt in scheduled_receipts or []:
         arrival = week_start(receipt["week_start"])
@@ -385,7 +417,7 @@ def project_inventory_and_order(
         inventory += receipt
         start_inventory = inventory
         inventory -= float(point.get("p50") or 0.0)
-        if need_by is None and inventory < float(point.get("p90") or 0.0):
+        if need_by is None and inventory < float(point.get(service_key) or 0.0):
             need_by = current_week
         projection.append({
             "week_start": current_week.isoformat(),
@@ -394,7 +426,7 @@ def project_inventory_and_order(
             "ending_inventory": round(inventory, 3),
         })
     coverage = max(1, int(lead_time_weeks)) + max(1, int(review_period_weeks))
-    target_demand = sum(float(point.get("p90") or 0.0) for point in forecast[:coverage])
+    target_demand = sum(float(point.get(service_key) or 0.0) for point in forecast[:coverage])
     inbound_during_lead = sum(
         quantity for receipt_week, quantity in receipts_by_week.items()
         if first_week <= receipt_week < first_week + timedelta(days=max(1, int(lead_time_weeks)) * 7)
@@ -403,7 +435,9 @@ def project_inventory_and_order(
     constraints = round_order_constraints(target_demand - inventory_position, case_pack, moq)
     return {
         "need_by_week": need_by.isoformat() if need_by else None,
+        "target_lead_time_demand": round(target_demand, 3),
         "target_lead_time_demand_p90": round(target_demand, 3),
+        "service_quantile": service_quantile,
         "inventory_position_at_order": round(inventory_position, 3),
         "projection": projection,
         **constraints,
@@ -417,24 +451,32 @@ def build_purchase_recommendation(
     as_of_date: date,
     horizon_weeks: int = DEFAULT_HORIZON_WEEKS,
     run_id: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    selection = select_champion(weekly_history, category_profile)
+    config = config or {}
+    forced_model = config.get("model") or "auto"
+    service_quantile = float(config.get("service_quantile") or 0.90)
+    demand_multiplier = max(0.0, float(config.get("demand_multiplier") or 1.0))
+    review_period_weeks = max(1, int(config.get("review_period_weeks") or item.get("review_period_weeks") or 4))
+    selection = select_champion(weekly_history, category_profile, forced_model=forced_model)
     point = selection["forecaster"](weekly_history, horizon_weeks)
+    point = [value * demand_multiplier for value in point]
     distribution = probabilistic_forecast(point, selection["residuals"])
     inventory = project_inventory_and_order(
         as_of_date=as_of_date,
         forecast=distribution,
         on_hand=item.get("on_hand", item.get("current_qoh", 0)),
         scheduled_receipts=item.get("scheduled_receipts") or [],
-        lead_time_weeks=max(1, int(math.ceil(float(item.get("lead_time_days") or item.get("lead_time") or 14) / 7.0))),
-        review_period_weeks=int(item.get("review_period_weeks") or 4),
+        lead_time_weeks=max(1, int(math.ceil(float(config.get("lead_time_days") or item.get("lead_time_days") or item.get("lead_time") or 14) / 7.0))),
+        review_period_weeks=review_period_weeks,
         case_pack=int(item.get("case_pack") or 1),
         moq=int(item.get("moq") or 0),
+        service_quantile=service_quantile,
     )
     landed_cost = item.get("landed_cost")
     selling_price = item.get("selling_price")
     rounded_qty = inventory["rounded_quantity"]
-    missing_cost = landed_cost is None
+    missing_cost = landed_cost is None or float(landed_cost) <= 0
     forecast_weeks = []
     first_week = week_start(as_of_date) + timedelta(days=7)
     for index, quantiles in enumerate(distribution):
@@ -457,7 +499,7 @@ def build_purchase_recommendation(
     if selection["classification"]["demand_class"] in {"intermittent", "lumpy"}:
         reasons.append("intermittent_demand")
     spend = round(rounded_qty * float(landed_cost), 2) if landed_cost is not None else None
-    protected_units = inventory["target_lead_time_demand_p90"]
+    protected_units = inventory["target_lead_time_demand"]
     gross_margin_protected = None
     priority_score = 0.0
     if landed_cost is not None and selling_price is not None:
@@ -477,16 +519,23 @@ def build_purchase_recommendation(
         "item_id": str(item.get("item_id") or item.get("system_id")),
         "sku": item.get("sku"),
         "description": item.get("description"),
+        "brand": item.get("brand"),
         "category": item.get("category"),
+        "category_top_level": item.get("category_top_level"),
         "location_id": str(item.get("location_id")),
         "location": item.get("location"),
         "vendor_id": str(item.get("vendor_id")) if item.get("vendor_id") is not None else None,
         "vendor_name": item.get("vendor_name") or item.get("vendor"),
+        "vendor_resolution_source": item.get("vendor_resolution_source"),
         "champion_model": selection["champion"],
+        "requested_model": forced_model,
+        "seasonal_source": "category-location" if category_profile else "flat fallback",
         "demand_classification": selection["classification"],
         "forecast_metrics": metrics,
         "confidence": confidence,
-        "service_quantile": 0.90,
+        "service_quantile": inventory["service_quantile"],
+        "demand_multiplier": demand_multiplier,
+        "review_period_weeks": review_period_weeks,
         "forecast": forecast_weeks,
         "inventory_projection": inventory["projection"],
         "need_by_week": inventory["need_by_week"],

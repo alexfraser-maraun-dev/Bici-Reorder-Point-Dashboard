@@ -960,7 +960,9 @@ def fetch_monthly_category_history(years: int = 3, force_refresh: bool = False) 
             category_path,
             EXTRACT(MONTH FROM sale_date) AS month_of_year,
             EXTRACT(YEAR FROM sale_date) AS sales_year,
-            SUM(units_sold) AS total_units_sold
+            SUM(units_sold) AS total_units_sold,
+            SUM(COALESCE(cost_of_goods_sold, 0)) AS total_cogs,
+            SUM(COALESCE(revenue, 0)) AS total_revenue
         FROM
             `{LS_DATASET}.sales_master_view`
         WHERE
@@ -1011,7 +1013,9 @@ def fetch_item_monthly_history(item_id, years: int = 3) -> pd.DataFrame:
             ANY_VALUE(category_top_level) AS category_top_level,
             EXTRACT(MONTH FROM sale_date) AS month_of_year,
             EXTRACT(YEAR FROM sale_date) AS sales_year,
-            SUM(units_sold) AS total_units_sold
+            SUM(units_sold) AS total_units_sold,
+            SUM(COALESCE(cost_of_goods_sold, 0)) AS total_cogs,
+            SUM(COALESCE(revenue, 0)) AS total_revenue
         FROM
             `{LS_DATASET}.sales_master_view`
         WHERE
@@ -1077,6 +1081,140 @@ def fetch_weekly_item_history(item_ids=None, years: int = 3) -> pd.DataFrame:
         query,
         job_config=bigquery.QueryJobConfig(query_parameters=parameters),
     ).to_dataframe()
+
+
+def fetch_planning_items(
+    scope_type: str = "auto_replen",
+    scope_value: str = None,
+    item_ids=None,
+    location_ids=None,
+    limit: int = 2500,
+) -> pd.DataFrame:
+    """Latest item-location planning inputs for a buyer-selected catalog scope.
+
+    Non-tag scopes are intentionally explicit so a buyer can evaluate a brand,
+    vendor, category, or selected SKUs without accidentally asking the synchronous
+    planner to model the entire catalog. Archived items remain excluded.
+    """
+    allowed = {"auto_replen", "brand", "vendor", "category", "item_ids"}
+    if scope_type not in allowed:
+        raise ValueError(f"scope_type must be one of {', '.join(sorted(allowed))}")
+    if scope_type != "auto_replen" and not (scope_value or item_ids):
+        raise ValueError(f"{scope_type} scope requires scope_value or item_ids")
+    normalized_items = [str(value) for value in (item_ids or []) if value is not None]
+    normalized_locations = [int(value) for value in (location_ids or TARGET_SHOP_IDS)]
+    scope_clause = {
+        "auto_replen": "s.item_id IN (SELECT item_id FROM qualified_items)",
+        "brand": "LOWER(TRIM(s.brand_name)) = LOWER(TRIM(@scope_value))",
+        "vendor": "(LOWER(TRIM(COALESCE(s.po_vendor_name_any, s.default_vendor, ''))) = LOWER(TRIM(@scope_value)) OR CAST(s.po_vendor_id_any AS STRING) = @scope_value)",
+        "category": "LOWER(TRIM(s.category_top_level)) = LOWER(TRIM(@scope_value))",
+        "item_ids": "(CAST(s.item_id AS STRING) IN UNNEST(@item_ids) OR CAST(s.system_sku AS STRING) IN UNNEST(@item_ids))",
+    }[scope_type]
+    query = f"""
+        WITH qualified_items AS (
+          SELECT item_id FROM `{QUALIFIED_ITEMS_VIEW}`
+        ), latest AS (
+          SELECT MAX(snapshot_date_local) AS snapshot_date_local
+          FROM `{LS_DATASET}.v_master_snapshot_latest`
+        )
+        SELECT
+          CAST(s.system_sku AS STRING) AS sku,
+          CAST(s.item_id AS STRING) AS item_id,
+          COALESCE(s.product_display_name, s.item_description) AS description,
+          s.brand_name AS brand,
+          s.category_name AS category,
+          s.category_top_level AS category_top_level,
+          s.shop_id AS location_id,
+          CAST(s.po_vendor_id_any AS STRING) AS vendor_id,
+          COALESCE(s.po_vendor_name_any, s.default_vendor) AS vendor,
+          s.default_vendor AS default_vendor,
+          COALESCE(NULLIF(s.item_default_cost, 0), NULLIF(s.item_avg_cost, 0)) AS landed_cost,
+          s.item_current_price AS selling_price,
+          COALESCE(s.qoh, 0) AS current_qoh,
+          COALESCE(s.po_units_remaining, 0) AS snapshot_on_order,
+          s.item_tags
+        FROM `{LS_DATASET}.v_master_snapshot_latest` s
+        CROSS JOIN latest
+        WHERE s.snapshot_date_local = latest.snapshot_date_local
+          AND s.shop_id IN UNNEST(@location_ids)
+          AND COALESCE(s.item_archived, FALSE) = FALSE
+          AND {scope_clause}
+        ORDER BY s.brand_name, description, s.shop_id
+        LIMIT @limit
+    """
+    parameters = [
+        bigquery.ArrayQueryParameter("location_ids", "INT64", normalized_locations),
+        bigquery.ScalarQueryParameter("limit", "INT64", max(1, min(int(limit), 10000))),
+    ]
+    if scope_type in {"brand", "vendor", "category"}:
+        parameters.append(bigquery.ScalarQueryParameter("scope_value", "STRING", str(scope_value)))
+    if scope_type == "item_ids":
+        parameters.append(bigquery.ArrayQueryParameter("item_ids", "STRING", normalized_items))
+    return get_bq_client().query(
+        query, job_config=bigquery.QueryJobConfig(query_parameters=parameters)
+    ).to_dataframe()
+
+
+def fetch_vendor_directory_by_name() -> dict:
+    """Normalized vendor-name -> canonical Lightspeed vendor identity.
+
+    The master snapshot exposes a default vendor name but not its ID for many
+    products. Current PO lines provide the missing stable name/ID relationship.
+    """
+    query = f"""
+        SELECT
+          LOWER(TRIM(vendor_name)) AS normalized_name,
+          ARRAY_AGG(
+            STRUCT(CAST(vendor_id AS STRING) AS vendor_id, vendor_name)
+            ORDER BY po_updated_at DESC LIMIT 1
+          )[OFFSET(0)] AS vendor
+        FROM `{LS_DATASET}.v_po_current_lines`
+        WHERE vendor_id IS NOT NULL AND vendor_name IS NOT NULL AND TRIM(vendor_name) != ''
+        GROUP BY normalized_name
+    """
+    result = {}
+    for row in get_bq_client().query(query).result():
+        vendor = dict(row.vendor)
+        result[str(row.normalized_name)] = {
+            "vendor_id": str(vendor["vendor_id"]),
+            "vendor_name": vendor["vendor_name"],
+        }
+    return result
+
+
+def fetch_scheduled_po_receipts(item_ids, location_ids=None) -> list:
+    """Read scheduled, unreceived supply from the canonical current-PO view."""
+    ids = sorted({str(value) for value in (item_ids or []) if value is not None})
+    if not ids:
+        return []
+    locations = [int(value) for value in (location_ids or TARGET_SHOP_IDS)]
+    query = f"""
+        SELECT
+          CAST(item_id AS STRING) AS item_id,
+          CAST(shop_id AS STRING) AS location_id,
+          CAST(order_id AS STRING) AS order_id,
+          ANY_VALUE(vendor_id) AS vendor_id,
+          ANY_VALUE(vendor_name) AS vendor_name,
+          ANY_VALUE(expected_arrival_at) AS expected_arrival_at,
+          ANY_VALUE(po_ordered_at) AS po_ordered_at,
+          SUM(GREATEST(COALESCE(
+            remaining_units_not_allocated_to_confirmed_open_special_orders,
+            net_units_remaining, 0
+          ), 0)) AS quantity
+        FROM `{LS_DATASET}.v_po_current_lines`
+        WHERE CAST(item_id AS STRING) IN UNNEST(@item_ids)
+          AND shop_id IN UNNEST(@location_ids)
+          AND NOT COALESCE(is_complete, FALSE)
+          AND NOT COALESCE(is_archived, FALSE)
+          AND COALESCE(net_units_remaining, 0) > 0
+        GROUP BY item_id, location_id, order_id
+        HAVING quantity > 0
+    """
+    config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ArrayQueryParameter("item_ids", "STRING", ids),
+        bigquery.ArrayQueryParameter("location_ids", "INT64", locations),
+    ])
+    return [dict(row) for row in get_bq_client().query(query, job_config=config).result()]
 
 
 def fetch_inventory_snapshot() -> pd.DataFrame:
@@ -1563,7 +1701,7 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
           COALESCE(sc.days_out_of_stock_60, 0) AS days_out_of_stock_60,
           COALESCE(s.qoh, 0) AS current_qoh,
           COALESCE(s.po_units_remaining, 0) AS on_order,
-          COALESCE(s.item_default_cost, s.item_avg_cost) AS landed_cost,
+          COALESCE(NULLIF(s.item_default_cost, 0), NULLIF(s.item_avg_cost, 0)) AS landed_cost,
           s.item_current_price AS selling_price,
           COALESCE(s.reorderPoint, 0) AS current_reorder_point,
           COALESCE(s.reorderLevel, 0) AS current_desired_level

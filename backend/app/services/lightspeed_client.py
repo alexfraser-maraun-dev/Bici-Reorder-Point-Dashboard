@@ -582,6 +582,104 @@ class LightspeedClient:
                 merged.update(partial)
         return merged
 
+    def get_ordered_purchase_orders(
+        self, ordered_since: str, page_limit: int = 100, max_pages: int = 40
+    ) -> List[Dict[str, Any]]:
+        """
+        Pages through incomplete, non-archived purchase orders whose orderedDate is
+        on/after ``ordered_since`` (ISO date), with Vendor, Shop and OrderLines
+        loaded. This is the PO-tracker source: every PO that has actually been
+        placed with a vendor (orderedDate set) but not yet fully received.
+        Unsent drafts (no orderedDate) are excluded by the server-side filter.
+        """
+        import json as _json
+        relations = _json.dumps(["Vendor", "Shop", "OrderLines"])
+        results: List[Dict[str, Any]] = []
+        offset = 0
+        for _ in range(max_pages):
+            params = {
+                "complete": "false",
+                "archived": "false",
+                "orderedDate": f">,{ordered_since}",
+                "load_relations": relations,
+                "limit": str(page_limit),
+                "offset": str(offset),
+            }
+            response = self._legacy_request("GET", "/Order.json", params=params)
+            if response is None or response.status_code != 200:
+                if response is not None:
+                    print(f"Error fetching ordered POs: {response.status_code} {response.text[:300]}")
+                raise LightspeedReadError("Lightspeed ordered-PO read failed before all pages were loaded.")
+            page = self._as_list(response.json().get("Order"))
+            results.extend(page)
+            if len(page) < page_limit:
+                break
+            offset += page_limit
+        return results
+
+    def get_order_with_lines(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Fetches a single purchase order (legacy API) with its OrderLines loaded."""
+        import json as _json
+        params = {
+            "orderID": str(order_id),
+            "load_relations": _json.dumps(["Vendor", "OrderLines"]),
+            "limit": "1",
+        }
+        response = self._legacy_request("GET", "/Order.json", params=params)
+        if response is None or response.status_code != 200:
+            return None
+        orders = self._as_list(response.json().get("Order"))
+        return orders[0] if orders else None
+
+    def get_employee_names(self, page_limit: int = 100, max_pages: int = 10) -> Dict[str, str]:
+        """{employeeID: "First Last"} for resolving Order.createdByEmployeeID."""
+        out: Dict[str, str] = {}
+        offset = 0
+        for _ in range(max_pages):
+            response = self._legacy_request(
+                "GET", "/Employee.json", params={"limit": str(page_limit), "offset": str(offset)}
+            )
+            if response is None or response.status_code != 200:
+                break
+            page = self._as_list(response.json().get("Employee"))
+            for emp in page:
+                emp_id = str(emp.get("employeeID") or "")
+                name = " ".join(part for part in (emp.get("firstName"), emp.get("lastName")) if part).strip()
+                if emp_id and name:
+                    out[emp_id] = name
+            if len(page) < page_limit:
+                break
+            offset += page_limit
+        return out
+
+    def get_items_basic_by_ids(self, item_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
+        """
+        {itemID: {"description", "sku"}} for labelling PO lines. The Order entity
+        does not allow the chained OrderLines.Item relation, so line items are
+        resolved with this separate chunked fetch instead.
+        """
+        unique_ids = sorted({str(i) for i in item_ids if i and str(i) != "0"})
+        return self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_item_basic_chunk)
+
+    def _fetch_item_basic_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
+        params = {
+            "itemID": f"IN,[{','.join(chunk)}]",
+            "limit": "100",
+        }
+        out: Dict[str, Dict[str, Any]] = {}
+        response = self._legacy_request("GET", "/Item.json", params=params)
+        if response is None or response.status_code != 200:
+            if response is not None:
+                print(f"Error fetching items: {response.status_code} {response.text[:300]}")
+            return out
+        for item in self._as_list(response.json().get("Item")):
+            item_id = str(item.get("itemID"))
+            out[item_id] = {
+                "description": item.get("description"),
+                "sku": item.get("customSku") or item.get("systemSku"),
+            }
+        return out
+
     def get_orders_by_ids(self, order_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
         """
         Fetches the purchase orders (Order entity) behind a set of special orders and

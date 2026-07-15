@@ -2,8 +2,8 @@
 
 The statistical engine is deliberately pure; this module owns BigQuery reads,
 calendar completion, category pooling and forecast-to-recommendation lineage.
-Run results are cached in-process for interactive use. Persisting analytical
-outputs to BigQuery can be added without changing the API contracts.
+Run results are cached in-process and persisted to Postgres for interactive use.
+BigQuery remains the analytical source of truth.
 """
 
 import math
@@ -22,6 +22,7 @@ from app.services.demand_planning import (
     monthly_rollups,
     week_start,
 )
+from app.services.planning_store import get_planning_store
 
 
 _RUNS: Dict[str, Dict[str, Any]] = {}
@@ -79,7 +80,8 @@ def _number(row: Dict[str, Any], *keys: str) -> Optional[float]:
 
 
 def _history_maps(
-    weekly_rows: Iterable[Dict[str, Any]], calendar: List[date]
+    weekly_rows: Iterable[Dict[str, Any]], calendar: List[date],
+    smoothing_window: int = 5, shrinkage: float = 1.0,
 ) -> Tuple[Dict[Tuple[str, str], List[float]], Dict[Tuple[str, str], Dict[int, float]]]:
     demand: Dict[Tuple[str, str, date], float] = defaultdict(float)
     categories_for_item: Dict[Tuple[str, str], set] = defaultdict(set)
@@ -119,8 +121,53 @@ def _history_maps(
                 "units": category_week.get((key[0], key[1], period), 0.0),
                 "observed": True,
             })
-        profiles[key] = exposure_adjusted_seasonal_profile(profile_rows)
+        profiles[key] = exposure_adjusted_seasonal_profile(
+            profile_rows, smoothing_window=smoothing_window, shrinkage=shrinkage
+        )
     return histories, profiles
+
+
+def _normalized_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    source = config or {}
+    service = float(source.get("service_quantile") or 0.90)
+    if service not in {0.50, 0.80, 0.90, 0.95}:
+        raise ValueError("service_quantile must be one of 0.50, 0.80, 0.90 or 0.95")
+    return {
+        "model": str(source.get("model") or "auto").strip().lower(),
+        "service_quantile": service,
+        "history_years": max(1, min(5, int(source.get("history_years") or 3))),
+        "review_period_weeks": max(1, min(26, int(source.get("review_period_weeks") or 4))),
+        "demand_multiplier": max(0.0, min(3.0, float(source.get("demand_multiplier") or 1.0))),
+        "seasonal_smoothing_weeks": max(1, min(13, int(source.get("seasonal_smoothing_weeks") or 5))),
+        "seasonal_shrinkage": max(0.0, min(10.0, float(source.get("seasonal_shrinkage") or 1.0))),
+        "lead_time_days": (
+            max(1, min(365, int(source["lead_time_days"])))
+            if source.get("lead_time_days") not in (None, "") else None
+        ),
+    }
+
+
+def _resolve_vendor(
+    row: Dict[str, Any], brand_rules: Dict[str, Dict[str, Any]],
+    vendor_directory: Dict[str, Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if row.get("vendor_id") not in (None, "", "nan"):
+        return str(row["vendor_id"]), row.get("vendor_name") or row.get("vendor"), "item-po-history"
+    brand = str(row.get("brand") or "").strip().casefold()
+    rule = next(
+        (value for key, value in brand_rules.items() if str(key).strip().casefold() == brand), None
+    )
+    if rule and rule.get("preferred_vendor_id"):
+        return (
+            str(rule["preferred_vendor_id"]),
+            rule.get("preferred_vendor_name") or row.get("vendor") or row.get("default_vendor"),
+            "brand-sourcing-rule",
+        )
+    vendor_name = row.get("vendor_name") or row.get("vendor") or row.get("default_vendor")
+    resolved = vendor_directory.get(str(vendor_name or "").strip().casefold())
+    if resolved:
+        return str(resolved["vendor_id"]), resolved.get("vendor_name") or vendor_name, "vendor-name-directory"
+    return None, vendor_name, None
 
 
 def create_planning_run(
@@ -131,6 +178,10 @@ def create_planning_run(
     horizon_weeks: int = DEFAULT_HORIZON_WEEKS,
     location_ids: Optional[Iterable[str]] = None,
     force_refresh: bool = False,
+    scope_type: str = "auto_replen",
+    scope_value: Optional[str] = None,
+    item_ids: Optional[Iterable[str]] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if not 1 <= int(horizon_weeks) <= 104:
         raise ValueError("horizon_weeks must be between 1 and 104")
@@ -138,24 +189,41 @@ def create_planning_run(
     if isinstance(as_of, str):
         as_of = date.fromisoformat(as_of)
     locations = {str(value) for value in (location_ids or [])}
+    planning_config = _normalized_config(config)
 
     lead_by_vendor_location: Dict[Tuple[str, str], float] = {}
     lead_by_vendor: Dict[str, float] = {}
+    vendor_directory: Dict[str, Dict[str, Any]] = {}
+    brand_rules: Dict[str, Dict[str, Any]] = {}
+    canonical_receipts: List[Dict[str, Any]] = []
     if items is None:
-        from app.services.bigquery_sync import build_lead_time_lookup, fetch_tagged_items_metrics
-        items = fetch_tagged_items_metrics("auto-replen", force_refresh=force_refresh)
+        from app.services.bigquery_sync import (
+            build_lead_time_lookup, fetch_planning_items, fetch_vendor_directory_by_name,
+            get_brand_sourcing_rules_map,
+        )
+        items = fetch_planning_items(
+            scope_type=scope_type, scope_value=scope_value, item_ids=item_ids,
+            location_ids=location_ids,
+        )
         lead_by_vendor_location, lead_by_vendor = build_lead_time_lookup(force_refresh=force_refresh)
+        vendor_directory = fetch_vendor_directory_by_name()
+        brand_rules = get_brand_sourcing_rules_map()
     item_rows = _records(items)
     if locations:
         item_rows = [row for row in item_rows if str(row.get("location_id")) in locations]
     item_ids = sorted({str(row.get("item_id")) for row in item_rows if row.get("item_id") is not None})
 
     if weekly_history is None:
-        from app.services.bigquery_sync import RELIABLE_HISTORY_START, fetch_weekly_item_history
-        weekly_history = fetch_weekly_item_history(item_ids=item_ids, years=3)
+        from app.services.bigquery_sync import (
+            RELIABLE_HISTORY_START, fetch_scheduled_po_receipts, fetch_weekly_item_history,
+        )
+        weekly_history = fetch_weekly_item_history(
+            item_ids=item_ids, years=planning_config["history_years"]
+        )
+        canonical_receipts = fetch_scheduled_po_receipts(item_ids, location_ids=location_ids)
         reliable_start = date.fromisoformat(RELIABLE_HISTORY_START)
     else:
-        reliable_start = date(as_of.year - 3, 1, 1)
+        reliable_start = date(as_of.year - planning_config["history_years"], 1, 1)
     weekly_rows = _records(weekly_history)
     if locations:
         weekly_rows = [row for row in weekly_rows if str(row.get("location_id")) in locations]
@@ -166,7 +234,11 @@ def create_planning_run(
         default=last_complete_week - timedelta(days=7 * 103),
     )
     calendar = _calendar(max(week_start(reliable_start), first_observed), last_complete_week)
-    histories, profiles = _history_maps(weekly_rows, calendar)
+    histories, profiles = _history_maps(
+        weekly_rows, calendar,
+        smoothing_window=planning_config["seasonal_smoothing_weeks"],
+        shrinkage=planning_config["seasonal_shrinkage"],
+    )
     item_categories: Dict[Tuple[str, str], List[str]] = defaultdict(list)
     for history_row in weekly_rows:
         key = (str(history_row.get("item_id")), str(history_row.get("location_id")))
@@ -176,6 +248,9 @@ def create_planning_run(
     run_id = str(uuid.uuid4())
     source_snapshot_at = datetime.now(timezone.utc).isoformat()
     recommendations = []
+    receipts_by_item_location: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for receipt in _records(canonical_receipts):
+        receipts_by_item_location[(str(receipt.get("item_id")), str(receipt.get("location_id")))].append(receipt)
 
     for row in item_rows:
         item_id = str(row.get("item_id"))
@@ -189,22 +264,43 @@ def create_planning_run(
                  if (location_id, candidate) in profiles),
                 None,
             )
-        vendor_id = str(row.get("vendor_id")) if row.get("vendor_id") is not None else ""
+        vendor_id, vendor_name, vendor_source = _resolve_vendor(row, brand_rules, vendor_directory)
         lead_days = int(
-            _number(row, "lead_time_days", "lead_time")
-            or lead_by_vendor_location.get((vendor_id, location_id))
-            or lead_by_vendor.get(vendor_id)
+            planning_config.get("lead_time_days")
+            or _number(row, "lead_time_days", "lead_time")
+            or lead_by_vendor_location.get((str(vendor_id or ""), location_id))
+            or lead_by_vendor.get(str(vendor_id or ""))
             or 14
         )
-        on_order = _number(row, "on_order") or 0.0
         scheduled_receipts = []
-        if on_order > 0:
+        for receipt in receipts_by_item_location.get((item_id, location_id), []):
+            arrival = receipt.get("expected_arrival_at")
+            reason = "lightspeed-expected-arrival"
+            confidence = "confirmed-date"
+            if not arrival:
+                ordered = receipt.get("po_ordered_at")
+                base = week_start(ordered) if ordered else week_start(as_of)
+                arrival = base + timedelta(days=7 * max(1, math.ceil(lead_days / 7)))
+                reason = "estimated-from-vendor-lead-time"
+                confidence = "estimated"
             scheduled_receipts.append({
-                "week_start": (week_start(as_of) + timedelta(days=7 * max(1, math.ceil(lead_days / 7)))).isoformat(),
-                "quantity": on_order,
-                "confidence": "estimated",
-                "reason": "source_po_has_no_normalized_expected_receipt_week",
+                "week_start": week_start(arrival).isoformat(),
+                "quantity": _number(receipt, "quantity") or 0.0,
+                "confidence": confidence,
+                "reason": reason,
+                "order_id": str(receipt.get("order_id")),
             })
+        # Injected test data and legacy callers may still supply a single on-order
+        # total. Production planning uses the dated canonical PO-line view above.
+        if not scheduled_receipts:
+            on_order = _number(row, "on_order", "snapshot_on_order") or 0.0
+            if on_order > 0:
+                scheduled_receipts.append({
+                    "week_start": (week_start(as_of) + timedelta(days=7 * max(1, math.ceil(lead_days / 7)))).isoformat(),
+                    "quantity": on_order,
+                    "confidence": "estimated",
+                    "reason": "snapshot-total-estimated-from-vendor-lead-time",
+                })
         item = {
             **row,
             "item_id": item_id,
@@ -217,10 +313,12 @@ def create_planning_run(
             "selling_price": _number(row, "selling_price", "price", "retail_price"),
             "case_pack": int(_number(row, "case_pack") or 1),
             "moq": int(_number(row, "moq") or 0),
-            "vendor_name": row.get("vendor_name") or row.get("vendor"),
+            "vendor_id": vendor_id,
+            "vendor_name": vendor_name,
+            "vendor_resolution_source": vendor_source,
         }
         recommendation = build_purchase_recommendation(
-            item, history, profile, as_of, int(horizon_weeks), run_id
+            item, history, profile, as_of, int(horizon_weeks), run_id, planning_config
         )
         recommendation["source_snapshot_at"] = source_snapshot_at
         recommendation["history"] = [
@@ -247,6 +345,9 @@ def create_planning_run(
         "horizon_weeks": int(horizon_weeks),
         "model_version": MODEL_VERSION,
         "assumption_version": ASSUMPTION_VERSION,
+        "scope_type": scope_type,
+        "scope_value": scope_value,
+        "config": planning_config,
         "recommendation_count": len(recommendations),
         "blocking_exception_count": sum(bool(row.get("blocked")) for row in recommendations),
         "recommendations": recommendations,
@@ -254,12 +355,28 @@ def create_planning_run(
     }
     with _RUN_LOCK:
         _RUNS[run_id] = run
+    get_planning_store().save_planning_run(run)
     return run
 
 
 def get_planning_run(run_id: str) -> Optional[Dict[str, Any]]:
     with _RUN_LOCK:
-        return _RUNS.get(run_id)
+        cached = _RUNS.get(run_id)
+    if cached:
+        return cached
+    stored = get_planning_store().get_planning_run(run_id)
+    if stored:
+        with _RUN_LOCK:
+            _RUNS[run_id] = stored
+    return stored
+
+
+def get_latest_planning_run() -> Optional[Dict[str, Any]]:
+    stored = get_planning_store().get_latest_planning_run()
+    if stored:
+        with _RUN_LOCK:
+            _RUNS[stored["run_id"]] = stored
+    return stored
 
 
 def get_recommendations(

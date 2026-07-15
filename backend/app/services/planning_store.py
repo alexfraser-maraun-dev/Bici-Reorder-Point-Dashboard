@@ -99,6 +99,9 @@ class PlanningStore:
                     draft_id TEXT NOT NULL REFERENCES po_drafts(draft_id) ON DELETE CASCADE,
                     recommendation_id TEXT,
                     sku TEXT,
+                    description TEXT,
+                    brand TEXT,
+                    category_top_level TEXT,
                     item_id TEXT NOT NULL,
                     location_id TEXT NOT NULL,
                     quantity INTEGER NOT NULL,
@@ -112,6 +115,18 @@ class PlanningStore:
                     case_pack INTEGER,
                     moq INTEGER,
                     constraint_warning TEXT
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS planning_runs (
+                    run_id {id_type} PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    source_snapshot_at TEXT,
+                    scope_type TEXT NOT NULL,
+                    scope_value TEXT,
+                    config_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL
                 )
             """)
             conn.execute(f"""
@@ -148,8 +163,35 @@ class PlanningStore:
                     updated_at TEXT NOT NULL
                 )
             """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS po_watch_acks (
+                    order_id {id_type} PRIMARY KEY,
+                    acked_by TEXT,
+                    note TEXT,
+                    acked_at TEXT NOT NULL,
+                    snooze_until TEXT,
+                    expected_date TEXT
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS po_watch_meta (
+                    key {id_type} PRIMARY KEY,
+                    value TEXT
+                )
+            """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_po_draft_lines_draft ON po_draft_lines(draft_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_po_drafts_status ON po_drafts(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_planning_runs_created ON planning_runs(created_at)")
+            # Render may already have the first planning schema. Add display
+            # metadata without requiring a destructive/manual migration.
+            if self.is_postgres:
+                for column in ("description TEXT", "brand TEXT", "category_top_level TEXT"):
+                    conn.execute(f"ALTER TABLE po_draft_lines ADD COLUMN IF NOT EXISTS {column}")
+            else:
+                existing = {row["name"] for row in conn.execute("PRAGMA table_info(po_draft_lines)").fetchall()}
+                for name in ("description", "brand", "category_top_level"):
+                    if name not in existing:
+                        conn.execute(f"ALTER TABLE po_draft_lines ADD COLUMN {name} TEXT")
 
     @staticmethod
     def _now() -> str:
@@ -192,7 +234,8 @@ class PlanningStore:
         for line in lines:
             values = (
                 str(line.get("line_id") or uuid.uuid4()), draft_id,
-                line.get("recommendation_id"), line.get("sku"), str(line["item_id"]),
+                line.get("recommendation_id"), line.get("sku"), line.get("description"),
+                line.get("brand"), line.get("category_top_level"), str(line["item_id"]),
                 str(line.get("location_id") or ""), int(line.get("quantity") or 0),
                 line.get("unit_cost"), line.get("landed_cost"), line.get("currency") or "CAD",
                 line.get("source") or "manual", line.get("reconciliation"),
@@ -201,11 +244,77 @@ class PlanningStore:
             )
             conn.execute(self._sql("""
                 INSERT INTO po_draft_lines (
-                    line_id,draft_id,recommendation_id,sku,item_id,location_id,quantity,
+                    line_id,draft_id,recommendation_id,sku,description,brand,category_top_level,item_id,location_id,quantity,
                     unit_cost,landed_cost,currency,source,reconciliation,target_lightspeed_order_id,
                     need_by_week,case_pack,moq,constraint_warning
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """), values)
+
+    def save_planning_run(self, run: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist a completed interactive run so browser navigation/restarts do not lose it."""
+        record = (
+            str(run["run_id"]), str(run.get("status") or "complete"),
+            str(run.get("created_at") or self._now()), run.get("source_snapshot_at"),
+            str(run.get("scope_type") or "auto_replen"), run.get("scope_value"),
+            json.dumps(run.get("config") or {}, sort_keys=True),
+            json.dumps(run, sort_keys=True, default=str),
+        )
+        with self.transaction(immediate=True) as conn:
+            conn.execute(self._sql("DELETE FROM planning_runs WHERE run_id = ?"), (record[0],))
+            conn.execute(self._sql("""
+                INSERT INTO planning_runs (
+                    run_id,status,created_at,source_snapshot_at,scope_type,scope_value,config_json,result_json
+                ) VALUES (?,?,?,?,?,?,?,?)
+            """), record)
+        return run
+
+    def get_planning_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                self._sql("SELECT result_json FROM planning_runs WHERE run_id = ?"), (str(run_id),)
+            ).fetchone()
+            return json.loads(self._dict(row)["result_json"]) if row else None
+        finally:
+            conn.close()
+
+    def get_latest_planning_run(self) -> Optional[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT result_json FROM planning_runs WHERE status = 'complete' ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            return json.loads(self._dict(row)["result_json"]) if row else None
+        finally:
+            conn.close()
+
+    def set_target_order(
+        self, draft_id: str, expected_version: int, order_id: Optional[str]
+    ) -> Dict[str, Any]:
+        """Select an explicit unsent PO (or clear it to create a new PO)."""
+        with self.transaction(immediate=True) as conn:
+            lock = " FOR UPDATE" if self.is_postgres else ""
+            row = conn.execute(self._sql(
+                f"SELECT status,version FROM po_drafts WHERE draft_id = ?{lock}"
+            ), (draft_id,)).fetchone()
+            if not row:
+                raise KeyError(draft_id)
+            current = self._dict(row)
+            if int(current["version"]) != int(expected_version):
+                raise PlanningConflict("Draft changed since it was loaded.")
+            if current["status"] != "draft":
+                raise PlanningConflict("PO routing can only be changed while the draft is editable.")
+            target = str(order_id) if order_id not in (None, "", "new") else None
+            conn.execute(self._sql("""
+                UPDATE po_drafts SET lightspeed_order_id = ?, version = version + 1, updated_at = ?
+                WHERE draft_id = ?
+            """), (target, self._now(), draft_id))
+            conn.execute(self._sql("""
+                UPDATE po_draft_lines
+                SET target_lightspeed_order_id = ?, reconciliation = ?
+                WHERE draft_id = ?
+            """), (target, "append_to_open_po" if target else "new_po", draft_id))
+        return self.get_draft(draft_id)
 
     def get_draft(self, draft_id: str) -> Optional[Dict[str, Any]]:
         conn = self._connect()
@@ -300,6 +409,58 @@ class PlanningStore:
                 records.append({"idempotency_key": key, "action": operation["action"]})
         return records
 
+    # ------------------------------------------------------------------
+    # PO-tracker alert acknowledgements
+    # ------------------------------------------------------------------
+    def upsert_po_ack(self, order_id: str, *, acked_by: Optional[str], note: Optional[str],
+                      snooze_until: Optional[str], expected_date: Optional[str]) -> Dict[str, Any]:
+        """Acknowledge a late-PO alert. ``expected_date`` pins the PO's expected date
+        at ack time so the ack auto-invalidates if the date is later changed in
+        Lightspeed. ``snooze_until`` (ISO date) re-arms the alert after that day;
+        NULL snoozes until the expected date changes or the PO closes."""
+        record = {
+            "order_id": str(order_id),
+            "acked_by": acked_by or "UI_User",
+            "note": note,
+            "acked_at": self._now(),
+            "snooze_until": snooze_until,
+            "expected_date": expected_date,
+        }
+        with self.transaction(immediate=True) as conn:
+            conn.execute(self._sql("DELETE FROM po_watch_acks WHERE order_id = ?"), (record["order_id"],))
+            conn.execute(self._sql("""
+                INSERT INTO po_watch_acks (order_id,acked_by,note,acked_at,snooze_until,expected_date)
+                VALUES (?,?,?,?,?,?)
+            """), tuple(record.values()))
+        return record
+
+    def delete_po_ack(self, order_id: str) -> None:
+        with self.transaction(immediate=True) as conn:
+            conn.execute(self._sql("DELETE FROM po_watch_acks WHERE order_id = ?"), (str(order_id),))
+
+    def list_po_acks(self) -> Dict[str, Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT * FROM po_watch_acks").fetchall()
+            return {str(self._dict(row)["order_id"]): self._dict(row) for row in rows}
+        finally:
+            conn.close()
+
+    def get_po_watch_meta(self, key: str) -> Optional[str]:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                self._sql("SELECT value FROM po_watch_meta WHERE key = ?"), (key,)
+            ).fetchone()
+            return self._dict(row)["value"] if row else None
+        finally:
+            conn.close()
+
+    def set_po_watch_meta(self, key: str, value: str) -> None:
+        with self.transaction(immediate=True) as conn:
+            conn.execute(self._sql("DELETE FROM po_watch_meta WHERE key = ?"), (key,))
+            conn.execute(self._sql("INSERT INTO po_watch_meta (key,value) VALUES (?,?)"), (key, value))
+
     def create_override(self, override: Dict[str, Any]) -> Dict[str, Any]:
         required = ("scope_type", "scope_id", "measure", "override_value", "reason", "created_by")
         missing = [field for field in required if override.get(field) in (None, "")]
@@ -338,4 +499,3 @@ def get_planning_store() -> PlanningStore:
     if _store is None:
         _store = PlanningStore()
     return _store
-

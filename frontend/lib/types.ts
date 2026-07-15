@@ -167,6 +167,9 @@ export interface PODraftLine {
   draft_id?: string
   recommendation_id?: string | null
   sku: string | null
+  description?: string | null
+  brand?: string | null
+  category_top_level?: string | null
   item_id: string
   location_id: string
   quantity: number
@@ -216,11 +219,17 @@ export interface PurchaseRecommendation {
   item_id: string
   sku?: string | null
   description?: string | null
+  brand?: string | null
   category?: string | null
+  category_top_level?: string | null
   location_id: string
+  location?: string | null
   vendor_id?: string | null
   vendor_name?: string | null
   champion_model: string
+  requested_model?: string
+  seasonal_source?: string
+  vendor_resolution_source?: string | null
   confidence: 'high' | 'medium' | 'low'
   forecast_metrics: { wape?: number; mase?: number; bias?: number }
   forecast: WeeklyForecastPoint[]
@@ -254,10 +263,38 @@ export interface ForecastRun {
   horizon_weeks: number
   model_version: string
   assumption_version: string
+  scope_type: PlanningScope
+  scope_value?: string | null
+  config: PlanningConfig
   recommendation_count: number
   blocking_exception_count: number
   recommendations: PurchaseRecommendation[]
   monthly_rollups: MonthlyPlanningRollup[]
+}
+
+export type PlanningScope = 'auto_replen' | 'brand' | 'vendor' | 'category' | 'item_ids'
+
+export interface PlanningConfig {
+  model: 'auto' | 'current_velocity' | 'seasonal_naive' | 'hierarchical_seasonal' | 'tsb' | 'ets_damped'
+  service_quantile: 0.5 | 0.8 | 0.9 | 0.95
+  history_years: number
+  review_period_weeks: number
+  demand_multiplier: number
+  seasonal_smoothing_weeks: number
+  seasonal_shrinkage: number
+  lead_time_days?: number | null
+}
+
+export interface LightspeedOpenOrder {
+  orderID: string
+  vendorID: string
+  shopID: string
+  po_state: 'unsent' | 'ordered' | 'partially_received' | 'complete' | 'archived'
+  createTime?: string | null
+  orderedDate?: string | null
+  expectedDate?: string | null
+  refNum?: string | null
+  OrderLine?: Array<{ orderLineID: string; itemID: string; quantity: number; numReceived?: number }>
 }
 
 export interface LightspeedPreviewOperation {
@@ -482,4 +519,95 @@ export interface SpecialOrderDashboard {
   summary: SpecialOrderSummary
   shopify_only: ShopifyOnlyOrder[]
   fetched_at?: string
+}
+
+// ---------------------------------------------------------------------------
+// PO Tracker (placed-but-unreceived POs triaged against expected arrival)
+// ---------------------------------------------------------------------------
+
+export type PoWatchTriage = 'critical' | 'very_late' | 'late' | 'due_soon' | 'no_eta' | 'on_track'
+export type PoWatchStatus = 'ordered' | 'receiving'
+export type PoWatchFlag =
+  | 'no_expected_date'
+  | 'implied_expected'
+  | 'expected_faster_than_median'
+  | 'expected_before_ordered'
+  | 'past_median_lead_time'
+  | 'fully_received_not_closed'
+
+export interface PoWatchAck {
+  acked_by: string | null
+  acked_at: string
+  note: string | null
+  snooze_until: string | null   // ISO date; null = until the LS expected date changes
+  active: boolean
+}
+
+export interface PoWatchOrder {
+  order_id: string
+  ref_num: string | null
+  vendor_id: string
+  vendor_name: string
+  shop_id: string
+  shop_name: string
+  created_by: string | null
+  created_date: string | null
+  ordered_date: string | null
+  expected_date: string | null           // the buyer-entered arrival date in LS
+  effective_expected_date: string | null // expected_date, or ordered + median when missing
+  expected_source: 'vendor' | 'implied' | null
+  status: PoWatchStatus
+  line_count: number
+  units_ordered: number
+  units_received: number
+  cost_ordered: number
+  cost_received: number
+  received_pct: number
+  median_lead_time_days: number | null
+  lead_time_po_count: number | null
+  promised_lead_time_days: number | null
+  days_since_ordered: number | null
+  days_late: number | null
+  days_until_expected: number | null
+  triage: PoWatchTriage
+  flags: PoWatchFlag[]
+  lightspeed_url: string
+  ack: PoWatchAck | null
+  alertable: boolean
+}
+
+export interface PoWatchSummary {
+  critical: number
+  very_late: number
+  late: number
+  due_soon: number
+  no_eta: number
+  on_track: number
+  alertable: number
+  acknowledged: number
+  expected_faster_than_median: number
+}
+
+export interface PoWatchResponse {
+  status: string
+  orders: PoWatchOrder[]
+  summary: PoWatchSummary
+  meta: {
+    ordered_within_days: number
+    ordered_since: string
+    order_count: number
+    fetched_at: string
+    alert_days_late_threshold: number
+  }
+}
+
+export interface PoWatchLine {
+  order_line_id: string
+  item_id: string
+  sku: string | null
+  description: string | null
+  quantity: number
+  received: number
+  unit_cost: number
+  total: number
 }

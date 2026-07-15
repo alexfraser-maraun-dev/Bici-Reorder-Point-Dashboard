@@ -5,8 +5,9 @@ import { SheetsReplenishment } from './sheets-replenishment'
 import { VendorLeadTimes } from './vendor-lead-times'
 import { BrandConfiguration } from './brand-configuration'
 import { PurchaseOrders } from './purchase-orders'
+import { PoTracker } from './po-tracker'
 import { DemandInsights } from './demand-insights'
-import { LayoutDashboard, SlidersHorizontal, Truck, ShoppingCart, TrendingUp } from 'lucide-react'
+import { LayoutDashboard, PackageSearch, SlidersHorizontal, Truck, ShoppingCart, TrendingUp } from 'lucide-react'
 import type { AdjustmentMode, DemandWeights } from './sheets-replenishment'
 
 interface DashboardContentProps {
@@ -31,7 +32,7 @@ export function DashboardContent(props: DashboardContentProps) {
   return (
     <div className="space-y-3 animate-in fade-in duration-700">
       <Tabs defaultValue="inventory" className="w-full">
-        <TabsList className="grid w-[1020px] grid-cols-5 mb-2 bg-muted/50 p-1 rounded-xl">
+        <TabsList className="grid w-[1180px] grid-cols-6 mb-2 bg-muted/50 p-1 rounded-xl">
           <TabsTrigger value="inventory" className="gap-2 rounded-lg data-[state=active]:bg-background data-[state=active]:shadow-sm">
             <LayoutDashboard className="w-4 h-4" />
             Inventory Dashboard
@@ -43,6 +44,10 @@ export function DashboardContent(props: DashboardContentProps) {
           <TabsTrigger value="purchase-orders" className="gap-2 rounded-lg data-[state=active]:bg-background data-[state=active]:shadow-sm">
             <ShoppingCart className="w-4 h-4" />
             Purchase Orders
+          </TabsTrigger>
+          <TabsTrigger value="po-tracker" className="gap-2 rounded-lg data-[state=active]:bg-background data-[state=active]:shadow-sm">
+            <PackageSearch className="w-4 h-4" />
+            PO Tracker
           </TabsTrigger>
           <TabsTrigger value="vendors" className="gap-2 rounded-lg data-[state=active]:bg-background data-[state=active]:shadow-sm">
             <Truck className="w-4 h-4" />
@@ -64,6 +69,10 @@ export function DashboardContent(props: DashboardContentProps) {
 
         <TabsContent value="purchase-orders" className="mt-0 border-none p-0 focus-visible:ring-0">
           <PurchaseOrders data={props.data} isLoading={props.isLoading} />
+        </TabsContent>
+
+        <TabsContent value="po-tracker" className="mt-0 border-none p-0 focus-visible:ring-0">
+          <PoTracker />
         </TabsContent>
 
         <TabsContent value="vendors" className="mt-0 border-none p-0 focus-visible:ring-0">

@@ -366,6 +366,86 @@ export function useOpenOrders(vendorId?: string, shopId?: string) {
   return { data: data?.data || [], isLoading, error, refetch: mutate }
 }
 
+// PO Tracker: ordered/partially-received POs triaged against expected arrival.
+// The backend caches the Lightspeed walk for ~5 min; refetch() forces a re-walk.
+export function usePoWatch(orderedWithinDays: number) {
+  const baseUrl = '/backend'
+  const url = `${baseUrl}/api/po/watch?ordered_within_days=${orderedWithinDays}`
+  const { data, error, mutate, isLoading } = useSWR<import('./types').PoWatchResponse>(
+    url, fetcher, adminDashboardSWRConfig
+  )
+  const [isRefreshing, setIsRefreshing] = useState(false)
+  const refetch = async () => {
+    setIsRefreshing(true)
+    try {
+      const fresh = await fetcher(`${url}&force_refresh=true`)
+      await mutate(fresh, { revalidate: false })
+    } finally {
+      setIsRefreshing(false)
+    }
+  }
+  // Plain re-GET (backend cache is fine) — used after ack/unack writes.
+  const revalidate = async () => {
+    const fresh = await fetcher(url)
+    await mutate(fresh, { revalidate: false })
+  }
+  return {
+    orders: data?.orders ?? [],
+    summary: data?.summary,
+    meta: data?.meta,
+    isLoading,
+    isRefreshing,
+    error,
+    refetch,
+    revalidate,
+  }
+}
+
+// Line-level detail for one PO (fetched when a tracker row is expanded).
+export async function fetchPoWatchLines(orderId: string): Promise<import('./types').PoWatchLine[]> {
+  const baseUrl = '/backend'
+  const res = await fetch(`${baseUrl}/api/po/watch/${orderId}/lines`)
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || 'Failed to load PO lines')
+  }
+  const payload = await res.json()
+  return payload?.data?.lines ?? []
+}
+
+// Acknowledge/snooze a late-PO alert. Passing the row's current expected_date pins
+// the ack to it, so an ETA change in Lightspeed re-arms the alert automatically.
+export async function ackPoWatchAlert(input: {
+  order_id: string
+  expected_date: string | null
+  snooze_days?: number | null
+  note?: string
+  acked_by?: string
+}) {
+  const baseUrl = '/backend'
+  const { order_id, ...body } = input
+  const res = await fetch(`${baseUrl}/api/po/watch/${order_id}/ack`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || 'Failed to acknowledge the PO alert')
+  }
+  return res.json()
+}
+
+export async function unackPoWatchAlert(orderId: string) {
+  const baseUrl = '/backend'
+  const res = await fetch(`${baseUrl}/api/po/watch/${orderId}/ack`, { method: 'DELETE' })
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || 'Failed to clear the acknowledgement')
+  }
+  return res.json()
+}
+
 async function planningMutation(path: string, method: 'POST' | 'PATCH', body?: unknown) {
   const baseUrl = '/backend'
   const res = await fetch(`${baseUrl}${path}`, {

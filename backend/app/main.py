@@ -506,19 +506,27 @@ def save_brand_sourcing_rule(rule: Dict[str, Any]):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/forecast/seasonal-profiles")
-def get_seasonal_profiles(years: int = 3, smoothing: float = 0.0, location: str = None):
+def get_seasonal_profiles(
+    years: int = 3, smoothing: float = 0.0, location: str = None, measure: str = "units"
+):
+    measure_columns = {"units": "total_units_sold", "cogs": "total_cogs", "revenue": "total_revenue"}
+    if measure not in measure_columns:
+        raise HTTPException(status_code=400, detail="measure must be units, cogs, or revenue")
     try:
         from app.services.bigquery_sync import fetch_monthly_category_history
         from app.services.forecasting import build_seasonal_profile_response
         df = fetch_monthly_category_history(years=years)
         if location is not None and len(df) and "location_id" in df.columns:
             df = df[df["location_id"].astype(str) == str(location)]
+        if measure != "units":
+            df = df.copy()
+            df["total_units_sold"] = df[measure_columns[measure]]
         records = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
         profiles = build_seasonal_profile_response(records, smoothing=smoothing)
         return {
             "status": "success",
             "data": to_json_safe(profiles),
-            "meta": {"years": years, "category_count": len(profiles), "location": location},
+            "meta": {"years": years, "category_count": len(profiles), "location": location, "measure": measure},
         }
     except Exception as e:
         import traceback
@@ -535,6 +543,7 @@ def get_demand_history(
     horizon_months: int = 12,
     lead_time_days: float = 14.0,
     coverage_days: float = 30.0,
+    measure: str = "units",
 ):
     """Monthly sales history + forward forecast for a category or a single SKU.
 
@@ -544,6 +553,9 @@ def get_demand_history(
     """
     if scope not in ("category", "sku"):
         raise HTTPException(status_code=400, detail="scope must be 'category' or 'sku'")
+    measure_columns = {"units": "total_units_sold", "cogs": "total_cogs", "revenue": "total_revenue"}
+    if measure not in measure_columns:
+        raise HTTPException(status_code=400, detail="measure must be units, cogs, or revenue")
     try:
         from app.services.bigquery_sync import (
             fetch_monthly_category_history,
@@ -575,7 +587,7 @@ def get_demand_history(
             ]
 
         def period_totals(frame):
-            grouped = frame.groupby("month_of_year")["total_units_sold"].sum()
+            grouped = frame.groupby("month_of_year")[measure_columns[measure]].sum()
             return {int(m): float(v) for m, v in grouped.items()}
 
         own_totals = period_totals(rows)
@@ -598,7 +610,7 @@ def get_demand_history(
         history = [
             {"year": int(r.sales_year), "month": int(r.month_of_year), "units": round(float(r.units), 2)}
             for r in (
-                rows.groupby(["sales_year", "month_of_year"])["total_units_sold"].sum()
+                rows.groupby(["sales_year", "month_of_year"])[measure_columns[measure]].sum()
                 .reset_index(name="units")
                 .sort_values(["sales_year", "month_of_year"])
                 .itertuples()
@@ -631,6 +643,7 @@ def get_demand_history(
                 "id": id,
                 "months_observed": months_observed,
                 "reference_month": last_complete_month,
+                "measure": measure,
             },
         }
     except HTTPException:
@@ -747,6 +760,9 @@ def _draft_line_from_recommendation(rec: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "recommendation_id": rec.get("recommendation_id"),
         "sku": rec.get("sku"),
+        "description": rec.get("description"),
+        "brand": rec.get("brand"),
+        "category_top_level": rec.get("category_top_level"),
         "item_id": rec.get("item_id"),
         "location_id": rec.get("location_id"),
         "quantity": _safe_int(rec.get("recommended_quantity")),
@@ -773,6 +789,10 @@ def create_planning_run_endpoint(payload: Dict[str, Any] = None):
             horizon_weeks=_safe_int(payload.get("horizon_weeks"), 52),
             location_ids=payload.get("location_ids"),
             force_refresh=bool(payload.get("force_refresh")),
+            scope_type=payload.get("scope_type") or "auto_replen",
+            scope_value=payload.get("scope_value"),
+            item_ids=payload.get("item_ids"),
+            config=payload.get("config"),
         )
         return {"status": "success", "data": to_json_safe(run)}
     except ValueError as exc:
@@ -781,6 +801,21 @@ def create_planning_run_endpoint(payload: Dict[str, Any] = None):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to create planning run.")
+
+
+@app.get("/api/planning/runs/latest")
+def latest_planning_run_endpoint():
+    _require_planning_v2()
+    from app.services.planning_service import get_latest_planning_run
+    run = get_latest_planning_run()
+    return {"status": "success", "data": to_json_safe(run)}
+
+
+@app.get("/api/planning/models")
+def planning_models_endpoint():
+    _require_planning_v2()
+    from app.services.demand_planning import MODEL_LEGEND
+    return {"status": "success", "data": MODEL_LEGEND}
 
 
 @app.get("/api/planning/runs/{run_id}/recommendations")
@@ -937,6 +972,35 @@ def update_po_draft_v2_endpoint(draft_id: str, payload: Dict[str, Any]):
     except PlanningConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
+
+@app.post("/api/po/drafts/{draft_id}/target-order")
+def set_po_draft_target_endpoint(draft_id: str, payload: Dict[str, Any]):
+    """Persist the buyer's explicit unsent-PO selection; performs no LS write."""
+    try:
+        from app.services.lightspeed_gateway import LiveLightspeedReadGateway
+        from app.services.planning_store import PlanningConflict, get_planning_store
+        target = payload.get("order_id")
+        if target not in (None, "", "new"):
+            draft = get_planning_store().get_draft(draft_id)
+            if not draft:
+                raise HTTPException(status_code=404, detail="Draft not found.")
+            candidates = LiveLightspeedReadGateway().list_purchase_orders(
+                vendor_id=draft["vendor_id"], shop_id=draft["shop_id"]
+            )
+            selected = next((row for row in candidates if str(row.get("order_id")) == str(target)), None)
+            if not selected or selected.get("state") != "unsent":
+                raise HTTPException(status_code=409, detail="The selected Lightspeed PO is no longer eligible.")
+        updated = get_planning_store().set_target_order(
+            draft_id, int(payload["expected_version"]), target
+        )
+        return {"status": "success", "data": to_json_safe(updated)}
+    except HTTPException:
+        raise
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Draft not found or version is missing.")
+    except PlanningConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
 @app.delete("/api/po/draft/{draft_id}")
 def delete_po_draft_endpoint(draft_id: str):
     response = get_po_draft_v2_endpoint(draft_id)
@@ -1001,6 +1065,89 @@ def preview_po_draft_endpoint(draft_id: str):
         raise HTTPException(status_code=503, detail=f"Complete Lightspeed PO snapshot unavailable: {exc}")
     except PlanningConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+# ---------------------------------------------------------------------------
+# PO Tracker: placed-but-unreceived POs triaged against expected arrival dates
+# ---------------------------------------------------------------------------
+
+@app.get("/api/po/watch")
+def get_po_watch(ordered_within_days: int = 300, force_refresh: bool = False):
+    """Ordered/partially-received POs with lateness triage, lead-time context,
+    ack state and a triage summary. ``ordered_within_days`` bounds how far back
+    the orderedDate window reaches (clamped to 1-730)."""
+    try:
+        from app.services.po_watch_service import get_po_watchlist
+        return {"status": "success", **to_json_safe(get_po_watchlist(
+            ordered_within_days=ordered_within_days, force_refresh=force_refresh
+        ))}
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail="Failed to load the PO tracker from Lightspeed.")
+
+
+@app.get("/api/po/watch/{order_id}/lines")
+def get_po_watch_lines(order_id: str):
+    try:
+        from app.services.po_watch_service import get_po_lines
+        detail = get_po_lines(order_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="Purchase order not found.")
+        return {"status": "success", "data": to_json_safe(detail)}
+    except HTTPException:
+        raise
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail="Failed to load PO lines from Lightspeed.")
+
+
+@app.post("/api/po/watch/{order_id}/ack")
+def ack_po_watch_alert(order_id: str, payload: Dict[str, Any] = None):
+    """Acknowledge/snooze a late-PO alert. Body: { acked_by?, note?, snooze_days?,
+    expected_date? }. snooze_days omitted/null = snooze until the expected date
+    changes in Lightspeed or the PO is received."""
+    payload = payload or {}
+    snooze_until = None
+    snooze_days = payload.get("snooze_days")
+    if snooze_days is not None:
+        days = _safe_int(snooze_days)
+        if days <= 0:
+            raise HTTPException(status_code=400, detail="snooze_days must be a positive integer.")
+        from datetime import timedelta, date as _date
+        snooze_until = (_date.today() + timedelta(days=days)).isoformat()
+    from app.services.planning_store import get_planning_store
+    record = get_planning_store().upsert_po_ack(
+        order_id,
+        acked_by=payload.get("acked_by"),
+        note=payload.get("note"),
+        snooze_until=snooze_until,
+        expected_date=payload.get("expected_date") or None,
+    )
+    return {"status": "success", "data": to_json_safe(record)}
+
+
+@app.delete("/api/po/watch/{order_id}/ack")
+def unack_po_watch_alert(order_id: str):
+    from app.services.planning_store import get_planning_store
+    get_planning_store().delete_po_ack(order_id)
+    return {"status": "success"}
+
+
+@app.post("/api/po/watch/slack-digest")
+def trigger_po_watch_digest(payload: Dict[str, Any] = None):
+    """Manually posts the late-PO Slack digest (bypasses the enabled flag and the
+    once-per-day scheduler guard; still requires the webhook env var)."""
+    from app.services.po_watch_service import send_slack_digest
+    return {"status": "success", "data": send_slack_digest(force=True)}
+
+
+@app.on_event("startup")
+def _start_po_watch_scheduler() -> None:
+    if os.getenv("PO_WATCH_SLACK_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"):
+        from app.services.po_watch_service import start_scheduler
+        start_scheduler()
+
 
 @app.get("/api/po/open-orders")
 def list_open_orders(vendor_id: str = None, shop_id: str = None):
