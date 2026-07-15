@@ -257,7 +257,7 @@ function AckMenu({ order, onDone }: { order: PoWatchOrder; onDone: () => Promise
 export function PoTracker() {
   const [windowDays, setWindowDays] = useState(300)
   const [windowInput, setWindowInput] = useState('300')
-  const { orders, summary, meta, isLoading, isRefreshing, error, refetch, revalidate } = usePoWatch(windowDays)
+  const { orders, meta, isLoading, isRefreshing, error, refetch, revalidate } = usePoWatch(windowDays)
 
   const [vendorFilter, setVendorFilter] = useState('all')
   const [shopFilter, setShopFilter] = useState('all')
@@ -282,17 +282,35 @@ export function PoTracker() {
     [orders],
   )
 
+  // Rows surviving every filter EXCEPT the triage-card one. KPI counts come from
+  // this set, so the cards react to the vendor/shop/status/received filters while
+  // clicking one card doesn't zero out the others.
+  const baseFiltered = useMemo(() => orders.filter((o) => {
+    if (vendorFilter !== 'all' && o.vendor_name !== vendorFilter) return false
+    if (shopFilter !== 'all' && o.shop_name !== shopFilter) return false
+    if (statusFilter !== 'all' && o.status !== statusFilter) return false
+    if (hideFullyReceived && o.received_pct >= 100) return false
+    return true
+  }), [orders, vendorFilter, shopFilter, statusFilter, hideFullyReceived])
+
+  const counts = useMemo(() => {
+    const result = {
+      critical: 0, very_late: 0, late: 0, due_soon: 0, no_eta: 0, on_track: 0,
+      alertable: 0, acknowledged: 0, expected_faster_than_median: 0,
+    }
+    for (const o of baseFiltered) {
+      result[o.triage] += 1
+      if (o.alertable) result.alertable += 1
+      if (o.ack?.active) result.acknowledged += 1
+      if (o.flags.includes('expected_faster_than_median')) result.expected_faster_than_median += 1
+    }
+    return result
+  }, [baseFiltered])
+
   const filtered = useMemo(() => {
-    const rows = orders.filter((o) => {
-      if (vendorFilter !== 'all' && o.vendor_name !== vendorFilter) return false
-      if (shopFilter !== 'all' && o.shop_name !== shopFilter) return false
-      if (statusFilter !== 'all' && o.status !== statusFilter) return false
-      if (hideFullyReceived && o.received_pct >= 100) return false
-      if (triageFilter && o.triage !== triageFilter) return false
-      return true
-    })
+    const rows = triageFilter ? baseFiltered.filter((o) => o.triage === triageFilter) : baseFiltered
     return sortOrders(rows, sort.key, sort.dir)
-  }, [orders, vendorFilter, shopFilter, statusFilter, hideFullyReceived, triageFilter, sort])
+  }, [baseFiltered, triageFilter, sort])
 
   const applyWindow = () => {
     const value = Number(windowInput)
@@ -361,19 +379,19 @@ export function PoTracker() {
             >
               <div className="text-xs text-muted-foreground">{meta_.label}</div>
               <div className="text-2xl font-semibold">
-                {summary ? summary[tier] : '—'}
+                {isLoading ? '—' : counts[tier]}
               </div>
             </button>
           )
         })}
       </div>
 
-      {summary && meta && (
+      {!isLoading && meta && (
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <Timer className="h-3.5 w-3.5" />
-          {summary.alertable} PO(s) are ≥{meta.alert_days_late_threshold}d late with nothing received and unacknowledged (Slack-alertable)
-          · {summary.acknowledged} snoozed
-          · {summary.expected_faster_than_median} promised faster than the vendor&apos;s median lead time
+          {counts.alertable} PO(s) are ≥{meta.alert_days_late_threshold}d late with nothing received and unacknowledged (Slack-alertable)
+          · {counts.acknowledged} snoozed
+          · {counts.expected_faster_than_median} promised faster than the vendor&apos;s median lead time
         </div>
       )}
 

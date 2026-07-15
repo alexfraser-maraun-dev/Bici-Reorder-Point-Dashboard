@@ -28,7 +28,7 @@ from app.services.lightspeed_client import LightspeedClient, _to_number
 from app.services.notifications import slack
 from app.services.planning_store import get_planning_store
 
-LIGHTSPEED_PO_URL = "https://us.merchantos.com/?name=purchase.views.order&form_name=view&id={order_id}"
+LIGHTSPEED_PO_URL = "https://us.merchantos.com/?name=purchase.views.purchase&form_name=view&id={order_id}&tab=main"
 
 TRIAGE_ORDER = ["critical", "very_late", "late", "due_soon", "no_eta", "on_track"]
 DUE_SOON_DAYS = 7
