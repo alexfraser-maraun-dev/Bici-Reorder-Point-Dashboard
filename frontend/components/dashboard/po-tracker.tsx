@@ -38,16 +38,19 @@ import {
 
 const money = new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 })
 
-const TRIAGE_META: Record<PoWatchTriage, { label: string; badge: string; card: string }> = {
-  critical: { label: 'Critical (15d+ late)', badge: 'bg-red-600 text-white', card: 'border-red-500/60' },
-  very_late: { label: 'Very late (8–14d)', badge: 'bg-orange-500 text-white', card: 'border-orange-400/60' },
-  late: { label: 'Late (1–7d)', badge: 'bg-amber-400 text-black', card: 'border-amber-300/60' },
-  due_soon: { label: 'Due within 7d', badge: 'bg-sky-500 text-white', card: 'border-sky-400/50' },
-  no_eta: { label: 'No ETA', badge: 'bg-muted text-muted-foreground', card: 'border-muted' },
-  on_track: { label: 'On track', badge: 'bg-emerald-600 text-white', card: 'border-emerald-500/40' },
+// The lateness tiers only ever contain fully-unreceived POs (chase the vendor);
+// anything with receiving progress lands in the single 'receiving' tile (close it out).
+const TRIAGE_META: Record<PoWatchTriage, { label: string; short: string; badge: string; card: string }> = {
+  critical: { label: 'Critical (15d+ late)', short: 'Critical', badge: 'bg-red-600 text-white', card: 'border-red-500/60' },
+  very_late: { label: 'Very late (8–14d)', short: 'Very late', badge: 'bg-orange-500 text-white', card: 'border-orange-400/60' },
+  late: { label: 'Late (1–7d)', short: 'Late', badge: 'bg-amber-400 text-black', card: 'border-amber-300/60' },
+  due_soon: { label: 'Due within 7d', short: 'Due soon', badge: 'bg-sky-500 text-white', card: 'border-sky-400/50' },
+  no_eta: { label: 'No ETA', short: 'No ETA', badge: 'bg-muted text-muted-foreground', card: 'border-muted' },
+  on_track: { label: 'On track', short: 'On track', badge: 'bg-emerald-600 text-white', card: 'border-emerald-500/40' },
+  receiving: { label: 'Receiving in progress', short: 'Receiving', badge: 'bg-violet-500 text-white', card: 'border-violet-400/50' },
 }
 
-const TRIAGE_KEYS: PoWatchTriage[] = ['critical', 'very_late', 'late', 'due_soon', 'no_eta', 'on_track']
+const TRIAGE_KEYS: PoWatchTriage[] = ['critical', 'very_late', 'late', 'due_soon', 'no_eta', 'on_track', 'receiving']
 
 const FLAG_META: Record<string, { label: string; hint: string }> = {
   expected_faster_than_median: {
@@ -231,7 +234,8 @@ function AckMenu({ order, onDone }: { order: PoWatchOrder; onDone: () => Promise
     )
   }
 
-  if (!order.days_late) return null
+  // Only late, fully-unreceived POs can ever Slack-alert, so only they get an Ack.
+  if (!order.days_late || order.triage === 'receiving') return null
 
   return (
     <DropdownMenu>
@@ -295,7 +299,7 @@ export function PoTracker() {
 
   const counts = useMemo(() => {
     const result = {
-      critical: 0, very_late: 0, late: 0, due_soon: 0, no_eta: 0, on_track: 0,
+      critical: 0, very_late: 0, late: 0, due_soon: 0, no_eta: 0, on_track: 0, receiving: 0,
       alertable: 0, acknowledged: 0, expected_faster_than_median: 0,
     }
     for (const o of baseFiltered) {
@@ -366,8 +370,9 @@ export function PoTracker() {
         </div>
       )}
 
-      {/* Triage KPI cards — click to filter */}
-      <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-6">
+      {/* Triage KPI cards — click to filter. Lateness tiers = unreceived POs only;
+          POs with receiving progress are their own bucket at the end. */}
+      <div className="grid gap-2 sm:grid-cols-4 lg:grid-cols-7">
         {TRIAGE_KEYS.map((tier) => {
           const meta_ = TRIAGE_META[tier]
           const active = triageFilter === tier
@@ -484,7 +489,13 @@ export function PoTracker() {
                       <TableCell className="text-sm">
                         {fmtDate(order.expected_date ?? order.effective_expected_date)}
                         {order.expected_source === 'implied' && <span className="ml-1 text-xs text-muted-foreground">(implied)</span>}
-                        {order.days_late != null && <div className="text-xs font-medium text-red-600 dark:text-red-400">{order.days_late}d late</div>}
+                        {order.days_late != null && (
+                          // Red only while nothing has been received — once receiving
+                          // starts, a passed ETA is informational, not an alarm.
+                          <div className={`text-xs ${order.triage === 'receiving' ? 'text-muted-foreground' : 'font-medium text-red-600 dark:text-red-400'}`}>
+                            {order.days_late}d past ETA
+                          </div>
+                        )}
                         {order.days_until_expected != null && <div className="text-xs text-muted-foreground">in {order.days_until_expected}d</div>}
                       </TableCell>
                       <TableCell className="text-right text-sm">{order.units_ordered}</TableCell>
@@ -505,8 +516,7 @@ export function PoTracker() {
                       </TableCell>
                       <TableCell>
                         <div className="flex flex-wrap items-center gap-1">
-                          <Badge className={`${triage.badge} border-transparent`}>{triage.label.split(' (')[0]}</Badge>
-                          {order.status === 'receiving' && <Badge variant="outline" className="text-xs">check-in</Badge>}
+                          <Badge className={`${triage.badge} border-transparent`}>{triage.short}</Badge>
                           <TooltipProvider delayDuration={200}>
                             {order.flags.map((flag) => FLAG_META[flag] && (
                               <Tooltip key={flag}>

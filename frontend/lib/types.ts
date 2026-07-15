@@ -525,7 +525,9 @@ export interface SpecialOrderDashboard {
 // PO Tracker (placed-but-unreceived POs triaged against expected arrival)
 // ---------------------------------------------------------------------------
 
-export type PoWatchTriage = 'critical' | 'very_late' | 'late' | 'due_soon' | 'no_eta' | 'on_track'
+// Lateness tiers apply only to fully-unreceived POs; any receiving progress
+// moves the PO into the single 'receiving' bucket (close-out work).
+export type PoWatchTriage = 'critical' | 'very_late' | 'late' | 'due_soon' | 'no_eta' | 'on_track' | 'receiving'
 export type PoWatchStatus = 'ordered' | 'receiving'
 export type PoWatchFlag =
   | 'no_expected_date'
@@ -583,6 +585,7 @@ export interface PoWatchSummary {
   due_soon: number
   no_eta: number
   on_track: number
+  receiving: number
   alertable: number
   acknowledged: number
   expected_faster_than_median: number

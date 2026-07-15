@@ -11,10 +11,13 @@ Data flow:
     is pinned to the PO's expected date at ack time, so editing the expected
     date in Lightspeed re-arms the alert automatically.
 
-Triage tiers (expected date relative to today):
+Triage tiers (expected date relative to today) apply ONLY to POs with no
+receiving progress — once a first receipt lands the vendor has delivered, so
+the PO leaves the lateness tiers entirely and sits in the separate
+"receiving" bucket (a close-out problem, not a chase-the-vendor problem):
   on_track > 7 days out · due_soon within 7 days · late 1-7 days past ·
   very_late 8-14 · critical 15+ · no_eta when no expected date exists and no
-  median lead time can imply one.
+  median lead time can imply one · receiving = any units received.
 """
 
 import os
@@ -30,7 +33,7 @@ from app.services.planning_store import get_planning_store
 
 LIGHTSPEED_PO_URL = "https://us.merchantos.com/?name=purchase.views.purchase&form_name=view&id={order_id}&tab=main"
 
-TRIAGE_ORDER = ["critical", "very_late", "late", "due_soon", "no_eta", "on_track"]
+TRIAGE_ORDER = ["critical", "very_late", "late", "due_soon", "no_eta", "on_track", "receiving"]
 DUE_SOON_DAYS = 7
 VERY_LATE_AFTER_DAYS = 7   # late -> very_late past this many days late
 CRITICAL_AFTER_DAYS = 14   # very_late -> critical past this many days late
@@ -238,7 +241,9 @@ def _normalize_order(order: Dict[str, Any], employee_names: Dict[str, str],
         "days_since_ordered": days_since_ordered,
         "days_late": days_late,
         "days_until_expected": days_until_expected,
-        "triage": _triage(days_late, days_until_expected),
+        # Lateness tiers are reserved for fully-unreceived POs; anything with
+        # receiving progress is one bucket regardless of its expected date.
+        "triage": "receiving" if receiving else _triage(days_late, days_until_expected),
         "flags": flags,
         "lightspeed_url": LIGHTSPEED_PO_URL.format(order_id=order_id),
     }
