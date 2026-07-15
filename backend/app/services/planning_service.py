@@ -17,6 +17,7 @@ from app.services.demand_planning import (
     ASSUMPTION_VERSION,
     DEFAULT_HORIZON_WEEKS,
     MODEL_VERSION,
+    MODEL_LEGEND,
     build_purchase_recommendation,
     exposure_adjusted_seasonal_profile,
     monthly_rollups,
@@ -31,6 +32,8 @@ _RUN_LOCK = threading.RLock()
 
 def _plain(value: Any) -> Any:
     if value is None:
+        return None
+    if type(value).__name__ in {"NAType", "NaTType"}:
         return None
     try:
         if math.isnan(value):
@@ -132,8 +135,11 @@ def _normalized_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     service = float(source.get("service_quantile") or 0.90)
     if service not in {0.50, 0.80, 0.90, 0.95}:
         raise ValueError("service_quantile must be one of 0.50, 0.80, 0.90 or 0.95")
+    model = str(source.get("model") or "auto").strip().lower()
+    if model not in MODEL_LEGEND:
+        raise ValueError(f"Unsupported forecast model: {model}")
     return {
-        "model": str(source.get("model") or "auto").strip().lower(),
+        "model": model,
         "service_quantile": service,
         "history_years": max(1, min(5, int(source.get("history_years") or 3))),
         "review_period_weeks": max(1, min(26, int(source.get("review_period_weeks") or 4))),
@@ -151,8 +157,10 @@ def _resolve_vendor(
     row: Dict[str, Any], brand_rules: Dict[str, Dict[str, Any]],
     vendor_directory: Dict[str, Dict[str, Any]],
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    if row.get("vendor_id") not in (None, "", "nan"):
-        return str(row["vendor_id"]), row.get("vendor_name") or row.get("vendor"), "item-po-history"
+    raw_vendor_id = row.get("vendor_id")
+    vendor_id_text = "" if raw_vendor_id is None else str(raw_vendor_id).strip().lower()
+    if vendor_id_text not in {"", "nan", "none", "<na>"}:
+        return str(raw_vendor_id), row.get("vendor_name") or row.get("vendor"), "item-po-history"
     brand = str(row.get("brand") or "").strip().casefold()
     rule = next(
         (value for key, value in brand_rules.items() if str(key).strip().casefold() == brand), None
@@ -182,6 +190,7 @@ def create_planning_run(
     scope_value: Optional[str] = None,
     item_ids: Optional[Iterable[str]] = None,
     config: Optional[Dict[str, Any]] = None,
+    persist: bool = True,
 ) -> Dict[str, Any]:
     if not 1 <= int(horizon_weeks) <= 104:
         raise ValueError("horizon_weeks must be between 1 and 104")
@@ -355,7 +364,8 @@ def create_planning_run(
     }
     with _RUN_LOCK:
         _RUNS[run_id] = run
-    get_planning_store().save_planning_run(run)
+    if persist:
+        get_planning_store().save_planning_run(run)
     return run
 
 

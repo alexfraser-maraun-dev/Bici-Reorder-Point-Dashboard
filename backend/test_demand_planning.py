@@ -59,6 +59,10 @@ class ModelSelectionTest(unittest.TestCase):
         self.assertGreater(metrics["bias"], 0)
         self.assertAlmostEqual(metrics["wape"], 0.2)
 
+    def test_buyer_can_force_a_challenger_model(self):
+        selection = select_champion([0, 3] * 30, forced_model="tsb")
+        self.assertEqual(selection["champion"], "tsb")
+
 
 class ProbabilityAndInventoryTest(unittest.TestCase):
     def test_quantiles_are_monotonic(self):
@@ -87,6 +91,12 @@ class ProbabilityAndInventoryTest(unittest.TestCase):
 
     def test_week_start_is_monday(self):
         self.assertEqual(week_start("2026-07-14").isoformat(), "2026-07-13")
+
+    def test_service_target_changes_inventory_math(self):
+        forecast = [{"p50": 2, "p80": 3, "p90": 5, "p95": 8}] * 3
+        p80 = project_inventory_and_order(date(2026, 7, 14), forecast, 0, [], 1, 1, service_quantile=.8)
+        p95 = project_inventory_and_order(date(2026, 7, 14), forecast, 0, [], 1, 1, service_quantile=.95)
+        self.assertGreater(p95["rounded_quantity"], p80["rounded_quantity"])
 
 
 class RecommendationTest(unittest.TestCase):

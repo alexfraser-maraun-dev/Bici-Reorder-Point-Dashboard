@@ -16,6 +16,7 @@ import {
 } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
@@ -38,8 +39,8 @@ const MAX_DEFAULT_SELECTED = 4
 const LOCATIONS = [
   { value: '', label: 'All locations' },
   { value: '3', label: 'Bici Adanac' },
-  { value: '2', label: 'Victoria' },
-  { value: '20', label: 'Langford' },
+  { value: '2', label: 'Bici Victoria' },
+  { value: '20', label: 'Bici Langford' },
 ]
 
 function indexFor(profile: SeasonalProfile, monthNumber: number): number {
@@ -64,7 +65,8 @@ function peakTrough(profile: SeasonalProfile) {
 
 export function DemandInsights() {
   const [location, setLocation] = useState('')
-  const { data, isLoading, error, refetch } = useSeasonalProfiles(location)
+  const [measure, setMeasure] = useState<'units' | 'cogs'>('units')
+  const { data, isLoading, error, refetch } = useSeasonalProfiles(location, measure)
   const [selected, setSelected] = useState<string[] | null>(null)
   // Category the history+forecast chart drills into (click a table row to set it).
   const [focusOverride, setFocusOverride] = useState<string | null>(null)
@@ -102,7 +104,7 @@ export function DemandInsights() {
     (focusOverride && effectiveSelected.includes(focusOverride) ? focusOverride : null) ??
     selectedProfiles[0]?.category_label ??
     null
-  const { data: focusHistory, isLoading: focusLoading } = useDemandHistory('category', focusCategory, location)
+  const { data: focusHistory, isLoading: focusLoading } = useDemandHistory('category', focusCategory, location, measure)
   const focusPayload = focusHistory?.data
   const focusHistoryPoints: DemandHistoryPoint[] = focusPayload?.history ?? []
   const focusForecast: ForecastPoint[] = focusPayload?.forecast ?? []
@@ -128,7 +130,11 @@ export function DemandInsights() {
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <ToggleGroup className="flex flex-wrap gap-1" type="single" value={measure} onValueChange={(value) => value && setMeasure(value as 'units' | 'cogs')}>
+            <ToggleGroupItem className="whitespace-nowrap" value="units">Units</ToggleGroupItem>
+            <ToggleGroupItem className="whitespace-nowrap" value="cogs">COGS</ToggleGroupItem>
+          </ToggleGroup>
           <Select value={location || 'all'} onValueChange={(v) => setLocation(v === 'all' ? '' : v)}>
             <SelectTrigger className="h-9 w-[170px]">
               <MapPin className="mr-1 h-3.5 w-3.5 text-muted-foreground" />
@@ -205,7 +211,7 @@ export function DemandInsights() {
                   <TableHead className="min-w-[160px]">Category <span className="text-muted-foreground font-normal">(click to drill into forecast)</span></TableHead>
                   <TableHead className="text-center">Peak</TableHead>
                   <TableHead className="text-center">Trough</TableHead>
-                  <TableHead className="text-right">Units (3yr)</TableHead>
+                  <TableHead className="text-right">{measure === 'units' ? 'Units' : 'COGS'} (3yr)</TableHead>
                   {MONTH_LABELS.map((label) => (
                     <TableHead key={label} className="text-center text-[10px]">
                       {label}
@@ -247,7 +253,7 @@ export function DemandInsights() {
                           </span>
                         </TableCell>
                         <TableCell className="text-right text-xs tabular-nums">
-                          {profile.sample_units.toLocaleString()}
+                          {measure === 'units' ? profile.sample_units.toLocaleString() : new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 }).format(profile.sample_units)}
                         </TableCell>
                         {MONTH_LABELS.map((label, monthIndex) => {
                           const value = indexFor(profile, monthIndex + 1)
@@ -281,7 +287,7 @@ export function DemandInsights() {
                 {focusCategory} — history &amp; forecast
               </h3>
               <p className="text-muted-foreground mb-3 text-xs">
-                Monthly units sold (bars) with the seasonally-adjusted forward forecast (dashed).
+                Monthly {measure === 'units' ? 'units sold' : 'COGS'} (bars) with the seasonally-adjusted forward forecast (dashed).
                 The shaded band marks the months a PO placed now would cover — buy ahead of the ramp.
               </p>
               <DemandForecastChart
@@ -290,6 +296,7 @@ export function DemandInsights() {
                 leadTimeWindow={focusWindow}
                 referenceMonth={focusReferenceMonth}
                 isLoading={focusLoading}
+                measure={measure}
               />
             </div>
           )}

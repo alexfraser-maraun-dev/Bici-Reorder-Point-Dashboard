@@ -270,18 +270,18 @@ class LightspeedClient:
                 "write flag, a separately supplied approval token, and a shop allowlist."
             )
 
-    def get_open_orders(self, vendor_id: str = None, shop_id: str = None) -> List[Dict[str, Any]]:
+    def get_open_orders(
+        self, vendor_id: str = None, shop_id: str = None, include_lines: bool = True
+    ) -> List[Dict[str, Any]]:
         """
-        Fetches open (incomplete, non-archived) purchase orders with their line
-        items loaded, optionally filtered by vendor and/or shop. Used to reconcile
+        Fetches open (incomplete, non-archived) purchase orders, optionally with
+        line relations and optionally filtered by vendor and/or shop. Used to reconcile
         suggested buys against POs that already exist so we don't create duplicates.
         Returns a list of Order dicts, each with a normalized "OrderLine" list.
         """
-        params = {
-            "complete": "false",
-            "archived": "false",
-            "load_relations": '["OrderLines"]',
-        }
+        params = {"complete": "false", "archived": "false"}
+        if include_lines:
+            params["load_relations"] = '["OrderLines"]'
         if vendor_id is not None:
             params["vendorID"] = str(vendor_id)
         if shop_id is not None:
@@ -311,7 +311,7 @@ class LightspeedClient:
             response = self._request_absolute("GET", next_url)
 
         for order in orders:
-            lines = order.get("OrderLines", {}).get("OrderLine", [])
+            lines = order.get("OrderLines", {}).get("OrderLine", []) if include_lines else []
             if isinstance(lines, dict):
                 lines = [lines]
             order["OrderLine"] = lines
@@ -675,8 +675,11 @@ class LightspeedClient:
         for item in self._as_list(response.json().get("Item")):
             item_id = str(item.get("itemID"))
             out[item_id] = {
+                # systemSku is the canonical auto-generated id (210000...); customSku
+                # is free-typed and often holds junk (vendor ids, prices), so it is
+                # only a fallback.
+                "sku": item.get("systemSku") or item.get("customSku"),
                 "description": item.get("description"),
-                "sku": item.get("customSku") or item.get("systemSku"),
             }
         return out
 

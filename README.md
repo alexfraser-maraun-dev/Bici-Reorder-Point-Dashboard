@@ -26,7 +26,18 @@ run a live test.
 
 Transactional PO drafts and planner overrides use Postgres when `DATABASE_URL` is a
 Postgres URL. SQLite is a local/test fallback. BigQuery remains the analytical source
-for demand history and inventory snapshots.
+for demand history and inventory snapshots. Completed interactive planning runs are
+also retained in Postgres so tab navigation does not lose them; retention is bounded
+to the latest 12 unreferenced runs plus runs attached to active drafts, making the
+1 GB Render database suitable for the current rollout.
+
+The advanced weekly planner can explicitly evaluate the safe `auto-replen` population,
+one brand, one vendor, one top-level category, or a supplied list of SKUs/item IDs.
+It reads dated on-order supply from `v_po_current_lines`; the paginated Lightspeed
+read gateway remains necessary to list empty unsent POs for buyer routing. The
+workbench shares one complete paginated Lightspeed PO header snapshot across
+vendor/shop selectors (five-minute default TTL) while Reconcile and Preview always
+perform a fresh vendor/shop read with line relations.
 
 ## Current Architecture
 
@@ -38,9 +49,9 @@ for demand history and inventory snapshots.
 
 2. **FastAPI backend calculates recommendations.**
    - Reads qualified `auto-replen` items from BigQuery.
-   - Limits rows to shop IDs `2`, `3`, and `20`: Victoria, Bici Adanac, and Langford.
+   - Limits rows to shop IDs `2`, `3`, and `20`: Bici Victoria, Bici Adanac, and Bici Langford.
    - Calculates guarded stockout-adjusted weighted velocity, safety stock, reorder points, desired levels, and suggested order quantity.
-   - Pushes approved values back to Lightspeed using the `ItemShop` API.
+   - Retains the legacy ROP/DL calculation as a secondary, independently gated workflow.
 
 3. **Next.js frontend is the review surface.**
    - Displays raw and adjusted 14d/30d/60d demand in the same columns.
@@ -68,9 +79,9 @@ The backend joins that qualified item list to the latest master snapshot view, r
 The app only cares about these Lightspeed shop IDs:
 
 ```text
-2  = Victoria
+2  = Bici Victoria
 3  = Bici Adanac
-20 = Langford
+20 = Bici Langford
 ```
 
 Rows from other shops are ignored.
@@ -249,6 +260,7 @@ Useful optional backend variables:
 APP_DATASET
 LS_DATASET
 QUALIFIED_ITEMS_VIEW
+LS_PO_SNAPSHOT_TTL_SECONDS
 ```
 
 The frontend requires:

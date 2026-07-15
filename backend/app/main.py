@@ -977,7 +977,7 @@ def update_po_draft_v2_endpoint(draft_id: str, payload: Dict[str, Any]):
 def set_po_draft_target_endpoint(draft_id: str, payload: Dict[str, Any]):
     """Persist the buyer's explicit unsent-PO selection; performs no LS write."""
     try:
-        from app.services.lightspeed_gateway import LiveLightspeedReadGateway
+        from app.services.lightspeed_gateway import LiveLightspeedReadGateway, LightspeedReadError
         from app.services.planning_store import PlanningConflict, get_planning_store
         target = payload.get("order_id")
         if target not in (None, "", "new"):
@@ -987,8 +987,8 @@ def set_po_draft_target_endpoint(draft_id: str, payload: Dict[str, Any]):
             candidates = LiveLightspeedReadGateway().list_purchase_orders(
                 vendor_id=draft["vendor_id"], shop_id=draft["shop_id"]
             )
-            selected = next((row for row in candidates if str(row.get("order_id")) == str(target)), None)
-            if not selected or selected.get("state") != "unsent":
+            selected = next((row for row in candidates if str(row.get("orderID")) == str(target)), None)
+            if not selected or selected.get("po_state") != "unsent":
                 raise HTTPException(status_code=409, detail="The selected Lightspeed PO is no longer eligible.")
         updated = get_planning_store().set_target_order(
             draft_id, int(payload["expected_version"]), target
@@ -1000,6 +1000,8 @@ def set_po_draft_target_endpoint(draft_id: str, payload: Dict[str, Any]):
         raise HTTPException(status_code=404, detail="Draft not found or version is missing.")
     except PlanningConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except LightspeedReadError as exc:
+        raise HTTPException(status_code=503, detail=f"Complete Lightspeed PO snapshot unavailable: {exc}")
 
 @app.delete("/api/po/draft/{draft_id}")
 def delete_po_draft_endpoint(draft_id: str):
@@ -1149,14 +1151,48 @@ def _start_po_watch_scheduler() -> None:
         start_scheduler()
 
 
-@app.get("/api/po/open-orders")
-def list_open_orders(vendor_id: str = None, shop_id: str = None):
-    """Lists incomplete POs and normalized states using GET requests only."""
+def _warm_po_snapshot_cache() -> None:
+    """Populate the read-only PO header cache before the buyer opens a draft."""
     try:
-        from app.services.lightspeed_gateway import LiveLightspeedReadGateway
-        orders = LiveLightspeedReadGateway().list_purchase_orders(vendor_id=vendor_id, shop_id=shop_id)
-        return {"status": "success", "data": to_json_safe(orders)}
-    except Exception as e:
+        from app.services.po_snapshot_service import get_po_snapshot_cache
+        result = get_po_snapshot_cache().get_orders()
+        print(
+            f"Warmed complete Lightspeed PO header snapshot: "
+            f"{result['meta']['total_order_count']} orders."
+        )
+    except Exception as exc:
+        # The endpoint remains fail-closed and will retry on demand. Startup must
+        # not fail merely because an external read is temporarily unavailable.
+        print(f"Lightspeed PO snapshot warm-up failed: {exc}")
+
+
+@app.on_event("startup")
+def _warm_po_snapshot_cache_on_startup() -> None:
+    threading.Thread(target=_warm_po_snapshot_cache, daemon=True).start()
+
+
+@app.get("/api/po/open-orders")
+def list_open_orders(
+    vendor_id: str = None, shop_id: str = None, refresh: bool = False
+):
+    """Filter one complete shared Lightspeed PO snapshot for the workbench."""
+    try:
+        from app.services.lightspeed_gateway import LightspeedReadError
+        from app.services.po_snapshot_service import get_po_snapshot_cache
+        result = get_po_snapshot_cache().get_orders(
+            vendor_id=vendor_id, shop_id=shop_id, force_refresh=refresh
+        )
+        return {
+            "status": "success",
+            "data": to_json_safe(result["orders"]),
+            "meta": to_json_safe(result["meta"]),
+        }
+    except LightspeedReadError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Complete Lightspeed PO snapshot unavailable: {exc}",
+        )
+    except Exception:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to fetch open orders.")

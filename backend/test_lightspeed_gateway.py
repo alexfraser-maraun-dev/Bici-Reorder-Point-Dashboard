@@ -50,6 +50,18 @@ class LightspeedSafetyTest(unittest.TestCase):
 
 
 class PaginationTest(unittest.TestCase):
+    def test_header_snapshot_omits_order_line_relations(self):
+        client = LightspeedClient()
+        response = _Response({"@attributes": {"next": ""}, "Order": [{
+            "orderID": "1", "complete": "false", "archived": "false",
+            "orderedDate": None,
+        }]})
+        with patch.object(client, "_request", return_value=response) as request:
+            orders = client.get_open_orders(include_lines=False)
+        self.assertNotIn("load_relations", request.call_args.kwargs["params"])
+        self.assertEqual(orders[0]["OrderLine"], [])
+        self.assertEqual(orders[0]["po_state"], "unsent")
+
     def test_loads_every_cursor_page_and_classifies_orders(self):
         client = LightspeedClient()
         first = _Response({

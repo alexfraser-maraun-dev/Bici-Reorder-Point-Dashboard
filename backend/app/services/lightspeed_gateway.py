@@ -20,7 +20,8 @@ class LightspeedGateway(Protocol):
     shop_id_map: Dict[str, str]
 
     def list_purchase_orders(
-        self, vendor_id: Optional[str] = None, shop_id: Optional[str] = None
+        self, vendor_id: Optional[str] = None, shop_id: Optional[str] = None,
+        include_lines: bool = True,
     ) -> List[Dict[str, Any]]: ...
 
     def create_unsent_order(self, vendor_id: str, shop_id: str) -> Dict[str, Any]: ...
@@ -40,9 +41,12 @@ class LiveLightspeedReadGateway:
         self.shop_id_map = self.client.shop_id_map
 
     def list_purchase_orders(
-        self, vendor_id: Optional[str] = None, shop_id: Optional[str] = None
+        self, vendor_id: Optional[str] = None, shop_id: Optional[str] = None,
+        include_lines: bool = True,
     ) -> List[Dict[str, Any]]:
-        return self.client.get_open_orders(vendor_id=vendor_id, shop_id=shop_id)
+        return self.client.get_open_orders(
+            vendor_id=vendor_id, shop_id=shop_id, include_lines=include_lines
+        )
 
 
 class LiveLightspeedWriteGateway(LiveLightspeedReadGateway):
@@ -95,7 +99,8 @@ class FakeLightspeedGateway:
         order["po_state"] = LightspeedClient.classify_purchase_order(order)
 
     def list_purchase_orders(
-        self, vendor_id: Optional[str] = None, shop_id: Optional[str] = None
+        self, vendor_id: Optional[str] = None, shop_id: Optional[str] = None,
+        include_lines: bool = True,
     ) -> List[Dict[str, Any]]:
         result = []
         for order in self.orders:
@@ -103,7 +108,10 @@ class FakeLightspeedGateway:
                 continue
             if shop_id is not None and str(order.get("shopID")) != str(shop_id):
                 continue
-            result.append(deepcopy(order))
+            copied = deepcopy(order)
+            if not include_lines:
+                copied["OrderLine"] = []
+            result.append(copied)
         return result
 
     def create_unsent_order(self, vendor_id: str, shop_id: str) -> Dict[str, Any]:

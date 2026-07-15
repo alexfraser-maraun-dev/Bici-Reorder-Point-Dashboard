@@ -10,8 +10,9 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Switch } from '@/components/ui/switch'
+import { Label } from '@/components/ui/label'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   DropdownMenu,
@@ -24,6 +25,9 @@ import {
 import {
   AlarmClock,
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   BellOff,
   ChevronDown,
   ChevronRight,
@@ -74,6 +78,63 @@ const FLAG_META: Record<string, { label: string; hint: string }> = {
 
 function fmtDate(value: string | null | undefined) {
   return value || '—'
+}
+
+// Column sorting. 'severity' is the backend's default order (worst first).
+type SortKey =
+  | 'severity' | 'order_id' | 'vendor' | 'shop' | 'created' | 'ordered'
+  | 'expected' | 'units' | 'cost' | 'received' | 'lead_time'
+
+const SORT_VALUE: Record<Exclude<SortKey, 'severity'>, (o: PoWatchOrder) => number | string | null> = {
+  order_id: (o) => Number(o.order_id),
+  vendor: (o) => o.vendor_name.toLowerCase(),
+  shop: (o) => o.shop_name.toLowerCase(),
+  created: (o) => o.created_date,
+  ordered: (o) => o.ordered_date,
+  // Sort the Expected column by urgency: most-late first when descending.
+  expected: (o) => (o.days_late != null ? o.days_late : o.days_until_expected != null ? -o.days_until_expected : null),
+  units: (o) => o.units_ordered,
+  cost: (o) => o.cost_ordered,
+  received: (o) => o.received_pct,
+  lead_time: (o) => o.median_lead_time_days,
+}
+
+function sortOrders(orders: PoWatchOrder[], key: SortKey, dir: 1 | -1): PoWatchOrder[] {
+  if (key === 'severity') return dir === 1 ? orders : [...orders].reverse()
+  const value = SORT_VALUE[key]
+  return [...orders].sort((a, b) => {
+    const va = value(a)
+    const vb = value(b)
+    if (va == null && vb == null) return 0
+    if (va == null) return 1 // nulls always last, regardless of direction
+    if (vb == null) return -1
+    if (va < vb) return -dir
+    if (va > vb) return dir
+    return 0
+  })
+}
+
+function SortableHead({ label, sortKey, sort, onSort, className }: {
+  label: string
+  sortKey: SortKey
+  sort: { key: SortKey; dir: 1 | -1 }
+  onSort: (key: SortKey) => void
+  className?: string
+}) {
+  const active = sort.key === sortKey
+  const Icon = !active ? ArrowUpDown : sort.dir === 1 ? ArrowUp : ArrowDown
+  return (
+    <TableHead className={className}>
+      <button
+        type="button"
+        onClick={() => onSort(sortKey)}
+        className={`inline-flex items-center gap-1 hover:text-foreground ${active ? 'text-foreground' : ''}`}
+      >
+        {label}
+        <Icon className={`h-3 w-3 ${active ? '' : 'opacity-40'}`} />
+      </button>
+    </TableHead>
+  )
 }
 
 function LinesPanel({ orderId }: { orderId: string }) {
@@ -201,8 +262,16 @@ export function PoTracker() {
   const [vendorFilter, setVendorFilter] = useState('all')
   const [shopFilter, setShopFilter] = useState('all')
   const [statusFilter, setStatusFilter] = useState('all')
+  const [hideFullyReceived, setHideFullyReceived] = useState(false)
   const [triageFilter, setTriageFilter] = useState<PoWatchTriage | null>(null)
+  const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: 'severity', dir: 1 })
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+
+  const toggleSort = (key: SortKey) => {
+    setSort((current) => current.key === key
+      ? { key, dir: current.dir === 1 ? -1 : 1 }
+      : { key, dir: key === 'severity' ? 1 : -1 }) // value columns start descending
+  }
 
   const vendors = useMemo(
     () => [...new Set(orders.map((o) => o.vendor_name))].sort((a, b) => a.localeCompare(b)),
@@ -213,13 +282,17 @@ export function PoTracker() {
     [orders],
   )
 
-  const filtered = useMemo(() => orders.filter((o) => {
-    if (vendorFilter !== 'all' && o.vendor_name !== vendorFilter) return false
-    if (shopFilter !== 'all' && o.shop_name !== shopFilter) return false
-    if (statusFilter !== 'all' && o.status !== statusFilter) return false
-    if (triageFilter && o.triage !== triageFilter) return false
-    return true
-  }), [orders, vendorFilter, shopFilter, statusFilter, triageFilter])
+  const filtered = useMemo(() => {
+    const rows = orders.filter((o) => {
+      if (vendorFilter !== 'all' && o.vendor_name !== vendorFilter) return false
+      if (shopFilter !== 'all' && o.shop_name !== shopFilter) return false
+      if (statusFilter !== 'all' && o.status !== statusFilter) return false
+      if (hideFullyReceived && o.received_pct >= 100) return false
+      if (triageFilter && o.triage !== triageFilter) return false
+      return true
+    })
+    return sortOrders(rows, sort.key, sort.dir)
+  }, [orders, vendorFilter, shopFilter, statusFilter, hideFullyReceived, triageFilter, sort])
 
   const applyWindow = () => {
     const value = Number(windowInput)
@@ -298,7 +371,7 @@ export function PoTracker() {
       {summary && meta && (
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <Timer className="h-3.5 w-3.5" />
-          {summary.alertable} PO(s) are ≥{meta.alert_days_late_threshold}d late and unacknowledged (Slack-alertable)
+          {summary.alertable} PO(s) are ≥{meta.alert_days_late_threshold}d late with nothing received and unacknowledged (Slack-alertable)
           · {summary.acknowledged} snoozed
           · {summary.expected_faster_than_median} promised faster than the vendor&apos;s median lead time
         </div>
@@ -320,14 +393,23 @@ export function PoTracker() {
             {shops.map((shop) => <SelectItem key={shop} value={shop}>{shop}</SelectItem>)}
           </SelectContent>
         </Select>
-        <ToggleGroup type="single" value={statusFilter} onValueChange={(value) => setStatusFilter(value || 'all')}>
-          <ToggleGroupItem value="all" className="h-8 text-xs">All</ToggleGroupItem>
-          <ToggleGroupItem value="ordered" className="h-8 text-xs">Ordered</ToggleGroupItem>
-          <ToggleGroupItem value="receiving" className="h-8 text-xs">Check-in started</ToggleGroupItem>
-        </ToggleGroup>
-        {(vendorFilter !== 'all' || shopFilter !== 'all' || statusFilter !== 'all' || triageFilter) && (
+        <Select value={statusFilter} onValueChange={setStatusFilter}>
+          <SelectTrigger className="h-8 w-44"><SelectValue placeholder="Status" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All statuses</SelectItem>
+            <SelectItem value="ordered">Ordered</SelectItem>
+            <SelectItem value="receiving">Check-in started</SelectItem>
+          </SelectContent>
+        </Select>
+        <div className="flex items-center gap-2 rounded-md border px-2.5 py-1.5">
+          <Switch id="hide-received" checked={hideFullyReceived} onCheckedChange={setHideFullyReceived} />
+          <Label htmlFor="hide-received" className="cursor-pointer text-xs font-normal text-muted-foreground">
+            Hide fully received
+          </Label>
+        </div>
+        {(vendorFilter !== 'all' || shopFilter !== 'all' || statusFilter !== 'all' || hideFullyReceived || triageFilter) && (
           <Button size="sm" variant="ghost" className="h-8 text-xs" onClick={() => {
-            setVendorFilter('all'); setShopFilter('all'); setStatusFilter('all'); setTriageFilter(null)
+            setVendorFilter('all'); setShopFilter('all'); setStatusFilter('all'); setHideFullyReceived(false); setTriageFilter(null)
           }}>Clear filters ({filtered.length} shown)</Button>
         )}
       </div>
@@ -342,17 +424,17 @@ export function PoTracker() {
           <Table>
             <TableHeader><TableRow className="text-xs">
               <TableHead className="w-8" />
-              <TableHead>PO</TableHead>
-              <TableHead>Vendor</TableHead>
-              <TableHead>Shop</TableHead>
-              <TableHead>Created</TableHead>
-              <TableHead>Ordered</TableHead>
-              <TableHead>Expected</TableHead>
-              <TableHead className="text-right">Units</TableHead>
-              <TableHead className="text-right">Cost</TableHead>
-              <TableHead className="w-32">Received</TableHead>
-              <TableHead>Lead time</TableHead>
-              <TableHead>Status</TableHead>
+              <SortableHead label="PO" sortKey="order_id" sort={sort} onSort={toggleSort} />
+              <SortableHead label="Vendor" sortKey="vendor" sort={sort} onSort={toggleSort} />
+              <SortableHead label="Shop" sortKey="shop" sort={sort} onSort={toggleSort} />
+              <SortableHead label="Created" sortKey="created" sort={sort} onSort={toggleSort} />
+              <SortableHead label="Ordered" sortKey="ordered" sort={sort} onSort={toggleSort} />
+              <SortableHead label="Expected" sortKey="expected" sort={sort} onSort={toggleSort} />
+              <SortableHead label="Units" sortKey="units" sort={sort} onSort={toggleSort} className="text-right" />
+              <SortableHead label="Cost" sortKey="cost" sort={sort} onSort={toggleSort} className="text-right" />
+              <SortableHead label="Received" sortKey="received" sort={sort} onSort={toggleSort} className="w-32" />
+              <SortableHead label="Lead time" sortKey="lead_time" sort={sort} onSort={toggleSort} />
+              <SortableHead label="Status" sortKey="severity" sort={sort} onSort={toggleSort} />
               <TableHead className="w-28" />
             </TableRow></TableHeader>
             <TableBody>

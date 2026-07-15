@@ -311,7 +311,15 @@ def get_po_watchlist(ordered_within_days: int = 300, force_refresh: bool = False
             "snooze_until": ack.get("snooze_until"),
             "active": active,
         } if ack else None
-        order["alertable"] = bool((order.get("days_late") or 0) >= threshold and not active)
+        # Slack-alertable = late AND nothing received yet AND not snoozed. Once a
+        # first receipt lands the vendor has delivered (that moment IS the lead
+        # time), so partially/fully received POs never page the channel — they
+        # remain visible in the tracker for close-out instead.
+        order["alertable"] = bool(
+            (order.get("days_late") or 0) >= threshold
+            and order.get("status") == "ordered"
+            and not active
+        )
         summary[order["triage"]] += 1
         summary["alertable"] += 1 if order["alertable"] else 0
         summary["acknowledged"] += 1 if active else 0
@@ -368,46 +376,82 @@ def slack_config() -> Dict[str, Any]:
     }
 
 
-def _digest_line(order: Dict[str, Any]) -> str:
-    pct = f" · {order['received_pct']:.0f}% received" if order["received_pct"] else ""
-    implied = " (implied ETA)" if order.get("expected_source") == "implied" else ""
-    return (
-        f"*<{order['lightspeed_url']}|PO #{order['order_id']}>* — {order['vendor_name']} → {order['shop_name']}: "
-        f"*{order['days_late']}d late*{implied} · expected {order['effective_expected_date']} · "
-        f"${order['cost_ordered']:,.0f}{pct}"
+# One color-barred attachment per PO — Slack's closest equivalent to a bordered
+# card. Bar color tracks the triage tier.
+_TIER_COLORS = {"critical": "#d21f3c", "very_late": "#e8912d", "late": "#f2c744"}
+
+
+def _fmt_slack_date(iso: Optional[str]) -> str:
+    if not iso:
+        return "—"
+    try:
+        parsed = datetime.strptime(iso, "%Y-%m-%d")
+    except ValueError:
+        return iso
+    day = parsed.strftime("%d").lstrip("0")
+    return f"{parsed.strftime('%b')} {day}, {parsed.strftime('%Y')}"
+
+
+def _po_attachment(order: Dict[str, Any]) -> Dict[str, Any]:
+    implied = " _(implied from median lead time)_" if order.get("expected_source") == "implied" else ""
+    title = (
+        f"*<{order['lightspeed_url']}|PO #{order['order_id']}>*  ·  "
+        f"{order['vendor_name']}  →  {order['shop_name']}"
     )
+    detail = (
+        f"*{order['days_late']:,} days late* — expected {_fmt_slack_date(order['effective_expected_date'])}{implied}\n"
+        f"${order['cost_ordered']:,.0f} on order ({order['units_ordered']} units) · "
+        f"placed {_fmt_slack_date(order['ordered_date'])}"
+        + (f" · by {order['created_by']}" if order.get("created_by") else "")
+    )
+    if "expected_before_ordered" in order["flags"]:
+        detail += "\n⚠️ _The expected date predates the ordered date — likely stale; fix the ETA in Lightspeed._"
+    return {
+        "color": _TIER_COLORS.get(order["triage"], "#f2c744"),
+        "fallback": f"PO #{order['order_id']} — {order['vendor_name']}: {order['days_late']}d late",
+        "blocks": [slack.section(f"{title}\n{detail}")],
+    }
 
 
 def build_slack_digest(ordered_within_days: int) -> Dict[str, Any]:
-    """Returns {text, blocks, alertable_count}; empty blocks when nothing to send."""
+    """Returns {text, blocks, attachments, alertable_count}; empty when nothing to send."""
     watchlist = get_po_watchlist(ordered_within_days=ordered_within_days)
     late = [o for o in watchlist["orders"] if o["alertable"]]
     threshold = watchlist["meta"]["alert_days_late_threshold"]
     if not late:
-        return {"text": None, "blocks": None, "alertable_count": 0}
+        return {"text": None, "blocks": None, "attachments": None, "alertable_count": 0}
 
     config = slack_config()
     late.sort(key=lambda o: -(o["days_late"] or 0))
     shown = late[: config["max_lines"]]
-    body_lines = [_digest_line(order) for order in shown]
-    if len(late) > len(shown):
-        body_lines.append(f"…and {len(late) - len(shown)} more late PO(s) in the tracker.")
-
+    total_value = sum(o["cost_ordered"] or 0 for o in late)
     acked = watchlist["summary"]["acknowledged"]
-    footer = (
-        f"{len(late)} unacknowledged PO(s) ≥{threshold} day(s) past their expected date"
-        + (f" · {acked} acknowledged (snoozed)" if acked else "")
-        + ". Acknowledge in the PO Tracker tab to stop these pings."
-    )
+
     blocks = [
-        slack.header(f"🚚 {len(late)} late purchase order(s)"),
-        slack.section("\n".join(body_lines)),
-        slack.divider(),
-        slack.section(footer),
+        slack.header(f"🚚 {len(late)} overdue purchase order{'s' if len(late) != 1 else ''}"),
+        slack.context(
+            f"Unreceived POs ≥{threshold} day(s) past their expected date · "
+            f"${total_value:,.0f} outstanding"
+            + (f" · {acked} snoozed" if acked else "")
+        ),
     ]
+    attachments = [_po_attachment(order) for order in shown]
+
+    footer_lines = []
+    if len(late) > len(shown):
+        footer_lines.append(f"…plus *{len(late) - len(shown)} more* overdue PO(s) not shown here.")
+    footer_lines.append("_Review and acknowledge in the PO Tracker tab to stop these pings; "
+                        "an acknowledged PO stays silent until its expected date changes or its snooze expires._")
+    attachments.append({
+        "color": "#a3a3a3",
+        "fallback": "Review in the PO Tracker tab.",
+        "blocks": [slack.context("\n".join(footer_lines))],
+    })
+
     return {
-        "text": f"{len(late)} purchase order(s) are {threshold}+ days past their expected date",
+        "text": f"{len(late)} unreceived purchase order(s) are {threshold}+ days past their expected date",
         "blocks": blocks,
+        "attachments": attachments,
         "alertable_count": len(late),
     }
 
@@ -422,7 +466,12 @@ def send_slack_digest(force: bool = False) -> Dict[str, Any]:
     digest = build_slack_digest(config["ordered_within_days"])
     if not digest["alertable_count"]:
         return {"sent": False, "reason": "no alertable POs", "alertable_count": 0}
-    ok = slack.post(config["webhook_url"], text=digest["text"], blocks=digest["blocks"])
+    ok = slack.post(
+        config["webhook_url"],
+        text=digest["text"],
+        blocks=digest["blocks"],
+        attachments=digest["attachments"],
+    )
     return {"sent": ok, "alertable_count": digest["alertable_count"]}
 
 

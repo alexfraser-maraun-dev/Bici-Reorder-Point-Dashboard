@@ -75,6 +75,30 @@ class PlanningApiContractTests(unittest.TestCase):
             })
         self.assertEqual(raised.exception.status_code, 409)
 
+    def test_latest_run_survives_in_memory_cache_clear(self):
+        run = self._run()
+        clear_run_cache()
+        restored = main.latest_planning_run_endpoint()["data"]
+        self.assertEqual(restored["run_id"], run["run_id"])
+
+    def test_buyer_can_choose_an_eligible_unsent_target(self):
+        run = self._run()
+        rec = run["recommendations"][0]
+        draft = main.create_po_drafts_endpoint({
+            "run_id": run["run_id"], "recommendation_ids": [rec["recommendation_id"]],
+        })["data"][0]
+        fake = FakeLightspeedGateway([{
+            "orderID": "16192", "vendorID": "55", "shopID": "3",
+            "complete": "false", "archived": "false", "orderedDate": None,
+            "OrderLine": [],
+        }])
+        with patch("app.services.lightspeed_gateway.LiveLightspeedReadGateway", return_value=fake):
+            routed = main.set_po_draft_target_endpoint(draft["draft_id"], {
+                "expected_version": draft["version"], "order_id": "16192",
+            })["data"]
+        self.assertEqual(routed["lightspeed_order_id"], "16192")
+        self.assertEqual(routed["lines"][0]["reconciliation"], "append_to_open_po")
+
     def test_every_push_route_fails_closed(self):
         for endpoint in (main.push_po_draft_endpoint, main.push_po_draft_v2_endpoint):
             with self.assertRaises(HTTPException) as raised:

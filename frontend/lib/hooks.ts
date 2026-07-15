@@ -206,12 +206,13 @@ export function useBrandSourcingRules() {
 }
 
 // Demand & Seasonality: category seasonal profiles for the visualization layer.
-export function useSeasonalProfiles(location?: string | number | null) {
+export function useSeasonalProfiles(location?: string | number | null, measure: 'units' | 'cogs' | 'revenue' = 'units') {
   const baseUrl = '/backend'
   const params = new URLSearchParams()
   if (location !== undefined && location !== null && location !== '') {
     params.set('location', String(location))
   }
+  params.set('measure', measure)
   const qs = params.toString()
   const url = `${baseUrl}/api/forecast/seasonal-profiles${qs ? `?${qs}` : ''}`
   const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
@@ -225,6 +226,7 @@ export function useDemandHistory(
   scope: 'category' | 'sku',
   id: string | null,
   location?: string | number | null,
+  measure: 'units' | 'cogs' | 'revenue' = 'units',
 ) {
   const baseUrl = '/backend'
   let url: string | null = null
@@ -233,6 +235,7 @@ export function useDemandHistory(
     if (location !== undefined && location !== null && location !== '') {
       params.set('location', String(location))
     }
+    params.set('measure', measure)
     url = `${baseUrl}/api/forecast/history?${params.toString()}`
   }
   const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
@@ -354,16 +357,45 @@ export function useLightspeedPoAccess() {
   return { poAccess: data?.poAccess ?? null, isLoading, refetch: mutate }
 }
 
-// Lists open (unsent) Lightspeed POs.
+// Filters the backend's shared complete Lightspeed PO snapshot by vendor/shop.
 export function useOpenOrders(vendorId?: string, shopId?: string) {
   const baseUrl = '/backend'
+  const poFetcher = async (requestUrl: string) => {
+    const response = await fetch(requestUrl)
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null)
+      throw new Error(payload?.detail || 'Complete Lightspeed PO snapshot unavailable')
+    }
+    return response.json()
+  }
   const params = new URLSearchParams()
   if (vendorId) params.set('vendor_id', vendorId)
   if (shopId) params.set('shop_id', shopId)
   const qs = params.toString()
   const url = `${baseUrl}/api/po/open-orders${qs ? `?${qs}` : ''}`
-  const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
-  return { data: data?.data || [], isLoading, error, refetch: mutate }
+  const { data, error, mutate, isLoading } = useSWR(url, poFetcher, adminDashboardSWRConfig)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+  const refetch = async (forceRefresh: boolean = false) => {
+    setIsRefreshing(true)
+    try {
+      const refreshUrl = forceRefresh
+        ? `${url}${url.includes('?') ? '&' : '?'}refresh=true`
+        : url
+      const fresh = await poFetcher(refreshUrl)
+      await mutate(fresh, { revalidate: false })
+      return fresh
+    } finally {
+      setIsRefreshing(false)
+    }
+  }
+  return {
+    data: data?.data || [],
+    meta: data?.meta || null,
+    isLoading,
+    isRefreshing,
+    error,
+    refetch,
+  }
 }
 
 // PO Tracker: ordered/partially-received POs triaged against expected arrival.
@@ -461,8 +493,28 @@ async function planningMutation(path: string, method: 'POST' | 'PATCH', body?: u
   return res.json()
 }
 
-export function createPlanningRun(input: { horizon_weeks?: number; location_ids?: string[] } = {}) {
+export function createPlanningRun(input: {
+  horizon_weeks?: number
+  location_ids?: string[]
+  scope_type?: import('./types').PlanningScope
+  scope_value?: string
+  item_ids?: string[]
+  config?: Partial<import('./types').PlanningConfig>
+} = {}) {
   return planningMutation('/api/planning/runs', 'POST', input)
+}
+
+export function useLatestPlanningRun() {
+  const baseUrl = '/backend'
+  const url = `${baseUrl}/api/planning/runs/latest`
+  const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
+  return { data: data?.data || null, isLoading, error, refetch: mutate }
+}
+
+export function usePlanningModels() {
+  const baseUrl = '/backend'
+  const { data, error, isLoading } = useSWR(`${baseUrl}/api/planning/models`, fetcher, adminDashboardSWRConfig)
+  return { data: data?.data || {}, isLoading, error }
 }
 
 export function createPODraft(runId: string, recommendationIds: string[], createdBy?: string) {
@@ -477,6 +529,13 @@ export function updatePODraft(draftId: string, expectedVersion: number, lines: u
   return planningMutation(`/api/po/drafts/${draftId}`, 'PATCH', {
     expected_version: expectedVersion,
     lines,
+  })
+}
+
+export function setPODraftTarget(draftId: string, expectedVersion: number, orderId: string | null) {
+  return planningMutation(`/api/po/drafts/${draftId}/target-order`, 'POST', {
+    expected_version: expectedVersion,
+    order_id: orderId,
   })
 }
 

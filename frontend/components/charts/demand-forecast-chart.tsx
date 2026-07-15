@@ -54,6 +54,7 @@ interface DemandForecastChartProps {
   referenceMonth: number
   isLoading?: boolean
   className?: string
+  measure?: 'units' | 'cogs' | 'revenue'
 }
 
 export function DemandForecastChart({
@@ -63,6 +64,7 @@ export function DemandForecastChart({
   referenceMonth,
   isLoading,
   className,
+  measure = 'units',
 }: DemandForecastChartProps) {
   const { rows, windowBounds } = useMemo(() => {
     const rows: Array<Record<string, number | string>> = []
@@ -112,7 +114,10 @@ export function DemandForecastChart({
       <ComposedChart data={rows} margin={{ left: 4, right: 12, top: 8, bottom: 4 }}>
         <CartesianGrid vertical={false} strokeDasharray="3 3" />
         <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={8} minTickGap={16} fontSize={10} />
-        <YAxis tickLine={false} axisLine={false} tickMargin={8} width={36} />
+        <YAxis
+          tickLine={false} axisLine={false} tickMargin={8} width={measure === 'units' ? 36 : 58}
+          tickFormatter={(value: number) => measure === 'units' ? String(value) : `$${Math.round(value / 1000)}k`}
+        />
         {windowBounds && (
           <ReferenceArea
             x1={windowBounds.x1}

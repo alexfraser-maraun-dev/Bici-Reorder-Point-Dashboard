@@ -28,6 +28,9 @@ class ForecastRun(TypedDict, total=False):
     source_snapshot_at: str
     as_of_date: str
     horizon_weeks: int
+    scope_type: str
+    scope_value: Optional[str]
+    config: Dict[str, Any]
     recommendations: List[Dict[str, Any]]
 
 
@@ -38,6 +41,10 @@ class PurchaseRecommendation(TypedDict, total=False):
     assumption_version: str
     source_snapshot_at: str
     item_id: str
+    sku: Optional[str]
+    description: Optional[str]
+    brand: Optional[str]
+    category_top_level: Optional[str]
     location_id: str
     vendor_id: Optional[str]
     forecast: List[ForecastPoint]
@@ -58,6 +65,10 @@ class PurchaseOrderSnapshot(TypedDict, total=False):
 class PODraftLine(TypedDict, total=False):
     line_id: str
     recommendation_id: Optional[str]
+    sku: Optional[str]
+    description: Optional[str]
+    brand: Optional[str]
+    category_top_level: Optional[str]
     item_id: str
     location_id: str
     quantity: int

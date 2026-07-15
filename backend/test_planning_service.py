@@ -37,6 +37,7 @@ class PlanningServiceTests(unittest.TestCase):
             }],
             weekly_history=self._rows(),
             as_of_date=date(2026, 7, 14),
+            persist=False,
         )
         self.assertEqual(run["status"], "complete")
         rec = run["recommendations"][0]
@@ -52,6 +53,7 @@ class PlanningServiceTests(unittest.TestCase):
             items=[{"item_id": "10", "location_id": "3", "category": "Nutrition", "vendor_id": "55"}],
             weekly_history=self._rows(),
             as_of_date=date(2026, 7, 14),
+            persist=False,
         )
         rec = get_recommendations(run["run_id"])[0]
         self.assertTrue(rec["blocked"])
@@ -67,6 +69,7 @@ class PlanningServiceTests(unittest.TestCase):
             weekly_history=self._rows(),
             as_of_date=date(2026, 7, 14),
             horizon_weeks=13,
+            persist=False,
         )
         rec = run["recommendations"][0]
         self.assertEqual(rec["scheduled_receipts"][0]["quantity"], 20)

@@ -266,6 +266,19 @@ class PlanningStore:
                     run_id,status,created_at,source_snapshot_at,scope_type,scope_value,config_json,result_json
                 ) VALUES (?,?,?,?,?,?,?,?)
             """), record)
+            # Interactive persistence is intentionally bounded for the 1 GB
+            # Render database. Keep recent work plus any run still referenced by
+            # a live draft; BigQuery remains the long-term analytical store.
+            conn.execute("""
+                DELETE FROM planning_runs
+                WHERE run_id NOT IN (
+                    SELECT run_id FROM planning_runs ORDER BY created_at DESC LIMIT 12
+                )
+                AND run_id NOT IN (
+                    SELECT DISTINCT run_id FROM po_drafts
+                    WHERE run_id IS NOT NULL AND status != 'cancelled'
+                )
+            """)
         return run
 
     def get_planning_run(self, run_id: str) -> Optional[Dict[str, Any]]:
@@ -315,6 +328,27 @@ class PlanningStore:
                 WHERE draft_id = ?
             """), (target, "append_to_open_po" if target else "new_po", draft_id))
         return self.get_draft(draft_id)
+
+    def backfill_line_display_metadata(self, items: Iterable[Dict[str, Any]]) -> int:
+        """Fill product display fields on drafts created before those columns existed."""
+        updated = 0
+        with self.transaction(immediate=True) as conn:
+            for item in items:
+                if not item.get("item_id"):
+                    continue
+                cursor = conn.execute(self._sql("""
+                    UPDATE po_draft_lines
+                    SET description = COALESCE(description, ?),
+                        brand = COALESCE(brand, ?),
+                        category_top_level = COALESCE(category_top_level, ?)
+                    WHERE item_id = ?
+                      AND (description IS NULL OR brand IS NULL OR category_top_level IS NULL)
+                """), (
+                    item.get("description"), item.get("brand"), item.get("category_top_level"),
+                    str(item["item_id"]),
+                ))
+                updated += max(0, int(cursor.rowcount or 0))
+        return updated
 
     def get_draft(self, draft_id: str) -> Optional[Dict[str, Any]]:
         conn = self._connect()

@@ -26,6 +26,11 @@ def divider() -> dict:
     return {"type": "divider"}
 
 
+def context(mrkdwn: str) -> dict:
+    # Small grey helper text under a message; 10-element/2000-char limits apply.
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": mrkdwn[:2000]}]}
+
+
 def to_mrkdwn(md: str) -> str:
     """Convert the small subset of Markdown the digest uses into Slack mrkdwn.
 
