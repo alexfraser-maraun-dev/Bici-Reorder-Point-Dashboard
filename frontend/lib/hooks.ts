@@ -332,7 +332,7 @@ export function usePODrafts(status?: string) {
 // Fetches a single draft with its line items.
 export function usePODraft(draftId: string | null) {
   const baseUrl = '/backend'
-  const url = draftId ? `${baseUrl}/api/po/draft/${draftId}` : null
+  const url = draftId ? `${baseUrl}/api/po/drafts/${draftId}` : null
   const { data, error, mutate, isLoading } = useSWR(url, fetcher)
   return { data: data?.data || null, isLoading, error, refetch: mutate }
 }
@@ -366,34 +366,53 @@ export function useOpenOrders(vendorId?: string, shopId?: string) {
   return { data: data?.data || [], isLoading, error, refetch: mutate }
 }
 
-// Builds drafts from selected recommendation rows (raw backend rec dicts).
-export async function createPODraft(recommendations: any[], createdBy?: string) {
+async function planningMutation(path: string, method: 'POST' | 'PATCH', body?: unknown) {
   const baseUrl = '/backend'
-  const res = await fetch(`${baseUrl}/api/po/draft`, {
-    method: 'POST',
+  const res = await fetch(`${baseUrl}${path}`, {
+    method,
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ recommendations, created_by: createdBy }),
+    body: JSON.stringify(body || {}),
   })
   if (!res.ok) {
     const errorData = await res.json().catch(() => null)
-    throw new Error(errorData?.detail || 'Failed to create PO draft')
+    const detail = errorData?.detail
+    throw new Error(typeof detail === 'string' ? detail : detail?.message || 'Planning request failed')
   }
   return res.json()
 }
 
-// Pushes a draft to Lightspeed.
-export async function pushPODraft(draftId: string, pushedBy?: string) {
-  const baseUrl = '/backend'
-  const res = await fetch(`${baseUrl}/api/po/push/${draftId}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ pushed_by: pushedBy }),
+export function createPlanningRun(input: { horizon_weeks?: number; location_ids?: string[] } = {}) {
+  return planningMutation('/api/planning/runs', 'POST', input)
+}
+
+export function createPODraft(runId: string, recommendationIds: string[], createdBy?: string) {
+  return planningMutation('/api/po/drafts', 'POST', {
+    run_id: runId,
+    recommendation_ids: recommendationIds,
+    created_by: createdBy,
   })
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => null)
-    throw new Error(errorData?.detail || 'Failed to push PO draft')
-  }
-  return res.json()
+}
+
+export function updatePODraft(draftId: string, expectedVersion: number, lines: unknown[]) {
+  return planningMutation(`/api/po/drafts/${draftId}`, 'PATCH', {
+    expected_version: expectedVersion,
+    lines,
+  })
+}
+
+export function transitionPODraft(draftId: string, expectedVersion: number, status: string) {
+  return planningMutation(`/api/po/drafts/${draftId}/transition`, 'POST', {
+    expected_version: expectedVersion,
+    status,
+  })
+}
+
+export function reconcilePODraft(draftId: string) {
+  return planningMutation(`/api/po/drafts/${draftId}/reconcile`, 'POST')
+}
+
+export function previewPODraft(draftId: string) {
+  return planningMutation(`/api/po/drafts/${draftId}/preview`, 'POST')
 }
 
 // Deletes a draft.

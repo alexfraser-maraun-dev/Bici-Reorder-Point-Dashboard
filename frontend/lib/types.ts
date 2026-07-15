@@ -151,21 +151,35 @@ export interface UseManagedSkusResult {
   error: Error | null
 }
 
-// Purchase Orders
-export type POStatus = 'draft' | 'submitted' | 'pushed' | 'failed'
+// Advanced weekly planning and purchase orders
+export type POStatus =
+  | 'draft'
+  | 'approved'
+  | 'previewed'
+  | 'ready_for_push'
+  | 'synchronized'
+  | 'partial_failure'
+  | 'cancelled'
 export type POReconciliation = 'new_po' | 'append_to_open_po' | 'already_on_po'
 
 export interface PODraftLine {
-  draft_id: string
-  sku: string
+  line_id?: string
+  draft_id?: string
+  recommendation_id?: string | null
+  sku: string | null
   item_id: string
   location_id: string
   quantity: number
   unit_cost: number | null
+  landed_cost?: number | null
+  currency?: string
   source: string
-  recommendation_run_id?: string | null
   reconciliation: POReconciliation
   target_lightspeed_order_id?: string | null
+  need_by_week?: string | null
+  case_pack?: number | null
+  moq?: number | null
+  constraint_warning?: string | null
 }
 
 export interface PurchaseOrderDraft {
@@ -174,12 +188,102 @@ export interface PurchaseOrderDraft {
   vendor_name?: string | null
   shop_id: string
   status: POStatus
+  version: number
   created_by?: string
   created_at?: string
   updated_at?: string
   lightspeed_order_id?: string | null
   notes?: string | null
   lines?: PODraftLine[]
+}
+
+export interface WeeklyForecastPoint {
+  week_start: string
+  p50: number
+  p80: number
+  p90: number
+  p95: number
+  forecast_cogs: number | null
+  forecast_revenue: number | null
+}
+
+export interface PurchaseRecommendation {
+  recommendation_id: string
+  run_id: string
+  model_version: string
+  assumption_version: string
+  source_snapshot_at: string
+  item_id: string
+  sku?: string | null
+  description?: string | null
+  category?: string | null
+  location_id: string
+  vendor_id?: string | null
+  vendor_name?: string | null
+  champion_model: string
+  confidence: 'high' | 'medium' | 'low'
+  forecast_metrics: { wape?: number; mase?: number; bias?: number }
+  forecast: WeeklyForecastPoint[]
+  need_by_week?: string | null
+  recommended_quantity: number
+  case_pack: number
+  moq: number
+  constraint_extra_units: number
+  landed_unit_cost: number | null
+  currency: string
+  purchase_commitment_spend: number | null
+  blocked: boolean
+  reason_codes: string[]
+}
+
+export interface MonthlyPlanningRollup {
+  category: string
+  month: string
+  units: number
+  cogs: number
+  revenue: number
+  missing_cogs: boolean
+}
+
+export interface ForecastRun {
+  run_id: string
+  status: 'complete'
+  created_at: string
+  source_snapshot_at: string
+  as_of_date: string
+  horizon_weeks: number
+  model_version: string
+  assumption_version: string
+  recommendation_count: number
+  blocking_exception_count: number
+  recommendations: PurchaseRecommendation[]
+  monthly_rollups: MonthlyPlanningRollup[]
+}
+
+export interface LightspeedPreviewOperation {
+  action: 'create_unsent_order' | 'add_order_line' | 'update_order_line'
+  order_id?: string
+  order_line_id?: string
+  vendor_id?: string
+  shop_id?: string
+  item_id?: string
+  sku?: string | null
+  quantity?: number
+  increment_quantity?: number
+  resulting_quantity?: number
+  unit_cost?: number | null
+  ordered_date?: null
+}
+
+export interface LightspeedPreview {
+  mode: 'preview'
+  draft_id: string
+  draft_version: number
+  target_order_id?: string | null
+  operations: LightspeedPreviewOperation[]
+  read_only_inbound_orders: Array<{ order_id: string; state: string }>
+  writes_performed: false
+  draft?: PurchaseOrderDraft
 }
 
 // Demand & Seasonality visualization layer

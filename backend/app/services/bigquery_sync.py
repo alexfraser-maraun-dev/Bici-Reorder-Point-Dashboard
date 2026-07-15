@@ -1038,6 +1038,47 @@ def fetch_item_monthly_history(item_id, years: int = 3) -> pd.DataFrame:
     return client.query(query, job_config=job_config).to_dataframe()
 
 
+def fetch_weekly_item_history(item_ids=None, years: int = 3) -> pd.DataFrame:
+    """Canonical completed-week demand at SKU-location grain.
+
+    The sales master already represents completed demand and retains special-order,
+    layaway and workorder demand. Warranty workorder lines are explicitly excluded.
+    Only complete Monday-Sunday weeks are returned so a partial current week cannot
+    depress a forecast. Callers add zero-demand weeks from a calendar spine; keeping
+    that expansion outside BigQuery avoids multiplying the scan result unnecessarily.
+    """
+    normalized_ids = [str(value) for value in (item_ids or []) if value is not None]
+    item_filter = "AND CAST(item_id AS STRING) IN UNNEST(@item_ids)" if normalized_ids else ""
+    query = f"""
+        SELECT
+            CAST(item_id AS STRING) AS item_id,
+            shop_id_int AS location_id,
+            DATE_TRUNC(sale_date, WEEK(MONDAY)) AS week_start,
+            ANY_VALUE(category_top_level) AS category_top_level,
+            ANY_VALUE(category_path) AS category_path,
+            SUM(units_sold) AS raw_units_sold
+        FROM `{LS_DATASET}.sales_master_view`
+        WHERE
+            sale_date >= GREATEST(DATE_SUB(CURRENT_DATE(), INTERVAL @years YEAR), DATE(@reliable_start))
+            AND sale_date < DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY))
+            AND shop_id_int IN {TARGET_SHOP_IDS}
+            AND NOT COALESCE(is_workorder_warranty_line, FALSE)
+            {item_filter}
+        GROUP BY item_id, location_id, week_start
+        ORDER BY item_id, location_id, week_start
+    """
+    parameters = [
+        bigquery.ScalarQueryParameter("years", "INT64", years),
+        bigquery.ScalarQueryParameter("reliable_start", "STRING", RELIABLE_HISTORY_START),
+    ]
+    if normalized_ids:
+        parameters.append(bigquery.ArrayQueryParameter("item_ids", "STRING", normalized_ids))
+    return get_bq_client().query(
+        query,
+        job_config=bigquery.QueryJobConfig(query_parameters=parameters),
+    ).to_dataframe()
+
+
 def fetch_inventory_snapshot() -> pd.DataFrame:
     """
     Fetches current on_hand from item_shop_history and calculates on_order_units
@@ -1522,6 +1563,8 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
           COALESCE(sc.days_out_of_stock_60, 0) AS days_out_of_stock_60,
           COALESCE(s.qoh, 0) AS current_qoh,
           COALESCE(s.po_units_remaining, 0) AS on_order,
+          COALESCE(s.item_default_cost, s.item_avg_cost) AS landed_cost,
+          s.item_current_price AS selling_price,
           COALESCE(s.reorderPoint, 0) AS current_reorder_point,
           COALESCE(s.reorderLevel, 0) AS current_desired_level
         FROM snapshot s

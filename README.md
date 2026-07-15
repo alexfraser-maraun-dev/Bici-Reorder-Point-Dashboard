@@ -1,6 +1,32 @@
-# SKU Reorder Point & Desired Inventory Automation
+# BICI Demand Planning & Procurement Cockpit
 
-Internal control panel for reviewing and pushing location-specific reorder points and desired inventory levels to Lightspeed R-Series.
+Internal weekly demand-planning and buyer workbench. ROP/DL remains a secondary
+output; the primary workflow is forecast → recommendation → editable PO draft →
+reconcile → approve → Lightspeed preview.
+
+## Lightspeed safety boundary
+
+Live Lightspeed writes are disabled. Automated tests use `FakeLightspeedGateway`,
+the live read adapter exposes no mutation methods, both PO push routes return 403,
+and the client blocks POST/PUT/PATCH/DELETE before network access unless every write
+gate is satisfied. No development or acceptance test may enable those gates without
+the user's explicit approval immediately before the exact live mutation test.
+
+Keep these values in development, CI, staging and the preview-only rollout:
+
+```text
+PLANNING_V2_ENABLED=true
+PO_WRITE_V2_ENABLED=false
+LIGHTSPEED_WRITES_ENABLED=false
+```
+
+The dormant client gate also requires a non-empty `LIGHTSPEED_WRITE_APPROVAL_TOKEN`
+and `LIGHTSPEED_WRITE_SHOP_ALLOWLIST`. These are defense in depth, not permission to
+run a live test.
+
+Transactional PO drafts and planner overrides use Postgres when `DATABASE_URL` is a
+Postgres URL. SQLite is a local/test fallback. BigQuery remains the analytical source
+for demand history and inventory snapshots.
 
 ## Current Architecture
 

@@ -52,6 +52,26 @@ def _find_open_po_and_line(open_orders: List[Dict[str, Any]], item_id: str):
     return target_order, existing_line
 
 
+def _list_orders(client, vendor_id: str, shop_id: str) -> List[Dict[str, Any]]:
+    """Support the gateway contract while retaining legacy test compatibility."""
+    if hasattr(client, "list_purchase_orders"):
+        return client.list_purchase_orders(vendor_id=vendor_id, shop_id=shop_id)
+    return client.get_open_orders(vendor_id=vendor_id, shop_id=shop_id)
+
+
+def _appendable_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Only unsent and wholly unreceived POs may be changed by BICI."""
+    return [order for order in orders if order.get("po_state") == "unsent"]
+
+
+def _order_for_line(orders: List[Dict[str, Any]], order_line_id: str):
+    for order in orders:
+        for line in order.get("OrderLine", []):
+            if str(line.get("orderLineID")) == str(order_line_id):
+                return order
+    return None
+
+
 def reconcile_recommendations(
     recs: List[Dict[str, Any]],
     client,
@@ -93,7 +113,8 @@ def reconcile_recommendations(
 
     for (vendor_id, shop_id), group in groups.items():
         # Open POs for this vendor+shop drive the reconciliation for the group.
-        open_orders = client.get_open_orders(vendor_id=vendor_id, shop_id=shop_id)
+        all_orders = _list_orders(client, vendor_id=vendor_id, shop_id=shop_id)
+        open_orders = _appendable_orders(all_orders)
         target_order_id = str(open_orders[0].get("orderID")) if open_orders else None
 
         draft_id = str(uuid.uuid4())
@@ -102,7 +123,7 @@ def reconcile_recommendations(
         for rec in group["recs"]:
             item_id = str(rec.get("system_id"))
             qty = int(rec.get("qty_to_order") or 0)
-            _, existing_line = _find_open_po_and_line(open_orders, item_id)
+            matching_order, existing_line = _find_open_po_and_line(open_orders, item_id)
 
             if qty <= 0:
                 if existing_line is not None:
@@ -124,7 +145,11 @@ def reconcile_recommendations(
                 "source": "recommendation",
                 "recommendation_run_id": rec.get("recommendation_run_id"),
                 "reconciliation": reconciliation,
-                "target_lightspeed_order_id": target_order_id if reconciliation == APPEND_TO_OPEN_PO else None,
+                "target_lightspeed_order_id": (
+                    str(matching_order.get("orderID"))
+                    if reconciliation == APPEND_TO_OPEN_PO and matching_order is not None
+                    else target_order_id if reconciliation == APPEND_TO_OPEN_PO else None
+                ),
             })
 
         if not lines:
@@ -145,6 +170,85 @@ def reconcile_recommendations(
         })
 
     return drafts
+
+
+def preview_draft(draft: Dict[str, Any], client) -> Dict[str, Any]:
+    """Return exact proposed Lightspeed operations without performing any writes.
+
+    Reconciliation is refreshed from a complete read at preview time. Ordered or
+    partially received POs remain visible as inbound supply but can never become
+    mutation targets.
+    """
+    vendor_id = str(draft.get("vendor_id"))
+    shop_id = str(draft.get("shop_id"))
+    all_orders = _list_orders(client, vendor_id=vendor_id, shop_id=shop_id)
+    appendable = _appendable_orders(all_orders)
+    preferred_target = str(draft.get("lightspeed_order_id") or "")
+    target_order = next(
+        (order for order in appendable if str(order.get("orderID")) == preferred_target),
+        None,
+    )
+    if target_order is None and appendable:
+        target_order = appendable[0]
+    operations: List[Dict[str, Any]] = []
+    virtual_new_order = False
+
+    for line in draft.get("lines", []):
+        qty = int(line.get("quantity") or 0)
+        if qty <= 0 or line.get("reconciliation") == ALREADY_ON_PO:
+            continue
+        item_id = str(line.get("item_id"))
+        matching_order, existing_line = _find_open_po_and_line(appendable, item_id)
+        if existing_line is not None and matching_order is not None:
+            operations.append({
+                "action": "update_order_line",
+                "order_id": str(matching_order.get("orderID")),
+                "order_line_id": str(existing_line.get("orderLineID")),
+                "item_id": item_id,
+                "sku": line.get("sku"),
+                "increment_quantity": qty,
+                "current_quantity": int(existing_line.get("quantity") or 0),
+                "resulting_quantity": int(existing_line.get("quantity") or 0) + qty,
+                "unit_cost": line.get("unit_cost"),
+            })
+            continue
+
+        if target_order is None and not virtual_new_order:
+            operations.append({
+                "action": "create_unsent_order",
+                "vendor_id": vendor_id,
+                "shop_id": shop_id,
+                "ordered_date": None,
+            })
+            virtual_new_order = True
+        operations.append({
+            "action": "add_order_line",
+            "order_id": str(target_order.get("orderID")) if target_order else "$NEW_ORDER_ID",
+            "item_id": item_id,
+            "sku": line.get("sku"),
+            "quantity": qty,
+            "unit_cost": line.get("unit_cost"),
+        })
+
+    read_only_inbound = [
+        {
+            "order_id": str(order.get("orderID")),
+            "state": order.get("po_state"),
+            "ordered_date": order.get("orderedDate"),
+            "received_date": order.get("receivedDate"),
+        }
+        for order in all_orders
+        if order.get("po_state") != "unsent"
+    ]
+    return {
+        "mode": "preview",
+        "draft_id": draft.get("draft_id"),
+        "draft_version": int(draft.get("version") or 1),
+        "target_order_id": str(target_order.get("orderID")) if target_order else None,
+        "operations": operations,
+        "read_only_inbound_orders": read_only_inbound,
+        "writes_performed": False,
+    }
 
 
 def _safe_float(value) -> Optional[float]:
@@ -168,7 +272,7 @@ def push_draft(draft: Dict[str, Any], client, triggered_by: str = "UI_User") -> 
     draft_id = draft["draft_id"]
 
     # Snapshot current open-PO state once for this push.
-    open_orders = client.get_open_orders(vendor_id=vendor_id, shop_id=shop_id)
+    open_orders = _appendable_orders(_list_orders(client, vendor_id=vendor_id, shop_id=shop_id))
     target_order = open_orders[0] if open_orders else None
     created_order_id = None  # lazily create a new PO only if a line needs one
     audit: List[Dict[str, Any]] = []
@@ -221,7 +325,10 @@ def push_draft(draft: Dict[str, Any], client, triggered_by: str = "UI_User") -> 
                 order_id = target_order.get("orderID")
             else:
                 if created_order_id is None:
-                    new_order = client.create_order(vendor_id, shop_id, datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S%z"))
+                    if hasattr(client, "create_unsent_order"):
+                        new_order = client.create_unsent_order(vendor_id, shop_id)
+                    else:
+                        new_order = client.create_order(vendor_id, shop_id, None)
                     if not new_order:
                         log(line, "create_po", qty, None, None, "failed", "Lightspeed order creation failed")
                         continue

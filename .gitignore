@@ -2,6 +2,7 @@
 backend/venv/
 frontend/node_modules/
 frontend/.next/
+.pnpm-store/
 
 # Environment / Credentials
 .env

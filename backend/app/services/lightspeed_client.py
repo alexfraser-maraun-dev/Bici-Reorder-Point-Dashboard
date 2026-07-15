@@ -2,6 +2,7 @@ import requests
 import os
 import time
 import threading
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
@@ -14,6 +15,35 @@ from typing import Dict, Any, Optional, List
 LIGHTSPEED_SCOPES = ["employee:inventory", "employee:purchase_orders"]
 LIGHTSPEED_AUTHORIZE_URL = "https://cloud.lightspeedapp.com/auth/oauth/authorize"
 LIGHTSPEED_TOKEN_URL = "https://cloud.lightspeedapp.com/oauth/access_token.php"
+
+
+class LightspeedWriteBlocked(RuntimeError):
+    """Raised before any mutating Lightspeed request when the write gate is shut."""
+
+
+class LightspeedReadError(RuntimeError):
+    """Raised when a complete, authoritative Lightspeed read cannot be produced."""
+
+
+def lightspeed_writes_enabled(shop_id: str = None) -> bool:
+    """Return True only when every process-level live-write safeguard is present.
+
+    The approval token is deliberately separate from the ordinary feature flag so
+    accidentally setting one environment variable cannot enable writes. Production
+    operators must also explicitly allow-list destination shop IDs.
+    """
+    enabled = os.getenv("LIGHTSPEED_WRITES_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    approval = os.getenv("LIGHTSPEED_WRITE_APPROVAL_TOKEN", "").strip()
+    allowed = {
+        value.strip()
+        for value in os.getenv("LIGHTSPEED_WRITE_SHOP_ALLOWLIST", "").split(",")
+        if value.strip()
+    }
+    if not enabled or not approval or not allowed:
+        return False
+    return shop_id is None or str(shop_id) in allowed
 
 
 def _to_number(value, default: float = 0.0) -> float:
@@ -158,6 +188,7 @@ class LightspeedClient:
         return []
 
     def update_reorder_levels(self, item_shop_id: str, reorder_point: int, reorder_level: int) -> Optional[Dict[str, Any]]:
+        self._assert_writes_enabled()
         url = f"{self.base_url}/ItemShop/{item_shop_id}.json"
         # Per API docs, fields are sent flat (not nested inside ItemShop wrapper)
         payload = {
@@ -203,7 +234,24 @@ class LightspeedClient:
         once on a 401. `path` is appended to base_url (e.g. "/Order.json").
         Returns the Response (caller inspects status), or None on a transport error.
         """
+        method = method.upper()
+        if method in {"POST", "PUT", "PATCH", "DELETE"}:
+            shop_id = (json or {}).get("shopID") if isinstance(json, dict) else None
+            self._assert_writes_enabled(shop_id)
         url = f"{self.base_url}{path}"
+        return self._request_absolute(method, url, params=params, json=json)
+
+    def _request_absolute(self, method: str, url: str, params: dict = None, json: dict = None) -> Optional[requests.Response]:
+        """Issue an authenticated request to an absolute Lightspeed URL.
+
+        Absolute requests are needed for the opaque cursor URLs returned by the
+        R-Series API. Mutating calls remain protected even if a caller bypasses
+        ``_request`` and supplies a full URL directly.
+        """
+        method = method.upper()
+        if method in {"POST", "PUT", "PATCH", "DELETE"}:
+            shop_id = (json or {}).get("shopID") if isinstance(json, dict) else None
+            self._assert_writes_enabled(shop_id)
         try:
             response = requests.request(method, url, headers=self._get_headers(), params=params, json=json, timeout=15)
             if response.status_code == 401:
@@ -211,8 +259,16 @@ class LightspeedClient:
                 response = requests.request(method, url, headers=self._get_headers(), params=params, json=json, timeout=15)
             return response
         except Exception as e:
-            print(f"Lightspeed API Error ({method} {path}): {e}")
+            safe_path = urlparse(url).path
+            print(f"Lightspeed API Error ({method} {safe_path}): {e}")
             return None
+
+    def _assert_writes_enabled(self, shop_id: str = None) -> None:
+        if not lightspeed_writes_enabled(shop_id):
+            raise LightspeedWriteBlocked(
+                "Live Lightspeed writes are disabled. Enabling them requires the "
+                "write flag, a separately supplied approval token, and a shop allowlist."
+            )
 
     def get_open_orders(self, vendor_id: str = None, shop_id: str = None) -> List[Dict[str, Any]]:
         """
@@ -232,22 +288,52 @@ class LightspeedClient:
             params["shopID"] = str(shop_id)
 
         response = self._request("GET", "/Order.json", params=params)
-        if response is None or response.status_code != 200:
-            if response is not None:
-                print(f"Error fetching open orders: {response.text}")
-            return []
+        orders: List[Dict[str, Any]] = []
+        seen_urls = set()
+        while True:
+            if response is None:
+                raise LightspeedReadError("Lightspeed purchase-order read failed before all pages were loaded.")
+            if response.status_code != 200:
+                raise LightspeedReadError(
+                    f"Lightspeed purchase-order read returned HTTP {response.status_code}."
+                )
+            payload = response.json()
+            page = payload.get("Order", [])
+            if isinstance(page, dict):
+                page = [page]
+            orders.extend(page)
+            next_url = (payload.get("@attributes") or {}).get("next")
+            if not next_url:
+                break
+            if next_url in seen_urls:
+                raise LightspeedReadError("Lightspeed returned a repeated pagination cursor.")
+            seen_urls.add(next_url)
+            response = self._request_absolute("GET", next_url)
 
-        orders = response.json().get("Order", [])
-        if isinstance(orders, dict):
-            orders = [orders]
-
-        # Normalize the nested OrderLines -> OrderLine into a plain list on each order.
         for order in orders:
             lines = order.get("OrderLines", {}).get("OrderLine", [])
             if isinstance(lines, dict):
                 lines = [lines]
             order["OrderLine"] = lines
+            order["po_state"] = self.classify_purchase_order(order)
         return orders
+
+    @staticmethod
+    def classify_purchase_order(order: Dict[str, Any]) -> str:
+        if str(order.get("archived", "false")).lower() == "true":
+            return "archived"
+        if str(order.get("complete", "false")).lower() == "true":
+            return "complete"
+        lines = order.get("OrderLine", []) or []
+        received = any(
+            _to_number(line.get("numReceived", line.get("num_received", 0))) > 0
+            for line in lines
+        )
+        if received or order.get("receivedDate"):
+            return "partially_received"
+        if order.get("orderedDate"):
+            return "ordered"
+        return "unsent"
 
     def create_order(self, vendor_id: str, shop_id: str, ordered_date: str = None) -> Optional[Dict[str, Any]]:
         """
@@ -313,6 +399,9 @@ class LightspeedClient:
         if not target_shop_id:
             print(f"  [Error] Location {location} not mapped to a shopID")
             return False
+        # Fail before even resolving the item. A write-intent workflow must not
+        # authenticate or issue preparatory live reads when writes are disabled.
+        self._assert_writes_enabled(target_shop_id)
             
         # 2. Resolve internal itemID. New payloads send lightspeed_item_id;
         # SKU lookup remains only as a compatibility fallback for older payloads.

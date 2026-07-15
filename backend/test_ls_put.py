@@ -2,6 +2,12 @@
 Confirms that pushes correctly target the specific item+shop combination.
 Tests all 3 shops for item 37 with different ROP/DL values to prove isolation.
 """
+import unittest
+
+raise unittest.SkipTest(
+    "Manual live Lightspeed mutation script quarantined; explicit user approval is required immediately before use."
+)
+
 import os
 from dotenv import load_dotenv
 import requests

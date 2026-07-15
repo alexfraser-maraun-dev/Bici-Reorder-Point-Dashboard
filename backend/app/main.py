@@ -734,39 +734,163 @@ def get_forward_coverage(
 # Purchase Order Master Dashboard
 # ---------------------------------------------------------------------------
 
-@app.post("/api/po/draft")
-def create_po_draft_endpoint(payload: Dict[str, Any]):
-    """
-    Builds PO drafts from selected recommendation rows, grouped by vendor + shop
-    and reconciled against currently-open Lightspeed POs so repeated runs don't
-    create duplicates. Body: {"recommendations": [...], "created_by": "..."}.
-    """
-    recs = payload.get("recommendations") or []
-    if not recs:
-        raise HTTPException(status_code=400, detail="No recommendations provided.")
-    created_by = payload.get("created_by") or "UI_User"
-    try:
-        from app.services.lightspeed_client import LightspeedClient
-        from app.services.po_service import reconcile_recommendations
-        from app.services.bigquery_sync import create_po_draft
+def _planning_v2_enabled() -> bool:
+    return os.getenv("PLANNING_V2_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
-        client = LightspeedClient()
-        drafts = reconcile_recommendations(recs, client, created_by=created_by)
-        for draft in drafts:
-            lines = draft["lines"]
-            header = {k: v for k, v in draft.items() if k != "lines"}
-            create_po_draft(header, lines)
-        return {"status": "success", "drafts": to_json_safe(drafts)}
-    except Exception as e:
+
+def _require_planning_v2() -> None:
+    if not _planning_v2_enabled():
+        raise HTTPException(status_code=404, detail="Planning v2 is disabled.")
+
+
+def _draft_line_from_recommendation(rec: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "recommendation_id": rec.get("recommendation_id"),
+        "sku": rec.get("sku"),
+        "item_id": rec.get("item_id"),
+        "location_id": rec.get("location_id"),
+        "quantity": _safe_int(rec.get("recommended_quantity")),
+        "unit_cost": rec.get("landed_unit_cost"),
+        "landed_cost": rec.get("landed_unit_cost"),
+        "currency": rec.get("currency") or "CAD",
+        "source": "recommendation",
+        "reconciliation": "new_po",
+        "need_by_week": rec.get("need_by_week"),
+        "case_pack": rec.get("case_pack"),
+        "moq": rec.get("moq"),
+        "constraint_warning": "Supplier constraints added units" if rec.get("constraint_extra_units") else None,
+    }
+
+
+@app.post("/api/planning/runs")
+def create_planning_run_endpoint(payload: Dict[str, Any] = None):
+    _require_planning_v2()
+    payload = payload or {}
+    try:
+        from app.services.planning_service import create_planning_run
+        run = create_planning_run(
+            as_of_date=payload.get("as_of_date"),
+            horizon_weeks=_safe_int(payload.get("horizon_weeks"), 52),
+            location_ids=payload.get("location_ids"),
+            force_refresh=bool(payload.get("force_refresh")),
+        )
+        return {"status": "success", "data": to_json_safe(run)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to create PO drafts.")
+        raise HTTPException(status_code=500, detail="Failed to create planning run.")
+
+
+@app.get("/api/planning/runs/{run_id}/recommendations")
+def planning_recommendations_endpoint(run_id: str, location_id: str = None, blocked: bool = None):
+    _require_planning_v2()
+    from app.services.planning_service import get_planning_run, get_recommendations
+    run = get_planning_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Planning run not found.")
+    rows = get_recommendations(run_id, location_id=location_id, blocked=blocked)
+    return {
+        "status": "success",
+        "data": to_json_safe(rows),
+        "meta": {
+            "run_id": run_id,
+            "model_version": run["model_version"],
+            "assumption_version": run["assumption_version"],
+            "source_snapshot_at": run["source_snapshot_at"],
+            "monthly_rollups": to_json_safe(run["monthly_rollups"]),
+        },
+    }
+
+
+@app.get("/api/planning/forecast/{item_id}/{location_id}")
+def planning_forecast_endpoint(item_id: str, location_id: str, run_id: str):
+    _require_planning_v2()
+    from app.services.planning_service import get_forecast, get_planning_run
+    if not get_planning_run(run_id):
+        raise HTTPException(status_code=404, detail="Planning run not found.")
+    forecast = get_forecast(run_id, item_id, location_id)
+    if forecast is None:
+        raise HTTPException(status_code=404, detail="Forecast not found.")
+    return {"status": "success", "data": to_json_safe(forecast)}
+
+
+@app.post("/api/planning/overrides")
+def create_planning_override_endpoint(payload: Dict[str, Any]):
+    _require_planning_v2()
+    try:
+        from app.services.planning_store import get_planning_store
+        return {"status": "success", "data": to_json_safe(get_planning_store().create_override(payload))}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.post("/api/po/draft")
+def create_po_draft_endpoint(payload: Dict[str, Any]):
+    return create_po_drafts_endpoint(payload)
+
+
+@app.post("/api/po/drafts")
+def create_po_drafts_endpoint(payload: Dict[str, Any]):
+    """Create local drafts from only the recommendations selected by a buyer."""
+    _require_planning_v2()
+    run_id = payload.get("run_id")
+    recommendation_ids = payload.get("recommendation_ids") or []
+    manual_lines = payload.get("lines") or []
+    if not recommendation_ids and not manual_lines:
+        raise HTTPException(status_code=400, detail="Select recommendations or provide manual lines.")
+    from app.services.planning_service import get_planning_run, get_recommendations_by_id
+    from app.services.planning_store import get_planning_store
+    run = get_planning_run(run_id) if run_id else None
+    recs = []
+    if recommendation_ids:
+        if not run:
+            raise HTTPException(status_code=404, detail="Planning run not found.")
+        recs = get_recommendations_by_id(run_id, recommendation_ids)
+        if len(recs) != len(set(map(str, recommendation_ids))):
+            raise HTTPException(status_code=400, detail="One or more recommendations were not found.")
+        blocked = [rec["recommendation_id"] for rec in recs if rec.get("blocked")]
+        if blocked:
+            raise HTTPException(status_code=409, detail={
+                "message": "Resolve blocking vendor/cost exceptions first.",
+                "recommendation_ids": blocked,
+            })
+
+    grouped: Dict[tuple, Dict[str, Any]] = {}
+    for rec in recs:
+        key = (str(rec.get("vendor_id")), str(rec.get("location_id")))
+        grouped.setdefault(key, {"vendor_name": rec.get("vendor_name"), "lines": []})
+        grouped[key]["lines"].append(_draft_line_from_recommendation(rec))
+    for line in manual_lines:
+        vendor_id = line.get("vendor_id") or payload.get("vendor_id")
+        shop_id = line.get("location_id") or payload.get("shop_id")
+        if not vendor_id or not shop_id or not line.get("item_id"):
+            raise HTTPException(status_code=400, detail="Manual lines require vendor_id, location_id and item_id.")
+        if line.get("unit_cost") is None and line.get("landed_cost") is None:
+            raise HTTPException(status_code=409, detail="Manual lines require a landed/unit cost.")
+        key = (str(vendor_id), str(shop_id))
+        grouped.setdefault(key, {"vendor_name": line.get("vendor_name"), "lines": []})
+        grouped[key]["lines"].append({**line, "source": "manual", "reconciliation": "new_po"})
+
+    store = get_planning_store()
+    drafts = []
+    for (vendor_id, shop_id), group in grouped.items():
+        drafts.append(store.create_draft({
+            "vendor_id": vendor_id,
+            "vendor_name": group["vendor_name"],
+            "shop_id": shop_id,
+            "created_by": payload.get("created_by") or "UI_User",
+            "run_id": run_id,
+            "model_version": run.get("model_version") if run else None,
+            "source_snapshot_at": run.get("source_snapshot_at") if run else None,
+        }, group["lines"]))
+    return {"status": "success", "data": to_json_safe(drafts)}
 
 @app.get("/api/po/drafts")
 def list_po_drafts(status: str = None):
     try:
-        from app.services.bigquery_sync import get_po_drafts
-        return {"status": "success", "data": to_json_safe(get_po_drafts(status))}
+        from app.services.planning_store import get_planning_store
+        return {"status": "success", "data": to_json_safe(get_planning_store().list_drafts(status))}
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -774,9 +898,14 @@ def list_po_drafts(status: str = None):
 
 @app.get("/api/po/draft/{draft_id}")
 def get_po_draft_endpoint(draft_id: str):
+    return get_po_draft_v2_endpoint(draft_id)
+
+
+@app.get("/api/po/drafts/{draft_id}")
+def get_po_draft_v2_endpoint(draft_id: str):
     try:
-        from app.services.bigquery_sync import get_po_draft
-        draft = get_po_draft(draft_id)
+        from app.services.planning_store import get_planning_store
+        draft = get_planning_store().get_draft(draft_id)
         if draft is None:
             raise HTTPException(status_code=404, detail="Draft not found.")
         return {"status": "success", "data": to_json_safe(draft)}
@@ -789,51 +918,96 @@ def get_po_draft_endpoint(draft_id: str):
 
 @app.put("/api/po/draft/{draft_id}")
 def update_po_draft_endpoint(draft_id: str, payload: Dict[str, Any]):
-    """Replaces the line items on a draft. Body: {"lines": [...]}."""
+    return update_po_draft_v2_endpoint(draft_id, payload)
+
+
+@app.patch("/api/po/drafts/{draft_id}")
+def update_po_draft_v2_endpoint(draft_id: str, payload: Dict[str, Any]):
+    """Optimistically replace editable lines and return the new version."""
     lines = payload.get("lines")
-    if lines is None:
-        raise HTTPException(status_code=400, detail="lines is required.")
+    expected_version = payload.get("expected_version")
+    if lines is None or expected_version is None:
+        raise HTTPException(status_code=400, detail="lines and expected_version are required.")
     try:
-        from app.services.bigquery_sync import update_po_draft_lines
-        normalized = []
-        for line in lines:
-            normalized.append({
-                "draft_id": draft_id,
-                "sku": line.get("sku"),
-                "item_id": str(line.get("item_id")) if line.get("item_id") is not None else None,
-                "location_id": str(line.get("location_id")) if line.get("location_id") is not None else None,
-                "quantity": _safe_int(line.get("quantity")),
-                "unit_cost": line.get("unit_cost"),
-                "source": line.get("source") or "manual",
-                "recommendation_run_id": line.get("recommendation_run_id"),
-                "reconciliation": line.get("reconciliation"),
-                "target_lightspeed_order_id": line.get("target_lightspeed_order_id"),
-            })
-        update_po_draft_lines(draft_id, normalized)
-        return {"status": "success"}
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to update PO draft.")
+        from app.services.planning_store import PlanningConflict, get_planning_store
+        draft = get_planning_store().replace_lines(draft_id, int(expected_version), lines)
+        return {"status": "success", "data": to_json_safe(draft)}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Draft not found.")
+    except PlanningConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 @app.delete("/api/po/draft/{draft_id}")
 def delete_po_draft_endpoint(draft_id: str):
+    response = get_po_draft_v2_endpoint(draft_id)
+    return transition_po_draft_endpoint(draft_id, {
+        "expected_version": response["data"]["version"], "status": "cancelled"
+    })
+
+
+@app.post("/api/po/drafts/{draft_id}/transition")
+def transition_po_draft_endpoint(draft_id: str, payload: Dict[str, Any]):
     try:
-        from app.services.bigquery_sync import delete_po_draft
-        delete_po_draft(draft_id)
-        return {"status": "success"}
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to delete PO draft.")
+        from app.services.planning_store import PlanningConflict, get_planning_store
+        draft = get_planning_store().transition(
+            draft_id, int(payload["expected_version"]), str(payload["status"])
+        )
+        return {"status": "success", "data": to_json_safe(draft)}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Draft not found or transition fields missing.")
+    except PlanningConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/api/po/drafts/{draft_id}/reconcile")
+def reconcile_po_draft_endpoint(draft_id: str):
+    """Read every PO page and return proposed routing without an LS mutation."""
+    try:
+        from app.services.lightspeed_gateway import LiveLightspeedReadGateway, LightspeedReadError
+        from app.services.planning_store import get_planning_store
+        from app.services.po_service import preview_draft
+        draft = get_planning_store().get_draft(draft_id)
+        if not draft:
+            raise HTTPException(status_code=404, detail="Draft not found.")
+        return {"status": "success", "data": to_json_safe(preview_draft(draft, LiveLightspeedReadGateway()))}
+    except HTTPException:
+        raise
+    except LightspeedReadError as exc:
+        raise HTTPException(status_code=503, detail=f"Complete Lightspeed PO snapshot unavailable: {exc}")
+
+
+@app.post("/api/po/drafts/{draft_id}/preview")
+def preview_po_draft_endpoint(draft_id: str):
+    """Generate exact normalized LS mutations without invoking a write method."""
+    try:
+        from app.services.lightspeed_gateway import LiveLightspeedReadGateway, LightspeedReadError
+        from app.services.planning_store import PlanningConflict, get_planning_store
+        from app.services.po_service import preview_draft
+        store = get_planning_store()
+        draft = store.get_draft(draft_id)
+        if not draft:
+            raise HTTPException(status_code=404, detail="Draft not found.")
+        if draft["status"] not in {"approved", "previewed"}:
+            raise HTTPException(status_code=409, detail="Approve the draft before generating a preview.")
+        preview = preview_draft(draft, LiveLightspeedReadGateway())
+        preview["idempotency_actions"] = store.record_actions(draft, preview["operations"])
+        if draft["status"] == "approved":
+            draft = store.transition(draft_id, int(draft["version"]), "previewed")
+        preview["draft"] = draft
+        return {"status": "success", "data": to_json_safe(preview)}
+    except HTTPException:
+        raise
+    except LightspeedReadError as exc:
+        raise HTTPException(status_code=503, detail=f"Complete Lightspeed PO snapshot unavailable: {exc}")
+    except PlanningConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 @app.get("/api/po/open-orders")
 def list_open_orders(vendor_id: str = None, shop_id: str = None):
-    """Lists open (unsent) Lightspeed POs with their line quantities."""
+    """Lists incomplete POs and normalized states using GET requests only."""
     try:
-        from app.services.lightspeed_client import LightspeedClient
-        client = LightspeedClient()
-        orders = client.get_open_orders(vendor_id=vendor_id, shop_id=shop_id)
+        from app.services.lightspeed_gateway import LiveLightspeedReadGateway
+        orders = LiveLightspeedReadGateway().list_purchase_orders(vendor_id=vendor_id, shop_id=shop_id)
         return {"status": "success", "data": to_json_safe(orders)}
     except Exception as e:
         import traceback
@@ -842,44 +1016,15 @@ def list_open_orders(vendor_id: str = None, shop_id: str = None):
 
 @app.post("/api/po/push/{draft_id}")
 def push_po_draft_endpoint(draft_id: str, payload: Dict[str, Any] = None):
-    """
-    Pushes a draft to Lightspeed: creates a new PO and/or appends/top-ups lines on
-    existing open POs per each line's reconciliation. Idempotent — a draft already
-    pushed is rejected, and open-PO state is re-checked at push time.
-    """
-    triggered_by = (payload or {}).get("pushed_by") or "UI_User"
-    try:
-        from app.services.lightspeed_client import LightspeedClient
-        from app.services.po_service import push_draft
-        from app.services.bigquery_sync import (
-            get_po_draft, log_po_push, update_po_draft_status,
-        )
+    raise HTTPException(
+        status_code=403,
+        detail="Live Lightspeed PO synchronization is disabled. Generate a preview instead.",
+    )
 
-        draft = get_po_draft(draft_id)
-        if draft is None:
-            raise HTTPException(status_code=404, detail="Draft not found.")
-        if draft.get("status") == "pushed":
-            raise HTTPException(status_code=409, detail="Draft has already been pushed.")
 
-        client = LightspeedClient()
-        audit = push_draft(draft, client, triggered_by=triggered_by)
-        log_po_push(audit)
-
-        failed = any(row.get("status") == "failed" for row in audit)
-        new_status = "failed" if failed else "pushed"
-        pushed_order_id = next(
-            (row.get("lightspeed_order_id") for row in audit
-             if row.get("status") == "success" and row.get("lightspeed_order_id")),
-            None,
-        )
-        update_po_draft_status(draft_id, new_status, pushed_order_id)
-        return {"status": new_status, "results": to_json_safe(audit)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to push PO draft.")
+@app.post("/api/po/drafts/{draft_id}/push")
+def push_po_draft_v2_endpoint(draft_id: str, payload: Dict[str, Any] = None):
+    return push_po_draft_endpoint(draft_id, payload)
 
 @app.get("/api/health/lightspeed")
 def check_lightspeed_health():

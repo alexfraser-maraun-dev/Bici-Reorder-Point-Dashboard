@@ -1,3 +1,9 @@
+import unittest
+
+raise unittest.SkipTest(
+    "Manual live Lightspeed mutation script quarantined; explicit user approval is required immediately before use."
+)
+
 import os
 import json
 from dotenv import load_dotenv
