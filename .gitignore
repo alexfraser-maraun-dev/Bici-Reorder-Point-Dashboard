@@ -28,3 +28,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 backend/logs/
+
+# Stray log files
+*.log
+backend/output.log

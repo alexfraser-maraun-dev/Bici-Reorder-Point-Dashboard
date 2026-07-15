@@ -1,0 +1,28 @@
+# Keep secrets, local dev cruft, and scratch scripts out of the image.
+.env
+.env.*
+*.log
+token.json
+client_secret*.json
+*credentials*.json
+bq_metrics_cache.json
+
+# Local virtualenvs
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# One-off scripts and tests that shouldn't ship to production
+test_*.py
+debug_*.py
+list_*.py
+exchange_ls_code.py
+reauthorize_lightspeed.py
+flush_logs.py
+scratch/
+
+# VCS / OS
+.git/
+.gitignore
+.DS_Store

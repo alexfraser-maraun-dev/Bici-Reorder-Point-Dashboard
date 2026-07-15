@@ -11,6 +11,10 @@ services:
       # against RSS creep on the 512MB instance, independent of the query fixes.
       - key: MALLOC_ARENA_MAX
         value: "2"
+      # Shared secret required on every API request (injected by the frontend proxy).
+      # Set the value in the Render dashboard; must match the frontend's copy.
+      - key: BACKEND_SHARED_SECRET
+        sync: false
 
   # Frontend Dashboard
   - type: web
@@ -22,3 +26,9 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20.9.0
+      # Server-side only (NOT NEXT_PUBLIC): the internal backend base URL the proxy
+      # forwards to, and the shared secret it injects. Set both in the dashboard.
+      - key: BACKEND_INTERNAL_URL
+        sync: false
+      - key: BACKEND_SHARED_SECRET
+        sync: false

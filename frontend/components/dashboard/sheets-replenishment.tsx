@@ -341,7 +341,7 @@ export function SheetsReplenishment({
 }: SheetsReplenishmentProps) {
 
   const { data: session } = useSession()
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   
   const [isPushing, setIsPushing] = useState(false)
   const [pushResult, setPushResult] = useState<{status: 'success'|'warning'|'error', msg: string} | null>(null)

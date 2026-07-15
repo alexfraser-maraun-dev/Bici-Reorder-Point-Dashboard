@@ -3,8 +3,9 @@ load_dotenv()
 
 import os
 import time
+import hmac
 import threading
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from app.services.bigquery_sync import (
     log_recommendation_run, log_velocity_snapshots, log_writeback,
@@ -16,7 +17,7 @@ import io
 import uuid
 from datetime import datetime
 from typing import List, Dict, Any
-from fastapi.responses import Response, RedirectResponse
+from fastapi.responses import Response, RedirectResponse, JSONResponse
 
 def build_lightspeed_item_url(item_id: str) -> str:
     return f"https://us.merchantos.com/?name=item.views.item&form_name=view&id={item_id}&tab=details"
@@ -39,7 +40,16 @@ def to_json_safe(value):
     return value
 
 # App initialization
-app = FastAPI(title="SKU Reorder Point Automation API")
+# Disable the interactive docs / OpenAPI schema outside development so the
+# public deployment doesn't publish a complete map of every endpoint. Set
+# EXPOSE_API_DOCS=true (e.g. locally) to turn them back on.
+_expose_docs = os.getenv("EXPOSE_API_DOCS", "false").strip().lower() in ("1", "true", "yes", "on")
+app = FastAPI(
+    title="SKU Reorder Point Automation API",
+    docs_url="/docs" if _expose_docs else None,
+    redoc_url="/redoc" if _expose_docs else None,
+    openapi_url="/openapi.json" if _expose_docs else None,
+)
 
 # Setup CORS for frontend — restrict to known origins via env var
 _raw_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:3002,http://127.0.0.1:3002")
@@ -52,6 +62,45 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Shared-secret gate. The frontend never calls this API directly from the browser;
+# it goes through a same-origin Next.js proxy that (a) enforces the NextAuth session
+# and (b) injects this secret server-side. So every legitimate request carries the
+# X-Internal-Secret header and the browser never sees the value.
+#
+# Behavior:
+#   * BACKEND_SHARED_SECRET set  -> every request (except liveness probes / preflight)
+#     must present a matching header, else 401.
+#   * BACKEND_SHARED_SECRET unset -> no-op, but we warn loudly at startup. This lets a
+#     deploy land before the secret is configured on both services (zero-downtime
+#     rollout) without instantly 401-ing the running app.
+_INTERNAL_SECRET = os.getenv("BACKEND_SHARED_SECRET", "")
+# Liveness/readiness probes hit these directly (Render health checks, uptime monitors)
+# and carry no secret, so they stay open. They expose nothing sensitive.
+_AUTH_EXEMPT_PATHS = {"/", "/api/health"}
+
+
+@app.middleware("http")
+async def _require_internal_secret(request: Request, call_next):
+    if (
+        _INTERNAL_SECRET
+        and request.method != "OPTIONS"
+        and request.url.path not in _AUTH_EXEMPT_PATHS
+    ):
+        provided = request.headers.get("x-internal-secret", "")
+        if not hmac.compare_digest(provided, _INTERNAL_SECRET):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
+
+
+@app.on_event("startup")
+def _warn_if_backend_unsecured() -> None:
+    if not _INTERNAL_SECRET:
+        print(
+            "WARNING: BACKEND_SHARED_SECRET is not set — this API is UNAUTHENTICATED "
+            "and reachable by anyone who knows its URL. Set BACKEND_SHARED_SECRET on "
+            "this service AND the frontend proxy to enforce access control."
+        )
 
 # Price Intelligence is fully feature-flagged: with the flag off the package is
 # never imported, so a disabled deployment carries none of its code, deps, or
@@ -111,7 +160,7 @@ def get_replenishment_debug():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/replenishment/debug/item/{item_id}")
 def get_replenishment_item_debug(item_id: int):
@@ -121,7 +170,7 @@ def get_replenishment_item_debug(item_id: int):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/skus/template")
 def download_sku_template():
@@ -139,9 +188,13 @@ def fetch_managed_skus():
     skus = get_managed_skus()
     return skus
 
+_MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap — the SKU CSV is tiny; guard the 512MB instance.
+
 @app.post("/api/skus/upload")
 async def upload_skus(file: UploadFile = File(...)):
     contents = await file.read()
+    if len(contents) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Uploaded file exceeds the 5 MB limit.")
     df = pd.read_csv(io.BytesIO(contents))
     
     # Expected columns: sku, item_id
@@ -327,7 +380,7 @@ def get_replenishment_data(
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/replenishment/push")
 def push_replenishment_updates(updates: List[Dict[str, Any]]):
@@ -418,7 +471,7 @@ def get_active_vendor_lead_times(force_refresh: bool = False):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/replenishment/brand-sourcing-rules")
 def get_brand_sourcing_rules(force_refresh: bool = False):
@@ -429,7 +482,7 @@ def get_brand_sourcing_rules(force_refresh: bool = False):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/replenishment/brand-sourcing-rules")
 def save_brand_sourcing_rule(rule: Dict[str, Any]):
@@ -442,7 +495,7 @@ def save_brand_sourcing_rule(rule: Dict[str, Any]):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 # ---------------------------------------------------------------------------
 # Demand & Seasonality (forecast visualization layer)
@@ -470,7 +523,7 @@ def get_seasonal_profiles(years: int = 3, smoothing: float = 0.0, location: str 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/api/forecast/history")
@@ -585,7 +638,7 @@ def get_demand_history(
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/api/forecast/coverage")
@@ -674,7 +727,7 @@ def get_forward_coverage(
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ---------------------------------------------------------------------------
@@ -955,7 +1008,7 @@ def get_special_orders(background_tasks: BackgroundTasks, refresh: bool = False)
         return _rebuild_special_orders_cache(force=refresh)
     except Exception as e:
         print(f"Error building special-order dashboard: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 def _refresh_special_orders_after_write() -> None:
@@ -1016,7 +1069,7 @@ def update_special_order_eta(payload: Dict[str, Any]):
             "error_message": str(e),
             "created_at": datetime.utcnow().isoformat(),
         })
-        raise HTTPException(status_code=502, detail=f"Shopify update failed: {e}")
+        raise HTTPException(status_code=502, detail="Shopify update failed")
 
     # Read and write share one source of truth: drop the Shopify pull cache, then rebuild the
     # response payload from the cached Lightspeed rows so the next GET is both fresh AND cheap.
@@ -1054,7 +1107,7 @@ def _so_override_request(payload: Dict[str, Any], action: str) -> Dict[str, Any]
             created_by=payload.get("updated_by") or "UI_Manual_Match",
         )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to save match override: {e}")
+        raise HTTPException(status_code=502, detail="Failed to save match override")
 
     _refresh_special_orders_after_write()
     return {

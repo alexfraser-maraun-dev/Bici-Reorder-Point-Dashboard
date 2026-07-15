@@ -23,7 +23,7 @@ import type {
   TrackedUrl,
 } from './types'
 
-const baseUrl = () => process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+const baseUrl = () => '/backend'
 
 const fetcher = async (url: string) => {
   const res = await fetch(url)

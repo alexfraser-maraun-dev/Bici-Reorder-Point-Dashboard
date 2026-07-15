@@ -25,6 +25,8 @@ import re
 import threading
 import time
 import unicodedata
+import ipaddress
+import socket
 import urllib.robotparser
 from typing import Dict, Iterator, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -35,6 +37,39 @@ from bs4 import BeautifulSoup
 from . import config
 
 _session = requests.Session()
+
+
+def _is_public_http_url(url: str) -> bool:
+    """SSRF guard: only allow http(s) requests to public, non-loopback hosts.
+
+    Tracked URLs can be registered through the API and are fetched server-side,
+    so a target of http://localhost / 127.0.0.1 / 169.254.169.254 (cloud
+    metadata) / RFC-1918 space must be refused before we ever issue the GET.
+    Resolves the hostname and rejects if ANY resolved address is private.
+    """
+    try:
+        parsed = urlparse(url)
+    except (ValueError, TypeError):
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
 _session.headers.update({"User-Agent": config.USER_AGENT, "Accept": "*/*"})
 
 
@@ -97,6 +132,9 @@ _robots = _RobotsCache()
 def polite_get(url: str, *, respect_robots: bool = True) -> Optional[requests.Response]:
     """GET with throttle, robots check, and backoff on 429/5xx. Returns None when
     blocked by robots or after exhausting retries."""
+    if not _is_public_http_url(url):
+        print(f"pi: refusing to fetch non-public/unsafe URL {url}")
+        return None
     if respect_robots and not _robots.can_fetch(url):
         print(f"pi: robots.txt disallows {url}")
         return None
@@ -245,6 +283,14 @@ def _shopify_variant(url: str, sku: Optional[str] = None) -> Optional[dict]:
     parsed = urlparse(url)
     handle = m.group(1)
     variant_id = (parse_qs(parsed.query).get("variant") or [None])[0]
+    if not variant_id:
+        # Some storefronts (e.g. Enroute) carry the variant in the path
+        # ('/products/<handle>/<variant_id>') instead of a '?variant=' query.
+        # Without this, a multi-variant pin with no query/SKU resolves to no
+        # variant -> HTML fallback -> the default variant or no price at all.
+        tail = re.match(rf"/products/{re.escape(handle)}/(\d+)", parsed.path or "")
+        if tail:
+            variant_id = tail.group(1)
     resp = polite_get(f"{parsed.scheme}://{parsed.netloc}/products/{handle}.js")
     if resp is None or resp.status_code != 200:
         return None

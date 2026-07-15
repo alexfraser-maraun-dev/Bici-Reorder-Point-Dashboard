@@ -506,7 +506,7 @@ def execute_price_push(payload: Dict[str, Any]):
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Lightspeed update failed: {e}")
+        raise HTTPException(status_code=502, detail="Lightspeed update failed")
 
 
 @router.get("/push-log")

@@ -23,7 +23,7 @@ export function WritebackLogs() {
 
   const fetchLogs = async () => {
     try {
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+      const baseUrl = '/backend'
       const response = await fetch(`${baseUrl}/api/replenishment/logs`)
       const data = await response.json()
       setLogs(data)

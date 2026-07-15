@@ -131,7 +131,7 @@ export function useReplenishmentData(
   adjustmentMode: string,
   enabled: boolean = true
 ) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const query = [
     `forecast_period=${forecastPeriod}`,
     `safety_days=${safetyDays}`,
@@ -170,27 +170,27 @@ export function useReplenishmentData(
 
 // Hook for recommendation runs (History)
 export function useRecommendationRuns() {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/runs`, fetcher)
   return { data: data || [], isLoading, error, refetch: mutate }
 }
 
 // Hook for writeback audit (Audit Logs)
 export function useWritebackAudit() {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/replenishment/logs`, fetcher)
   return { data: data || [], isLoading, error, refetch: mutate }
 }
 
 // Hook for managed SKUs
 export function useManagedSkus() {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const { data, error, mutate, isLoading } = useSWR(`${baseUrl}/api/skus`, fetcher)
   return { data: data || [], isLoading, error, refetch: mutate }
 }
 
 export function useActiveVendorLeadTimes() {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const url = `${baseUrl}/api/replenishment/active-vendor-lead-times`
   const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
   const refetch = () => mutate(fetcher(`${url}?force_refresh=true`), false)
@@ -198,7 +198,7 @@ export function useActiveVendorLeadTimes() {
 }
 
 export function useBrandSourcingRules() {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const url = `${baseUrl}/api/replenishment/brand-sourcing-rules`
   const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
   const refetch = () => mutate(fetcher(`${url}?force_refresh=true`), false)
@@ -207,7 +207,7 @@ export function useBrandSourcingRules() {
 
 // Demand & Seasonality: category seasonal profiles for the visualization layer.
 export function useSeasonalProfiles(location?: string | number | null) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const params = new URLSearchParams()
   if (location !== undefined && location !== null && location !== '') {
     params.set('location', String(location))
@@ -226,7 +226,7 @@ export function useDemandHistory(
   id: string | null,
   location?: string | number | null,
 ) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   let url: string | null = null
   if (id) {
     const params = new URLSearchParams({ scope, id: String(id) })
@@ -241,7 +241,7 @@ export function useDemandHistory(
 
 // Demand & Seasonality: forward weeks-of-cover heatmap (soonest stockouts first).
 export function useCoverage(location?: string | null, limit: number = 150) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const params = new URLSearchParams({ limit: String(limit) })
   if (location) params.set('location', location)
   const url = `${baseUrl}/api/forecast/coverage?${params.toString()}`
@@ -257,7 +257,7 @@ export async function saveBrandSourcingRule(rule: {
   notes?: string | null
   updated_by?: string
 }) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const res = await fetch(`${baseUrl}/api/replenishment/brand-sourcing-rules`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -278,7 +278,7 @@ export async function updateShopifyEta(input: {
   eta: string | null
   updated_by?: string
 }) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const res = await fetch(`${baseUrl}/api/special-orders/eta`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -298,7 +298,7 @@ async function postSoMatchOverride(
   path: 'match' | 'unmatch',
   input: { special_order_id: string; shopify_order_id: string; updated_by?: string }
 ) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const res = await fetch(`${baseUrl}/api/special-orders/${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -323,7 +323,7 @@ export const unmatchSpecialOrder = (input: { special_order_id: string; shopify_o
 
 // Lists PO drafts (optionally filtered by status).
 export function usePODrafts(status?: string) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const url = `${baseUrl}/api/po/drafts${status ? `?status=${status}` : ''}`
   const { data, error, mutate, isLoading } = useSWR(url, fetcher, adminDashboardSWRConfig)
   return { data: data?.data || [], isLoading, error, refetch: mutate }
@@ -331,7 +331,7 @@ export function usePODrafts(status?: string) {
 
 // Fetches a single draft with its line items.
 export function usePODraft(draftId: string | null) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const url = draftId ? `${baseUrl}/api/po/draft/${draftId}` : null
   const { data, error, mutate, isLoading } = useSWR(url, fetcher)
   return { data: data?.data || null, isLoading, error, refetch: mutate }
@@ -340,7 +340,7 @@ export function usePODraft(draftId: string | null) {
 // Reports whether the Lightspeed token can access purchase orders
 // (i.e. was re-authorized with the employee:purchase_orders scope).
 export function useLightspeedPoAccess() {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const url = `${baseUrl}/api/health/lightspeed-po`
   // Don't throw on 503 — treat a non-ok response as "no access".
   const poFetcher = async (u: string) => {
@@ -356,7 +356,7 @@ export function useLightspeedPoAccess() {
 
 // Lists open (unsent) Lightspeed POs.
 export function useOpenOrders(vendorId?: string, shopId?: string) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const params = new URLSearchParams()
   if (vendorId) params.set('vendor_id', vendorId)
   if (shopId) params.set('shop_id', shopId)
@@ -368,7 +368,7 @@ export function useOpenOrders(vendorId?: string, shopId?: string) {
 
 // Builds drafts from selected recommendation rows (raw backend rec dicts).
 export async function createPODraft(recommendations: any[], createdBy?: string) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const res = await fetch(`${baseUrl}/api/po/draft`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -383,7 +383,7 @@ export async function createPODraft(recommendations: any[], createdBy?: string) 
 
 // Pushes a draft to Lightspeed.
 export async function pushPODraft(draftId: string, pushedBy?: string) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const res = await fetch(`${baseUrl}/api/po/push/${draftId}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -398,7 +398,7 @@ export async function pushPODraft(draftId: string, pushedBy?: string) {
 
 // Deletes a draft.
 export async function deletePODraft(draftId: string) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const res = await fetch(`${baseUrl}/api/po/draft/${draftId}`, { method: 'DELETE' })
   if (!res.ok) {
     const errorData = await res.json().catch(() => null)
@@ -416,7 +416,7 @@ export function useConnectionStatus() {
 
   useEffect(() => {
     const checkHealth = () => {
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+      const baseUrl = '/backend'
 
       const controller = new AbortController()
       const timeoutId = setTimeout(() => controller.abort(), 8000) // 8s timeout
@@ -461,7 +461,7 @@ export function useConnectionStatus() {
 // Mirrors the live PO-draft hooks above. `refetch()` forces a server-side re-fetch
 // from Lightspeed (bypasses the backend TTL cache).
 export function useSpecialOrders() {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const baseUrl = '/backend'
   const url = `${baseUrl}/api/special-orders`
   const { data, error, mutate, isLoading } = useSWR<import('./types').SpecialOrderDashboard>(
     url,
