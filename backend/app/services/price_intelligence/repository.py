@@ -221,6 +221,25 @@ def ensure_pi_tables():
             "activated_at": "TIMESTAMP",
         })
         _ensure_columns(client, T_EVENTS, {"item_brand": "STRING"})
+        _ensure_columns(client, T_URLS, {
+            "competitor_sku": "STRING",
+            "competitor_variant_id": "STRING",
+            "competitor_gtin": "STRING",
+            "variant_options_json": "STRING",
+        })
+        _ensure_columns(client, T_OBSERVATIONS, {
+            "extraction_method": "STRING",
+            "price_scope": "STRING",
+            "variant_id": "STRING",
+            "variant_options_json": "STRING",
+            "price_low": "FLOAT64",
+            "price_high": "FLOAT64",
+        })
+        _ensure_columns(client, T_LINKS, {
+            "variant_id": "STRING",
+            "variant_options_json": "STRING",
+        })
+        _ensure_columns(client, T_RUNS, {"stats_json": "STRING"})
         _tables_ensured = True
 
 
@@ -468,7 +487,8 @@ def get_tracked_urls(include_disabled: bool = True):
 def update_tracked_url(url_id: str, fields: dict):
     """Updates the mutable fields of a tracked URL (item_id / label / competitor_id)."""
     ensure_pi_tables()
-    allowed = {"item_id", "label", "competitor_id"}
+    allowed = {"item_id", "label", "competitor_id", "competitor_sku",
+               "competitor_variant_id", "competitor_gtin", "variant_options_json"}
     sets, params = [], [bigquery.ScalarQueryParameter("uid", "STRING", str(url_id))]
     for k, v in fields.items():
         if k not in allowed:
@@ -492,6 +512,10 @@ def upsert_tracked_url(data: dict) -> dict:
         "competitor_id": data.get("competitor_id"),
         "item_id": str(data["item_id"]) if data.get("item_id") else None,
         "label": data.get("label"),
+        "competitor_sku": data.get("competitor_sku"),
+        "competitor_variant_id": data.get("competitor_variant_id"),
+        "competitor_gtin": data.get("competitor_gtin"),
+        "variant_options_json": data.get("variant_options_json"),
         "enabled": bool(data.get("enabled", True)),
         "created_by": data.get("created_by", "Dashboard"),
         "created_at": data.get("created_at") or now,
@@ -500,7 +524,9 @@ def upsert_tracked_url(data: dict) -> dict:
     }
     _merge_upsert(
         T_URLS, [row], "url_id",
-        update_cols=["url", "competitor_id", "item_id", "label", "enabled"],
+        update_cols=["url", "competitor_id", "item_id", "label", "enabled",
+                     "competitor_sku", "competitor_variant_id", "competitor_gtin",
+                     "variant_options_json"],
         insert_cols=list(row.keys()),
     )
     invalidate_pi_caches()
@@ -551,10 +577,8 @@ def get_tracked_products_with_market(days: int = 7):
     """Tracked products joined with market min/median from the latest observation
     per (competitor, product) over the trailing window.
 
-    Market data aggregates at the model/matrix grain when the item belongs to a
-    matrix (sizes share MSRP, so a 56cm listing prices every tracked size), else
-    per item. competitor_count COALESCEs NULL competitor_id (tracked-URL rows)
-    to the URL so URL-only tracking still counts as a store."""
+    Only exact variant/product observations participate. Range observations remain
+    available for display and diagnostics but cannot influence decision KPIs."""
     ensure_pi_tables()
     cache_key = f"tracked_market_{days}"
     cached = _cache_get(cache_key)
@@ -562,35 +586,26 @@ def get_tracked_products_with_market(days: int = 7):
         return cached
     rows = _rows(f"""
         WITH latest AS (
-            SELECT o.*,
-                   -- digit signature of the listing's size (last '-' segment only,
-                   -- so the model number e.g. '5000' doesn't pollute the size match)
-                   (SELECT STRING_AGG(d, ',' ORDER BY d) FROM UNNEST(REGEXP_EXTRACT_ALL(
-                       LOWER(ARRAY_REVERSE(SPLIT(COALESCE(o.competitor_title, ''), ' - '))[SAFE_OFFSET(0)]),
-                       r'[0-9]+')) d) AS comp_size_sig
+            SELECT o.*
             FROM `{T_OBSERVATIONS}` o
             WHERE observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND match_item_id IS NOT NULL AND price IS NOT NULL
+              AND (COALESCE(price_scope, 'variant') = 'variant'
+                   OR (price_scope = 'product' AND NOT EXISTS (
+                       SELECT 1 FROM `{T_TRACKED}` mt
+                       WHERE mt.item_id = o.match_item_id AND mt.item_matrix_id IS NOT NULL)))
             QUALIFY ROW_NUMBER() OVER (PARTITION BY diff_key ORDER BY observed_at DESC) = 1
         ),
-        grouped AS (
-            SELECT l.*, COALESCE(t.item_matrix_id, t.item_id) AS group_key
-            FROM latest l
-            JOIN `{T_TRACKED}` t ON t.item_id = l.match_item_id
-        ),
-        -- one representative per (matrix, store): freshest in-stock, then cheapest,
-        -- so a stale listing can't undercut the current price (mirrors the breakdown).
         store_rep AS (
-            SELECT * FROM grouped
+            SELECT * FROM latest
             QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY group_key, COALESCE(competitor_id, CONCAT('url:', url))
+                PARTITION BY match_item_id, COALESCE(competitor_id, CONCAT('url:', url))
                 ORDER BY IF(COALESCE(in_stock, FALSE), 1, 0) DESC, observed_at DESC, price ASC
             ) = 1
         ),
-        -- fallback: pool the whole matrix (sizes share MSRP for bikes)
-        matrix_market AS (
+        market AS (
             SELECT
-                group_key,
+                match_item_id AS item_id,
                 MIN(IF(in_stock, price, NULL)) AS market_min_in_stock,
                 MIN(price) AS market_min,
                 APPROX_QUANTILES(price, 2)[SAFE_OFFSET(1)] AS market_median,
@@ -598,51 +613,13 @@ def get_tracked_products_with_market(days: int = 7):
                 ARRAY_AGG(DISTINCT competitor_id IGNORE NULLS) AS competitor_ids,
                 MAX(observed_at) AS last_observed_at
             FROM store_rep
-            GROUP BY group_key
-        ),
-        tracked_active AS (
-            SELECT *, COALESCE(item_matrix_id, item_id) AS group_key,
-                   (SELECT STRING_AGG(d, ',' ORDER BY d) FROM UNNEST(REGEXP_EXTRACT_ALL(
-                       LOWER(CONCAT(COALESCE(attribute_1,''),' ',COALESCE(attribute_2,''),' ',
-                       COALESCE(attribute_3,''))), r'[0-9]+')) d) AS item_size_sig
-            FROM `{T_TRACKED}` WHERE COALESCE(archived, FALSE) = FALSE
-        ),
-        -- preferred: competitor listings whose size signature matches this item's,
-        -- so market data stays size-accurate for matrices priced per size (tires);
-        -- reduced to the freshest representative per (item, store).
-        item_rep AS (
-            SELECT t.item_id, g.competitor_id, g.url, g.in_stock, g.price, g.observed_at
-            FROM tracked_active t
-            JOIN grouped g
-              ON g.group_key = t.group_key AND g.comp_size_sig = t.item_size_sig
-            WHERE t.item_size_sig IS NOT NULL AND t.item_size_sig != ''
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY t.item_id, COALESCE(g.competitor_id, CONCAT('url:', g.url))
-                ORDER BY IF(COALESCE(g.in_stock, FALSE), 1, 0) DESC, g.observed_at DESC, g.price ASC
-            ) = 1
-        ),
-        item_market AS (
-            SELECT
-                item_id,
-                MIN(IF(in_stock, price, NULL)) AS market_min_in_stock,
-                MIN(price) AS market_min,
-                APPROX_QUANTILES(price, 2)[SAFE_OFFSET(1)] AS market_median,
-                COUNT(DISTINCT COALESCE(competitor_id, CONCAT('url:', url))) AS competitor_count,
-                ARRAY_AGG(DISTINCT competitor_id IGNORE NULLS) AS competitor_ids,
-                MAX(observed_at) AS last_observed_at
-            FROM item_rep
-            GROUP BY item_id
+            GROUP BY match_item_id
         )
-        SELECT t.* EXCEPT(group_key, item_size_sig),
-               COALESCE(im.market_min_in_stock, mm.market_min_in_stock) AS market_min_in_stock,
-               COALESCE(im.market_min, mm.market_min) AS market_min,
-               COALESCE(im.market_median, mm.market_median) AS market_median,
-               COALESCE(im.competitor_count, mm.competitor_count) AS competitor_count,
-               COALESCE(im.competitor_ids, mm.competitor_ids) AS competitor_ids,
-               COALESCE(im.last_observed_at, mm.last_observed_at) AS last_observed_at
-        FROM tracked_active t
-        LEFT JOIN item_market im ON im.item_id = t.item_id
-        LEFT JOIN matrix_market mm ON mm.group_key = t.group_key
+        SELECT t.*, m.market_min_in_stock, m.market_min, m.market_median,
+               m.competitor_count, m.competitor_ids, m.last_observed_at
+        FROM `{T_TRACKED}` t
+        LEFT JOIN market m ON m.item_id = t.item_id
+        WHERE COALESCE(t.archived, FALSE) = FALSE
         ORDER BY t.revenue_rank
     """, params=[bigquery.ScalarQueryParameter("days", "INT64", days)])
     _cache_set(cache_key, rows)
@@ -651,63 +628,48 @@ def get_tracked_products_with_market(days: int = 7):
 
 def get_item_competitor_prices(item_id: str, days: int = 45):
     """One representative price per competitor for an item — the per-store breakdown.
-    Includes matrix-sibling matches, but keeps it size-accurate: for each store we
-    prefer a listing whose size matches this item (falling back to size-unknown, then
-    any), and among those the freshest in-stock, then cheapest — so a stale or wrong-
-    size sibling can't undercut the real price. NULL competitor_id → URL host name."""
+    Exact child observations never propagate to matrix siblings. Range observations
+    are returned separately by observation APIs, not this KPI-oriented breakdown."""
     ensure_pi_tables()
     rows = _rows(f"""
-        WITH me AS (
-            SELECT item_id, item_matrix_id, attribute_1, attribute_2, attribute_3
-            FROM `{T_TRACKED}` WHERE item_id = @item_id
-        ),
-        variants AS (
-            SELECT t.item_id FROM `{T_TRACKED}` t, me
-            WHERE t.item_id = me.item_id
-               OR (me.item_matrix_id IS NOT NULL AND t.item_matrix_id = me.item_matrix_id)
-        ),
-        latest AS (
+        WITH latest AS (
             SELECT o.* FROM `{T_OBSERVATIONS}` o
-            JOIN variants v ON v.item_id = o.match_item_id
-            WHERE o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+            WHERE o.match_item_id = @item_id
+              AND o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND o.price IS NOT NULL
+              AND (COALESCE(o.price_scope, 'variant') = 'variant'
+                   OR (o.price_scope = 'product' AND NOT EXISTS (
+                       SELECT 1 FROM `{T_TRACKED}` mt
+                       WHERE mt.item_id = o.match_item_id AND mt.item_matrix_id IS NOT NULL)))
             QUALIFY ROW_NUMBER() OVER (PARTITION BY o.diff_key ORDER BY o.observed_at DESC) = 1
         )
         SELECT l.competitor_id, c.name AS competitor_name, l.source, l.url,
                l.competitor_title, l.price, l.compare_at_price, l.in_stock,
                l.observed_at, l.match_method, l.match_confidence,
-               me.attribute_1 AS it_a1, me.attribute_2 AS it_a2, me.attribute_3 AS it_a3
+               l.price_scope, l.price_low, l.price_high, l.extraction_method,
+               l.variant_id, l.variant_options_json
         FROM latest l
         LEFT JOIN `{T_COMPETITORS}` c ON c.competitor_id = l.competitor_id
-        CROSS JOIN me
     """, params=[
         bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
         bigquery.ScalarQueryParameter("days", "INT64", days),
     ])
     from urllib.parse import urlparse
-    from .matcher import size_matches_item
-
     # group latest-per-listing rows by store, pick the best representative
     stores: dict = {}
     for r in rows:
-        r["_size"] = size_matches_item(
-            r.get("competitor_title"), [r.get("it_a1"), r.get("it_a2"), r.get("it_a3")])
         key = r.get("competitor_id") or f"url:{r.get('url')}"
         stores.setdefault(key, []).append(r)
 
     out = []
     for group in stores.values():
-        pool = ([r for r in group if r["_size"] is True]
-                or [r for r in group if r["_size"] is None] or group)
-        best = sorted(pool, key=lambda r: (
+        best = sorted(group, key=lambda r: (
             1 if r.get("in_stock") else 0,
             r.get("observed_at") or "",
             -(r.get("price") or 0.0),
         ), reverse=True)[0]
         if not best.get("competitor_name") and best.get("url"):
             best["competitor_name"] = urlparse(best["url"]).netloc
-        for k in ("_size", "it_a1", "it_a2", "it_a3"):
-            best.pop(k, None)
         out.append(best)
     out.sort(key=lambda r: r.get("price") or 0.0)
     return out
@@ -850,6 +812,7 @@ def get_latest_observation_map(days: int = 45):
         SELECT diff_key, price, in_stock
         FROM `{T_OBSERVATIONS}`
         WHERE observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+          AND COALESCE(price_scope, 'variant') IN ('variant', 'product')
         QUALIFY ROW_NUMBER() OVER (PARTITION BY diff_key ORDER BY observed_at DESC) = 1
     """, params=[bigquery.ScalarQueryParameter("days", "INT64", days)])
     return {r["diff_key"]: r for r in rows if r.get("diff_key")}
@@ -858,7 +821,8 @@ def get_latest_observation_map(days: int = 45):
 def get_item_observations(item_id: str, days: int = 120):
     return _rows(f"""
         SELECT observed_at, competitor_id, url, price, compare_at_price, in_stock,
-               match_method, match_confidence, competitor_title
+               match_method, match_confidence, competitor_title, extraction_method,
+               price_scope, price_low, price_high, variant_id, variant_options_json
         FROM `{T_OBSERVATIONS}`
         WHERE match_item_id = @item_id
           AND observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
@@ -876,21 +840,31 @@ def get_item_price_history(item_id: str, days: int = 120):
     even over a long window (one item, lazy on expand). A price holds until the next
     change (the client draws it as a step line).
 
-    Competitor series aggregate at the model/matrix grain (matrix siblings included,
-    like get_item_competitor_prices); when a competitor has multiple listings at one
-    snapshot we keep the in-stock, lowest price as the representative point."""
+    Competitor series are item-specific; child observations never bleed across a
+    matrix. Ambiguous/range observations are excluded from the chart.
+
+    Each series also includes one baseline point — its latest change before the
+    window (lookback capped at 365 days) — so the client can carry the price
+    forward from the window's left edge instead of starting the line blank."""
     ensure_pi_tables()
     ours = _rows(f"""
         SELECT observed_at, price FROM (
             SELECT observed_at, price,
                    LAG(price) OVER (ORDER BY observed_at) AS prev_price,
-                   MAX(observed_at) OVER () AS last_at
+                   MAX(observed_at) OVER () AS last_at,
+                   observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+                       AS in_window,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+                       ORDER BY observed_at DESC) AS rn
             FROM `{T_OUR_PRICE_HISTORY}`
             WHERE item_id = @item_id
-              AND observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+              AND observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
               AND price IS NOT NULL
         )
-        WHERE prev_price IS NULL OR ABS(price - prev_price) > 0.005 OR observed_at = last_at
+        WHERE (in_window AND (prev_price IS NULL OR ABS(price - prev_price) > 0.005
+                              OR observed_at = last_at))
+           OR (NOT in_window AND rn = 1)
         ORDER BY observed_at
     """, params=[
         bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
@@ -898,23 +872,18 @@ def get_item_price_history(item_id: str, days: int = 120):
     ])
 
     comp_rows = _rows(f"""
-        WITH me AS (
-            SELECT item_id, item_matrix_id FROM `{T_TRACKED}`
-            WHERE item_id = @item_id
-        ),
-        variants AS (
-            SELECT t.item_id FROM `{T_TRACKED}` t, me
-            WHERE t.item_id = me.item_id
-               OR (me.item_matrix_id IS NOT NULL AND t.item_matrix_id = me.item_matrix_id)
-        ),
-        obs AS (
+        WITH obs AS (
             SELECT
                 COALESCE(o.competitor_id, CONCAT('url:', o.url)) AS series_key,
                 o.competitor_id, o.url, o.run_id, o.observed_at, o.price, o.in_stock
             FROM `{T_OBSERVATIONS}` o
-            JOIN variants v ON v.item_id = o.match_item_id
-            WHERE o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+            WHERE o.match_item_id = @item_id
+              AND o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
               AND o.price IS NOT NULL
+              AND (COALESCE(o.price_scope, 'variant') = 'variant'
+                   OR (o.price_scope = 'product' AND NOT EXISTS (
+                       SELECT 1 FROM `{T_TRACKED}` mt
+                       WHERE mt.item_id = o.match_item_id AND mt.item_matrix_id IS NOT NULL)))
         ),
         per_run AS (
             -- One representative point per competitor per scrape: prefer an
@@ -935,15 +904,22 @@ def get_item_price_history(item_id: str, days: int = 120):
         changed AS (
             SELECT *,
                    LAG(price) OVER (PARTITION BY series_key ORDER BY observed_at) AS prev_price,
-                   MAX(observed_at) OVER (PARTITION BY series_key) AS last_at
+                   MAX(observed_at) OVER (PARTITION BY series_key) AS last_at,
+                   observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+                       AS in_window,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY series_key,
+                           observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+                       ORDER BY observed_at DESC) AS rn
             FROM per_run
         )
         SELECT c.series_key, c.competitor_id, comp.name AS competitor_name, c.url,
                c.observed_at, c.price, c.in_stock
         FROM changed c
         LEFT JOIN `{T_COMPETITORS}` comp ON comp.competitor_id = c.competitor_id
-        WHERE c.prev_price IS NULL OR ABS(c.price - c.prev_price) > 0.005
-           OR c.observed_at = c.last_at
+        WHERE (c.in_window AND (c.prev_price IS NULL OR ABS(c.price - c.prev_price) > 0.005
+                                OR c.observed_at = c.last_at))
+           OR (NOT c.in_window AND c.rn = 1)
         ORDER BY c.series_key, c.observed_at
     """, params=[
         bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
@@ -1298,7 +1274,8 @@ def upsert_human_link(row: dict):
     _merge_upsert(
         T_LINKS, [row], "match_key",
         update_cols=["item_id", "competitor_id", "competitor_url", "competitor_sku",
-                     "competitor_title", "level", "status", "source", "confidence",
+                     "competitor_title", "gtin", "variant_id", "variant_options_json",
+                     "level", "status", "source", "confidence",
                      "decided_by", "updated_at"],
         insert_cols=list(row.keys()),
     )
@@ -1407,7 +1384,7 @@ def fetch_and_record_link(link_id: str):
     ensure_pi_tables()
     rows = _rows(f"""
         SELECT link_id, item_id, competitor_id, competitor_url, competitor_sku,
-               competitor_title, gtin, confidence
+               competitor_title, gtin, variant_id, variant_options_json, confidence
         FROM `{T_LINKS}` WHERE link_id = @lid AND status = 'confirmed'
     """, params=[bigquery.ScalarQueryParameter("lid", "STRING", str(link_id))])
     if not rows:
@@ -1417,8 +1394,14 @@ def fetch_and_record_link(link_id: str):
     if not url or not item_id:
         return
     try:
-        parsed = PageScraper().fetch(url, sku=l.get("competitor_sku"))
+        parsed = PageScraper().fetch(
+            url, sku=l.get("competitor_sku"), gtin=l.get("gtin"),
+            variant_id=l.get("variant_id"),
+            variant_options=json.loads(l.get("variant_options_json") or "[]"),
+        )
         if parsed and parsed.get("price") is not None:
+            if parsed.get("_matched_by") in ("sku", "gtin", "variant_id", "variant_options"):
+                parsed["price_scope"] = "variant"
             load_rows(T_OBSERVATIONS, [{
                 "observed_at": utcnow_iso(), "run_id": f"confirm-{uuid.uuid4()}",
                 "source": "link", "diff_key": f"link:{l['link_id']}",
@@ -1430,6 +1413,11 @@ def fetch_and_record_link(link_id: str):
                 "match_confidence": l.get("confidence") or 1.0,
                 "price": parsed.get("price"), "compare_at_price": parsed.get("compare_at_price"),
                 "currency": parsed.get("currency"), "in_stock": parsed.get("in_stock"),
+                "extraction_method": parsed.get("extraction_method"),
+                "price_scope": parsed.get("price_scope") or "variant",
+                "variant_id": parsed.get("variant_id"),
+                "variant_options_json": json.dumps(parsed.get("variant_options") or []),
+                "price_low": parsed.get("price_low"), "price_high": parsed.get("price_high"),
             }])
             invalidate_pi_caches()
     except Exception as e:

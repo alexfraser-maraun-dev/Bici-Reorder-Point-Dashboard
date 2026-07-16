@@ -80,6 +80,8 @@ def build_digest_stats(run_id: str) -> dict:
             FROM `{repository.T_OBSERVATIONS}` o
             JOIN `{repository.T_TRACKED}` t ON t.item_id = o.match_item_id
             WHERE o.run_id = @run_id AND o.price IS NOT NULL
+              AND (COALESCE(o.price_scope, 'variant') = 'variant'
+                   OR (o.price_scope = 'product' AND t.item_matrix_id IS NULL))
             GROUP BY o.match_item_id
         )
         SELECT
@@ -111,6 +113,8 @@ def build_digest_stats(run_id: str) -> dict:
             FROM `{repository.T_OBSERVATIONS}` o
             JOIN `{repository.T_TRACKED}` t ON t.item_id = o.match_item_id
             WHERE o.run_id = @run_id AND o.price IS NOT NULL
+              AND (COALESCE(o.price_scope, 'variant') = 'variant'
+                   OR (o.price_scope = 'product' AND t.item_matrix_id IS NULL))
             GROUP BY o.match_item_id
         )
         SELECT match_item_id AS item_id, title AS item, our_price, market_min,
@@ -132,6 +136,8 @@ def build_digest_stats(run_id: str) -> dict:
             FROM `{repository.T_OBSERVATIONS}` o
             JOIN `{repository.T_TRACKED}` t ON t.item_id = o.match_item_id
             WHERE o.run_id = @run_id AND o.price IS NOT NULL
+              AND (COALESCE(o.price_scope, 'variant') = 'variant'
+                   OR (o.price_scope = 'product' AND t.item_matrix_id IS NULL))
             GROUP BY o.match_item_id
         )
         SELECT match_item_id AS item_id, title AS item, our_price, market_min,

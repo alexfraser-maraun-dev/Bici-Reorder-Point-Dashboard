@@ -4,7 +4,7 @@ export interface Competitor {
   competitor_id: string
   name: string
   base_url: string
-  connector_type: 'shopify_json' | 'shopify_html' | 'unknown' | null
+  connector_type: 'shopify_json' | 'shopify_html' | 'sitemap_html' | 'unknown' | null
   enabled: boolean
   notes: string | null
   created_at: string | null
@@ -24,6 +24,10 @@ export interface TrackedUrl {
   created_at: string | null
   last_scraped_at: string | null
   last_status: string | null
+  competitor_sku: string | null
+  competitor_variant_id: string | null
+  competitor_gtin: string | null
+  variant_options_json: string | null
   // joined from pi_tracked_products when item_id is set
   item_title: string | null
   item_brand: string | null
@@ -54,7 +58,7 @@ export interface TrackedProduct {
   attribute_2: string | null
   attribute_3: string | null
   updated_at: string | null
-  // joined market fields (matrix-grain when the item belongs to a matrix)
+  // joined market fields; exact observations only, never matrix-propagated
   market_min_in_stock: number | null
   market_min: number | null
   market_median: number | null
@@ -133,6 +137,12 @@ export interface ScrapeStatus {
   links_total?: number
   observations?: number
   changes?: number
+  variants_extracted?: number
+  exact_resolutions?: number
+  ambiguous_pages?: number
+  ranges_excluded?: number
+  fallback_failures?: number
+  extractor_methods?: Record<string, number>
   errors?: string[]
 }
 
@@ -147,6 +157,7 @@ export interface ScrapeRun {
   observations_count: number
   changes_count: number
   error: string | null
+  stats_json: string | null
 }
 
 export interface PriceIntelSummary {
@@ -198,6 +209,12 @@ export interface ItemObservation {
   match_method: string | null
   match_confidence: number | null
   competitor_title: string | null
+  extraction_method: string | null
+  price_scope: 'variant' | 'product' | 'range' | null
+  price_low: number | null
+  price_high: number | null
+  variant_id: string | null
+  variant_options_json: string | null
 }
 
 export interface Digest {
@@ -227,6 +244,42 @@ export interface PricePushPreview {
   guard_reasons: string[]
 }
 
+// Whole-matrix push preview: one row per variant, enumerated live from Lightspeed.
+export interface MatrixVariantPreview {
+  item_id: string
+  description: string | null
+  system_sku: string | null
+  attributes: string[]
+  current_price: number | null
+  cost: number | null
+  tracked: boolean
+  floor_price: number | null
+  floor_source: 'map_price' | 'min_price_override' | 'cost_margin_floor' | null
+  guard: 'ok' | 'below_floor' | 'rejected'
+  guard_reasons: string[]
+}
+
+export interface MatrixPushPreview {
+  item_matrix_id: string
+  matrix_description: string | null
+  anchor_item_id: string
+  proposed_price: number
+  variant_count: number
+  variants: MatrixVariantPreview[]
+  guard: 'ok' | 'below_floor' | 'rejected'
+  guard_reasons: string[]
+  warnings: string[]
+}
+
+export interface MatrixPushResult {
+  item_matrix_id: string
+  matrix_description: string | null
+  proposed_price: number
+  variant_count: number
+  status: string
+  results: { item_id: string; description: string | null; status: string; error: string | null }[]
+}
+
 export interface ItemSearchResult {
   item_id: string
   title: string | null
@@ -253,6 +306,8 @@ export interface ProductLink {
   competitor_sku: string | null
   competitor_title: string | null
   gtin: string | null
+  variant_id: string | null
+  variant_options_json: string | null
   level: 'variant' | 'model' | null
   status: ProductLinkStatus
   source: 'gtin' | 'llm' | 'human' | 'manual_url'
@@ -288,6 +343,32 @@ export interface ItemCompetitorPrice {
   observed_at: string
   match_method: string | null
   match_confidence: number | null
+  extraction_method: string | null
+  price_scope: 'variant' | 'product' | 'range' | null
+  price_low: number | null
+  price_high: number | null
+  variant_id: string | null
+  variant_options_json: string | null
+}
+
+export interface VariantCandidate {
+  title: string | null
+  sku: string | null
+  gtin: string | null
+  variant_id: string | null
+  variant_options: string[]
+  price: number | null
+  compare_at_price: number | null
+  currency: string | null
+  in_stock: boolean | null
+  price_scope: 'variant' | 'product' | 'range'
+  extraction_method: string | null
+}
+
+export interface VariantSelectionRequired {
+  code: 'variant_selection_required'
+  message: string
+  candidates: VariantCandidate[]
 }
 
 // Admin console: one row per runtime setting. Secret values (Slack webhooks)

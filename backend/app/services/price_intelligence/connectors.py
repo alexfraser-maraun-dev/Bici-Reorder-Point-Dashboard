@@ -29,7 +29,7 @@ import ipaddress
 import socket
 import urllib.robotparser
 from typing import Dict, Iterator, Optional
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -127,6 +127,8 @@ class _RobotsCache:
 
 
 _robots = _RobotsCache()
+_magento_graphql_capabilities = {}
+_magento_graphql_lock = threading.Lock()
 
 
 def polite_get(url: str, *, respect_robots: bool = True) -> Optional[requests.Response]:
@@ -171,7 +173,15 @@ def _to_price(value) -> Optional[float]:
     if value is None:
         return None
     try:
-        cleaned = re.sub(r"[^\d.]", "", str(value).replace(",", ""))
+        raw = re.sub(r"[^\d,.-]", "", str(value)).strip()
+        # 1.234,56 / 1 234,56 are decimal-comma prices; 1,234.56 is not.
+        if "," in raw and "." not in raw:
+            tail = raw.rsplit(",", 1)[-1]
+            raw = raw.replace(",", ".") if len(tail) in (1, 2) else raw.replace(",", "")
+        elif "," in raw and "." in raw:
+            raw = raw.replace(",", "") if raw.rfind(".") > raw.rfind(",") \
+                else raw.replace(".", "").replace(",", ".")
+        cleaned = raw
         return float(cleaned) if cleaned else None
     except (TypeError, ValueError):
         return None
@@ -204,37 +214,191 @@ def _offer_fields(offer: dict) -> dict:
         in_stock = "instock" in availability or "limitedavailability" in availability
     return {
         "price": price,
+        "price_low": _to_price(offer.get("lowPrice")),
+        "price_high": _to_price(offer.get("highPrice")),
         "currency": offer.get("priceCurrency"),
         "in_stock": in_stock,
     }
 
 
-def parse_product_page(html: str, url: str) -> Optional[dict]:
-    """Extracts {title, price, currency, in_stock, gtin, sku, brand} from a product
-    page. JSON-LD first (most reliable, carries GTIN), then OpenGraph/microdata."""
-    soup = BeautifulSoup(html, "lxml")
+def _brand_name(value):
+    return value.get("name") if isinstance(value, dict) else value
 
-    for product in _iter_jsonld_products(soup):
-        offers = product.get("offers")
-        if isinstance(offers, list):
-            offers = offers[0] if offers else {}
-        if not isinstance(offers, dict):
-            offers = {}
-        fields = _offer_fields(offers)
-        if fields["price"] is None:
+
+def _gtin(*objects):
+    for obj in objects:
+        if not isinstance(obj, dict):
             continue
-        brand = product.get("brand")
-        if isinstance(brand, dict):
-            brand = brand.get("name")
-        gtin = (product.get("gtin13") or product.get("gtin12") or product.get("gtin14")
-                or product.get("gtin") or offers.get("gtin13") or offers.get("gtin12"))
-        return {
-            "title": product.get("name"),
-            "brand": brand,
-            "sku": product.get("sku") or offers.get("sku"),
-            "gtin": str(gtin) if gtin else None,
-            **fields,
-        }
+        value = (obj.get("gtin14") or obj.get("gtin13") or obj.get("gtin12")
+                 or obj.get("gtin8") or obj.get("gtin"))
+        if value:
+            return str(value)
+    return None
+
+
+def _normalized_listing(**values) -> dict:
+    row = {
+        "title": None, "brand": None, "sku": None, "gtin": None,
+        "variant_id": None, "variant_options": [], "price": None,
+        "compare_at_price": None, "price_low": None, "price_high": None,
+        "currency": None, "in_stock": None, "price_scope": "product",
+        "extraction_method": None, "url": None,
+    }
+    row.update(values)
+    row["variant_options"] = row.get("variant_options") or []
+    return row
+
+
+def _magento_listings(soup: BeautifulSoup, url: str) -> list:
+    """Extract the main Magento configurable product's child records.
+
+    Magento pages commonly contain several x-magento-init blocks for carousels and
+    related products. Only the main swatch-options component is authoritative for
+    the PDP; failing to find that exact key deliberately returns no records.
+    """
+    configs = []
+    for script in soup.find_all("script", type="text/x-magento-init"):
+        try:
+            data = json.loads(script.string or script.get_text() or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        swatch = data.get("[data-role=swatch-options]") if isinstance(data, dict) else None
+        if not isinstance(swatch, dict):
+            continue
+        component = swatch.get("Magento_Swatches/js/swatch-renderer")
+        if not isinstance(component, dict):
+            continue
+        cfg = component.get("jsonConfig")
+        if isinstance(cfg, dict) and isinstance(cfg.get("index"), dict):
+            configs.append(cfg)
+    if not configs:
+        return []
+    cfg = max(configs, key=lambda c: len(c.get("index") or {}))
+    index = cfg.get("index") or {}
+    attributes = cfg.get("attributes") or {}
+    skus = cfg.get("sku") or {}
+    upcs = cfg.get("upc") or {}
+    prices = cfg.get("optionPrices") or {}
+    stock = cfg.get("stockInfo") or {}
+
+    product = next(_iter_jsonld_products(soup), {})
+    base_title = product.get("name") if isinstance(product, dict) else None
+    base_brand = _brand_name(product.get("brand")) if isinstance(product, dict) else None
+    if not base_title:
+        title_tag = soup.find("meta", attrs={"property": "og:title"})
+        base_title = title_tag.get("content") if title_tag else None
+
+    option_labels = {}
+    for attr_id, attr in attributes.items():
+        values = {}
+        for option in (attr or {}).get("options") or []:
+            oid = str(option.get("id"))
+            values[oid] = option.get("label")
+        option_labels[str(attr_id)] = values
+
+    rows = []
+    for child_id, selected in index.items():
+        child_id = str(child_id)
+        options = []
+        for attr_id, option_id in (selected or {}).items():
+            label = option_labels.get(str(attr_id), {}).get(str(option_id))
+            if label:
+                options.append(str(label).strip())
+        sku = skus.get(child_id)
+        price_cfg = prices.get(child_id) or {}
+        final = _to_price((price_cfg.get("finalPrice") or {}).get("amount"))
+        regular = _to_price((price_cfg.get("oldPrice") or {}).get("amount"))
+        stock_cfg = stock.get(child_id) or stock.get(str(sku)) or {}
+        in_stock = stock_cfg.get("isSalable")
+        rows.append(_normalized_listing(
+            title=(f"{base_title} - {' / '.join(options)}" if base_title and options else base_title),
+            brand=base_brand, sku=str(sku) if sku else None,
+            gtin=str(upcs.get(str(sku))) if sku and upcs.get(str(sku)) else None,
+            variant_id=child_id, variant_options=options, price=final,
+            compare_at_price=regular if regular and final and regular > final else None,
+            currency=next((o.get("priceCurrency") for o in (
+                product.get("offers") if isinstance(product.get("offers"), list)
+                else [product.get("offers")])
+                if isinstance(o, dict) and o.get("priceCurrency")), None)
+                if isinstance(product, dict) else None,
+            in_stock=bool(in_stock) if in_stock is not None else None,
+            price_scope="variant", extraction_method="magento_json_config", url=url,
+        ))
+    return [r for r in rows if r.get("price") is not None]
+
+
+def _jsonld_listings(soup: BeautifulSoup, url: str) -> list:
+    rows = []
+    for product in _iter_jsonld_products(soup):
+        brand = _brand_name(product.get("brand"))
+        variants = product.get("hasVariant") or []
+        if isinstance(variants, dict):
+            variants = [variants]
+        sources = variants if variants else [product]
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            source_brand = _brand_name(source.get("brand")) or brand
+            offers = source.get("offers")
+            if isinstance(offers, dict) and isinstance(offers.get("offers"), list):
+                offers = offers.get("offers")
+            offer_list = offers if isinstance(offers, list) else ([offers] if isinstance(offers, dict) else [])
+            if not offer_list:
+                continue
+            for offer in offer_list:
+                if not isinstance(offer, dict):
+                    continue
+                fields = _offer_fields(offer)
+                low, high = fields.pop("price_low"), fields.pop("price_high")
+                is_range = (low is not None and high is not None and abs(low - high) > .005
+                            and not offer.get("sku") and source is product)
+                price = fields.pop("price")
+                if price is None and low is None:
+                    continue
+                sku = offer.get("sku") or source.get("sku")
+                variant_options = []
+                for key in ("color", "size"):
+                    if source.get(key):
+                        variant_options.append(str(source[key]))
+                rows.append(_normalized_listing(
+                    title=source.get("name") or product.get("name"), brand=source_brand,
+                    sku=str(sku) if sku else None, gtin=_gtin(offer, source, product),
+                    variant_id=str(source.get("productID")) if source.get("productID") else None,
+                    variant_options=variant_options,
+                    price=low if is_range else price, price_low=low, price_high=high,
+                    currency=fields.get("currency"), in_stock=fields.get("in_stock"),
+                    price_scope="range" if is_range else ("variant" if (variants or len(offer_list) > 1) else "product"),
+                    extraction_method="jsonld", url=url,
+                ))
+    # ProductGroup children are often repeated as standalone Product nodes in
+    # @graph. Collapse only truly identical records; differing seller prices for
+    # the same SKU remain ambiguous rather than becoming order-dependent.
+    deduped = {}
+    for row in rows:
+        key = (
+            row.get("variant_id"), row.get("sku"), row.get("gtin"),
+            tuple(row.get("variant_options") or []), row.get("price"),
+            row.get("price_low"), row.get("price_high"), row.get("in_stock"),
+        )
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = row
+        else:
+            for field, value in row.items():
+                if existing.get(field) in (None, [], "") and value not in (None, [], ""):
+                    existing[field] = value
+    return list(deduped.values())
+
+
+def extract_listings(html: str, url: str) -> list:
+    """Return every independently identifiable price listing on a product page."""
+    soup = BeautifulSoup(html, "lxml")
+    magento = _magento_listings(soup, url)
+    if magento:
+        return magento
+    jsonld = _jsonld_listings(soup, url)
+    if jsonld:
+        return jsonld
 
     # OpenGraph / Twitter product meta.
     def _meta(*names):
@@ -251,23 +415,142 @@ def parse_product_page(html: str, url: str) -> Optional[dict]:
         if tag is not None:
             price = _to_price(tag.get("content") or tag.get_text())
     if price is None:
-        return None
+        return []
     availability = (_meta("product:availability", "og:availability") or "").lower()
     in_stock = None
     if availability:
         in_stock = "instock" in availability or "in stock" in availability
-    return {
-        "title": _meta("og:title") or (soup.title.get_text(strip=True) if soup.title else None),
-        "brand": _meta("product:brand"),
-        "sku": None,
-        "gtin": None,
-        "price": price,
-        "currency": _meta("product:price:currency", "og:price:currency"),
-        "in_stock": in_stock,
-    }
+    return [_normalized_listing(
+        title=_meta("og:title") or (soup.title.get_text(strip=True) if soup.title else None),
+        brand=_meta("product:brand"), price=price,
+        currency=_meta("product:price:currency", "og:price:currency"),
+        in_stock=in_stock, price_scope="product", extraction_method="opengraph_microdata",
+        url=url,
+    )]
 
 
-def _shopify_variant(url: str, sku: Optional[str] = None) -> Optional[dict]:
+def _magento_graphql_listings(html: str, url: str) -> list:
+    """Use anonymous Magento GraphQL when the storefront exposes it.
+
+    Capability failures are cached for an hour so disabled endpoints cost one
+    probe, not one request per product. Static extraction remains authoritative
+    fallback and this helper is never used by the pure offline extractor.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    if not soup.find("script", type="text/x-magento-init"):
+        return []
+    parent = next(_iter_jsonld_products(soup), {})
+    sku = parent.get("sku") if isinstance(parent, dict) else None
+    if not sku:
+        return []
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    with _magento_graphql_lock:
+        cached = _magento_graphql_capabilities.get(origin)
+    if cached and not cached[0] and time.time() - cached[1] < 3600:
+        return []
+    query = """query VariantPrices($sku:String!){products(filter:{sku:{eq:$sku}}){items{
+      name sku ... on ConfigurableProduct {variants{attributes{code label value_index} product{
+      uid name sku stock_status price_range{minimum_price{regular_price{value currency}
+      final_price{value currency}}}}}}}}}"""
+    endpoint = f"{origin}/graphql?{urlencode({'query': query, 'variables': json.dumps({'sku': str(sku)})})}"
+    resp = polite_get(endpoint)
+    try:
+        payload = resp.json() if resp is not None and resp.status_code == 200 else None
+    except ValueError:
+        payload = None
+    items = ((payload or {}).get("data") or {}).get("products", {}).get("items") or []
+    variants = items[0].get("variants") or [] if items else []
+    rows = []
+    for variant in variants:
+        child = variant.get("product") or {}
+        price_info = ((child.get("price_range") or {}).get("minimum_price") or {})
+        final = price_info.get("final_price") or {}
+        regular = price_info.get("regular_price") or {}
+        price = _to_price(final.get("value"))
+        if price is None:
+            continue
+        options = [str(a.get("label")) for a in (variant.get("attributes") or []) if a.get("label")]
+        regular_price = _to_price(regular.get("value"))
+        stock_status = str(child.get("stock_status") or "").upper()
+        rows.append(_normalized_listing(
+            title=(f"{items[0].get('name')} - {' / '.join(options)}" if options else child.get("name")),
+            brand=_brand_name(parent.get("brand")), sku=child.get("sku"),
+            variant_id=str(child.get("uid")) if child.get("uid") else None,
+            variant_options=options, price=price,
+            compare_at_price=regular_price if regular_price and regular_price > price else None,
+            currency=final.get("currency") or regular.get("currency"),
+            in_stock=(stock_status == "IN_STOCK") if stock_status else None,
+            price_scope="variant", extraction_method="magento_graphql", url=url,
+        ))
+    # Embedded config often carries UPCs/custom stock metadata omitted from the
+    # public GraphQL schema. Join it by child SKU without replacing API prices.
+    static_by_sku = {r.get("sku"): r for r in _magento_listings(soup, url) if r.get("sku")}
+    for row in rows:
+        static = static_by_sku.get(row.get("sku")) or {}
+        for field in ("gtin", "in_stock"):
+            if row.get(field) is None:
+                row[field] = static.get(field)
+        if not row.get("variant_options"):
+            row["variant_options"] = static.get("variant_options") or []
+    with _magento_graphql_lock:
+        _magento_graphql_capabilities[origin] = (bool(rows), time.time())
+    return rows
+
+
+def _norm_identity(value) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def resolve_listing(listings: list, target_identity: Optional[dict] = None) -> dict:
+    """Resolve a listing without allowing document order to choose a variant."""
+    listings = [r for r in (listings or []) if r.get("price") is not None]
+    if not listings:
+        return {"status": "not_found", "listing": None, "candidates": []}
+    target = target_identity or {}
+    priorities = (
+        ("variant_id", target.get("variant_id")),
+        ("sku", target.get("sku")),
+        ("gtin", target.get("gtin")),
+    )
+    for field, wanted in priorities:
+        if wanted:
+            matches = [r for r in listings if _norm_identity(r.get(field)) == _norm_identity(wanted)]
+            if len(matches) == 1:
+                return {"status": "exact", "matched_by": field,
+                        "listing": matches[0], "candidates": matches}
+    wanted_options = [_norm_identity(v) for v in (target.get("variant_options") or []) if v]
+    if wanted_options:
+        available = {_norm_identity(v) for r in listings for v in (r.get("variant_options") or [])}
+        relevant_options = [w for w in wanted_options if w in available]
+        matches = [r for r in listings if all(
+            w in {_norm_identity(v) for v in (r.get("variant_options") or [])}
+            for w in relevant_options)] if relevant_options else []
+        if len(matches) == 1:
+            return {"status": "exact", "matched_by": "variant_options",
+                    "listing": matches[0], "candidates": matches}
+    if len(listings) == 1:
+        return {"status": "exact", "matched_by": "single_listing",
+                "listing": listings[0], "candidates": listings}
+    prices = [float(r["price"]) for r in listings if r.get("price") is not None]
+    currencies = {r.get("currency") for r in listings if r.get("currency")}
+    summary = _normalized_listing(
+        title=listings[0].get("title"), brand=listings[0].get("brand"),
+        price=min(prices), price_low=min(prices), price_high=max(prices),
+        currency=next(iter(currencies)) if len(currencies) == 1 else None,
+        in_stock=any(r.get("in_stock") is True for r in listings),
+        price_scope="range", extraction_method="ambiguous_variant_set",
+        url=listings[0].get("url"),
+    )
+    return {"status": "ambiguous", "listing": summary, "candidates": listings}
+
+
+def parse_product_page(html: str, url: str) -> Optional[dict]:
+    """Backward-compatible single-result wrapper; ambiguous pages return a range."""
+    return resolve_listing(extract_listings(html, url)).get("listing")
+
+
+def _shopify_listings(url: str) -> list:
     """Resolve a *specific* Shopify variant's price/stock from /products/<handle>.js.
 
     A Shopify PDP's HTML/JSON-LD only ever reflects the default variant — the
@@ -279,7 +562,7 @@ def _shopify_variant(url: str, sku: Optional[str] = None) -> Optional[dict]:
     can't be identified — callers fall back to generic HTML parsing."""
     m = re.search(r"/products/([^/?#]+)", url or "")
     if not m:
-        return None
+        return []
     parsed = urlparse(url)
     handle = m.group(1)
     variant_id = (parse_qs(parsed.query).get("variant") or [None])[0]
@@ -293,54 +576,75 @@ def _shopify_variant(url: str, sku: Optional[str] = None) -> Optional[dict]:
             variant_id = tail.group(1)
     resp = polite_get(f"{parsed.scheme}://{parsed.netloc}/products/{handle}.js")
     if resp is None or resp.status_code != 200:
-        return None
+        return []
     try:
         data = resp.json()
     except ValueError:
-        return None
+        return []
     variants = data.get("variants") or []
     if not variants:
-        return None
-    chosen = None
-    if variant_id:
-        chosen = next((v for v in variants if str(v.get("id")) == str(variant_id)), None)
-    if chosen is None and sku:
-        chosen = next((v for v in variants if str(v.get("sku") or "") == str(sku)), None)
-    if chosen is None and len(variants) == 1:
-        chosen = variants[0]
-    if chosen is None:
-        return None  # ambiguous (base URL, no id/sku) — let HTML fallback decide
+        return []
     cents = lambda c: round(c / 100.0, 2) if isinstance(c, (int, float)) else None
-    pub = chosen.get("public_title") or chosen.get("title")
-    title = data.get("title")
-    return {
-        "title": f"{title} - {pub}" if pub and pub != "Default Title" else title,
-        "brand": data.get("vendor"),
-        "sku": chosen.get("sku"),
-        "gtin": str(chosen["barcode"]) if chosen.get("barcode") else None,
-        "price": cents(chosen.get("price")),
-        "compare_at_price": cents(chosen.get("compare_at_price")),
-        "in_stock": bool(chosen.get("available", True)),
-        "currency": data.get("currency"),
-    }
+    rows = []
+    for chosen in variants:
+        pub = chosen.get("public_title") or chosen.get("title")
+        title = data.get("title")
+        options = [chosen.get(k) for k in ("option1", "option2", "option3")
+                   if chosen.get(k) and chosen.get(k) != "Default Title"]
+        rows.append(_normalized_listing(
+            title=f"{title} - {pub}" if pub and pub != "Default Title" else title,
+            brand=data.get("vendor"), sku=chosen.get("sku"),
+            gtin=str(chosen["barcode"]) if chosen.get("barcode") else None,
+            variant_id=str(chosen.get("id")) if chosen.get("id") else None,
+            variant_options=options, price=cents(chosen.get("price")),
+            compare_at_price=cents(chosen.get("compare_at_price")),
+            in_stock=bool(chosen.get("available", True)), currency=data.get("currency"),
+            price_scope="variant", extraction_method="shopify_js", url=url,
+        ))
+    # URL variant is an identity hint, not permission to discard the others.
+    if variant_id:
+        for row in rows:
+            if row.get("variant_id") == str(variant_id):
+                row["url"] = url
+    return rows
+
+
+def _shopify_variant(url: str, sku: Optional[str] = None) -> Optional[dict]:
+    parsed = urlparse(url)
+    variant_id = (parse_qs(parsed.query).get("variant") or [None])[0]
+    return resolve_listing(_shopify_listings(url), {"variant_id": variant_id, "sku": sku}).get("listing")
 
 
 class PageScraper:
     """Scrapes one registered product URL (feature a)."""
 
-    def fetch(self, url: str, sku: Optional[str] = None) -> Optional[dict]:
+    def listings(self, url: str) -> list:
+        shopify = _shopify_listings(url)
+        if shopify:
+            return shopify
+        resp = polite_get(url)
+        if resp is None or resp.status_code != 200:
+            if resp is not None:
+                print(f"pi: {resp.status_code} fetching tracked url {url}")
+            return []
+        return _magento_graphql_listings(resp.text, url) or extract_listings(resp.text, url)
+
+    def fetch(self, url: str, sku: Optional[str] = None, gtin: Optional[str] = None,
+              variant_id: Optional[str] = None, variant_options=None) -> Optional[dict]:
         # Shopify: resolve the exact variant via .js first (the PDP HTML only shows
         # the default variant's price); otherwise fall back to generic page parsing.
-        variant = _shopify_variant(url, sku=sku)
-        if variant is not None and variant.get("price") is not None:
-            return variant
-        resp = polite_get(url)
-        if resp is None:
-            return None
-        if resp.status_code != 200:
-            print(f"pi: {resp.status_code} fetching tracked url {url}")
-            return None
-        return parse_product_page(resp.text, url)
+        parsed = urlparse(url)
+        url_variant = (parse_qs(parsed.query).get("variant") or [None])[0]
+        result = resolve_listing(self.listings(url), {
+            "variant_id": variant_id or url_variant, "sku": sku, "gtin": gtin,
+            "variant_options": variant_options or [],
+        })
+        listing = result.get("listing")
+        if listing is not None:
+            listing["_resolution_status"] = result["status"]
+            listing["_matched_by"] = result.get("matched_by")
+            listing["_candidates"] = result.get("candidates") or []
+        return listing
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +706,10 @@ class ShopifyJsonConnector:
                         "variant_id": str(vid) if vid else None,
                         "currency": None,
                         "variant_options": options,
+                        "price_low": None,
+                        "price_high": None,
+                        "price_scope": "variant",
+                        "extraction_method": "shopify_json",
                     }
 
 
@@ -485,8 +793,8 @@ class ShopifyHtmlConnector:
             if resp is None or resp.status_code != 200:
                 continue
             fetched += 1
-            parsed = parse_product_page(resp.text, url)
-            if parsed and parsed.get("price") is not None:
+            for parsed in (_magento_graphql_listings(resp.text, url)
+                           or extract_listings(resp.text, url)):
                 if not parsed.get("brand"):
                     parsed["brand"] = _slug_brand(slug, self._brand_names)
                 parsed["url"] = url
@@ -572,8 +880,8 @@ class GenericSitemapConnector:
             if resp is None or resp.status_code != 200:
                 continue
             fetched += 1
-            parsed = parse_product_page(resp.text, url)
-            if parsed and parsed.get("price") is not None:
+            for parsed in (_magento_graphql_listings(resp.text, url)
+                           or extract_listings(resp.text, url)):
                 if not parsed.get("brand"):
                     parsed["brand"] = _slug_brand(path, self._brand_names)
                 parsed["url"] = url

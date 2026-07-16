@@ -11,6 +11,7 @@ strictly sequentially, catalogs stream through generators, and observation
 buffers flush to BigQuery per competitor (capped at FLUSH_ROWS), so peak state is
 one page of products plus the small diff/match dicts.
 """
+import json
 import threading
 import time
 import uuid
@@ -56,6 +57,9 @@ def start_scrape(trigger: str = "manual", full: bool = False):
             "urls_done": 0, "urls_total": 0,
             "links_done": 0, "links_total": 0,
             "observations": 0, "changes": 0, "errors": [],
+            "variants_extracted": 0, "exact_resolutions": 0,
+            "ambiguous_pages": 0, "ranges_excluded": 0,
+            "fallback_failures": 0, "extractor_methods": {},
         })
     threading.Thread(target=_run, args=(run_id, trigger, full), daemon=True).start()
     return run_id
@@ -111,6 +115,9 @@ def _build_events(prev_map, obs, competitor_name, item_lookup):
     """Diffs one observation against the previous one for its diff_key and returns
     change-event rows. First sightings are logged pre-acknowledged so a new
     competitor doesn't flood the badge; real price/stock changes arrive unread."""
+    # A range is useful evidence, but is not a price for the matched item.
+    if obs.get("price_scope") == "range":
+        return []
     events = []
     key = obs["diff_key"]
     prev = prev_map.get(key)
@@ -189,9 +196,40 @@ def _build_events(prev_map, obs, competitor_name, item_lookup):
     return events
 
 
+def _extraction_fields(product: dict) -> dict:
+    return {
+        "extraction_method": product.get("extraction_method"),
+        "price_scope": product.get("price_scope") or "variant",
+        "variant_id": product.get("variant_id"),
+        "variant_options_json": json.dumps(product.get("variant_options") or []),
+        "price_low": product.get("price_low"),
+        "price_high": product.get("price_high"),
+    }
+
+
+def _url_diff_key(url: str, product: dict) -> str:
+    identity = (product.get("variant_id") or product.get("sku") or product.get("gtin")
+                or "unresolved")
+    return f"url:{url}:{identity}"
+
+
+def _count_extraction(counters: dict, product: dict):
+    counters["variants_extracted"] += int(product.get("price_scope") == "variant")
+    status = product.get("_resolution_status")
+    counters["exact_resolutions"] += int(status == "exact")
+    counters["ambiguous_pages"] += int(status == "ambiguous")
+    counters["ranges_excluded"] += int(product.get("price_scope") == "range")
+    method = product.get("extraction_method") or "unknown"
+    counters["extractor_methods"][method] = counters["extractor_methods"].get(method, 0) + 1
+
+
 def _run(run_id: str, trigger: str, force_full: bool = False):
     started_at = _now_iso()
-    counters = {"competitors_done": 0, "urls_done": 0, "observations": 0, "changes": 0}
+    counters = {
+        "competitors_done": 0, "urls_done": 0, "observations": 0, "changes": 0,
+        "variants_extracted": 0, "exact_resolutions": 0, "ambiguous_pages": 0,
+        "ranges_excluded": 0, "fallback_failures": 0, "extractor_methods": {},
+    }
     errors = []
     try:
         _set_status(phase="preparing")
@@ -254,6 +292,8 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 "competitor_sku": product.get("sku"),
                 "competitor_title": product.get("title"),
                 "gtin": product.get("gtin"),
+                "variant_id": product.get("variant_id"),
+                "variant_options_json": json.dumps(product.get("variant_options") or []),
                 "level": "variant" if is_confirmed else (candidate or {}).get("level", "variant"),
                 "status": "confirmed" if is_confirmed else "pending",
                 "source": ("gtin" if method == "gtin"
@@ -315,8 +355,18 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 products_seen = 0
                 for product in connector.iter_products():
                     products_seen += 1
+                    _count_extraction(counters, product)
                     match_key = build_match_key(cid, product)
                     item_id, method, confidence, candidate = index.match(product, match_key)
+                    if item_id is not None and product.get("price_scope") == "product":
+                        item = item_lookup.get(str(item_id)) or {}
+                        if item.get("item_matrix_id"):
+                            if method in ("gtin", "brand_sku", "attr_exact"):
+                                product["price_scope"] = "variant"
+                            else:
+                                product["price_scope"] = "range"
+                                product["price_low"] = product.get("price")
+                                product["price_high"] = product.get("price")
                     observed_at = _now_iso()
                     # Identity for price diffing over time. Route the SKU through
                     # _identifying_sku so Shopify's blank-SKU placeholders
@@ -344,6 +394,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                         "compare_at_price": product.get("compare_at_price"),
                         "currency": product.get("currency"),
                         "in_stock": product.get("in_stock"),
+                        **_extraction_fields(product),
                     }
                     if method == "gtin":
                         # Persist the exact match as a confirmed link so future
@@ -392,7 +443,10 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             repository.mark_competitor_scraped(cid, comp_status[:200])
             counters["competitors_done"] += 1
             _set_status(competitors_done=counters["competitors_done"],
-                        observations=counters["observations"], changes=counters["changes"])
+                        observations=counters["observations"], changes=counters["changes"],
+                        variants_extracted=counters["variants_extracted"],
+                        ranges_excluded=counters["ranges_excluded"],
+                        extractor_methods=dict(counters["extractor_methods"]))
 
         # --- SERP discovery: competitors with no crawlable catalog -----------
         # Runs whenever items need discovery (same trigger as the full crawl);
@@ -420,12 +474,12 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         if not full_scan:
             # Tracked-URL rows are scraped in their own phase below; skip links
             # that would fetch the same page twice.
-            tracked_url_set = {u["url"] for u in urls}
+            tracked_url_items = {(u["url"], str(u.get("item_id") or "")) for u in urls}
             link_targets = [
                 l for l in confirmed_links
                 if l.get("competitor_url") and l.get("item_id")
                 and str(l["item_id"]) in item_lookup
-                and l["competitor_url"] not in tracked_url_set
+                and (l["competitor_url"], str(l.get("item_id") or "")) not in tracked_url_items
             ]
             _set_status(phase="scraping confirmed links", links_total=len(link_targets))
             obs_buffer, event_buffer = [], []
@@ -434,8 +488,15 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 try:
                     # Pass the known SKU so Shopify variant resolution works even for
                     # older links stored as the base (non-?variant) product URL.
-                    parsed = scraper.fetch(link["competitor_url"], sku=link.get("competitor_sku"))
+                    parsed = scraper.fetch(
+                        link["competitor_url"], sku=link.get("competitor_sku"),
+                        gtin=link.get("gtin"), variant_id=link.get("variant_id"),
+                        variant_options=json.loads(link.get("variant_options_json") or "[]"),
+                    )
                     if parsed is not None and parsed.get("price") is not None:
+                        if parsed.get("_matched_by") in ("sku", "gtin", "variant_id", "variant_options"):
+                            parsed["price_scope"] = "variant"
+                        _count_extraction(counters, parsed)
                         obs = {
                             "observed_at": _now_iso(),
                             "run_id": run_id,
@@ -453,6 +514,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                             "compare_at_price": parsed.get("compare_at_price"),
                             "currency": parsed.get("currency"),
                             "in_stock": parsed.get("in_stock"),
+                            **_extraction_fields(parsed),
                         }
                         obs_buffer.append(obs)
                         name = (competitor_names.get(link.get("competitor_id"))
@@ -479,10 +541,19 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         for url_row in urls:
             url = url_row["url"]
             try:
-                parsed = scraper.fetch(url)
+                parsed = scraper.fetch(
+                    url, sku=url_row.get("competitor_sku"),
+                    gtin=url_row.get("competitor_gtin"),
+                    variant_id=url_row.get("competitor_variant_id"),
+                    variant_options=json.loads(url_row.get("variant_options_json") or "[]"),
+                )
                 if parsed is None or parsed.get("price") is None:
+                    counters["fallback_failures"] += 1
                     repository.mark_url_scraped(url_row["url_id"], "no_price")
                 else:
+                    if parsed.get("_matched_by") in ("sku", "gtin", "variant_id", "variant_options"):
+                        parsed["price_scope"] = "variant"
+                    _count_extraction(counters, parsed)
                     item_id = str(url_row["item_id"]) if url_row.get("item_id") else None
                     method, confidence = ("manual_url", 1.0) if item_id else (None, 0.0)
                     if not item_id:
@@ -493,7 +564,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                         "observed_at": _now_iso(),
                         "run_id": run_id,
                         "source": "url",
-                        "diff_key": f"url:{url}",
+                        "diff_key": _url_diff_key(url, parsed),
                         "competitor_id": url_row.get("competitor_id"),
                         "url": url,
                         "competitor_title": parsed.get("title"),
@@ -506,6 +577,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                         "compare_at_price": parsed.get("compare_at_price"),
                         "currency": parsed.get("currency"),
                         "in_stock": parsed.get("in_stock"),
+                        **_extraction_fields(parsed),
                     }
                     obs_buffer.append(obs)
                     name = competitor_names.get(url_row.get("competitor_id")) or urlparse_domain(url)
@@ -583,6 +655,10 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 "observations_count": counters["observations"],
                 "changes_count": counters["changes"],
                 "error": "; ".join(errors)[:1000] if errors else None,
+                "stats_json": json.dumps({
+                    k: v for k, v in counters.items()
+                    if k not in ("competitors_done", "urls_done", "observations", "changes")
+                }),
             })
         except Exception as e:
             print(f"pi: failed to save run record: {e}")
@@ -594,7 +670,10 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         except Exception as e:
             print(f"pi: slack dispatch failed: {e}")
         _set_status(status=status, phase="done", finished_at=finished_at,
-                    errors=errors[:20])
+                    errors=errors[:20], **{
+                        k: v for k, v in counters.items()
+                        if k not in ("competitors_done", "urls_done", "observations", "changes")
+                    })
         _scrape_lock.release()
 
 

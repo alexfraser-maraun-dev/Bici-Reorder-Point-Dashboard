@@ -12,9 +12,10 @@ import {
 } from '@/components/ui/table'
 import { cn } from '@/lib/utils'
 import {
-  apiPost, useCompetitors, useItemCompetitorPrices, useTrackedProducts,
+  ApiError, apiPost, useCompetitors, useItemCompetitorPrices, useTrackedProducts,
 } from '@/lib/price-intel/hooks'
-import type { ItemSearchResult, TrackedProduct } from '@/lib/price-intel/types'
+import type { ItemSearchResult, TrackedProduct, VariantCandidate,
+  VariantSelectionRequired } from '@/lib/price-intel/types'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog'
@@ -23,6 +24,7 @@ import {
 } from '@/components/ui/select'
 import { isMapViolation, mapFloor, itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
 import { PricePushDialog } from './price-push-dialog'
+import { MatrixPushDialog } from './matrix-push-dialog'
 import { ItemSearchPicker } from './item-search-picker'
 import { PriceHistoryChart } from './price-history-chart'
 import {
@@ -43,11 +45,16 @@ const MATCH_METHOD_LABEL: Record<string, string> = {
   attr: 'color+size',
 }
 
-// Expanded-row panel: latest price per store for this item (and its matrix
-// siblings — sizes share MSRP). Lazy: only fetches while expanded.
-function CompetitorBreakdown({ itemId, onRejected }: {
-  itemId: string; onRejected?: () => void
+// Expanded-row panel: latest exact price per store for this item only.
+// Each priced row offers "match": set our price to the competitor's, either for
+// this one variant or (via the guarded matrix dialog) the whole matrix.
+function CompetitorBreakdown({ product, onRejected, onMatchVariant, onMatchMatrix }: {
+  product: TrackedProduct
+  onRejected?: () => void
+  onMatchVariant: (price: number) => void
+  onMatchMatrix: (price: number) => void
 }) {
+  const itemId = product.item_id
   const { prices, isLoading, mutate } = useItemCompetitorPrices(itemId)
 
   const reject = async (competitorId: string | null, url: string | null, name: string) => {
@@ -104,6 +111,22 @@ function CompetitorBreakdown({ itemId, onRejected }: {
           <span className="shrink-0 text-xs text-muted-foreground">
             {new Date(p.observed_at).toLocaleDateString()}
           </span>
+          {p.price != null && !product.excluded && (
+            <span className="flex shrink-0 items-center gap-1">
+              <Button variant="outline" size="sm" className="h-6 px-2 text-[11px]"
+                      title={`Push ${fmt(p.price)} to Lightspeed for this variant only`}
+                      onClick={() => onMatchVariant(p.price!)}>
+                Match variant
+              </Button>
+              {product.item_matrix_id && (
+                <Button variant="outline" size="sm" className="h-6 px-2 text-[11px]"
+                        title={`Push ${fmt(p.price)} to every variant of ${product.matrix_description ?? 'this matrix'} (opens a review dialog)`}
+                        onClick={() => onMatchMatrix(p.price!)}>
+                  Match matrix
+                </Button>
+              )}
+            </span>
+          )}
           {p.url && (
             <a href={p.url} target="_blank" rel="noopener noreferrer"
                className="shrink-0 text-muted-foreground hover:text-foreground"
@@ -184,6 +207,11 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
     }
   }, [quickFilter])
   const [pushTarget, setPushTarget] = useState<TrackedProduct | null>(null)
+  // Set when the push was opened from a competitor row ("match variant") so the
+  // dialog pre-fills that competitor's price instead of the market min.
+  const [pushInitialPrice, setPushInitialPrice] = useState<number | null>(null)
+  const [matrixTarget, setMatrixTarget] =
+    useState<{ product: TrackedProduct; price: number } | null>(null)
   const [reseeding, setReseeding] = useState(false)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const { competitors } = useCompetitors()
@@ -191,8 +219,9 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
   const [overrideUrl, setOverrideUrl] = useState('')
   const [overrideCompetitor, setOverrideCompetitor] = useState<string>('none')
   const [savingOverride, setSavingOverride] = useState(false)
+  const [overrideCandidates, setOverrideCandidates] = useState<VariantCandidate[]>([])
 
-  const saveOverride = async () => {
+  const saveOverride = async (candidate?: VariantCandidate) => {
     if (!overrideTarget) return
     const url = overrideUrl.trim()
     if (!/^https?:\/\//.test(url)) {
@@ -206,16 +235,28 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
         item_id: overrideTarget.item_id,
         competitor_id: overrideCompetitor === 'none' ? null : overrideCompetitor,
         label: overrideTarget.title,
+        competitor_sku: candidate?.sku,
+        competitor_variant_id: candidate?.variant_id,
+        competitor_gtin: candidate?.gtin,
+        variant_options: candidate?.variant_options,
       })
       toast.success('Match locked in — fetching the competitor price now')
       setOverrideTarget(null)
       setOverrideUrl('')
       setOverrideCompetitor('none')
+      setOverrideCandidates([])
       await mutate()
       // the first observation is fetched in a background task server-side —
       // refresh again once it has landed so price/stores update without a reload
       setTimeout(() => { void mutate() }, 12000)
     } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        const detail = e.detail as VariantSelectionRequired
+        if (detail?.code === 'variant_selection_required') {
+          setOverrideCandidates(detail.candidates)
+          return
+        }
+      }
       toast.error(e instanceof Error ? e.message : 'Failed to save match')
     } finally {
       setSavingOverride(false)
@@ -510,7 +551,8 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
                             <Link2 className="h-4 w-4 text-muted-foreground" />
                           </Button>
                           <Button variant="ghost" size="sm" title="Push price to Lightspeed"
-                                  onClick={() => setPushTarget(p)} disabled={p.excluded}>
+                                  onClick={() => { setPushInitialPrice(null); setPushTarget(p) }}
+                                  disabled={p.excluded}>
                             <DollarSign className="h-4 w-4" />
                           </Button>
                           <Button variant="ghost" size="sm" title="Set MAP price"
@@ -540,7 +582,15 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
                               </p>
                               <PriceHistoryChart itemId={p.item_id} />
                             </div>
-                            <CompetitorBreakdown itemId={p.item_id} onRejected={() => mutate()} />
+                            <CompetitorBreakdown
+                              product={p}
+                              onRejected={() => mutate()}
+                              onMatchVariant={(price) => {
+                                setPushInitialPrice(price)
+                                setPushTarget(p)
+                              }}
+                              onMatchMatrix={(price) => setMatrixTarget({ product: p, price })}
+                            />
                           </div>
                         </TableCell>
                       </TableRow>
@@ -556,12 +606,25 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
       <PricePushDialog
         product={pushTarget}
         open={pushTarget !== null}
-        onOpenChange={(open) => !open && setPushTarget(null)}
+        initialPrice={pushInitialPrice}
+        onOpenChange={(open) => {
+          if (!open) { setPushTarget(null); setPushInitialPrice(null) }
+        }}
+        onPushed={() => mutate()}
+      />
+
+      <MatrixPushDialog
+        product={matrixTarget?.product ?? null}
+        price={matrixTarget?.price ?? null}
+        open={matrixTarget !== null}
+        onOpenChange={(open) => !open && setMatrixTarget(null)}
         onPushed={() => mutate()}
       />
 
       <Dialog open={overrideTarget !== null}
-              onOpenChange={(open) => !open && setOverrideTarget(null)}>
+              onOpenChange={(open) => {
+                if (!open) { setOverrideTarget(null); setOverrideCandidates([]) }
+              }}>
         <DialogContent className="max-w-xl">
           <DialogHeader>
             <DialogTitle>Link the true competitor match</DialogTitle>
@@ -574,8 +637,8 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
           </p>
           <div className="space-y-2">
             <Input placeholder="https://store.example.com/products/…" value={overrideUrl}
-                   onChange={(e) => setOverrideUrl(e.target.value)}
-                   onKeyDown={(e) => e.key === 'Enter' && saveOverride()} />
+                   onChange={(e) => { setOverrideUrl(e.target.value); setOverrideCandidates([]) }}
+                   onKeyDown={(e) => e.key === 'Enter' && void saveOverride()} />
             <div className="flex items-center gap-2">
               <Select value={overrideCompetitor} onValueChange={setOverrideCompetitor}>
                 <SelectTrigger className="w-56">
@@ -588,10 +651,34 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
                   ))}
                 </SelectContent>
               </Select>
-              <Button size="sm" onClick={saveOverride} disabled={savingOverride}>
+              <Button size="sm" onClick={() => void saveOverride()} disabled={savingOverride}>
                 <Link2 className="h-4 w-4" /> Lock in match
               </Button>
             </div>
+            {overrideCandidates.length > 0 && (
+              <div className="space-y-2 rounded-md border p-3">
+                <p className="text-sm font-medium">Choose the matching variant</p>
+                <div className="max-h-64 space-y-1 overflow-y-auto">
+                  {overrideCandidates.map((candidate, i) => (
+                    <button key={`${candidate.variant_id ?? candidate.sku ?? i}`}
+                            type="button" onClick={() => void saveOverride(candidate)}
+                            disabled={savingOverride}
+                            className="flex w-full items-center justify-between rounded border px-3 py-2 text-left text-sm hover:bg-muted">
+                      <span>
+                        <span className="block font-medium">
+                          {candidate.variant_options.join(' / ') || candidate.title || 'Variant'}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          {candidate.sku ? `SKU ${candidate.sku}` : candidate.gtin ? `UPC ${candidate.gtin}` : 'No SKU'}
+                          {' · '}{candidate.in_stock === false ? 'out of stock' : 'in stock'}
+                        </span>
+                      </span>
+                      <span className="font-semibold tabular-nums">{fmt(candidate.price)}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         </DialogContent>
       </Dialog>

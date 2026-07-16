@@ -16,15 +16,16 @@ import {
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog'
-import { apiPost, useCompetitors, useTrackedUrls } from '@/lib/price-intel/hooks'
+import { ApiError, apiPost, useCompetitors, useTrackedUrls } from '@/lib/price-intel/hooks'
 import { itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
-import type { TrackedUrl } from '@/lib/price-intel/types'
+import type { TrackedUrl, VariantCandidate, VariantSelectionRequired } from '@/lib/price-intel/types'
 import { ItemSearchPicker } from './item-search-picker'
 import { ExternalLink, Globe, Link2, Plus, Trash2 } from 'lucide-react'
 
 const CONNECTOR_LABEL: Record<string, { label: string; tone: string }> = {
   shopify_json: { label: 'Shopify (catalog)', tone: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
   shopify_html: { label: 'Shopify (pages)', tone: 'bg-sky-50 text-sky-700 border-sky-200' },
+  sitemap_html: { label: 'Sitemap (variant-aware)', tone: 'bg-violet-50 text-violet-700 border-violet-200' },
   unknown: { label: 'URL-only', tone: 'bg-slate-100 text-slate-600 border-slate-200' },
 }
 
@@ -44,16 +45,34 @@ export function CompetitorManager() {
   const [newUrlCompetitor, setNewUrlCompetitor] = useState<string>('none')
   const [saving, setSaving] = useState(false)
   const [linkTarget, setLinkTarget] = useState<TrackedUrl | null>(null)
+  const [linkChoice, setLinkChoice] = useState<{
+    itemId: string; itemTitle: string | null; candidates: VariantCandidate[]
+  } | null>(null)
 
-  const linkItem = async (itemId: string, itemTitle: string | null) => {
+  const linkItem = async (itemId: string, itemTitle: string | null,
+                          candidate?: VariantCandidate) => {
     if (!linkTarget) return
     try {
-      await apiPost(`/api/price-intel/urls/${linkTarget.url_id}`, { item_id: itemId }, 'PUT')
+      await apiPost(`/api/price-intel/urls/${linkTarget.url_id}`, {
+        item_id: itemId,
+        competitor_sku: candidate?.sku,
+        competitor_variant_id: candidate?.variant_id,
+        competitor_gtin: candidate?.gtin,
+        variant_options: candidate?.variant_options,
+      }, 'PUT')
       toast.success(`Linked to ${itemTitle ?? itemId} — fetching its price now`)
       setLinkTarget(null)
+      setLinkChoice(null)
       await mutateUrls()
       setTimeout(() => { void mutateUrls() }, 12000)
     } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        const detail = e.detail as VariantSelectionRequired
+        if (detail?.code === 'variant_selection_required') {
+          setLinkChoice({ itemId, itemTitle, candidates: detail.candidates })
+          return
+        }
+      }
       toast.error(e instanceof Error ? e.message : 'Failed to link item')
     }
   }
@@ -289,7 +308,9 @@ export function CompetitorManager() {
         </CardContent>
       </Card>
 
-      <Dialog open={linkTarget !== null} onOpenChange={(open) => !open && setLinkTarget(null)}>
+      <Dialog open={linkTarget !== null} onOpenChange={(open) => {
+        if (!open) { setLinkTarget(null); setLinkChoice(null) }
+      }}>
         <DialogContent className="max-w-2xl">
           <DialogHeader>
             <DialogTitle>Link URL to a catalog item</DialogTitle>
@@ -300,6 +321,31 @@ export function CompetitorManager() {
             placeholder="Search our catalog (name / SKU / id)…"
             onSelect={(item) => linkItem(item.item_id, item.title)}
           />
+          {linkChoice && (
+            <div className="space-y-2 rounded-md border p-3">
+              <p className="text-sm font-medium">Choose the matching competitor variant</p>
+              <div className="max-h-64 space-y-1 overflow-y-auto">
+                {linkChoice.candidates.map((candidate, i) => (
+                  <button key={`${candidate.variant_id ?? candidate.sku ?? i}`}
+                          type="button"
+                          onClick={() => void linkItem(linkChoice.itemId, linkChoice.itemTitle, candidate)}
+                          className="flex w-full items-center justify-between rounded border px-3 py-2 text-left text-sm hover:bg-muted">
+                    <span>
+                      <span className="block font-medium">
+                        {candidate.variant_options.join(' / ') || candidate.title || 'Variant'}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {candidate.sku ? `SKU ${candidate.sku}` : candidate.gtin ? `UPC ${candidate.gtin}` : 'No SKU'}
+                      </span>
+                    </span>
+                    <span className="font-semibold tabular-nums">
+                      {candidate.price == null ? '—' : `$${Number(candidate.price).toFixed(2)}`}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </DialogContent>
       </Dialog>
     </div>

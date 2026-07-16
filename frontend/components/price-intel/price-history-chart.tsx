@@ -17,31 +17,31 @@ const COMPETITOR_PALETTE = [
 ]
 
 const OUR_KEY = 'ours'
+const WINDOW_DAYS = 60
+const DAY_MS = 24 * 60 * 60 * 1000
 
-// Turns the compressed per-series change-points into one time-indexed dataset.
-// Each series contributes a value only at its own change timestamps; the step
-// line (type="stepAfter") + connectNulls carries each price forward until the
-// next change, and dots mark the actual change-points.
+// Expands the compressed per-series change-points into a daily grid over the
+// trailing 2-month window: each series' price is carried forward day by day
+// (the backend supplies a baseline point before the window so lines start at
+// the left edge, not at their first in-window change). Daily points + monotone
+// interpolation give the smoothed look; a change-point still reads as a clear
+// level shift.
 export function PriceHistoryChart({ itemId }: { itemId: string }) {
-  const { history, isLoading } = useItemPriceHistory(itemId)
+  const { history, isLoading } = useItemPriceHistory(itemId, WINDOW_DAYS)
 
-  const { data, config, series, span } = useMemo(() => {
+  const { data, config, series } = useMemo(() => {
     const cfg: ChartConfig = {}
-    const seriesKeys: { key: string; color: string }[] = []
-    const byTs = new Map<number, Record<string, number | null>>()
+    const seriesList: { key: string; color: string; points: { ts: number; price: number }[] }[] = []
 
     const add = (key: string, label: string, color: string,
                  points: { observed_at: string; price: number | null }[]) => {
-      if (!points.some((p) => p.price != null)) return
+      const pts = points
+        .filter((p) => p.price != null)
+        .map((p) => ({ ts: new Date(p.observed_at).getTime(), price: p.price as number }))
+        .sort((a, b) => a.ts - b.ts)
+      if (!pts.length) return
       cfg[key] = { label, color }
-      seriesKeys.push({ key, color })
-      for (const p of points) {
-        if (p.price == null) continue
-        const ts = new Date(p.observed_at).getTime()
-        const row = byTs.get(ts) ?? { ts }
-        row[key] = p.price
-        byTs.set(ts, row)
-      }
+      seriesList.push({ key, color, points: pts })
     }
 
     if (history) {
@@ -51,24 +51,30 @@ export function PriceHistoryChart({ itemId }: { itemId: string }) {
       })
     }
 
-    const rows = [...byTs.values()].sort((a, b) => (a.ts as number) - (b.ts as number))
-    // Carry each series' last known value forward to the right edge, so a price
-    // that hasn't changed (a single change-point) still draws as a flat line
-    // instead of a lone dot.
-    if (rows.length) {
-      const lastRow = rows[rows.length - 1]
-      for (const { key } of seriesKeys) {
-        let lastVal: number | null = null
-        for (const r of rows) if (r[key] != null) lastVal = r[key]
-        if (lastVal != null && lastRow[key] == null) lastRow[key] = lastVal
+    // Daily grid: local midnight for each day in the window, ending today.
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    const rows: Record<string, number | null>[] = []
+    for (let d = WINDOW_DAYS; d >= 0; d--) {
+      rows.push({ ts: today.getTime() - d * DAY_MS })
+    }
+    for (const s of seriesList) {
+      let i = 0
+      let last: number | null = null
+      for (const row of rows) {
+        const dayEnd = (row.ts as number) + DAY_MS - 1
+        while (i < s.points.length && s.points[i].ts <= dayEnd) {
+          last = s.points[i].price
+          i++
+        }
+        row[s.key] = last
       }
     }
-    const span = rows.length ? (rows[rows.length - 1].ts as number) - (rows[0].ts as number) : 0
-    return { data: rows, config: cfg, series: seriesKeys, span }
+    return { data: rows, config: cfg, series: seriesList }
   }, [history])
 
   if (isLoading) return <Skeleton className="h-52 rounded-md" />
-  if (data.length === 0) {
+  if (series.length === 0) {
     return (
       <p className="py-3 text-xs text-muted-foreground">
         No price history yet — the trend appears once scrapes record price changes.
@@ -76,16 +82,8 @@ export function PriceHistoryChart({ itemId }: { itemId: string }) {
     )
   }
 
-  // Within ~2 days, points cluster on one date — show the time so intraday
-  // snapshots are distinguishable; over longer ranges show the date.
-  const intraday = span < 2 * 24 * 60 * 60 * 1000
   const fmtDate = (ts: number) =>
-    new Date(ts).toLocaleString(undefined, intraday
-      ? { hour: 'numeric', minute: '2-digit' }
-      : { month: 'short', day: 'numeric' })
-  const fmtFull = (ts: number) =>
-    new Date(ts).toLocaleString(undefined,
-      { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+    new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 
   return (
     <ChartContainer config={config} className="aspect-auto h-52 w-full">
@@ -113,7 +111,7 @@ export function PriceHistoryChart({ itemId }: { itemId: string }) {
           content={
             <ChartTooltipContent
               labelFormatter={(_, payload) =>
-                payload?.[0] != null ? fmtFull(payload[0].payload.ts) : ''
+                payload?.[0] != null ? fmtDate(payload[0].payload.ts) : ''
               }
               formatter={(value, name, item) => (
                 <span className="flex w-full items-center justify-between gap-3">
@@ -136,10 +134,11 @@ export function PriceHistoryChart({ itemId }: { itemId: string }) {
             key={key}
             dataKey={key}
             name={key}
-            type="stepAfter"
+            type="monotone"
             stroke={color}
             strokeWidth={key === OUR_KEY ? 2.5 : 1.5}
-            dot={{ r: 2, fill: color }}
+            dot={false}
+            activeDot={{ r: 3 }}
             connectNulls
             isAnimationActive={false}
           />

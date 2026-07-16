@@ -1,6 +1,7 @@
 """API routes for the Price Intelligence page. Mounted by main.py only when
 PRICE_INTEL_ENABLED is on, so none of this (or its imports) exists in a disabled
 deployment."""
+import json
 import uuid
 from typing import Any, Dict, Optional
 
@@ -126,8 +127,63 @@ def list_tracked_urls():
     return repository.get_tracked_urls()
 
 
+def _variant_identity(payload: dict, item: dict) -> dict:
+    options = payload.get("variant_options")
+    if options is None and payload.get("variant_options_json"):
+        try:
+            options = json.loads(payload["variant_options_json"])
+        except (TypeError, ValueError):
+            options = []
+    if options is None:
+        options = [item.get(k) for k in ("attribute_1", "attribute_2", "attribute_3")
+                   if item.get(k)]
+    return {
+        "sku": payload.get("competitor_sku") or item.get("sku"),
+        "gtin": payload.get("competitor_gtin") or item.get("upc_normalized"),
+        "variant_id": payload.get("competitor_variant_id"),
+        "variant_options": options,
+    }
+
+
+def _inspect_linked_url(url: str, item_id: str, payload: dict) -> dict:
+    """Resolve a manual URL before saving it; 409 carries selectable candidates."""
+    items = {str(r["item_id"]): r for r in repository.get_tracked_products(include_archived=True)}
+    item = items.get(str(item_id))
+    if item is None:
+        matches = repository.search_snapshot_items(str(item_id), limit=2)
+        item = next((r for r in matches if str(r.get("item_id")) == str(item_id)), {})
+    identity = _variant_identity(payload, item or {})
+    from .connectors import PageScraper, resolve_listing
+    scraper = PageScraper()
+    result = resolve_listing(scraper.listings(url), identity)
+    selected = result.get("listing")
+    # A matrix item cannot safely accept a lone parent/product price unless an
+    # identity signal actually matched it.
+    unsafe_parent = bool((item or {}).get("item_matrix_id") and
+                         result.get("matched_by") == "single_listing" and
+                         selected and selected.get("price_scope") == "product")
+    if result["status"] == "ambiguous" or unsafe_parent:
+        candidates = result.get("candidates") or ([selected] if selected else [])
+        raise HTTPException(status_code=409, detail={
+            "code": "variant_selection_required",
+            "message": "Select the competitor variant that matches this item.",
+            "candidates": [{k: row.get(k) for k in (
+                "title", "sku", "gtin", "variant_id", "variant_options", "price",
+                "compare_at_price", "currency", "in_stock", "price_scope",
+                "extraction_method")}
+                for row in candidates],
+        })
+    if result["status"] == "not_found" or selected is None:
+        raise HTTPException(status_code=422, detail="No price listing was found at this URL")
+    # An identity match makes the result variant-grain even if its markup called
+    # the enclosing object a Product rather than a variant.
+    if result.get("matched_by") in ("sku", "gtin", "variant_id", "variant_options"):
+        selected["price_scope"] = "variant"
+    return selected
+
+
 def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None,
-                      url_id=None):
+                      url_id=None, selected_listing=None):
     """Records a confirmed manual_url link and tombstones any conflicting
     auto-matches for the same item at the same store — the human-provided URL is
     the truth. Items not already actively tracked get pinned so their market
@@ -147,15 +203,20 @@ def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None,
     # bare fuzzy 'title match' listings (no link row) so nothing stale lingers.
     repository.sweep_domain_for_item(str(item_id), url)
     now = repository.utcnow_iso()
+    link_identity = ((selected_listing or {}).get("variant_id") or
+                     (selected_listing or {}).get("sku") or
+                     (selected_listing or {}).get("gtin") or str(item_id))
     repository.upsert_human_link({
         "link_id": str(uuid.uuid4()),
         "item_id": str(item_id),
         "competitor_id": competitor_id,
-        "match_key": f"url:{url}",
+        "match_key": f"url:{url}:{link_identity}",
         "competitor_url": url,
-        "competitor_sku": None,
-        "competitor_title": label,
-        "gtin": None,
+        "competitor_sku": (selected_listing or {}).get("sku"),
+        "competitor_title": (selected_listing or {}).get("title") or label,
+        "gtin": (selected_listing or {}).get("gtin"),
+        "variant_id": (selected_listing or {}).get("variant_id"),
+        "variant_options_json": json.dumps((selected_listing or {}).get("variant_options") or []),
         "level": "variant",
         "status": "confirmed",
         "source": "manual_url",
@@ -174,7 +235,7 @@ def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None,
     # price / market min / Stores columns reflect the new match right away.
     try:
         from .connectors import PageScraper
-        parsed = PageScraper().fetch(url)
+        parsed = selected_listing or PageScraper().fetch(url)
         if parsed is not None and parsed.get("price") is not None:
             repository.load_rows(repository.T_OBSERVATIONS, [{
                 "observed_at": repository.utcnow_iso(),
@@ -182,7 +243,8 @@ def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None,
                 "source": "url",
                 # same diff key the nightly tracked-URL phase uses, so change
                 # detection diffs against this baseline instead of re-alerting
-                "diff_key": f"url:{url}",
+                "diff_key": (f"url:{url}:" + str(parsed.get("variant_id") or
+                             parsed.get("sku") or parsed.get("gtin") or "unresolved")),
                 "competitor_id": competitor_id,
                 "url": url,
                 "competitor_title": parsed.get("title"),
@@ -195,6 +257,12 @@ def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None,
                 "compare_at_price": parsed.get("compare_at_price"),
                 "currency": parsed.get("currency"),
                 "in_stock": parsed.get("in_stock"),
+                "extraction_method": parsed.get("extraction_method"),
+                "price_scope": parsed.get("price_scope") or "variant",
+                "variant_id": parsed.get("variant_id"),
+                "variant_options_json": json.dumps(parsed.get("variant_options") or []),
+                "price_low": parsed.get("price_low"),
+                "price_high": parsed.get("price_high"),
             }])
             if url_id:
                 repository.mark_url_scraped(url_id, "success")
@@ -218,10 +286,21 @@ def create_tracked_url(payload: Dict[str, Any], background_tasks: BackgroundTask
             if domain and domain in c["base_url"].lower():
                 payload["competitor_id"] = c["competitor_id"]
                 break
+    selected = None
+    if payload.get("item_id"):
+        selected = _inspect_linked_url(url, str(payload["item_id"]), payload)
+        payload.update({
+            "competitor_sku": selected.get("sku"),
+            "competitor_variant_id": selected.get("variant_id"),
+            "competitor_gtin": selected.get("gtin"),
+            "variant_options_json": json.dumps(selected.get("variant_options") or []),
+        })
     # Same URL registered again (e.g. correcting a match from another tab):
     # update the existing row instead of creating a duplicate to scrape twice.
     existing = next(
-        (u for u in repository.get_tracked_urls() if u["url"] == url and u.get("enabled")),
+        (u for u in repository.get_tracked_urls()
+         if u["url"] == url and u.get("enabled")
+         and (str(u.get("item_id") or "") == str(payload.get("item_id") or ""))),
         None,
     )
     if existing:
@@ -233,7 +312,7 @@ def create_tracked_url(payload: Dict[str, Any], background_tasks: BackgroundTask
         background_tasks.add_task(
             _link_url_to_item, url, str(payload["item_id"]),
             payload.get("competitor_id"), payload.get("label"),
-            row["url_id"],
+            row["url_id"], selected,
         )
     return {"status": "success", "url": row}
 
@@ -244,13 +323,22 @@ def update_tracked_url(url_id: str, payload: Dict[str, Any], background_tasks: B
     rows = [u for u in repository.get_tracked_urls() if u.get("url_id") == url_id]
     if not rows:
         raise HTTPException(status_code=404, detail="Tracked URL not found")
+    selected = None
+    if payload.get("item_id"):
+        selected = _inspect_linked_url(rows[0]["url"], str(payload["item_id"]), payload)
+        payload.update({
+            "competitor_sku": selected.get("sku"),
+            "competitor_variant_id": selected.get("variant_id"),
+            "competitor_gtin": selected.get("gtin"),
+            "variant_options_json": json.dumps(selected.get("variant_options") or []),
+        })
     repository.update_tracked_url(url_id, payload)
     if payload.get("item_id"):
         background_tasks.add_task(
             _link_url_to_item, rows[0]["url"], str(payload["item_id"]),
             payload.get("competitor_id") or rows[0].get("competitor_id"),
             payload.get("label") or rows[0].get("label"),
-            url_id,
+            url_id, selected,
         )
     return {"status": "success"}
 
@@ -506,6 +594,49 @@ def execute_price_push(payload: Dict[str, Any]):
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
+        raise HTTPException(status_code=502, detail="Lightspeed update failed")
+
+
+@router.post("/push-price/matrix/preview")
+def preview_matrix_price_push(payload: Dict[str, Any]):
+    """Per-variant guard preview for a whole-matrix push. The variant list is read
+    live from Lightspeed so the client can show (and later echo back) exactly what
+    would be repriced."""
+    item_id, new_price = payload.get("item_id"), payload.get("new_price")
+    if not item_id or new_price is None:
+        raise HTTPException(status_code=400, detail="item_id and new_price are required")
+    try:
+        return pricing.build_matrix_preview(str(item_id), float(new_price))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not load the matrix from Lightspeed")
+
+
+@router.post("/push-price/matrix")
+def execute_matrix_price_push(payload: Dict[str, Any]):
+    item_id, new_price = payload.get("item_id"), payload.get("new_price")
+    expected = payload.get("expected_item_ids")
+    if not item_id or new_price is None:
+        raise HTTPException(status_code=400, detail="item_id and new_price are required")
+    if not payload.get("confirm"):
+        raise HTTPException(status_code=400, detail="confirm: true is required")
+    if not isinstance(expected, list) or not expected:
+        raise HTTPException(
+            status_code=400,
+            detail="expected_item_ids (the previewed variant list) is required")
+    try:
+        return pricing.push_matrix_price(
+            str(item_id), float(new_price),
+            actor=payload.get("actor") or "Dashboard",
+            override_floor=bool(payload.get("override_floor")),
+            expected_item_ids=expected,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception:
         raise HTTPException(status_code=502, detail="Lightspeed update failed")
 
 

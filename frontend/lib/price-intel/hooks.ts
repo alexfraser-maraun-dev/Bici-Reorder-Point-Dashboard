@@ -14,6 +14,8 @@ import type {
   ItemObservation,
   ItemPriceHistory,
   ItemSearchResult,
+  MatrixPushPreview,
+  MatrixPushResult,
   PriceIntelSummary,
   PricePushPreview,
   ProductLink,
@@ -37,6 +39,21 @@ const swrConfig = {
   dedupingInterval: 300000, // 5 min; scrape completion mutates explicitly
 }
 
+export class ApiError extends Error {
+  status: number
+  detail: unknown
+
+  constructor(status: number, detail: unknown) {
+    const message = typeof detail === 'string'
+      ? detail
+      : (detail as { message?: string } | null)?.message ?? `Request failed (${status})`
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.detail = detail
+  }
+}
+
 export async function apiPost(path: string, body?: unknown, method: string = 'POST') {
   const res = await fetch(`${baseUrl()}${path}`, {
     method,
@@ -45,7 +62,7 @@ export async function apiPost(path: string, body?: unknown, method: string = 'PO
   })
   const payload = await res.json().catch(() => ({}))
   if (!res.ok) {
-    throw new Error(payload?.detail || `Request failed (${res.status})`)
+    throw new ApiError(res.status, payload?.detail)
   }
   return payload
 }
@@ -141,12 +158,14 @@ export function useItemObservations(itemId: string | null) {
   return { observations: data ?? [], error, isLoading }
 }
 
-// Lazy: change-point-compressed price history (our line + one per competitor).
-// Keyed on itemId so only expanded rows fetch; inherits the 5-min SWR dedup.
-export function useItemPriceHistory(itemId: string | null) {
+// Lazy: change-point-compressed price history (our line + one per competitor),
+// including one baseline point per series before the window so the chart can
+// forward-fill from the left edge. Keyed on itemId so only expanded rows fetch;
+// inherits the 5-min SWR dedup.
+export function useItemPriceHistory(itemId: string | null, days: number = 60) {
   const { data, error, isLoading } = useSWR<ItemPriceHistory>(
     itemId
-      ? `${baseUrl()}/api/price-intel/tracked/${encodeURIComponent(itemId)}/price-history`
+      ? `${baseUrl()}/api/price-intel/tracked/${encodeURIComponent(itemId)}/price-history?days=${days}`
       : null,
     fetcher, swrConfig
   )
@@ -185,5 +204,28 @@ export async function executePricePush(
     new_price: newPrice,
     confirm: true,
     override_floor: overrideFloor,
+  })
+}
+
+export async function previewMatrixPush(
+  itemId: string, newPrice: number
+): Promise<MatrixPushPreview> {
+  return apiPost('/api/price-intel/push-price/matrix/preview', {
+    item_id: itemId,
+    new_price: newPrice,
+  })
+}
+
+// expectedItemIds is the exact variant list the user reviewed in the preview —
+// the server rejects the push if Lightspeed's live list no longer matches it.
+export async function executeMatrixPush(
+  itemId: string, newPrice: number, overrideFloor: boolean, expectedItemIds: string[]
+): Promise<MatrixPushResult> {
+  return apiPost('/api/price-intel/push-price/matrix', {
+    item_id: itemId,
+    new_price: newPrice,
+    confirm: true,
+    override_floor: overrideFloor,
+    expected_item_ids: expectedItemIds,
   })
 }

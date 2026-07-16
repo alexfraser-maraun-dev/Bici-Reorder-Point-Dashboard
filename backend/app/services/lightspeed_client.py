@@ -208,6 +208,45 @@ class LightspeedClient:
             print(f"Lightspeed Update Error: {e}")
             return None
 
+    def get_matrix_items(self, matrix_id: str) -> List[Dict[str, Any]]:
+        """
+        Every non-archived variant Item of a matrix, read live from Lightspeed.
+        This is the authoritative membership list used before a whole-matrix price
+        push, so it must be complete: any failed or truncated page raises
+        LightspeedReadError rather than returning a partial list.
+        """
+        params = {
+            "itemMatrixID": str(matrix_id),
+            "load_relations": '["ItemAttributes"]',
+            "archived": "false",
+            "limit": 100,
+        }
+        response = self._request("GET", "/Item.json", params=params)
+        items: List[Dict[str, Any]] = []
+        seen_urls = set()
+        while True:
+            if response is None:
+                raise LightspeedReadError(
+                    f"Lightspeed matrix-item read failed before all pages were loaded (matrix {matrix_id})."
+                )
+            if response.status_code != 200:
+                raise LightspeedReadError(
+                    f"Lightspeed matrix-item read returned HTTP {response.status_code} (matrix {matrix_id})."
+                )
+            payload = response.json()
+            page = payload.get("Item", [])
+            if isinstance(page, dict):
+                page = [page]
+            items.extend(page)
+            next_url = (payload.get("@attributes") or {}).get("next")
+            if not next_url:
+                break
+            if next_url in seen_urls:
+                raise LightspeedReadError("Lightspeed returned a repeated pagination cursor.")
+            seen_urls.add(next_url)
+            response = self._request_absolute("GET", next_url)
+        return items
+
     def update_item_price(self, item_id: str, price: float, use_type: str = "Default") -> Optional[Dict[str, Any]]:
         """
         Updates one item's retail price (the "Default" ItemPrice) via PUT
