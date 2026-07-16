@@ -10,7 +10,11 @@ import { DemandInsights } from './demand-insights'
 import { LayoutDashboard, PackageSearch, SlidersHorizontal, Truck, ShoppingCart, TrendingUp } from 'lucide-react'
 import type { AdjustmentMode, DemandWeights } from './sheets-replenishment'
 
+export type DashboardTab = 'inventory' | 'demand' | 'purchase-orders' | 'po-tracker' | 'vendors' | 'brands'
+
 interface DashboardContentProps {
+  activeTab: DashboardTab
+  setActiveTab: (value: DashboardTab) => void
   data: any
   isLoading: boolean
   refetch: () => void
@@ -31,7 +35,11 @@ interface DashboardContentProps {
 export function DashboardContent(props: DashboardContentProps) {
   return (
     <div className="space-y-3 animate-in fade-in duration-700">
-      <Tabs defaultValue="inventory" className="w-full">
+      <Tabs
+        value={props.activeTab}
+        onValueChange={(value) => props.setActiveTab(value as DashboardTab)}
+        className="w-full"
+      >
         <TabsList className="grid w-[1180px] grid-cols-6 mb-2 bg-muted/50 p-1 rounded-xl">
           <TabsTrigger value="inventory" className="gap-2 rounded-lg data-[state=active]:bg-background data-[state=active]:shadow-sm">
             <LayoutDashboard className="w-4 h-4" />
@@ -68,7 +76,7 @@ export function DashboardContent(props: DashboardContentProps) {
         </TabsContent>
 
         <TabsContent value="purchase-orders" className="mt-0 border-none p-0 focus-visible:ring-0">
-          <PurchaseOrders data={props.data} isLoading={props.isLoading} />
+          <PurchaseOrders />
         </TabsContent>
 
         <TabsContent value="po-tracker" className="mt-0 border-none p-0 focus-visible:ring-0">

@@ -56,11 +56,6 @@ import {
   SlidersHorizontal,
 } from 'lucide-react'
 
-interface PurchaseOrdersProps {
-  data: unknown
-  isLoading: boolean
-}
-
 type Measure = 'units' | 'cogs' | 'revenue' | 'spend'
 
 const RECON_LABELS: Record<POReconciliation, string> = {
@@ -349,7 +344,7 @@ function DraftCard({ draft, onChanged }: { draft: PurchaseOrderDraft; onChanged:
   )
 }
 
-export function PurchaseOrders({ isLoading }: PurchaseOrdersProps) {
+export function PurchaseOrders() {
   const { data: drafts, isLoading: draftsLoading, refetch } = usePODrafts()
   const { data: latestRun, refetch: refetchLatestRun } = useLatestPlanningRun()
   const { data: modelLegend } = usePlanningModels()
@@ -469,7 +464,7 @@ export function PurchaseOrders({ isLoading }: PurchaseOrdersProps) {
         </div>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={() => refetch()}><RefreshCw className="mr-1 h-3.5 w-3.5" />Refresh drafts</Button>
-          <Button onClick={runPlan} disabled={busy || isLoading}><Play className="mr-1 h-4 w-4" />{busy ? 'Working…' : 'Run 52-week plan'}</Button>
+          <Button onClick={runPlan} disabled={busy}><Play className="mr-1 h-4 w-4" />{busy ? 'Working…' : 'Run 52-week plan'}</Button>
         </div>
       </div>
 

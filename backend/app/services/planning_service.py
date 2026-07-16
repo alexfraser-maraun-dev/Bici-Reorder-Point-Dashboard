@@ -9,7 +9,7 @@ BigQuery remains the analytical source of truth.
 import math
 import threading
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -26,8 +26,31 @@ from app.services.demand_planning import (
 from app.services.planning_store import get_planning_store
 
 
-_RUNS: Dict[str, Dict[str, Any]] = {}
+# Postgres is the durable source for interactive runs. Keep only the most
+# recently accessed run in process memory so repeated planning runs cannot
+# accumulate hundreds of megabytes in a long-lived Render worker.
+MAX_CACHED_RUNS = 1
+_RUNS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _RUN_LOCK = threading.RLock()
+
+
+def _cache_run(run: Dict[str, Any]) -> None:
+    run_id = str(run["run_id"])
+    with _RUN_LOCK:
+        _RUNS[run_id] = run
+        _RUNS.move_to_end(run_id)
+        while len(_RUNS) > MAX_CACHED_RUNS:
+            _RUNS.popitem(last=False)
+
+
+def get_run_cache_info() -> Dict[str, Any]:
+    """Small diagnostics surface used by tests and operational checks."""
+    with _RUN_LOCK:
+        return {
+            "size": len(_RUNS),
+            "max_size": MAX_CACHED_RUNS,
+            "run_ids": list(_RUNS.keys()),
+        }
 
 
 def _plain(value: Any) -> Any:
@@ -192,6 +215,9 @@ def create_planning_run(
     config: Optional[Dict[str, Any]] = None,
     persist: bool = True,
 ) -> Dict[str, Any]:
+    # Release the previous large object graph before materializing new BigQuery
+    # frames, histories and forecast points. It remains available in Postgres.
+    clear_run_cache()
     if not 1 <= int(horizon_weeks) <= 104:
         raise ValueError("horizon_weeks must be between 1 and 104")
     as_of = as_of_date or date.today()
@@ -362,8 +388,7 @@ def create_planning_run(
         "recommendations": recommendations,
         "monthly_rollups": monthly_rollups(recommendations),
     }
-    with _RUN_LOCK:
-        _RUNS[run_id] = run
+    _cache_run(run)
     if persist:
         get_planning_store().save_planning_run(run)
     return run
@@ -372,20 +397,20 @@ def create_planning_run(
 def get_planning_run(run_id: str) -> Optional[Dict[str, Any]]:
     with _RUN_LOCK:
         cached = _RUNS.get(run_id)
+        if cached is not None:
+            _RUNS.move_to_end(run_id)
     if cached:
         return cached
     stored = get_planning_store().get_planning_run(run_id)
     if stored:
-        with _RUN_LOCK:
-            _RUNS[run_id] = stored
+        _cache_run(stored)
     return stored
 
 
 def get_latest_planning_run() -> Optional[Dict[str, Any]]:
     stored = get_planning_store().get_latest_planning_run()
     if stored:
-        with _RUN_LOCK:
-            _RUNS[stored["run_id"]] = stored
+        _cache_run(stored)
     return stored
 
 

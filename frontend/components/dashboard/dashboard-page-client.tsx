@@ -7,10 +7,13 @@ import { Button } from '@/components/ui/button'
 import { Toaster } from '@/components/ui/sonner'
 import { useReplenishmentData } from '@/lib/hooks'
 import { cn } from '@/lib/utils'
-import { DashboardContent } from './dashboard-content'
+import { DashboardContent, type DashboardTab } from './dashboard-content'
 import type { AdjustmentMode, DemandWeights } from './sheets-replenishment'
 
 export function DashboardPageClient() {
+  // Procurement is the primary cockpit. The legacy inventory engine remains
+  // available, but its BigQuery/Pandas workload starts only when explicitly opened.
+  const [activeTab, setActiveTab] = useState<DashboardTab>('purchase-orders')
   const [forecastPeriod, setForecastPeriod] = useState(60)
   const [safetyDays, setSafetyDays] = useState(7)
   const [growthMultiplier, setGrowthMultiplier] = useState(1.0)
@@ -42,9 +45,9 @@ export function DashboardPageClient() {
     growthMultiplier,
     debouncedDemandWeights,
     adjustmentMode,
-    isDemandWeightValid
+    isDemandWeightValid && activeTab === 'inventory'
   )
-  const headerActions = (
+  const headerActions = activeTab === 'inventory' ? (
     <Button
       variant="secondary"
       className="h-8 gap-2 text-xs font-semibold border"
@@ -54,11 +57,13 @@ export function DashboardPageClient() {
       <RefreshCw className={cn("w-3 h-3", isLoading && "animate-spin")} />
       {isLoading ? "Syncing..." : "Sync Product Data"}
     </Button>
-  )
+  ) : undefined
 
   return (
     <AppShell headerActions={headerActions} mainClassName="p-2 lg:p-3">
       <DashboardContent
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
         data={data}
         isLoading={isLoading}
         refetch={refetch}

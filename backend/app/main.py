@@ -117,18 +117,18 @@ if os.getenv("PRICE_INTEL_ENABLED", "false").strip().lower() in ("1", "true", "y
 
 
 def _warm_replenishment_caches() -> None:
-    """Populate the heavy BigQuery-backed caches (tagged item metrics, lead times,
-    brand sourcing) on boot so the first Inventory dashboard load reads a hot cache
-    instead of running the 60-day stockout query cold. Best-effort; failures here
-    just mean the first real request pays the cold cost as before."""
+    """Populate small shared reference caches used across procurement surfaces.
+
+    The legacy tagged-item inventory DataFrame is intentionally excluded: that
+    heavier BigQuery/Pandas workload now loads only when a buyer explicitly opens
+    the Inventory Dashboard tab.
+    """
     try:
         from app.services.bigquery_sync import (
-            fetch_tagged_items_metrics,
             fetch_lead_times,
             get_brand_sourcing_rules_map,
             fetch_brand_vendor_sourcing,
         )
-        fetch_tagged_items_metrics("auto-replen")
         fetch_lead_times()
         get_brand_sourcing_rules_map()
         # Brand-level "Available from" sourcing for the Special Orders page.

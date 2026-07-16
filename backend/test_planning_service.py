@@ -7,6 +7,7 @@ from app.services.planning_service import (
     create_planning_run,
     get_forecast,
     get_recommendations,
+    get_run_cache_info,
 )
 
 
@@ -75,6 +76,32 @@ class PlanningServiceTests(unittest.TestCase):
         self.assertEqual(rec["scheduled_receipts"][0]["quantity"], 20)
         self.assertEqual(rec["scheduled_receipts"][0]["confidence"], "estimated")
         self.assertEqual(rec["inventory_projection"][0]["scheduled_receipts"], 0)
+
+    def test_completed_runs_do_not_accumulate_in_process_memory(self):
+        first = create_planning_run(
+            items=[{
+                "item_id": "10", "location_id": "3", "category": "Nutrition",
+                "vendor_id": "55", "landed_cost": 2,
+            }],
+            weekly_history=self._rows(),
+            as_of_date=date(2026, 7, 14),
+            persist=False,
+        )
+        second = create_planning_run(
+            items=[{
+                "item_id": "10", "location_id": "3", "category": "Nutrition",
+                "vendor_id": "55", "landed_cost": 2,
+            }],
+            weekly_history=self._rows(),
+            as_of_date=date(2026, 7, 21),
+            persist=False,
+        )
+
+        cache = get_run_cache_info()
+        self.assertEqual(cache["size"], 1)
+        self.assertEqual(cache["max_size"], 1)
+        self.assertEqual(cache["run_ids"], [second["run_id"]])
+        self.assertNotIn(first["run_id"], cache["run_ids"])
 
 
 if __name__ == "__main__":
