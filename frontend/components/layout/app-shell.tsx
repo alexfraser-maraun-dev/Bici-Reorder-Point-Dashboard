@@ -15,6 +15,7 @@ import { PriceIntelNavBadge } from '@/components/price-intel/nav-badge'
 import { signOut, useSession } from 'next-auth/react'
 import { APP_VERSION, APP_VERSION_SUMMARY, APP_GIT_SHA, APP_GIT_DATE } from '@/lib/version'
 import { ConnectionIndicators } from '@/components/layout/connection-indicators'
+import { BrandMark } from '@/components/layout/brand-mark'
 import { Button } from '@/components/ui/button'
 import {
   Sheet,
@@ -88,17 +89,18 @@ export function AppShell({ children, headerActions, mainClassName }: AppShellPro
 
           {/* Logo */}
           <div className="flex items-center gap-4">
-            <div className="flex items-center">
-              <img
-                src="/logo.svg"
-                alt="Bici Logo"
-                className="h-5 w-auto"
+            <div className="flex w-9 items-center">
+              <BrandMark
+                animated
+                bColor="var(--color-foreground)"
+                lineColor="var(--color-signal)"
+                className="pulse-beat"
               />
             </div>
             <div className="h-6 w-[1px] bg-muted mx-1 hidden sm:block" />
             <div className="hidden items-baseline gap-2 sm:flex">
               <span className="font-semibold text-foreground/80 tracking-tight">
-                Procurement Tool
+                BICI Pulse
               </span>
               <span
                 className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground"

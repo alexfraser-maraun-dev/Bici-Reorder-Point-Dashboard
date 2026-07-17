@@ -37,6 +37,7 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+  --signal: oklch(0.74 0.15 168);
 }
 
 .dark {
@@ -72,6 +73,7 @@
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(0.269 0 0);
   --sidebar-ring: oklch(0.439 0 0);
+  --signal: oklch(0.74 0.15 168);
 }
 
 @theme inline {
@@ -113,6 +115,7 @@
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
+  --color-signal: var(--signal);
 }
 
 @layer base {
@@ -121,5 +124,53 @@
   }
   body {
     @apply bg-background text-foreground;
+  }
+}
+
+/* BICI Pulse brand mark — see components/layout/brand-mark.tsx */
+@keyframes ecg-sweep {
+  from {
+    stroke-dashoffset: 1;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes heartbeat-scale {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  10% {
+    transform: scale(1.05);
+  }
+  20% {
+    transform: scale(1);
+  }
+}
+@keyframes signal-flicker {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+.ecg-beam {
+  animation: ecg-sweep 2.4s linear infinite;
+}
+.pulse-beat {
+  transform-origin: center;
+  animation: heartbeat-scale 2.4s ease-in-out infinite;
+}
+.ecg-base {
+  animation: signal-flicker 2.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ecg-beam,
+  .pulse-beat,
+  .ecg-base {
+    animation: none;
   }
 }
