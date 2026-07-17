@@ -40,9 +40,11 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
   Download,
   Eye,
   FileJson,
@@ -483,27 +485,76 @@ export function PurchaseOrders() {
       </Alert>
       {poAccess === false && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>Read access unavailable</AlertTitle><AlertDescription>A complete PO snapshot is required; reconciliation and preview will fail closed.</AlertDescription></Alert>}
 
-      <div className="rounded-xl border p-4">
-        <div className="mb-4 flex items-center gap-2"><SlidersHorizontal className="h-4 w-4" /><div><div className="font-medium">Planning scope &amp; mathematics</div><div className="text-xs text-muted-foreground">Use the safe tagged catalog, or explicitly call forward a brand, vendor, category, or SKU list.</div></div></div>
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-          <div><div className="mb-1 text-xs font-medium">Evaluation scope</div><Select value={scopeType} onValueChange={(value) => setScopeType(value as PlanningScope)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="auto_replen">Auto-replen tagged products</SelectItem><SelectItem value="brand">Specific brand</SelectItem><SelectItem value="vendor">Specific vendor</SelectItem><SelectItem value="category">Top-level category</SelectItem><SelectItem value="item_ids">SKU / item ID list</SelectItem></SelectContent></Select></div>
-          <div><div className="mb-1 text-xs font-medium">Scope value</div><Input value={scopeValue} onChange={(event) => setScopeValue(event.target.value)} disabled={scopeType === 'auto_replen'} placeholder={scopeType === 'item_ids' ? 'Comma-separated SKUs or IDs' : scopeType === 'auto_replen' ? 'Not required' : `Enter ${scopeType}`} /></div>
-          <div><div className="mb-1 text-xs font-medium">Plan shop</div><Select value={planShop} onValueChange={setPlanShop}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="all">All Bici shops</SelectItem>{Object.entries(SHOP_NAMES).map(([id, label]) => <SelectItem key={id} value={id}>{label}</SelectItem>)}</SelectContent></Select></div>
-          <div><div className="mb-1 text-xs font-medium">Forecast model</div><Select value={config.model} onValueChange={(value) => setConfig({ ...config, model: value as PlanningConfig['model'] })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{MODEL_OPTIONS.map((key) => <SelectItem key={key} value={key}>{key === 'auto' ? 'Automatic champion' : key.replaceAll('_', ' ')}</SelectItem>)}</SelectContent></Select></div>
-          <div><div className="mb-1 text-xs font-medium">Service target</div><Select value={String(config.service_quantile)} onValueChange={(value) => setConfig({ ...config, service_quantile: Number(value) as PlanningConfig['service_quantile'] })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="0.8">P80</SelectItem><SelectItem value="0.9">P90 balanced default</SelectItem><SelectItem value="0.95">P95</SelectItem></SelectContent></Select></div>
-          <div><div className="mb-1 text-xs font-medium">Demand multiplier</div><Input type="number" min={0} max={3} step={0.05} value={config.demand_multiplier} onChange={(event) => setConfig({ ...config, demand_multiplier: Number(event.target.value) })} /></div>
+      <Collapsible defaultOpen className="rounded-xl border p-4">
+        <CollapsibleTrigger className="group flex w-full items-center gap-2 text-left">
+          <SlidersHorizontal className="h-4 w-4" />
+          <div className="flex-1">
+            <div className="font-medium">Demand engine configuration</div>
+            <div className="text-xs text-muted-foreground">Use the safe tagged catalog, or explicitly call forward a brand, vendor, category, or SKU list.</div>
+          </div>
+          <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <div>
+            <div className="mb-1 text-xs font-medium">Evaluation scope</div>
+            <Select value={scopeType} onValueChange={(value) => setScopeType(value as PlanningScope)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="auto_replen">Auto-replen tagged products</SelectItem><SelectItem value="brand">Specific brand</SelectItem><SelectItem value="vendor">Specific vendor</SelectItem><SelectItem value="category">Top-level category</SelectItem><SelectItem value="item_ids">SKU / item ID list</SelectItem></SelectContent></Select>
+            <div className="mt-1 text-[11px] text-muted-foreground">Which products this run evaluates. Auto-replen is the safe tagged catalog; the other scopes explicitly call a set forward.</div>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium">Scope value</div>
+            <Input value={scopeValue} onChange={(event) => setScopeValue(event.target.value)} disabled={scopeType === 'auto_replen'} placeholder={scopeType === 'item_ids' ? 'Comma-separated SKUs or IDs' : scopeType === 'auto_replen' ? 'Not required' : `Enter ${scopeType}`} />
+            <div className="mt-1 text-[11px] text-muted-foreground">The brand, vendor, or category name — or a comma-separated SKU list — for the chosen scope. Not needed for auto-replen.</div>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium">Plan shop</div>
+            <Select value={planShop} onValueChange={setPlanShop}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="all">All Bici shops</SelectItem>{Object.entries(SHOP_NAMES).map(([id, label]) => <SelectItem key={id} value={id}>{label}</SelectItem>)}</SelectContent></Select>
+            <div className="mt-1 text-[11px] text-muted-foreground">Plan every shop together or restrict the run to a single location.</div>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium">Forecast model</div>
+            <Select value={config.model} onValueChange={(value) => setConfig({ ...config, model: value as PlanningConfig['model'] })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{MODEL_OPTIONS.map((key) => <SelectItem key={key} value={key}>{key === 'auto' ? 'Automatic champion' : key.replaceAll('_', ' ')}</SelectItem>)}</SelectContent></Select>
+            <div className="mt-1 text-[11px] text-muted-foreground">Automatic champion picks the best model per SKU; choosing a specific model forces it for the whole run. See the legend below.</div>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium">Service target</div>
+            <Select value={String(config.service_quantile)} onValueChange={(value) => setConfig({ ...config, service_quantile: Number(value) as PlanningConfig['service_quantile'] })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="0.8">P80</SelectItem><SelectItem value="0.9">P90 balanced default</SelectItem><SelectItem value="0.95">P95</SelectItem></SelectContent></Select>
+            <div className="mt-1 text-[11px] text-muted-foreground">Safety-stock service level. P90 balances stockouts against overstock; P95 buys more protection with more inventory.</div>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium">Demand multiplier</div>
+            <Input type="number" min={0} max={3} step={0.05} value={config.demand_multiplier} onChange={(event) => setConfig({ ...config, demand_multiplier: Number(event.target.value) })} />
+            <div className="mt-1 text-[11px] text-muted-foreground">Scales the whole demand forecast. 1 plans the forecast as-is; 1.2 plans for 20% more demand.</div>
+          </div>
           <div>
             <div className="mb-1 text-xs font-medium">PO coverage after receipt (weeks)</div>
             <Input type="number" min={1} max={52} value={config.order_coverage_weeks} onChange={(event) => setConfig({ ...config, order_coverage_weeks: Number(event.target.value) })} />
             <div className="mt-1 text-[11px] text-muted-foreground">How many forecast weeks this order should cover after it arrives. Lead time is protected separately.</div>
           </div>
-          <div><div className="mb-1 text-xs font-medium">Lead-time override (days)</div><Input type="number" min={1} max={365} value={config.lead_time_days ?? ''} onChange={(event) => setConfig({ ...config, lead_time_days: event.target.value ? Number(event.target.value) : null })} placeholder="Use vendor history" /></div>
-          <div><div className="mb-1 text-xs font-medium">History (years)</div><Input type="number" min={1} max={5} value={config.history_years} onChange={(event) => setConfig({ ...config, history_years: Number(event.target.value) })} /></div>
-          <div><div className="mb-1 text-xs font-medium">Season smoothing (weeks)</div><Input type="number" min={1} max={13} value={config.seasonal_smoothing_weeks} onChange={(event) => setConfig({ ...config, seasonal_smoothing_weeks: Number(event.target.value) })} /></div>
-          <div><div className="mb-1 text-xs font-medium">Category shrinkage</div><Input type="number" min={0} max={10} step={0.25} value={config.seasonal_shrinkage} onChange={(event) => setConfig({ ...config, seasonal_shrinkage: Number(event.target.value) })} /></div>
+          <div>
+            <div className="mb-1 text-xs font-medium">Lead-time override (days)</div>
+            <Input type="number" min={1} max={365} value={config.lead_time_days ?? ''} onChange={(event) => setConfig({ ...config, lead_time_days: event.target.value ? Number(event.target.value) : null })} placeholder="Use vendor history" />
+            <div className="mt-1 text-[11px] text-muted-foreground">Forces one fixed lead time for every vendor in the run. Leave blank to use each vendor&apos;s own historical lead time.</div>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium">History (years)</div>
+            <Input type="number" min={1} max={5} value={config.history_years} onChange={(event) => setConfig({ ...config, history_years: Number(event.target.value) })} />
+            <div className="mt-1 text-[11px] text-muted-foreground">Years of sales history feeding the forecast and seasonal profile.</div>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium">Season smoothing (weeks)</div>
+            <Input type="number" min={1} max={13} value={config.seasonal_smoothing_weeks} onChange={(event) => setConfig({ ...config, seasonal_smoothing_weeks: Number(event.target.value) })} />
+            <div className="mt-1 text-[11px] text-muted-foreground">Width of the moving average applied to the 52-week seasonal curve. Wider windows mean smoother, less spiky seasonality.</div>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium">Category shrinkage</div>
+            <Input type="number" min={0} max={10} step={0.25} value={config.seasonal_shrinkage} onChange={(event) => setConfig({ ...config, seasonal_shrinkage: Number(event.target.value) })} />
+            <div className="mt-1 text-[11px] text-muted-foreground">Pulls weekly seasonal indices toward flat. 0 trusts the raw curve fully; higher values damp noisy seasonality.</div>
+          </div>
         </div>
         <details className="mt-4 rounded-lg bg-muted/40 p-3"><summary className="cursor-pointer text-sm font-medium">Forecast model legend</summary><div className="mt-3 grid gap-2 md:grid-cols-2">{Object.entries(effectiveModelLegend).map(([key, explanation]) => <div key={key} className="rounded-md border bg-background p-3"><div className="text-sm font-medium">{key === 'auto' ? 'Automatic champion' : key.replaceAll('_', ' ')}</div><div className="mt-1 text-xs text-muted-foreground">{String(explanation)}</div></div>)}</div></details>
-      </div>
+        </CollapsibleContent>
+      </Collapsible>
 
       {run && (
         <>
