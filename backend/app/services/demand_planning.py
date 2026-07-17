@@ -394,6 +394,7 @@ def project_inventory_and_order(
     scheduled_receipts: Iterable[Dict[str, Any]],
     lead_time_weeks: int,
     review_period_weeks: int = 4,
+    order_coverage_weeks: Optional[int] = None,
     case_pack: int = 1,
     moq: int = 0,
     service_quantile: float = 0.90,
@@ -425,20 +426,33 @@ def project_inventory_and_order(
             "scheduled_receipts": round(receipt, 3),
             "ending_inventory": round(inventory, 3),
         })
-    coverage = max(1, int(lead_time_weeks)) + max(1, int(review_period_weeks))
-    target_demand = sum(float(point.get(service_key) or 0.0) for point in forecast[:coverage])
-    inbound_during_lead = sum(
-        quantity for receipt_week, quantity in receipts_by_week.items()
-        if first_week <= receipt_week < first_week + timedelta(days=max(1, int(lead_time_weeks)) * 7)
+    coverage_after_receipt = max(1, int(
+        order_coverage_weeks if order_coverage_weeks is not None else review_period_weeks
+    ))
+    requested_protection_weeks = max(1, int(lead_time_weeks)) + coverage_after_receipt
+    protection_weeks = min(len(forecast), requested_protection_weeks)
+    target_demand = sum(
+        float(point.get(service_key) or 0.0) for point in forecast[:protection_weeks]
     )
-    inventory_position = max(0.0, float(on_hand or 0.0)) + inbound_during_lead
+    # Net every canonical receipt that arrives while this PO is intended to
+    # protect demand—not only receipts inside lead time. This prevents a later
+    # open PO from being duplicated by today's recommendation.
+    inbound_during_protection = sum(
+        quantity for receipt_week, quantity in receipts_by_week.items()
+        if first_week <= receipt_week < first_week + timedelta(days=protection_weeks * 7)
+    )
+    inventory_position = max(0.0, float(on_hand or 0.0)) + inbound_during_protection
     constraints = round_order_constraints(target_demand - inventory_position, case_pack, moq)
     return {
         "need_by_week": need_by.isoformat() if need_by else None,
         "target_lead_time_demand": round(target_demand, 3),
         "target_lead_time_demand_p90": round(target_demand, 3),
+        "target_protection_demand": round(target_demand, 3),
         "service_quantile": service_quantile,
         "inventory_position_at_order": round(inventory_position, 3),
+        "incoming_within_protection": round(inbound_during_protection, 3),
+        "order_coverage_weeks": coverage_after_receipt,
+        "protection_horizon_weeks": protection_weeks,
         "projection": projection,
         **constraints,
     }
@@ -457,7 +471,13 @@ def build_purchase_recommendation(
     forced_model = config.get("model") or "auto"
     service_quantile = float(config.get("service_quantile") or 0.90)
     demand_multiplier = max(0.0, float(config.get("demand_multiplier") or 1.0))
-    review_period_weeks = max(1, int(config.get("review_period_weeks") or item.get("review_period_weeks") or 4))
+    order_coverage_weeks = max(1, int(
+        config.get("order_coverage_weeks")
+        or config.get("review_period_weeks")
+        or item.get("order_coverage_weeks")
+        or item.get("review_period_weeks")
+        or 8
+    ))
     selection = select_champion(weekly_history, category_profile, forced_model=forced_model)
     point = selection["forecaster"](weekly_history, horizon_weeks)
     point = [value * demand_multiplier for value in point]
@@ -468,7 +488,7 @@ def build_purchase_recommendation(
         on_hand=item.get("on_hand", item.get("current_qoh", 0)),
         scheduled_receipts=item.get("scheduled_receipts") or [],
         lead_time_weeks=max(1, int(math.ceil(float(config.get("lead_time_days") or item.get("lead_time_days") or item.get("lead_time") or 14) / 7.0))),
-        review_period_weeks=review_period_weeks,
+        order_coverage_weeks=order_coverage_weeks,
         case_pack=int(item.get("case_pack") or 1),
         moq=int(item.get("moq") or 0),
         service_quantile=service_quantile,
@@ -535,7 +555,9 @@ def build_purchase_recommendation(
         "confidence": confidence,
         "service_quantile": inventory["service_quantile"],
         "demand_multiplier": demand_multiplier,
-        "review_period_weeks": review_period_weeks,
+        "order_coverage_weeks": inventory["order_coverage_weeks"],
+        "protection_horizon_weeks": inventory["protection_horizon_weeks"],
+        "incoming_within_protection": inventory["incoming_within_protection"],
         "forecast": forecast_weeks,
         "inventory_projection": inventory["projection"],
         "need_by_week": inventory["need_by_week"],

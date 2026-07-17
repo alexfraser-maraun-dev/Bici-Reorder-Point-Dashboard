@@ -12,6 +12,10 @@ import type { AdjustmentMode, DemandWeights } from './sheets-replenishment'
 
 export type DashboardTab = 'inventory' | 'demand' | 'purchase-orders' | 'po-tracker' | 'vendors' | 'brands'
 
+// The legacy Inventory Dashboard is retired from production but its code is kept.
+// Flip to true to restore the tab (trigger, content, and replenishment data fetch).
+export const SHOW_INVENTORY_DASHBOARD = false
+
 interface DashboardContentProps {
   activeTab: DashboardTab
   setActiveTab: (value: DashboardTab) => void
@@ -40,11 +44,15 @@ export function DashboardContent(props: DashboardContentProps) {
         onValueChange={(value) => props.setActiveTab(value as DashboardTab)}
         className="w-full"
       >
-        <TabsList className="grid w-[1180px] grid-cols-6 mb-2 bg-muted/50 p-1 rounded-xl">
-          <TabsTrigger value="inventory" className="gap-2 rounded-lg data-[state=active]:bg-background data-[state=active]:shadow-sm">
-            <LayoutDashboard className="w-4 h-4" />
-            Inventory Dashboard
-          </TabsTrigger>
+        <TabsList className={SHOW_INVENTORY_DASHBOARD
+          ? "grid w-[1180px] grid-cols-6 mb-2 bg-muted/50 p-1 rounded-xl"
+          : "grid w-[985px] grid-cols-5 mb-2 bg-muted/50 p-1 rounded-xl"}>
+          {SHOW_INVENTORY_DASHBOARD && (
+            <TabsTrigger value="inventory" className="gap-2 rounded-lg data-[state=active]:bg-background data-[state=active]:shadow-sm">
+              <LayoutDashboard className="w-4 h-4" />
+              Inventory Dashboard
+            </TabsTrigger>
+          )}
           <TabsTrigger value="demand" className="gap-2 rounded-lg data-[state=active]:bg-background data-[state=active]:shadow-sm">
             <TrendingUp className="w-4 h-4" />
             Demand &amp; Seasonality
@@ -67,9 +75,11 @@ export function DashboardContent(props: DashboardContentProps) {
           </TabsTrigger>
         </TabsList>
         
-        <TabsContent value="inventory" className="mt-0 border-none p-0 focus-visible:ring-0">
-          <SheetsReplenishment {...props} />
-        </TabsContent>
+        {SHOW_INVENTORY_DASHBOARD && (
+          <TabsContent value="inventory" className="mt-0 border-none p-0 focus-visible:ring-0">
+            <SheetsReplenishment {...props} />
+          </TabsContent>
+        )}
 
         <TabsContent value="demand" className="mt-0 border-none p-0 focus-visible:ring-0">
           <DemandInsights />

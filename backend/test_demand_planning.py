@@ -83,6 +83,25 @@ class ProbabilityAndInventoryTest(unittest.TestCase):
         self.assertEqual(result["projection"][1]["scheduled_receipts"], 10)
         self.assertEqual(result["need_by_week"], "2026-07-20")
 
+    def test_incoming_is_netted_across_the_full_po_protection_horizon(self):
+        forecast = [{"p50": 8, "p90": 10}] * 8
+        result = project_inventory_and_order(
+            date(2026, 7, 14), forecast, on_hand=0,
+            scheduled_receipts=[
+                # After the two-week lead time, but inside the six-week
+                # protection horizon (two lead + four coverage).
+                {"week_start": "2026-08-17", "quantity": 15},
+                # Outside the protection horizon; it must not reduce this PO.
+                {"week_start": "2026-09-07", "quantity": 20},
+            ],
+            lead_time_weeks=2,
+            order_coverage_weeks=4,
+        )
+        self.assertEqual(result["protection_horizon_weeks"], 6)
+        self.assertEqual(result["incoming_within_protection"], 15)
+        self.assertEqual(result["target_protection_demand"], 60)
+        self.assertEqual(result["unconstrained_quantity"], 45)
+
     def test_case_pack_and_moq_round_after_unconstrained_need(self):
         result = round_order_constraints(7.2, case_pack=6, moq=18)
         self.assertEqual(result["unconstrained_quantity"], 8)

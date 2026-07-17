@@ -44,6 +44,8 @@ class PlanningServiceTests(unittest.TestCase):
         rec = run["recommendations"][0]
         self.assertEqual(rec["run_id"], run["run_id"])
         self.assertEqual(len(rec["forecast"]), 52)
+        self.assertEqual(run["config"]["order_coverage_weeks"], 8)
+        self.assertEqual(rec["order_coverage_weeks"], 8)
         self.assertFalse(rec["blocked"])
         self.assertGreaterEqual(rec["recommended_quantity"] % 12, 0)
         self.assertTrue(run["monthly_rollups"])
@@ -102,6 +104,20 @@ class PlanningServiceTests(unittest.TestCase):
         self.assertEqual(cache["max_size"], 1)
         self.assertEqual(cache["run_ids"], [second["run_id"]])
         self.assertNotIn(first["run_id"], cache["run_ids"])
+
+    def test_legacy_review_period_maps_to_po_coverage(self):
+        run = create_planning_run(
+            items=[{
+                "item_id": "10", "location_id": "3", "category": "Nutrition",
+                "vendor_id": "55", "landed_cost": 2,
+            }],
+            weekly_history=self._rows(),
+            as_of_date=date(2026, 7, 14),
+            config={"review_period_weeks": 6},
+            persist=False,
+        )
+        self.assertEqual(run["config"]["order_coverage_weeks"], 6)
+        self.assertEqual(run["recommendations"][0]["order_coverage_weeks"], 6)
 
 
 if __name__ == "__main__":

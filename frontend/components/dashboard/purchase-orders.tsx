@@ -358,7 +358,7 @@ export function PurchaseOrders() {
   const [planShop, setPlanShop] = useState('all')
   const [config, setConfig] = useState<PlanningConfig>({
     model: 'auto', service_quantile: 0.9, history_years: 3,
-    review_period_weeks: 4, demand_multiplier: 1,
+    order_coverage_weeks: 8, demand_multiplier: 1,
     seasonal_smoothing_weeks: 5, seasonal_shrinkage: 1, lead_time_days: null,
   })
   const [shopFilter, setShopFilter] = useState('all')
@@ -372,7 +372,16 @@ export function PurchaseOrders() {
     if (latestRun) {
       const restored = latestRun as ForecastRun
       setRun(restored)
-      if (restored.config) setConfig((current) => ({ ...current, ...restored.config }))
+      if (restored.config) {
+        setConfig((current) => ({
+          ...current,
+          ...restored.config,
+          order_coverage_weeks:
+            restored.config.order_coverage_weeks
+            ?? restored.config.review_period_weeks
+            ?? current.order_coverage_weeks,
+        }))
+      }
       if (restored.scope_type) setScopeType(restored.scope_type)
       if (restored.scope_value) setScopeValue(restored.scope_value)
     }
@@ -483,7 +492,11 @@ export function PurchaseOrders() {
           <div><div className="mb-1 text-xs font-medium">Forecast model</div><Select value={config.model} onValueChange={(value) => setConfig({ ...config, model: value as PlanningConfig['model'] })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{MODEL_OPTIONS.map((key) => <SelectItem key={key} value={key}>{key === 'auto' ? 'Automatic champion' : key.replaceAll('_', ' ')}</SelectItem>)}</SelectContent></Select></div>
           <div><div className="mb-1 text-xs font-medium">Service target</div><Select value={String(config.service_quantile)} onValueChange={(value) => setConfig({ ...config, service_quantile: Number(value) as PlanningConfig['service_quantile'] })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="0.8">P80</SelectItem><SelectItem value="0.9">P90 balanced default</SelectItem><SelectItem value="0.95">P95</SelectItem></SelectContent></Select></div>
           <div><div className="mb-1 text-xs font-medium">Demand multiplier</div><Input type="number" min={0} max={3} step={0.05} value={config.demand_multiplier} onChange={(event) => setConfig({ ...config, demand_multiplier: Number(event.target.value) })} /></div>
-          <div><div className="mb-1 text-xs font-medium">Review period (weeks)</div><Input type="number" min={1} max={26} value={config.review_period_weeks} onChange={(event) => setConfig({ ...config, review_period_weeks: Number(event.target.value) })} /></div>
+          <div>
+            <div className="mb-1 text-xs font-medium">PO coverage after receipt (weeks)</div>
+            <Input type="number" min={1} max={52} value={config.order_coverage_weeks} onChange={(event) => setConfig({ ...config, order_coverage_weeks: Number(event.target.value) })} />
+            <div className="mt-1 text-[11px] text-muted-foreground">How many forecast weeks this order should cover after it arrives. Lead time is protected separately.</div>
+          </div>
           <div><div className="mb-1 text-xs font-medium">Lead-time override (days)</div><Input type="number" min={1} max={365} value={config.lead_time_days ?? ''} onChange={(event) => setConfig({ ...config, lead_time_days: event.target.value ? Number(event.target.value) : null })} placeholder="Use vendor history" /></div>
           <div><div className="mb-1 text-xs font-medium">History (years)</div><Input type="number" min={1} max={5} value={config.history_years} onChange={(event) => setConfig({ ...config, history_years: Number(event.target.value) })} /></div>
           <div><div className="mb-1 text-xs font-medium">Season smoothing (weeks)</div><Input type="number" min={1} max={13} value={config.seasonal_smoothing_weeks} onChange={(event) => setConfig({ ...config, seasonal_smoothing_weeks: Number(event.target.value) })} /></div>
@@ -539,7 +552,15 @@ export function PurchaseOrders() {
                   <TableCell className="text-sm">{row.vendor_name}<div className="text-xs text-muted-foreground">{SHOP_NAMES[row.location_id] || `Shop ${row.location_id}`}</div></TableCell>
                   <TableCell><Badge variant="outline">{row.champion_model}</Badge><div className="mt-1 text-xs text-muted-foreground">{row.confidence} confidence</div></TableCell>
                   <TableCell className="text-sm">{row.need_by_week || 'Monitor'}</TableCell>
-                  <TableCell className="text-right font-medium">{row.recommended_quantity}</TableCell>
+                  <TableCell className="text-right font-medium">
+                    {row.recommended_quantity}
+                    <div className="mt-1 text-xs font-normal text-muted-foreground">
+                      {row.order_coverage_weeks}w coverage
+                      {row.incoming_within_protection > 0
+                        ? ` · net of ${number.format(row.incoming_within_protection)} incoming`
+                        : ''}
+                    </div>
+                  </TableCell>
                   <TableCell className="text-right">{row.purchase_commitment_spend == null ? '—' : money.format(row.purchase_commitment_spend)}</TableCell>
                 </TableRow>
               ))}

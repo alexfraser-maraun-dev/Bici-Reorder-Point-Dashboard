@@ -234,6 +234,9 @@ export interface PurchaseRecommendation {
   forecast_metrics: { wape?: number; mase?: number; bias?: number }
   forecast: WeeklyForecastPoint[]
   need_by_week?: string | null
+  order_coverage_weeks: number
+  protection_horizon_weeks: number
+  incoming_within_protection: number
   recommended_quantity: number
   case_pack: number
   moq: number
@@ -278,7 +281,8 @@ export interface PlanningConfig {
   model: 'auto' | 'current_velocity' | 'seasonal_naive' | 'hierarchical_seasonal' | 'tsb' | 'ets_damped'
   service_quantile: 0.5 | 0.8 | 0.9 | 0.95
   history_years: number
-  review_period_weeks: number
+  order_coverage_weeks: number
+  review_period_weeks?: number
   demand_multiplier: number
   seasonal_smoothing_weeks: number
   seasonal_shrinkage: number

@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Toaster } from '@/components/ui/sonner'
 import { useReplenishmentData } from '@/lib/hooks'
 import { cn } from '@/lib/utils'
-import { DashboardContent, type DashboardTab } from './dashboard-content'
+import { DashboardContent, SHOW_INVENTORY_DASHBOARD, type DashboardTab } from './dashboard-content'
 import type { AdjustmentMode, DemandWeights } from './sheets-replenishment'
 
 export function DashboardPageClient() {
@@ -45,9 +45,9 @@ export function DashboardPageClient() {
     growthMultiplier,
     debouncedDemandWeights,
     adjustmentMode,
-    isDemandWeightValid && activeTab === 'inventory'
+    SHOW_INVENTORY_DASHBOARD && isDemandWeightValid && activeTab === 'inventory'
   )
-  const headerActions = activeTab === 'inventory' ? (
+  const headerActions = SHOW_INVENTORY_DASHBOARD && activeTab === 'inventory' ? (
     <Button
       variant="secondary"
       className="h-8 gap-2 text-xs font-semibold border"

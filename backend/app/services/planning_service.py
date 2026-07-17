@@ -161,11 +161,17 @@ def _normalized_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     model = str(source.get("model") or "auto").strip().lower()
     if model not in MODEL_LEGEND:
         raise ValueError(f"Unsupported forecast model: {model}")
+    # Backward compatibility for runs saved before the buyer-facing setting
+    # was renamed. Coverage is measured after receipt; lead time is added
+    # separately to form the full protection horizon.
+    order_coverage = source.get("order_coverage_weeks")
+    if order_coverage in (None, ""):
+        order_coverage = source.get("review_period_weeks")
     return {
         "model": model,
         "service_quantile": service,
         "history_years": max(1, min(5, int(source.get("history_years") or 3))),
-        "review_period_weeks": max(1, min(26, int(source.get("review_period_weeks") or 4))),
+        "order_coverage_weeks": max(1, min(52, int(order_coverage or 8))),
         "demand_multiplier": max(0.0, min(3.0, float(source.get("demand_multiplier") or 1.0))),
         "seasonal_smoothing_weeks": max(1, min(13, int(source.get("seasonal_smoothing_weeks") or 5))),
         "seasonal_shrinkage": max(0.0, min(10.0, float(source.get("seasonal_shrinkage") or 1.0))),
