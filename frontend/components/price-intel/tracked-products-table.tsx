@@ -458,8 +458,10 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
       .filter((a): a is string => !!a && a.trim() !== '')
     return [
       <TableRow key={p.item_id}
-                className={cn(indent && 'bg-muted/20', p.excluded && 'opacity-50')}>
-        <TableCell className={cn('pr-0', indent && 'pl-8 border-l-2 border-muted-foreground/20')}>
+                className={cn(
+                  indent && 'bg-sky-50/80 hover:bg-sky-100/50 dark:bg-sky-950/20 dark:hover:bg-sky-950/30',
+                  p.excluded && 'opacity-50')}>
+        <TableCell className={cn('pr-0', indent && 'pl-8 border-l-2 border-sky-400 dark:border-sky-500')}>
           <button onClick={() => toggleExpanded(p.item_id)}
                   title="Show per-competitor prices"
                   className="text-muted-foreground hover:text-foreground">
@@ -536,7 +538,7 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
         <TableRow key={`${p.item_id}-detail`} className="hover:bg-transparent">
           <TableCell colSpan={8}
                      className={cn('py-3 pl-10 pr-4',
-                       indent ? 'bg-muted/30 border-l-2 border-muted-foreground/20' : 'bg-muted/20')}>
+                       indent ? 'bg-sky-100/50 dark:bg-sky-950/30 border-l-2 border-sky-400 dark:border-sky-500' : 'bg-muted/20')}>
             <div className="space-y-3">
               <div>
                 <p className="mb-1 text-xs font-medium text-muted-foreground">
@@ -587,8 +589,9 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
     const retailLabel = retailMin == null ? '—'
       : retailMax != null && retailMax !== retailMin ? `${fmt(retailMin)}–${fmt(retailMax)}` : fmt(retailMin)
     return [
-      <TableRow key={`m-${matrixId}`} className="bg-muted/40">
-        <TableCell className="pr-0">
+      <TableRow key={`m-${matrixId}`}
+                className="bg-sky-100/60 hover:bg-sky-100/80 dark:bg-sky-950/40 dark:hover:bg-sky-950/50">
+        <TableCell className="pr-0 border-l-2 border-sky-400 dark:border-sky-500">
           <button onClick={() => toggleMatrixExpanded(matrixId)}
                   title="Show matrix variants and competitor coverage"
                   className="text-muted-foreground hover:text-foreground">
@@ -635,7 +638,7 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
       isOpen ? (
         <TableRow key={`m-${matrixId}-cov`} className="hover:bg-transparent">
           <TableCell colSpan={8}
-                     className="bg-muted/20 py-3 pl-10 pr-4 border-l-2 border-muted-foreground/20">
+                     className="bg-sky-50/80 dark:bg-sky-950/20 py-3 pl-10 pr-4 border-l-2 border-sky-400 dark:border-sky-500">
             <MatrixCoveragePanel matrixId={matrixId} variantsTotal={variantsTotal} />
           </TableCell>
         </TableRow>
