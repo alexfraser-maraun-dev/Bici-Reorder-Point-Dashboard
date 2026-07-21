@@ -130,7 +130,7 @@ if os.getenv("PRICE_INTEL_ENABLED", "false").strip().lower() in ("1", "true", "y
                         built = built.replace(tzinfo=timezone.utc)
                     if datetime.now(timezone.utc) - built < timedelta(hours=20):
                         return  # recent enough — don't rebuild on every restart
-                repository.refresh_item_search_index()
+                repository.refresh_item_search_index(trigger="startup")
             except Exception as e:
                 print(f"pi: item search index warm-up failed (search falls back to live): {e}")
         threading.Thread(target=_run, daemon=True).start()

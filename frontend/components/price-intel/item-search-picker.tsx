@@ -7,6 +7,7 @@
 // table and the "link item" flow on tracked URLs.
 
 import { useState } from 'react'
+import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -98,7 +99,7 @@ export function ItemSearchPicker({
   const [openMatrices, setOpenMatrices] = useState<Set<string>>(new Set())
 
   const runSearch = async () => {
-    if (query.trim().length < 2) return
+    if (query.trim().length < 2 || searching) return
     setSearching(true)
     try {
       const found = await searchItems(query.trim())
@@ -106,6 +107,9 @@ export function ItemSearchPicker({
       // auto-expand when only a couple of matrices come back
       const matrixIds = [...new Set(found.map((r) => r.item_matrix_id).filter(Boolean))] as string[]
       setOpenMatrices(new Set(matrixIds.length <= 2 ? matrixIds : []))
+    } catch (e) {
+      setResults([])
+      toast.error(e instanceof Error ? e.message : 'Item search failed')
     } finally {
       setSearching(false)
     }

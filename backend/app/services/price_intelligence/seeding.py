@@ -14,29 +14,109 @@ events stay put, and removing/re-adding the tag toggles tracking with history
 intact (a reactivation restarts the discovery window via activated_at). is_map
 comes from the Lightspeed `map` item tag (comma-separated in item_tags).
 """
+import threading
+from datetime import datetime, timezone
+
 from google.cloud import bigquery
 
 from app.services.bigquery_sync import get_bq_client, LS_DATASET
 from . import config, repository
 
 
-def refresh_tracked_products(top_n: int = None) -> int:
-    if config.SEED_MODE == "track_tag":
-        count = refresh_from_track_tag()
-    else:
-        count = refresh_from_top_revenue(top_n)
-    # Self-sync subscribed matrices AFTER the primary seed (so its source-scoped
-    # archival never fights the tag/top-revenue archival) and BEFORE the
-    # descriptive refresh (which then backfills any newly-inserted variant rows).
-    expand_tracked_matrices()
-    refresh_descriptive_fields()
-    # Rebuild the full-catalog search index (backs the pin picker). Wholesale
-    # CREATE OR REPLACE, so it just refreshes to current catalog state.
+_refresh_lock = threading.Lock()
+_refresh_status_lock = threading.Lock()
+_refresh_status = {"status": "idle"}
+
+
+class ItemSearchIndexRefreshError(RuntimeError):
+    """Tracked rows refreshed, but the separate catalog search index failed."""
+
+
+def _set_refresh_status(**fields) -> None:
+    with _refresh_status_lock:
+        _refresh_status.update(fields)
+
+
+def get_refresh_status() -> dict:
+    with _refresh_status_lock:
+        status = dict(_refresh_status)
+    status["search_index"] = repository.item_search_index_status()
+    return status
+
+
+def queue_refresh(trigger: str = "manual") -> bool:
+    """Mark a background refresh queued before the HTTP response is returned."""
+    with _refresh_status_lock:
+        if _refresh_status.get("status") in ("queued", "running"):
+            return False
+        _refresh_status.update({
+            "status": "queued", "trigger": trigger, "mode": config.SEED_MODE,
+            "started_at": None, "finished_at": None, "count": None,
+            "error": None, "index_error": None,
+        })
+    return True
+
+
+def refresh_tracked_products(
+    top_n: int = None,
+    trigger: str = "unknown",
+    raise_on_index_error: bool = False,
+) -> int:
+    """Refresh tracked rows, subscribed matrices, descriptions, and search index.
+
+    Only one refresh runs per process. The tracked-row work and item-search build
+    report separate outcomes so a best-effort index failure is visible without
+    pretending the successful tracked-list MERGEs were rolled back.
+    """
+    if not _refresh_lock.acquire(blocking=False):
+        return 0
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    _set_refresh_status(
+        status="running", trigger=trigger, mode=config.SEED_MODE,
+        started_at=started_at, finished_at=None, count=None, error=None,
+        index_error=None,
+    )
     try:
-        repository.refresh_item_search_index()
+        if config.SEED_MODE == "track_tag":
+            count = refresh_from_track_tag()
+        else:
+            count = refresh_from_top_revenue(top_n)
+        # Self-sync subscribed matrices AFTER the primary seed (so its source-scoped
+        # archival never fights the tag/top-revenue archival) and BEFORE the
+        # descriptive refresh (which then backfills any newly-inserted variant rows).
+        expand_tracked_matrices()
+        refresh_descriptive_fields()
+
+        try:
+            index_result = repository.refresh_item_search_index(trigger=trigger)
+        except Exception as e:
+            message = str(e)
+            _set_refresh_status(
+                status="partial", count=count, index_error=message,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+            print(f"pi: item search index rebuild failed (tracked list refreshed): {e}")
+            if raise_on_index_error:
+                raise ItemSearchIndexRefreshError(message) from e
+            return count
+
+        _set_refresh_status(
+            status="success", count=count,
+            index_status=index_result.get("status") if index_result else "success",
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return count
+    except ItemSearchIndexRefreshError:
+        raise
     except Exception as e:
-        print(f"pi: item search index rebuild failed (search falls back to live): {e}")
-    return count
+        _set_refresh_status(
+            status="failed", error=str(e),
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+        raise
+    finally:
+        _refresh_lock.release()
 
 
 def refresh_descriptive_fields() -> int:

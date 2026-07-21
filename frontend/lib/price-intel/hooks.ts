@@ -69,6 +69,15 @@ export async function apiPost(path: string, body?: unknown, method: string = 'PO
   return payload
 }
 
+export async function apiGet<T>(path: string): Promise<T> {
+  const res = await fetch(`${baseUrl()}${path}`)
+  const payload = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    throw new ApiError(res.status, payload?.detail)
+  }
+  return payload as T
+}
+
 export function usePriceIntelSummary() {
   const { data, error, isLoading, mutate } = useSWR<PriceIntelSummary>(
     `${baseUrl()}/api/price-intel/summary`, fetcher, swrConfig
@@ -208,10 +217,35 @@ export async function updatePriceIntelSettings(
   return apiPost('/api/price-intel/settings', { changes }, 'PUT')
 }
 
+const itemSearchCache = new Map<string, { at: number; results: ItemSearchResult[] }>()
+const ITEM_SEARCH_CACHE_MS = 5 * 60 * 1000
+const ITEM_SEARCH_CACHE_MAX = 100
+
+export function clearItemSearchCache() {
+  itemSearchCache.clear()
+}
+
 export async function searchItems(q: string): Promise<ItemSearchResult[]> {
+  const key = q.trim().toLowerCase()
+  const cached = itemSearchCache.get(key)
+  if (cached && Date.now() - cached.at < ITEM_SEARCH_CACHE_MS) {
+    itemSearchCache.delete(key)
+    itemSearchCache.set(key, cached)
+    return cached.results
+  }
+  if (cached) itemSearchCache.delete(key)
+
   const res = await fetch(`${baseUrl()}/api/price-intel/items/search?q=${encodeURIComponent(q)}`)
-  if (!res.ok) return []
-  return res.json()
+  const payload = await res.json().catch(() => ({}))
+  if (!res.ok) throw new ApiError(res.status, payload?.detail)
+  const results = payload as ItemSearchResult[]
+  itemSearchCache.set(key, { at: Date.now(), results })
+  while (itemSearchCache.size > ITEM_SEARCH_CACHE_MAX) {
+    const oldest = itemSearchCache.keys().next().value
+    if (oldest === undefined) break
+    itemSearchCache.delete(oldest)
+  }
+  return results
 }
 
 export async function previewPricePush(itemId: string, newPrice: number): Promise<PricePushPreview> {

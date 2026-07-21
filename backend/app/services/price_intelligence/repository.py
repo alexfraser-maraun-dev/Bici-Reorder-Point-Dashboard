@@ -9,6 +9,7 @@ import json
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from datetime import date, datetime, timezone
 
 from google.cloud import bigquery
@@ -277,23 +278,35 @@ def _ensure_columns(client, table_id: str, columns: dict):
 # ---------------------------------------------------------------------------
 # Small TTL caches (same shape as the bigquery_sync admin caches).
 # ---------------------------------------------------------------------------
-_caches = {}
+_caches = OrderedDict()
 _CACHE_TTL_SECONDS = 300
+_CACHE_MAX_ENTRIES = 500
+_cache_lock = threading.Lock()
 
 
 def _cache_get(key):
-    entry = _caches.get(key)
-    if entry and (time.time() - entry[0]) < _CACHE_TTL_SECONDS:
+    with _cache_lock:
+        entry = _caches.get(key)
+        if not entry:
+            return None
+        if (time.time() - entry[0]) >= _CACHE_TTL_SECONDS:
+            _caches.pop(key, None)
+            return None
+        _caches.move_to_end(key)
         return entry[1]
-    return None
 
 
 def _cache_set(key, value):
-    _caches[key] = (time.time(), value)
+    with _cache_lock:
+        _caches[key] = (time.time(), value)
+        _caches.move_to_end(key)
+        while len(_caches) > _CACHE_MAX_ENTRIES:
+            _caches.popitem(last=False)
 
 
 def invalidate_pi_caches():
-    _caches.clear()
+    with _cache_lock:
+        _caches.clear()
 
 
 def _rows(query: str, params=None):
@@ -970,12 +983,13 @@ _ITEM_SEARCH_COLS = (
 )
 
 
-def _item_search_base_query() -> str:
-    """One row per non-archived catalog item with a prebuilt lowercased `search_text`
-    blob (title + manufacturer_sku + matrix_description) and a `rev` sort key. The
-    single source of truth shared by the materialized index (refresh_item_search_index)
-    and the live fallback — the same snapshot ⋈ item_history ⋈ item_matrix_history join
-    the picker has always used; only WHERE/ORDER/LIMIT differ per caller."""
+def _item_search_catalog_query() -> str:
+    """One row per active catalog item before search-specific fields are added.
+
+    The materialized builder and emergency live fallback share only this source join.
+    Their filtering expressions intentionally stay independent so a builder-specific
+    SQL regression cannot break the fallback too.
+    """
     return f"""
         WITH latest AS (
             SELECT MAX(snapshot_date_local) AS d FROM `{LS_DATASET}.v_master_snapshot_latest`
@@ -1002,7 +1016,8 @@ def _item_search_base_query() -> str:
                 ANY_VALUE(manufacturer_sku) AS manufacturer_sku,
                 ANY_VALUE(CAST(system_sku AS STRING)) AS system_sku,
                 MAX(item_current_price) AS current_retail,
-                MAX(COALESCE(sales_revenue_l90d, 0)) AS rev
+                MAX(COALESCE(sales_revenue_l90d, 0)) AS rev,
+                ANY_VALUE(latest.d) AS source_snapshot_date
             FROM `{LS_DATASET}.v_master_snapshot_latest` s CROSS JOIN latest
             WHERE s.snapshot_date_local = latest.d
               AND COALESCE(item_archived, FALSE) = FALSE
@@ -1015,52 +1030,185 @@ def _item_search_base_query() -> str:
                 AS upc_normalized,
             a.item_matrix_id, m.matrix_description,
             a.attribute_1, a.attribute_2, a.attribute_3,
-            s.rev,
-            LOWER(CONCAT_WS(' ', COALESCE(s.title, ''),
-                  COALESCE(s.manufacturer_sku, ''),
-                  COALESCE(m.matrix_description, ''))) AS search_text
+            s.rev, s.source_snapshot_date
         FROM snap s
         LEFT JOIN attrs a USING (item_id)
         LEFT JOIN matrix m ON m.matrix_id = a.item_matrix_id
     """
 
 
-def refresh_item_search_index():
+def _item_search_base_query() -> str:
+    """Catalog rows plus a BigQuery-compatible normalized search blob.
+
+    ARRAY_TO_STRING is used instead of CONCAT_WS (which GoogleSQL does not
+    implement). Search covers every identity buyers commonly paste into the picker.
+    """
+    return f"""
+        SELECT c.*,
+            LOWER(ARRAY_TO_STRING([
+                COALESCE(c.title, ''),
+                COALESCE(c.brand, ''),
+                COALESCE(c.manufacturer_sku, ''),
+                COALESCE(c.system_sku, ''),
+                COALESCE(c.upc_normalized, ''),
+                COALESCE(c.matrix_description, ''),
+                COALESCE(c.attribute_1, ''),
+                COALESCE(c.attribute_2, ''),
+                COALESCE(c.attribute_3, '')
+            ], ' ')) AS search_text
+        FROM ({_item_search_catalog_query()}) c
+    """
+
+
+_item_search_rebuild_lock = threading.Lock()
+_item_search_status_lock = threading.Lock()
+_item_search_status = {"status": "idle"}
+
+
+def _set_item_search_status(**fields):
+    with _item_search_status_lock:
+        _item_search_status.update(fields)
+
+
+def _iso(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def item_search_index_status():
+    """Current process rebuild state plus authoritative BigQuery table metadata."""
+    with _item_search_status_lock:
+        status = dict(_item_search_status)
+    try:
+        table = get_bq_client().get_table(T_ITEM_SEARCH)
+    except NotFound:
+        status.update({"exists": False, "built_at": None, "row_count": 0, "bytes": 0})
+        if status.get("status") not in ("running", "failed"):
+            status["status"] = "missing"
+        return status
+    except Exception as e:
+        status["metadata_error"] = str(e)
+        return status
+
+    modified = table.modified
+    status.update({
+        "exists": True,
+        "built_at": _iso(modified),
+        "row_count": table.num_rows,
+        "bytes": table.num_bytes,
+    })
+    if modified is not None:
+        if modified.tzinfo is None:
+            modified = modified.replace(tzinfo=timezone.utc)
+        status["stale"] = (datetime.now(timezone.utc) - modified).total_seconds() >= 20 * 3600
+    if status.get("status") in ("idle", "missing"):
+        status["status"] = "ready"
+    return status
+
+
+def _item_search_build_query() -> str:
+    return f"""
+        CREATE OR REPLACE TABLE `{T_ITEM_SEARCH}` AS
+        SELECT *, CURRENT_TIMESTAMP() AS built_at
+        FROM ({_item_search_base_query()})
+    """
+
+
+def refresh_item_search_index(trigger: str = "unknown"):
     """Rebuild pi_item_search: one row per non-archived catalog item with a prebuilt
     search_text blob. CREATE OR REPLACE is a wholesale, atomic swap — the table never
     accumulates, so it stays flat at ~catalog size regardless of rebuild count. Runs
     nightly with the scrape and on manual reseed (via seeding.refresh_tracked_products),
-    never per search. Clears the query caches so the next search sees fresh data."""
-    get_bq_client().query(f"""
-        CREATE OR REPLACE TABLE `{T_ITEM_SEARCH}` AS
-        SELECT *, CURRENT_TIMESTAMP() AS built_at
-        FROM ({_item_search_base_query()})
-    """).result()
-    invalidate_pi_caches()
+    never per search. A single-flight lock prevents duplicate 700+ MB rebuilds when
+    startup, manual reseed, and the scheduler overlap."""
+    if not _item_search_rebuild_lock.acquire(blocking=False):
+        status = item_search_index_status()
+        status["already_running"] = True
+        return status
+
+    started_at = datetime.now(timezone.utc)
+    started = time.monotonic()
+    _set_item_search_status(
+        status="running", trigger=trigger, started_at=started_at.isoformat(),
+        finished_at=None, error=None,
+    )
+    try:
+        client = get_bq_client()
+        job = client.query(_item_search_build_query())
+        job.result()
+        invalidate_pi_caches()
+        table = client.get_table(T_ITEM_SEARCH)
+        result = {
+            "status": "success",
+            "trigger": trigger,
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "row_count": table.num_rows,
+            "bytes": table.num_bytes,
+            "bytes_processed": getattr(job, "total_bytes_processed", None),
+            "slot_millis": getattr(job, "slot_millis", None),
+            "error": None,
+        }
+        _set_item_search_status(**result)
+        return item_search_index_status()
+    except Exception as e:
+        _set_item_search_status(
+            status="failed", trigger=trigger,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            duration_seconds=round(time.monotonic() - started, 3), error=str(e),
+        )
+        raise
+    finally:
+        _item_search_rebuild_lock.release()
 
 
 def item_search_built_at():
     """UTC timestamp of the last index build, or None if the table is absent/empty.
     Drives the startup warm-up's staleness check."""
     try:
-        rows = _rows(f"SELECT MAX(built_at) AS built_at FROM `{T_ITEM_SEARCH}`")
+        return get_bq_client().get_table(T_ITEM_SEARCH).modified
     except NotFound:
         return None
-    return rows[0]["built_at"] if rows else None
+
+
+def _item_search_live_query(limit: int = 40) -> str:
+    return f"""
+        SELECT {_ITEM_SEARCH_COLS}
+        FROM ({_item_search_catalog_query()})
+        WHERE STRPOS(LOWER(COALESCE(title, '')), @term) > 0
+           OR STRPOS(LOWER(COALESCE(brand, '')), @term) > 0
+           OR STRPOS(LOWER(COALESCE(manufacturer_sku, '')), @term) > 0
+           OR STRPOS(LOWER(COALESCE(system_sku, '')), @term) > 0
+           OR STRPOS(LOWER(COALESCE(upc_normalized, '')), @term) > 0
+           OR STRPOS(LOWER(COALESCE(matrix_description, '')), @term) > 0
+           OR STRPOS(LOWER(COALESCE(attribute_1, '')), @term) > 0
+           OR STRPOS(LOWER(COALESCE(attribute_2, '')), @term) > 0
+           OR STRPOS(LOWER(COALESCE(attribute_3, '')), @term) > 0
+           OR item_id = @exact
+        ORDER BY rev DESC, matrix_description, attribute_1
+        LIMIT {int(limit)}
+    """
+
+
+def _item_search_fast_query(limit: int = 40) -> str:
+    return f"""
+        SELECT {_ITEM_SEARCH_COLS}
+        FROM `{T_ITEM_SEARCH}`
+        WHERE STRPOS(search_text, @term) > 0 OR item_id = @exact
+        ORDER BY rev DESC, matrix_description, attribute_1
+        LIMIT {int(limit)}
+    """
 
 
 def _search_snapshot_items_live(q: str, limit: int = 40):
-    """Uncached snapshot-join search (the original behavior). Fallback used only until
-    the pi_item_search index has been built, so search never breaks."""
-    like = f"%{q.lower()}%"
-    return _rows(f"""
-        SELECT {_ITEM_SEARCH_COLS}
-        FROM ({_item_search_base_query()})
-        WHERE search_text LIKE @like OR item_id = @exact
-        ORDER BY rev DESC, matrix_description, attribute_1
-        LIMIT {int(limit)}
-    """, params=[
-        bigquery.ScalarQueryParameter("like", "STRING", like),
+    """Independent emergency search used while the materialized index is absent.
+
+    This deliberately filters the raw catalog columns and never consumes the
+    builder's search_text expression, preserving a real fallback boundary.
+    """
+    term = q.strip().lower()
+    return _rows(_item_search_live_query(limit), params=[
+        bigquery.ScalarQueryParameter("term", "STRING", term),
         bigquery.ScalarQueryParameter("exact", "STRING", q.strip()),
     ])
 
@@ -1070,23 +1218,17 @@ def search_snapshot_items(q: str, limit: int = 40):
     pi_item_search index (refreshed nightly + on reseed). Falls back to the live
     snapshot join only until that index exists, so search never breaks. A short
     per-query TTL cache makes repeat searches (reopening the picker) free."""
-    cache_key = f"item_search_{q.strip().lower()}_{int(limit)}"
+    term = q.strip().lower()
+    cache_key = f"item_search_{term}_{int(limit)}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    like = f"%{q.lower()}%"
     params = [
-        bigquery.ScalarQueryParameter("like", "STRING", like),
+        bigquery.ScalarQueryParameter("term", "STRING", term),
         bigquery.ScalarQueryParameter("exact", "STRING", q.strip()),
     ]
     try:
-        rows = _rows(f"""
-            SELECT {_ITEM_SEARCH_COLS}
-            FROM `{T_ITEM_SEARCH}`
-            WHERE search_text LIKE @like OR item_id = @exact
-            ORDER BY rev DESC, matrix_description, attribute_1
-            LIMIT {int(limit)}
-        """, params=params)
+        rows = _rows(_item_search_fast_query(limit), params=params)
     except NotFound:
         # Index not built yet (first boot before warm-up/reseed) — serve the live
         # query so search works, slowly, until the index lands.

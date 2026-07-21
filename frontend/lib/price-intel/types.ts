@@ -295,6 +295,34 @@ export interface ItemSearchResult {
   attribute_3: string | null
 }
 
+export interface ItemSearchIndexStatus {
+  status: 'idle' | 'missing' | 'running' | 'ready' | 'success' | 'failed'
+  exists?: boolean
+  trigger?: string
+  started_at?: string | null
+  finished_at?: string | null
+  built_at?: string | null
+  duration_seconds?: number
+  row_count?: number
+  bytes?: number
+  bytes_processed?: number | null
+  stale?: boolean
+  error?: string | null
+  already_running?: boolean
+}
+
+export interface SeedRefreshStatus {
+  status: 'idle' | 'queued' | 'running' | 'success' | 'partial' | 'failed'
+  trigger?: string
+  mode?: 'track_tag' | 'top_revenue' | string
+  started_at?: string | null
+  finished_at?: string | null
+  count?: number | null
+  error?: string | null
+  index_error?: string | null
+  search_index: ItemSearchIndexStatus
+}
+
 // Matrix-grain rollup for the tracked table (one row per tracked matrix). Market
 // numbers are aggregated only from variants' own exact observations — never
 // propagated across siblings. `subscribed` = has a live pi_tracked_matrices row.

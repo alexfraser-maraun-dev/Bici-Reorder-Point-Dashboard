@@ -238,7 +238,9 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         # Keep the comparison list current before matching against it.
         try:
             from . import seeding
-            seeding.refresh_tracked_products()
+            seeding.refresh_tracked_products(
+                trigger=trigger, raise_on_index_error=True,
+            )
         except Exception as e:
             errors.append(f"seeding: {e}")
             print(f"pi: seeding failed (continuing with existing list): {e}")

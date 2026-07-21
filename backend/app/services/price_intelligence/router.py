@@ -359,8 +359,18 @@ def list_tracked_products():
 @router.post("/tracked/seed")
 def reseed_tracked_products(background_tasks: BackgroundTasks):
     from . import seeding
-    background_tasks.add_task(seeding.refresh_tracked_products)
-    return {"status": "started"}
+    if not seeding.queue_refresh(trigger="manual"):
+        return {"status": "already_running", "mode": config.SEED_MODE}
+    background_tasks.add_task(
+        seeding.refresh_tracked_products, trigger="manual",
+    )
+    return {"status": "started", "mode": config.SEED_MODE}
+
+
+@router.get("/tracked/seed/status")
+def reseed_tracked_products_status():
+    from . import seeding
+    return seeding.get_refresh_status()
 
 
 @router.post("/tracked/pin")
@@ -476,6 +486,11 @@ def search_items(q: str):
     if not q or len(q.strip()) < 2:
         return []
     return repository.search_snapshot_items(q.strip())
+
+
+@router.get("/items/search-index/status")
+def item_search_index_status():
+    return repository.item_search_index_status()
 
 
 # --- product links / match review ------------------------------------------------

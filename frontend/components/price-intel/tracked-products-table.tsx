@@ -12,10 +12,10 @@ import {
 } from '@/components/ui/table'
 import { cn } from '@/lib/utils'
 import {
-  ApiError, apiPost, useCompetitors, useItemCompetitorPrices, useMatrixCoverage,
-  useTrackedMatrices, useTrackedProducts,
+  ApiError, apiGet, apiPost, clearItemSearchCache, useCompetitors,
+  useItemCompetitorPrices, useMatrixCoverage, useTrackedMatrices, useTrackedProducts,
 } from '@/lib/price-intel/hooks'
-import type { ItemSearchResult, MatrixCoverage, TrackedMatrix, TrackedProduct,
+import type { ItemSearchResult, MatrixCoverage, SeedRefreshStatus, TrackedMatrix, TrackedProduct,
   VariantCandidate, VariantSelectionRequired } from '@/lib/price-intel/types'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle,
@@ -431,10 +431,46 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
   const reseed = async () => {
     setReseeding(true)
     try {
-      await apiPost('/api/price-intel/tracked/seed')
-      toast.success('Re-seeding from top-revenue SKUs — refresh in a minute')
+      const started = await apiPost('/api/price-intel/tracked/seed')
+      const modeLabel = started.mode === 'track_tag'
+        ? 'Lightspeed “track” tags'
+        : 'top-revenue items'
+      toast.info(started.status === 'already_running'
+        ? 'A tracked-list refresh is already running'
+        : `Refreshing tracked products from ${modeLabel}…`)
+
+      const deadline = Date.now() + 3 * 60 * 1000
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2000))
+        const status = await apiGet<SeedRefreshStatus>('/api/price-intel/tracked/seed/status')
+        const indexStatus = status.search_index?.status
+        if (
+          status.status === 'queued'
+          || status.status === 'running'
+          || indexStatus === 'running'
+        ) continue
+
+        if (status.status === 'failed' || status.status === 'partial' || indexStatus === 'failed') {
+          const message = status.index_error || status.error || status.search_index?.error
+            || 'The tracked list refreshed, but the search index failed'
+          toast.error(message)
+          await Promise.all([mutate(), mutateMatrices()])
+          return
+        }
+
+        if (status.status === 'success' && status.search_index?.exists) {
+          clearItemSearchCache()
+          await Promise.all([mutate(), mutateMatrices()])
+          toast.success(
+            `Refresh complete — ${status.count ?? 'all'} tracked items processed and `
+            + `${status.search_index.row_count ?? 'all'} catalog items indexed`
+          )
+          return
+        }
+      }
+      toast.warning('Refresh is still running. You can keep working and check again shortly.')
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to start re-seed')
+      toast.error(e instanceof Error ? e.message : 'Failed to refresh tracked products')
     } finally {
       setReseeding(false)
     }

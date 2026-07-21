@@ -52,7 +52,9 @@ class ExpandTrackedMatricesTests(unittest.TestCase):
              patch.object(seeding, "expand_tracked_matrices",
                           side_effect=lambda: order.append("expand")), \
              patch.object(seeding, "refresh_descriptive_fields",
-                          side_effect=lambda: order.append("descriptive")):
+                          side_effect=lambda: order.append("descriptive")), \
+             patch.object(repository, "refresh_item_search_index",
+                          return_value={"status": "success"}):
             seeding.refresh_tracked_products()
         self.assertEqual(["seed", "expand", "descriptive"], order)
 
