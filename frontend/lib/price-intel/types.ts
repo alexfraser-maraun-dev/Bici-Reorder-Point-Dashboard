@@ -295,6 +295,40 @@ export interface ItemSearchResult {
   attribute_3: string | null
 }
 
+// Matrix-grain rollup for the tracked table (one row per tracked matrix). Market
+// numbers are aggregated only from variants' own exact observations — never
+// propagated across siblings. `subscribed` = has a live pi_tracked_matrices row.
+export interface TrackedMatrix {
+  item_matrix_id: string
+  matrix_description: string | null
+  brand: string | null
+  variants_total: number
+  variants_with_market: number
+  matrix_market_min_in_stock: number | null
+  matrix_market_min: number | null
+  current_retail_min: number | null
+  current_retail_max: number | null
+  competitor_count: number
+  competitor_ids: string[] | null
+  last_observed_at: string | null
+  revenue_rank: number | null
+  subscribed: boolean
+}
+
+// Per-competitor coverage for one matrix: how many of our variants that competitor
+// carries (has an exact observation for) and how many undercut our retail.
+export interface MatrixCoverage {
+  competitor_key: string
+  competitor_id: string | null
+  competitor_name: string | null
+  url: string | null
+  variants_carried: number
+  variants_undercut: number
+  price_min: number | null
+  price_max: number | null
+  last_observed_at: string | null
+}
+
 export type ProductLinkStatus = 'pending' | 'confirmed' | 'rejected'
 
 export interface ProductLink {

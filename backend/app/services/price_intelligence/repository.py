@@ -17,6 +17,7 @@ from app.services.bigquery_sync import get_bq_client, APP_DATASET, LS_DATASET
 
 T_COMPETITORS = f"{APP_DATASET}.pi_competitors"
 T_TRACKED = f"{APP_DATASET}.pi_tracked_products"
+T_TRACKED_MATRICES = f"{APP_DATASET}.pi_tracked_matrices"
 T_URLS = f"{APP_DATASET}.pi_tracked_urls"
 T_OBSERVATIONS = f"{APP_DATASET}.pi_price_observations"
 T_EVENTS = f"{APP_DATASET}.pi_change_events"
@@ -205,6 +206,21 @@ def ensure_pi_tables():
                 value_json STRING,
                 updated_at TIMESTAMP,
                 updated_by STRING
+            )""",
+            # Persistent matrix subscriptions: one row per LS item_matrix_id the
+            # user has chosen to track as a unit. Durable, unlike a one-shot
+            # pin-matrix — the seed step (seeding.expand_tracked_matrices) re-
+            # expands active rows every run so new variants auto-join and removed
+            # ones archive. active=FALSE means unsubscribed (its variants are
+            # archived). See pi_tracked_products.source='matrix_sub'.
+            f"""CREATE TABLE IF NOT EXISTS `{T_TRACKED_MATRICES}` (
+                item_matrix_id STRING NOT NULL,
+                matrix_description STRING,
+                brand STRING,
+                source STRING,
+                active BOOL,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
             )""",
         ]
         for stmt in statements:
@@ -673,6 +689,205 @@ def get_item_competitor_prices(item_id: str, days: int = 45):
         out.append(best)
     out.sort(key=lambda r: r.get("price") or 0.0)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Matrix subscriptions (persistent "track this matrix" registry)
+# ---------------------------------------------------------------------------
+
+def get_tracked_matrices(active_only: bool = False):
+    """All matrix subscriptions, newest first. active_only filters to live ones."""
+    ensure_pi_tables()
+    rows = _rows(f"SELECT * FROM `{T_TRACKED_MATRICES}` ORDER BY updated_at DESC")
+    if active_only:
+        rows = [r for r in rows if r.get("active")]
+    return rows
+
+
+def get_active_matrix_ids() -> list:
+    """item_matrix_ids the user is actively subscribed to (drives the seed sync)."""
+    return [str(r["item_matrix_id"]) for r in get_tracked_matrices(active_only=True)]
+
+
+def upsert_tracked_matrix(matrix_id: str, matrix_description=None, brand=None) -> dict:
+    """Subscribe (or re-activate) a matrix. Idempotent on item_matrix_id."""
+    now = utcnow_iso()
+    row = {
+        "item_matrix_id": str(matrix_id),
+        "matrix_description": matrix_description,
+        "brand": brand,
+        "source": "manual",
+        "active": True,
+        "created_at": now,
+        "updated_at": now,
+    }
+    _merge_upsert(
+        T_TRACKED_MATRICES, [row], "item_matrix_id",
+        update_cols=["matrix_description", "brand", "active", "updated_at"],
+        insert_cols=list(row.keys()),
+    )
+    invalidate_pi_caches()
+    return row
+
+
+def set_tracked_matrix_active(matrix_id: str, active: bool):
+    """Toggle a subscription. Deactivating leaves the row for history; the caller
+    (router) archives its source='matrix_sub' variants."""
+    ensure_pi_tables()
+    get_bq_client().query(
+        f"UPDATE `{T_TRACKED_MATRICES}` SET active = @active, "
+        "updated_at = CURRENT_TIMESTAMP() WHERE item_matrix_id = @mid",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("active", "BOOL", bool(active)),
+            bigquery.ScalarQueryParameter("mid", "STRING", str(matrix_id)),
+        ]),
+    ).result()
+    invalidate_pi_caches()
+
+
+def archive_matrix_sub_variants(matrix_id: str):
+    """Archive the auto-added (source='matrix_sub'), unpinned variants of a matrix
+    on unsubscribe. Pinned variants and tag-owned rows are left untouched — their
+    own tracking signal governs them."""
+    ensure_pi_tables()
+    get_bq_client().query(
+        f"UPDATE `{T_TRACKED}` SET archived = TRUE, updated_at = CURRENT_TIMESTAMP() "
+        "WHERE item_matrix_id = @mid AND source = 'matrix_sub' "
+        "AND COALESCE(pinned, FALSE) = FALSE AND COALESCE(archived, FALSE) = FALSE",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("mid", "STRING", str(matrix_id)),
+        ]),
+    ).result()
+    invalidate_pi_caches()
+
+
+def get_tracked_matrices_with_market(days: int = 7):
+    """Matrix-grain rollup: one row per tracked matrix with variant counts and the
+    market summary aggregated from its variants' *own* exact observations. No cross-
+    propagation — a variant with no observations contributes nothing, and no price is
+    ever borrowed from a sibling (inherits the price_scope guard of the per-variant
+    query). `subscribed` marks matrices with a live pi_tracked_matrices row."""
+    ensure_pi_tables()
+    cache_key = f"tracked_matrices_market_{days}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    rows = _rows(f"""
+        WITH latest AS (
+            SELECT o.*
+            FROM `{T_OBSERVATIONS}` o
+            WHERE observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+              AND match_item_id IS NOT NULL AND price IS NOT NULL
+              AND (COALESCE(price_scope, 'variant') = 'variant'
+                   OR (price_scope = 'product' AND NOT EXISTS (
+                       SELECT 1 FROM `{T_TRACKED}` mt
+                       WHERE mt.item_id = o.match_item_id AND mt.item_matrix_id IS NOT NULL)))
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY diff_key ORDER BY observed_at DESC) = 1
+        ),
+        store_rep AS (
+            SELECT * FROM latest
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY match_item_id, COALESCE(competitor_id, CONCAT('url:', url))
+                ORDER BY IF(COALESCE(in_stock, FALSE), 1, 0) DESC, observed_at DESC, price ASC
+            ) = 1
+        ),
+        mv AS (
+            SELECT sr.*, t.item_matrix_id AS mid
+            FROM store_rep sr
+            JOIN `{T_TRACKED}` t ON t.item_id = sr.match_item_id
+            WHERE t.item_matrix_id IS NOT NULL AND COALESCE(t.archived, FALSE) = FALSE
+        ),
+        mat AS (
+            SELECT mid,
+                MIN(IF(in_stock, price, NULL)) AS matrix_market_min_in_stock,
+                MIN(price) AS matrix_market_min,
+                COUNT(DISTINCT COALESCE(competitor_id, CONCAT('url:', url))) AS competitor_count,
+                ARRAY_AGG(DISTINCT competitor_id IGNORE NULLS) AS competitor_ids,
+                COUNT(DISTINCT match_item_id) AS variants_with_market,
+                MAX(observed_at) AS last_observed_at
+            FROM mv GROUP BY mid
+        ),
+        variants AS (
+            SELECT item_matrix_id AS mid,
+                ANY_VALUE(matrix_description) AS matrix_description,
+                ANY_VALUE(brand) AS brand,
+                COUNT(*) AS variants_total,
+                MIN(current_retail) AS current_retail_min,
+                MAX(current_retail) AS current_retail_max,
+                MIN(revenue_rank) AS revenue_rank
+            FROM `{T_TRACKED}`
+            WHERE item_matrix_id IS NOT NULL AND COALESCE(archived, FALSE) = FALSE
+            GROUP BY item_matrix_id
+        )
+        SELECT v.mid AS item_matrix_id, v.matrix_description, v.brand,
+               v.variants_total,
+               COALESCE(mat.variants_with_market, 0) AS variants_with_market,
+               mat.matrix_market_min_in_stock, mat.matrix_market_min,
+               v.current_retail_min, v.current_retail_max,
+               COALESCE(mat.competitor_count, 0) AS competitor_count,
+               mat.competitor_ids, mat.last_observed_at, v.revenue_rank,
+               EXISTS(SELECT 1 FROM `{T_TRACKED_MATRICES}` sub
+                      WHERE sub.item_matrix_id = v.mid
+                        AND COALESCE(sub.active, FALSE)) AS subscribed
+        FROM variants v
+        LEFT JOIN mat ON mat.mid = v.mid
+        ORDER BY v.revenue_rank
+    """, params=[bigquery.ScalarQueryParameter("days", "INT64", days)])
+    _cache_set(cache_key, rows)
+    return rows
+
+
+def get_matrix_coverage(matrix_id: str, days: int = 45):
+    """Per-competitor coverage for one matrix: how many of our variants each
+    competitor carries (has an exact observation for) and how many undercut our
+    retail. Read-only over existing observations; same price_scope guard as the
+    per-variant breakdown so a parent/product price never counts as coverage."""
+    ensure_pi_tables()
+    rows = _rows(f"""
+        WITH latest AS (
+            SELECT o.* FROM `{T_OBSERVATIONS}` o
+            JOIN `{T_TRACKED}` t ON t.item_id = o.match_item_id
+            WHERE t.item_matrix_id = @mid
+              AND o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+              AND o.price IS NOT NULL
+              AND (COALESCE(o.price_scope, 'variant') = 'variant'
+                   OR (o.price_scope = 'product' AND NOT EXISTS (
+                       SELECT 1 FROM `{T_TRACKED}` mt
+                       WHERE mt.item_id = o.match_item_id AND mt.item_matrix_id IS NOT NULL)))
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY o.diff_key ORDER BY o.observed_at DESC) = 1
+        ),
+        store_rep AS (
+            SELECT l.*, t.current_retail
+            FROM latest l JOIN `{T_TRACKED}` t ON t.item_id = l.match_item_id
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY l.match_item_id, COALESCE(l.competitor_id, CONCAT('url:', l.url))
+                ORDER BY IF(COALESCE(l.in_stock, FALSE), 1, 0) DESC, l.observed_at DESC, l.price ASC
+            ) = 1
+        )
+        SELECT
+            COALESCE(sr.competitor_id, CONCAT('url:', sr.url)) AS competitor_key,
+            ANY_VALUE(sr.competitor_id) AS competitor_id,
+            ANY_VALUE(c.name) AS competitor_name,
+            ANY_VALUE(sr.url) AS url,
+            COUNT(DISTINCT sr.match_item_id) AS variants_carried,
+            COUNT(DISTINCT IF(sr.current_retail IS NOT NULL
+                              AND sr.price < sr.current_retail - 0.005,
+                              sr.match_item_id, NULL)) AS variants_undercut,
+            MIN(sr.price) AS price_min, MAX(sr.price) AS price_max,
+            MAX(sr.observed_at) AS last_observed_at
+        FROM store_rep sr
+        LEFT JOIN `{T_COMPETITORS}` c ON c.competitor_id = sr.competitor_id
+        GROUP BY competitor_key
+        ORDER BY variants_carried DESC
+    """, params=[
+        bigquery.ScalarQueryParameter("mid", "STRING", str(matrix_id)),
+        bigquery.ScalarQueryParameter("days", "INT64", days),
+    ])
+    from urllib.parse import urlparse
+    for r in rows:
+        if not r.get("competitor_name") and r.get("url"):
+            r["competitor_name"] = urlparse(r["url"]).netloc
+    return rows
 
 
 def update_tracked_product(item_id: str, fields: dict):

@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -12,10 +12,11 @@ import {
 } from '@/components/ui/table'
 import { cn } from '@/lib/utils'
 import {
-  ApiError, apiPost, useCompetitors, useItemCompetitorPrices, useTrackedProducts,
+  ApiError, apiPost, useCompetitors, useItemCompetitorPrices, useMatrixCoverage,
+  useTrackedMatrices, useTrackedProducts,
 } from '@/lib/price-intel/hooks'
-import type { ItemSearchResult, TrackedProduct, VariantCandidate,
-  VariantSelectionRequired } from '@/lib/price-intel/types'
+import type { ItemSearchResult, MatrixCoverage, TrackedMatrix, TrackedProduct,
+  VariantCandidate, VariantSelectionRequired } from '@/lib/price-intel/types'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog'
@@ -29,8 +30,8 @@ import { ItemSearchPicker } from './item-search-picker'
 import { PriceHistoryChart } from './price-history-chart'
 import {
   ArrowDown, ArrowUp, ArrowUpDown, Ban, ChevronDown, ChevronRight, DollarSign,
-  ExternalLink, EyeOff, Link2, Pin, PinOff, RefreshCw, Search, ShieldAlert,
-  ShieldCheck, Undo2,
+  ExternalLink, EyeOff, Layers, Link2, Pin, PinOff, RefreshCw, Search, ShieldAlert,
+  ShieldCheck, Undo2, X,
 } from 'lucide-react'
 
 const fmt = (v: number | null | undefined) => (v == null ? '—' : `$${Number(v).toFixed(2)}`)
@@ -181,6 +182,49 @@ function PositionBadge({ product }: { product: TrackedProduct }) {
   )
 }
 
+// Expanded matrix panel: how many of the matrix's variants each competitor carries
+// (has an exact observation for), and how many undercut our retail. Read-only over
+// existing per-variant observations — nothing is propagated across siblings.
+function MatrixCoveragePanel({ matrixId, variantsTotal }: {
+  matrixId: string
+  variantsTotal: number
+}) {
+  const { coverage, isLoading } = useMatrixCoverage(matrixId)
+  if (isLoading) return <Skeleton className="h-12 rounded-md" />
+  if (coverage.length === 0) {
+    return (
+      <p className="py-1 text-xs text-muted-foreground">
+        No competitor carries any variant of this matrix yet.
+      </p>
+    )
+  }
+  return (
+    <div className="space-y-1">
+      <p className="text-xs font-medium text-muted-foreground">Competitor coverage</p>
+      <div className="flex flex-wrap gap-1.5">
+        {coverage.map((c: MatrixCoverage) => (
+          <div key={c.competitor_key}
+               className="flex items-center gap-2 rounded-md border bg-muted/30 px-2.5 py-1 text-xs">
+            <span className="font-medium">{c.competitor_name ?? 'Unknown store'}</span>
+            <span className="tabular-nums text-muted-foreground">
+              carries {c.variants_carried}/{variantsTotal}
+            </span>
+            {c.variants_undercut > 0 && (
+              <Badge variant="outline"
+                     className="gap-1 border-rose-200 bg-rose-50 px-1.5 py-0 text-[11px] font-semibold text-rose-700">
+                <ShieldAlert className="h-3 w-3" /> undercut on {c.variants_undercut}
+              </Badge>
+            )}
+            <span className="tabular-nums text-muted-foreground">
+              {fmt(c.price_min)}{c.price_max != null && c.price_max !== c.price_min ? `–${fmt(c.price_max)}` : ''}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 type SortKey = 'title' | 'rank' | 'our' | 'market' | 'stores'
 
 export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
@@ -214,7 +258,13 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
     useState<{ product: TrackedProduct; price: number } | null>(null)
   const [reseeding, setReseeding] = useState(false)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [expandedMatrices, setExpandedMatrices] = useState<Set<string>>(new Set())
   const { competitors } = useCompetitors()
+  const { matrices, mutate: mutateMatrices } = useTrackedMatrices()
+  const matrixById = useMemo(
+    () => new Map<string, TrackedMatrix>(matrices.map((m) => [m.item_matrix_id, m])),
+    [matrices]
+  )
   const [overrideTarget, setOverrideTarget] = useState<TrackedProduct | null>(null)
   const [overrideUrl, setOverrideUrl] = useState('')
   const [overrideCompetitor, setOverrideCompetitor] = useState<string>('none')
@@ -335,11 +385,24 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
 
   const pinMatrix = async (matrixId: string, description: string | null) => {
     try {
-      const res = await apiPost('/api/price-intel/tracked/pin-matrix', { item_matrix_id: matrixId })
-      toast.success(`Pinned ${res.affected ?? 'all'} variants of ${description ?? 'matrix'}`)
-      await mutate()
+      const res = await apiPost('/api/price-intel/tracked/track-matrix', {
+        item_matrix_id: matrixId, matrix_description: description,
+      })
+      toast.success(`Tracking ${res.affected ?? 'all'} variants of ${description ?? 'matrix'} — kept in sync each run`)
+      await Promise.all([mutate(), mutateMatrices()])
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to pin variants')
+      toast.error(e instanceof Error ? e.message : 'Failed to track matrix')
+    }
+  }
+
+  const untrackMatrix = async (matrixId: string, description: string | null) => {
+    if (!window.confirm(`Stop tracking ${description ?? 'this matrix'}? Its auto-added variants are archived (pinned ones stay).`)) return
+    try {
+      await apiPost(`/api/price-intel/tracked/track-matrix/${encodeURIComponent(matrixId)}`, undefined, 'DELETE')
+      toast.success(`Stopped tracking ${description ?? 'matrix'}`)
+      await Promise.all([mutate(), mutateMatrices()])
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to untrack matrix')
     }
   }
 
@@ -348,6 +411,15 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
       const next = new Set(prev)
       if (next.has(itemId)) next.delete(itemId)
       else next.add(itemId)
+      return next
+    })
+  }
+
+  const toggleMatrixExpanded = (matrixId: string) => {
+    setExpandedMatrices((prev) => {
+      const next = new Set(prev)
+      if (next.has(matrixId)) next.delete(matrixId)
+      else next.add(matrixId)
       return next
     })
   }
@@ -376,6 +448,221 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
       return
     }
     await patch(product.item_id, { map_price: value }, 'MAP price updated')
+  }
+
+  // One tracked item as a row (+ its lazy detail row when expanded). Reused for
+  // standalone items and for the variant children of an expanded matrix group.
+  const renderProductRow = (p: TrackedProduct, indent = false) => {
+    const isOpen = expanded.has(p.item_id)
+    const attributes = [p.attribute_1, p.attribute_2, p.attribute_3]
+      .filter((a): a is string => !!a && a.trim() !== '')
+    return [
+      <TableRow key={p.item_id} className={cn(p.excluded && 'opacity-50')}>
+        <TableCell className={cn('pr-0', indent && 'pl-8')}>
+          <button onClick={() => toggleExpanded(p.item_id)}
+                  title="Show per-competitor prices"
+                  className="text-muted-foreground hover:text-foreground">
+            {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+          </button>
+        </TableCell>
+        <TableCell className="text-xs tabular-nums text-muted-foreground">
+          {p.revenue_rank ?? '—'}
+        </TableCell>
+        <TableCell className="max-w-72">
+          <div className="flex items-center gap-1.5">
+            {p.pinned && <Pin className="h-3 w-3 shrink-0 text-sky-600" />}
+            {p.is_map && (
+              <span title={p.map_price != null ? `MAP ${fmt(p.map_price)}` : 'MAP-tagged (no price set)'}>
+                <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-violet-600" />
+              </span>
+            )}
+            <a href={lightspeedItemUrl(p.item_id)} target="_blank"
+               rel="noopener noreferrer" title="Open in Lightspeed"
+               className="truncate font-medium hover:underline">
+              {indent && attributes.length > 0 ? attributes.join(' / ') : p.title}
+            </a>
+            {attributes.map((a) => (
+              <Badge key={a} variant="outline" className="shrink-0 px-1.5 py-0 text-[11px]">
+                {a}
+              </Badge>
+            ))}
+            {isMapViolation(p) && (
+              <Badge variant="outline"
+                     title={`Competitor at ${fmt(p.market_min_in_stock)} is below our price ${fmt(mapFloor(p))}`}
+                     className="shrink-0 gap-1 border-amber-300 bg-amber-50 px-1.5 py-0 text-[11px] font-semibold text-amber-800">
+                <ShieldAlert className="h-3 w-3" /> MAP violation
+              </Badge>
+            )}
+          </div>
+          <p className="truncate text-xs text-muted-foreground">
+            {itemIdentity({ brand: p.brand, upc: p.upc_normalized, systemSku: p.system_sku })}
+          </p>
+        </TableCell>
+        <TableCell className="text-right tabular-nums">{fmt(p.current_retail)}</TableCell>
+        <TableCell className="text-right tabular-nums">{fmt(p.market_min_in_stock)}</TableCell>
+        <TableCell><PositionBadge product={p} /></TableCell>
+        <TableCell className="text-right tabular-nums">{p.competitor_count ?? 0}</TableCell>
+        <TableCell>
+          <div className="flex items-center justify-end gap-0.5">
+            <Button variant="ghost" size="sm"
+                    title="Link the competitor URL that truly matches this item"
+                    onClick={() => setOverrideTarget(p)}>
+              <Link2 className="h-4 w-4 text-muted-foreground" />
+            </Button>
+            <Button variant="ghost" size="sm" title="Push price to Lightspeed"
+                    onClick={() => { setPushInitialPrice(null); setPushTarget(p) }}
+                    disabled={p.excluded}>
+              <DollarSign className="h-4 w-4" />
+            </Button>
+            <Button variant="ghost" size="sm" title="Set MAP price"
+                    onClick={() => setMapPrice(p)}>
+              <ShieldCheck className={cn('h-4 w-4', p.map_price != null ? 'text-violet-600' : 'text-muted-foreground')} />
+            </Button>
+            <Button variant="ghost" size="sm"
+                    title={p.pinned ? 'Unpin' : 'Pin (survives re-seeding)'}
+                    onClick={() => patch(p.item_id, { pinned: !p.pinned }, p.pinned ? 'Unpinned' : 'Pinned')}>
+              {p.pinned ? <PinOff className="h-4 w-4" /> : <Pin className="h-4 w-4 text-muted-foreground" />}
+            </Button>
+            <Button variant="ghost" size="sm"
+                    title={p.excluded ? 'Re-include in matching' : 'Exclude from matching'}
+                    onClick={() => patch(p.item_id, { excluded: !p.excluded }, p.excluded ? 'Re-included' : 'Excluded')}>
+              {p.excluded ? <Undo2 className="h-4 w-4" /> : <EyeOff className="h-4 w-4 text-muted-foreground" />}
+            </Button>
+          </div>
+        </TableCell>
+      </TableRow>,
+      isOpen ? (
+        <TableRow key={`${p.item_id}-detail`} className="hover:bg-transparent">
+          <TableCell colSpan={8} className="bg-muted/20 py-3 pl-10 pr-4">
+            <div className="space-y-3">
+              <div>
+                <p className="mb-1 text-xs font-medium text-muted-foreground">
+                  Price history — our price vs. tracked competitors
+                </p>
+                <PriceHistoryChart itemId={p.item_id} />
+              </div>
+              <CompetitorBreakdown
+                product={p}
+                onRejected={() => mutate()}
+                onMatchVariant={(price) => {
+                  setPushInitialPrice(price)
+                  setPushTarget(p)
+                }}
+                onMatchMatrix={(price) => setMatrixTarget({ product: p, price })}
+              />
+            </div>
+          </TableCell>
+        </TableRow>
+      ) : null,
+    ]
+  }
+
+  // A matrix rendered as one expandable parent row (rollup) over its variant rows.
+  // Rollup numbers come from the backend matrix aggregate when present (authoritative,
+  // whole-matrix); children are the filtered variants currently visible.
+  const renderMatrixGroup = (matrixId: string, variants: TrackedProduct[]) => {
+    const roll = matrixById.get(matrixId)
+    const first = variants[0]
+    const isOpen = expandedMatrices.has(matrixId)
+    const retails = variants.map((v) => v.current_retail).filter((x): x is number => x != null)
+    const mins = variants.map((v) => v.market_min_in_stock).filter((x): x is number => x != null)
+    const localComps = new Set<string>()
+    let localWithMarket = 0
+    for (const v of variants) {
+      if ((v.competitor_count ?? 0) > 0) localWithMarket += 1
+      for (const c of v.competitor_ids ?? []) localComps.add(c)
+    }
+    const description = roll?.matrix_description ?? first?.matrix_description ?? first?.title ?? 'Matrix'
+    const brand = roll?.brand ?? first?.brand ?? null
+    const variantsTotal = roll?.variants_total ?? variants.length
+    const withMarket = roll?.variants_with_market ?? localWithMarket
+    const marketMin = roll?.matrix_market_min_in_stock ?? (mins.length ? Math.min(...mins) : null)
+    const retailMin = roll?.current_retail_min ?? (retails.length ? Math.min(...retails) : null)
+    const retailMax = roll?.current_retail_max ?? (retails.length ? Math.max(...retails) : null)
+    const competitorCount = roll?.competitor_count ?? localComps.size
+    const subscribed = roll?.subscribed ?? false
+    const retailLabel = retailMin == null ? '—'
+      : retailMax != null && retailMax !== retailMin ? `${fmt(retailMin)}–${fmt(retailMax)}` : fmt(retailMin)
+    return [
+      <TableRow key={`m-${matrixId}`} className="bg-muted/40">
+        <TableCell className="pr-0">
+          <button onClick={() => toggleMatrixExpanded(matrixId)}
+                  title="Show matrix variants and competitor coverage"
+                  className="text-muted-foreground hover:text-foreground">
+            {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+          </button>
+        </TableCell>
+        <TableCell className="text-xs tabular-nums text-muted-foreground">
+          {roll?.revenue_rank ?? first?.revenue_rank ?? '—'}
+        </TableCell>
+        <TableCell className="max-w-72">
+          <div className="flex items-center gap-1.5">
+            <Layers className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <span className="truncate font-semibold">{description}</span>
+            <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[11px]">
+              {variantsTotal} variant{variantsTotal === 1 ? '' : 's'}
+            </Badge>
+            {subscribed && (
+              <Badge variant="outline"
+                     title="Tracked as a matrix — variants kept in sync each run"
+                     className="shrink-0 gap-1 border-sky-200 bg-sky-50 px-1.5 py-0 text-[11px] text-sky-700">
+                <Layers className="h-3 w-3" /> tracked
+              </Badge>
+            )}
+          </div>
+          <p className="truncate text-xs text-muted-foreground">
+            {[brand, `${withMarket}/${variantsTotal} matched`].filter(Boolean).join(' · ')}
+          </p>
+        </TableCell>
+        <TableCell className="text-right text-xs tabular-nums text-muted-foreground">{retailLabel}</TableCell>
+        <TableCell className="text-right tabular-nums">{fmt(marketMin)}</TableCell>
+        <TableCell />
+        <TableCell className="text-right tabular-nums">{competitorCount}</TableCell>
+        <TableCell>
+          <div className="flex items-center justify-end gap-0.5">
+            {subscribed && (
+              <Button variant="ghost" size="sm" title="Stop tracking this matrix"
+                      onClick={() => untrackMatrix(matrixId, description)}>
+                <X className="h-4 w-4 text-muted-foreground" />
+              </Button>
+            )}
+          </div>
+        </TableCell>
+      </TableRow>,
+      isOpen ? (
+        <TableRow key={`m-${matrixId}-cov`} className="hover:bg-transparent">
+          <TableCell colSpan={8} className="bg-muted/20 py-3 pl-10 pr-4">
+            <MatrixCoveragePanel matrixId={matrixId} variantsTotal={variantsTotal} />
+          </TableCell>
+        </TableRow>
+      ) : null,
+      ...(isOpen ? variants.flatMap((v) => renderProductRow(v, true)) : []),
+    ]
+  }
+
+  // Order-preserving grouping: matrix variants collapse under one parent at the
+  // position of the matrix's first visible variant; standalone items stay inline.
+  const renderRows = () => {
+    const byMatrix = new Map<string, TrackedProduct[]>()
+    for (const p of visible) {
+      if (p.item_matrix_id) {
+        const list = byMatrix.get(p.item_matrix_id) ?? []
+        list.push(p)
+        byMatrix.set(p.item_matrix_id, list)
+      }
+    }
+    const seen = new Set<string>()
+    const out: ReactNode[] = []
+    for (const p of visible) {
+      if (p.item_matrix_id) {
+        if (seen.has(p.item_matrix_id)) continue
+        seen.add(p.item_matrix_id)
+        out.push(...renderMatrixGroup(p.item_matrix_id, byMatrix.get(p.item_matrix_id)!))
+      } else {
+        out.push(...renderProductRow(p))
+      }
+    }
+    return out
   }
 
   return (
@@ -493,110 +780,7 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {visible.map((p) => {
-                  const isOpen = expanded.has(p.item_id)
-                  const attributes = [p.attribute_1, p.attribute_2, p.attribute_3]
-                    .filter((a): a is string => !!a && a.trim() !== '')
-                  return [
-                    <TableRow key={p.item_id} className={cn(p.excluded && 'opacity-50')}>
-                      <TableCell className="pr-0">
-                        <button onClick={() => toggleExpanded(p.item_id)}
-                                title="Show per-competitor prices"
-                                className="text-muted-foreground hover:text-foreground">
-                          {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-                        </button>
-                      </TableCell>
-                      <TableCell className="text-xs tabular-nums text-muted-foreground">
-                        {p.revenue_rank ?? '—'}
-                      </TableCell>
-                      <TableCell className="max-w-72">
-                        <div className="flex items-center gap-1.5">
-                          {p.pinned && <Pin className="h-3 w-3 shrink-0 text-sky-600" />}
-                          {p.is_map && (
-                            <span title={p.map_price != null ? `MAP ${fmt(p.map_price)}` : 'MAP-tagged (no price set)'}>
-                              <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-violet-600" />
-                            </span>
-                          )}
-                          <a href={lightspeedItemUrl(p.item_id)} target="_blank"
-                             rel="noopener noreferrer" title="Open in Lightspeed"
-                             className="truncate font-medium hover:underline">
-                            {p.title}
-                          </a>
-                          {attributes.map((a) => (
-                            <Badge key={a} variant="outline" className="shrink-0 px-1.5 py-0 text-[11px]">
-                              {a}
-                            </Badge>
-                          ))}
-                          {isMapViolation(p) && (
-                            <Badge variant="outline"
-                                   title={`Competitor at ${fmt(p.market_min_in_stock)} is below our price ${fmt(mapFloor(p))}`}
-                                   className="shrink-0 gap-1 border-amber-300 bg-amber-50 px-1.5 py-0 text-[11px] font-semibold text-amber-800">
-                              <ShieldAlert className="h-3 w-3" /> MAP violation
-                            </Badge>
-                          )}
-                        </div>
-                        <p className="truncate text-xs text-muted-foreground">
-                          {itemIdentity({ brand: p.brand, upc: p.upc_normalized, systemSku: p.system_sku })}
-                        </p>
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">{fmt(p.current_retail)}</TableCell>
-                      <TableCell className="text-right tabular-nums">{fmt(p.market_min_in_stock)}</TableCell>
-                      <TableCell><PositionBadge product={p} /></TableCell>
-                      <TableCell className="text-right tabular-nums">{p.competitor_count ?? 0}</TableCell>
-                      <TableCell>
-                        <div className="flex items-center justify-end gap-0.5">
-                          <Button variant="ghost" size="sm"
-                                  title="Link the competitor URL that truly matches this item"
-                                  onClick={() => setOverrideTarget(p)}>
-                            <Link2 className="h-4 w-4 text-muted-foreground" />
-                          </Button>
-                          <Button variant="ghost" size="sm" title="Push price to Lightspeed"
-                                  onClick={() => { setPushInitialPrice(null); setPushTarget(p) }}
-                                  disabled={p.excluded}>
-                            <DollarSign className="h-4 w-4" />
-                          </Button>
-                          <Button variant="ghost" size="sm" title="Set MAP price"
-                                  onClick={() => setMapPrice(p)}>
-                            <ShieldCheck className={cn('h-4 w-4', p.map_price != null ? 'text-violet-600' : 'text-muted-foreground')} />
-                          </Button>
-                          <Button variant="ghost" size="sm"
-                                  title={p.pinned ? 'Unpin' : 'Pin (survives re-seeding)'}
-                                  onClick={() => patch(p.item_id, { pinned: !p.pinned }, p.pinned ? 'Unpinned' : 'Pinned')}>
-                            {p.pinned ? <PinOff className="h-4 w-4" /> : <Pin className="h-4 w-4 text-muted-foreground" />}
-                          </Button>
-                          <Button variant="ghost" size="sm"
-                                  title={p.excluded ? 'Re-include in matching' : 'Exclude from matching'}
-                                  onClick={() => patch(p.item_id, { excluded: !p.excluded }, p.excluded ? 'Re-included' : 'Excluded')}>
-                            {p.excluded ? <Undo2 className="h-4 w-4" /> : <EyeOff className="h-4 w-4 text-muted-foreground" />}
-                          </Button>
-                        </div>
-                      </TableCell>
-                    </TableRow>,
-                    isOpen ? (
-                      <TableRow key={`${p.item_id}-detail`} className="hover:bg-transparent">
-                        <TableCell colSpan={8} className="bg-muted/20 py-3 pl-10 pr-4">
-                          <div className="space-y-3">
-                            <div>
-                              <p className="mb-1 text-xs font-medium text-muted-foreground">
-                                Price history — our price vs. tracked competitors
-                              </p>
-                              <PriceHistoryChart itemId={p.item_id} />
-                            </div>
-                            <CompetitorBreakdown
-                              product={p}
-                              onRejected={() => mutate()}
-                              onMatchVariant={(price) => {
-                                setPushInitialPrice(price)
-                                setPushTarget(p)
-                              }}
-                              onMatchMatrix={(price) => setMatrixTarget({ product: p, price })}
-                            />
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    ) : null,
-                  ]
-                })}
+                {renderRows()}
               </TableBody>
             </Table>
           )}

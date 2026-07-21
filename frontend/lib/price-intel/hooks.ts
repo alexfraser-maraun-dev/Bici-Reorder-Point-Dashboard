@@ -14,6 +14,7 @@ import type {
   ItemObservation,
   ItemPriceHistory,
   ItemSearchResult,
+  MatrixCoverage,
   MatrixPushPreview,
   MatrixPushResult,
   PriceIntelSummary,
@@ -21,6 +22,7 @@ import type {
   ProductLink,
   ScrapeRun,
   ScrapeStatus,
+  TrackedMatrix,
   TrackedProduct,
   TrackedUrl,
 } from './types'
@@ -79,6 +81,26 @@ export function useTrackedProducts() {
     `${baseUrl()}/api/price-intel/tracked`, fetcher, swrConfig
   )
   return { products: data ?? [], error, isLoading, mutate }
+}
+
+// Matrix-grain rollup rows for the tracked table's collapsed matrix parents.
+export function useTrackedMatrices() {
+  const { data, error, isLoading, mutate } = useSWR<TrackedMatrix[]>(
+    `${baseUrl()}/api/price-intel/tracked/matrices`, fetcher, swrConfig
+  )
+  return { matrices: data ?? [], error, isLoading, mutate }
+}
+
+// Lazy: per-competitor coverage for one matrix; pass null until the matrix row
+// is expanded so only open matrices query.
+export function useMatrixCoverage(matrixId: string | null) {
+  const { data, error, isLoading } = useSWR<MatrixCoverage[]>(
+    matrixId
+      ? `${baseUrl()}/api/price-intel/tracked/matrices/${encodeURIComponent(matrixId)}/coverage`
+      : null,
+    fetcher, swrConfig
+  )
+  return { coverage: data ?? [], error, isLoading }
 }
 
 export function useCompetitors() {

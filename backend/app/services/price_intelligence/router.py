@@ -376,9 +376,10 @@ def pin_item(payload: Dict[str, Any]):
     return {"status": "success"}
 
 
-@router.post("/tracked/pin-matrix")
-def pin_matrix(payload: Dict[str, Any]):
-    """Pins every variant of a matrix ("pin all variants" in the search picker)."""
+def _subscribe_matrix(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Record a persistent matrix subscription and do the first expansion now.
+    Shared by /tracked/track-matrix and the legacy /tracked/pin-matrix so both
+    paths give the matrix self-syncing (not one-shot) semantics."""
     matrix_id = payload.get("item_matrix_id")
     if not matrix_id:
         raise HTTPException(status_code=400, detail="item_matrix_id is required")
@@ -387,7 +388,47 @@ def pin_matrix(payload: Dict[str, Any]):
         affected = seeding.add_manual_tracked_products_for_matrix(str(matrix_id))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    return {"status": "success", "affected": affected}
+    # Persist the subscription only once the matrix is known to exist.
+    repository.upsert_tracked_matrix(
+        str(matrix_id),
+        matrix_description=payload.get("matrix_description"),
+        brand=payload.get("brand"),
+    )
+    return {"status": "success", "affected": affected, "item_matrix_id": str(matrix_id)}
+
+
+@router.get("/tracked/matrices")
+def list_tracked_matrices(days: int = 7):
+    """Matrix-grain rollup for the tracked table (one row per tracked matrix)."""
+    return repository.get_tracked_matrices_with_market(days=days)
+
+
+@router.get("/tracked/matrices/{matrix_id}/coverage")
+def matrix_coverage(matrix_id: str, days: int = 45):
+    """Per-competitor variant coverage / undercut for one matrix."""
+    return repository.get_matrix_coverage(matrix_id, days=days)
+
+
+@router.post("/tracked/track-matrix")
+def track_matrix(payload: Dict[str, Any]):
+    """Subscribe a matrix as a unit: houses every current variant now and keeps the
+    set in sync each run (seeding.expand_tracked_matrices)."""
+    return _subscribe_matrix(payload)
+
+
+@router.delete("/tracked/track-matrix/{matrix_id}")
+def untrack_matrix(matrix_id: str):
+    """Unsubscribe a matrix: deactivate the subscription and archive the variants it
+    auto-added (source='matrix_sub', unpinned). Pinned/tag-owned variants stay."""
+    repository.set_tracked_matrix_active(str(matrix_id), False)
+    repository.archive_matrix_sub_variants(str(matrix_id))
+    return {"status": "success"}
+
+
+@router.post("/tracked/pin-matrix")
+def pin_matrix(payload: Dict[str, Any]):
+    """Legacy alias for track-matrix ("pin all variants" in the search picker)."""
+    return _subscribe_matrix(payload)
 
 
 @router.put("/tracked/{item_id}")
