@@ -115,6 +115,26 @@ if os.getenv("PRICE_INTEL_ENABLED", "false").strip().lower() in ("1", "true", "y
     def _start_price_intel_scheduler() -> None:
         _start_pi_scheduler()
 
+    @app.on_event("startup")
+    def _warm_item_search_index() -> None:
+        """Build the pin-picker search index on boot (daemon thread, non-blocking) so
+        the first searches are fast without waiting for the nightly seed. Rebuilds only
+        when the index is missing or older than ~20h, so restarts don't rebuild it."""
+        def _run() -> None:
+            try:
+                from datetime import datetime, timezone, timedelta
+                from app.services.price_intelligence import repository
+                built = repository.item_search_built_at()
+                if built is not None:
+                    if built.tzinfo is None:
+                        built = built.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) - built < timedelta(hours=20):
+                        return  # recent enough — don't rebuild on every restart
+                repository.refresh_item_search_index()
+            except Exception as e:
+                print(f"pi: item search index warm-up failed (search falls back to live): {e}")
+        threading.Thread(target=_run, daemon=True).start()
+
 
 def _warm_replenishment_caches() -> None:
     """Populate small shared reference caches used across procurement surfaces.

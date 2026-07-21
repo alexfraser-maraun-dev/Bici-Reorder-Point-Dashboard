@@ -383,18 +383,29 @@ def _subscribe_matrix(payload: Dict[str, Any]) -> Dict[str, Any]:
     matrix_id = payload.get("item_matrix_id")
     if not matrix_id:
         raise HTTPException(status_code=400, detail="item_matrix_id is required")
+    matrix_id = str(matrix_id)
     from . import seeding
     try:
-        affected = seeding.add_manual_tracked_products_for_matrix(str(matrix_id))
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    # Persist the subscription only once the matrix is known to exist.
+        affected = seeding.add_manual_tracked_products_for_matrix(matrix_id)
+    except ValueError:
+        affected = 0
+    # Search can offer a matrix the *live* snapshot no longer has (the search index
+    # refreshes nightly, so it can lag archival/new items by up to a day). Don't create
+    # an empty subscription or throw a scary 404 — report it plainly so the UI can
+    # explain and suggest a Re-seed.
+    if not affected:
+        return {
+            "status": "empty", "item_matrix_id": matrix_id, "variants": 0,
+            "warning": ("No active items for this matrix in the latest snapshot. If you "
+                        "just changed it in Lightspeed, Re-seed the list and try again."),
+        }
+    # Persist the subscription only once the matrix is confirmed to have variants.
     repository.upsert_tracked_matrix(
-        str(matrix_id),
+        matrix_id,
         matrix_description=payload.get("matrix_description"),
         brand=payload.get("brand"),
     )
-    return {"status": "success", "affected": affected, "item_matrix_id": str(matrix_id)}
+    return {"status": "success", "variants": affected, "item_matrix_id": matrix_id}
 
 
 @router.get("/tracked/matrices")

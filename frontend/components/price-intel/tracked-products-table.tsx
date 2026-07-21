@@ -388,7 +388,11 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
       const res = await apiPost('/api/price-intel/tracked/track-matrix', {
         item_matrix_id: matrixId, matrix_description: description,
       })
-      toast.success(`Tracking ${res.affected ?? 'all'} variants of ${description ?? 'matrix'} — kept in sync each run`)
+      if (res.status === 'empty') {
+        toast.warning(res.warning ?? 'No active items to track for this matrix')
+        return
+      }
+      toast.success(`Now tracking ${res.variants} variants of ${description ?? 'matrix'} — kept in sync each run`)
       await Promise.all([mutate(), mutateMatrices()])
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to track matrix')
@@ -774,7 +778,8 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
 
           <ItemSearchPicker
             actionLabel="Pin"
-            placeholder="Pin another item (search name / SKU / id)…"
+            matrixActionLabel="Track"
+            placeholder="Pin an item or track a matrix (search name / SKU / id)…"
             onSelect={pinItem}
             onSelectMatrix={pinMatrix}
           />

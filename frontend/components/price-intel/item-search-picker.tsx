@@ -76,16 +76,22 @@ function VariantRow({ item, actionLabel, onSelect }: {
 
 export function ItemSearchPicker({
   actionLabel = 'Pin',
+  matrixActionLabel,
   placeholder = 'Search name / SKU / id…',
   onSelect,
   onSelectMatrix,
 }: {
   actionLabel?: string
+  // Label for the whole-matrix action (defaults to actionLabel). The tracked table
+  // passes "Track" because subscribing a matrix is a persistent, self-syncing action,
+  // not a one-shot pin.
+  matrixActionLabel?: string
   placeholder?: string
   onSelect: (item: ItemSearchResult) => void | Promise<void>
-  // when provided, matrix headers offer "<actionLabel> all N variants"
+  // when provided, matrix headers offer "<matrixActionLabel> all N variants"
   onSelectMatrix?: (matrixId: string, description: string | null) => void | Promise<void>
 }) {
+  const matrixLabel = matrixActionLabel ?? actionLabel
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<ItemSearchResult[]>([])
   const [searching, setSearching] = useState(false)
@@ -166,7 +172,7 @@ export function ItemSearchPicker({
                               await onSelectMatrix(group.matrixId!, group.description)
                               clear()
                             }}>
-                      {actionLabel} all {group.items.length}
+                      {matrixLabel} all {group.items.length}
                     </Button>
                   )}
                 </div>

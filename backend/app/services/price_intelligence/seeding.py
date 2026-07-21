@@ -30,6 +30,12 @@ def refresh_tracked_products(top_n: int = None) -> int:
     # descriptive refresh (which then backfills any newly-inserted variant rows).
     expand_tracked_matrices()
     refresh_descriptive_fields()
+    # Rebuild the full-catalog search index (backs the pin picker). Wholesale
+    # CREATE OR REPLACE, so it just refreshes to current catalog state.
+    try:
+        repository.refresh_item_search_index()
+    except Exception as e:
+        print(f"pi: item search index rebuild failed (search falls back to live): {e}")
     return count
 
 

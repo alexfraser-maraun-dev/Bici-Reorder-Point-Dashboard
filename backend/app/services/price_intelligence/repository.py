@@ -12,12 +12,17 @@ import uuid
 from datetime import date, datetime, timezone
 
 from google.cloud import bigquery
+from google.api_core.exceptions import NotFound
 
 from app.services.bigquery_sync import get_bq_client, APP_DATASET, LS_DATASET
 
 T_COMPETITORS = f"{APP_DATASET}.pi_competitors"
 T_TRACKED = f"{APP_DATASET}.pi_tracked_products"
 T_TRACKED_MATRICES = f"{APP_DATASET}.pi_tracked_matrices"
+# Prebuilt one-row-per-item search index (materialized by seeding.refresh_item_search_index
+# via CREATE OR REPLACE, so it never accumulates). Backs the fast path of
+# search_snapshot_items; absent until the first build, which falls back to the live query.
+T_ITEM_SEARCH = f"{APP_DATASET}.pi_item_search"
 T_URLS = f"{APP_DATASET}.pi_tracked_urls"
 T_OBSERVATIONS = f"{APP_DATASET}.pi_price_observations"
 T_EVENTS = f"{APP_DATASET}.pi_change_events"
@@ -956,12 +961,22 @@ def record_our_price_snapshot():
         print(f"pi: failed to record our price snapshot: {e}")
 
 
-def search_snapshot_items(q: str, limit: int = 40):
-    """Item search (for pinning) against the latest master snapshot, joined to
-    item_history/item_matrix_history for matrix + variant attributes so the UI
-    can tell 'Rapha Core Bib - M / Black' from its 19 siblings."""
-    like = f"%{q.lower()}%"
-    return _rows(f"""
+# Columns the picker consumes (order matches the ItemSearchResult shape). `rev` and
+# `search_text` exist in the base/index for ORDER BY / WHERE but aren't returned.
+_ITEM_SEARCH_COLS = (
+    "item_id, title, brand, manufacturer_sku, system_sku, current_retail, "
+    "upc_normalized, item_matrix_id, matrix_description, "
+    "attribute_1, attribute_2, attribute_3"
+)
+
+
+def _item_search_base_query() -> str:
+    """One row per non-archived catalog item with a prebuilt lowercased `search_text`
+    blob (title + manufacturer_sku + matrix_description) and a `rev` sort key. The
+    single source of truth shared by the materialized index (refresh_item_search_index)
+    and the live fallback — the same snapshot ⋈ item_history ⋈ item_matrix_history join
+    the picker has always used; only WHERE/ORDER/LIMIT differ per caller."""
+    return f"""
         WITH latest AS (
             SELECT MAX(snapshot_date_local) AS d FROM `{LS_DATASET}.v_master_snapshot_latest`
         ),
@@ -999,20 +1014,85 @@ def search_snapshot_items(q: str, limit: int = 40):
             NULLIF(LTRIM(REGEXP_REPLACE(COALESCE(a.raw_upc, ''), r'\\D', ''), '0'), '')
                 AS upc_normalized,
             a.item_matrix_id, m.matrix_description,
-            a.attribute_1, a.attribute_2, a.attribute_3
+            a.attribute_1, a.attribute_2, a.attribute_3,
+            s.rev,
+            LOWER(CONCAT_WS(' ', COALESCE(s.title, ''),
+                  COALESCE(s.manufacturer_sku, ''),
+                  COALESCE(m.matrix_description, ''))) AS search_text
         FROM snap s
         LEFT JOIN attrs a USING (item_id)
         LEFT JOIN matrix m ON m.matrix_id = a.item_matrix_id
-        WHERE LOWER(COALESCE(s.title, '')) LIKE @like
-           OR LOWER(COALESCE(s.manufacturer_sku, '')) LIKE @like
-           OR LOWER(COALESCE(m.matrix_description, '')) LIKE @like
-           OR s.item_id = @exact
-        ORDER BY s.rev DESC, m.matrix_description, a.attribute_1
+    """
+
+
+def refresh_item_search_index():
+    """Rebuild pi_item_search: one row per non-archived catalog item with a prebuilt
+    search_text blob. CREATE OR REPLACE is a wholesale, atomic swap — the table never
+    accumulates, so it stays flat at ~catalog size regardless of rebuild count. Runs
+    nightly with the scrape and on manual reseed (via seeding.refresh_tracked_products),
+    never per search. Clears the query caches so the next search sees fresh data."""
+    get_bq_client().query(f"""
+        CREATE OR REPLACE TABLE `{T_ITEM_SEARCH}` AS
+        SELECT *, CURRENT_TIMESTAMP() AS built_at
+        FROM ({_item_search_base_query()})
+    """).result()
+    invalidate_pi_caches()
+
+
+def item_search_built_at():
+    """UTC timestamp of the last index build, or None if the table is absent/empty.
+    Drives the startup warm-up's staleness check."""
+    try:
+        rows = _rows(f"SELECT MAX(built_at) AS built_at FROM `{T_ITEM_SEARCH}`")
+    except NotFound:
+        return None
+    return rows[0]["built_at"] if rows else None
+
+
+def _search_snapshot_items_live(q: str, limit: int = 40):
+    """Uncached snapshot-join search (the original behavior). Fallback used only until
+    the pi_item_search index has been built, so search never breaks."""
+    like = f"%{q.lower()}%"
+    return _rows(f"""
+        SELECT {_ITEM_SEARCH_COLS}
+        FROM ({_item_search_base_query()})
+        WHERE search_text LIKE @like OR item_id = @exact
+        ORDER BY rev DESC, matrix_description, attribute_1
         LIMIT {int(limit)}
     """, params=[
         bigquery.ScalarQueryParameter("like", "STRING", like),
         bigquery.ScalarQueryParameter("exact", "STRING", q.strip()),
     ])
+
+
+def search_snapshot_items(q: str, limit: int = 40):
+    """Item search for the pin picker. Fast path: a single scan of the prebuilt
+    pi_item_search index (refreshed nightly + on reseed). Falls back to the live
+    snapshot join only until that index exists, so search never breaks. A short
+    per-query TTL cache makes repeat searches (reopening the picker) free."""
+    cache_key = f"item_search_{q.strip().lower()}_{int(limit)}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    like = f"%{q.lower()}%"
+    params = [
+        bigquery.ScalarQueryParameter("like", "STRING", like),
+        bigquery.ScalarQueryParameter("exact", "STRING", q.strip()),
+    ]
+    try:
+        rows = _rows(f"""
+            SELECT {_ITEM_SEARCH_COLS}
+            FROM `{T_ITEM_SEARCH}`
+            WHERE search_text LIKE @like OR item_id = @exact
+            ORDER BY rev DESC, matrix_description, attribute_1
+            LIMIT {int(limit)}
+        """, params=params)
+    except NotFound:
+        # Index not built yet (first boot before warm-up/reseed) — serve the live
+        # query so search works, slowly, until the index lands.
+        rows = _search_snapshot_items_live(q, limit)
+    _cache_set(cache_key, rows)
+    return rows
 
 
 # ---------------------------------------------------------------------------
