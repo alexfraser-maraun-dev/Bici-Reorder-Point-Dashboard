@@ -457,8 +457,9 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
     const attributes = [p.attribute_1, p.attribute_2, p.attribute_3]
       .filter((a): a is string => !!a && a.trim() !== '')
     return [
-      <TableRow key={p.item_id} className={cn(p.excluded && 'opacity-50')}>
-        <TableCell className={cn('pr-0', indent && 'pl-8')}>
+      <TableRow key={p.item_id}
+                className={cn(indent && 'bg-muted/20', p.excluded && 'opacity-50')}>
+        <TableCell className={cn('pr-0', indent && 'pl-8 border-l-2 border-muted-foreground/20')}>
           <button onClick={() => toggleExpanded(p.item_id)}
                   title="Show per-competitor prices"
                   className="text-muted-foreground hover:text-foreground">
@@ -533,7 +534,9 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
       </TableRow>,
       isOpen ? (
         <TableRow key={`${p.item_id}-detail`} className="hover:bg-transparent">
-          <TableCell colSpan={8} className="bg-muted/20 py-3 pl-10 pr-4">
+          <TableCell colSpan={8}
+                     className={cn('py-3 pl-10 pr-4',
+                       indent ? 'bg-muted/30 border-l-2 border-muted-foreground/20' : 'bg-muted/20')}>
             <div className="space-y-3">
               <div>
                 <p className="mb-1 text-xs font-medium text-muted-foreground">
@@ -631,7 +634,8 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
       </TableRow>,
       isOpen ? (
         <TableRow key={`m-${matrixId}-cov`} className="hover:bg-transparent">
-          <TableCell colSpan={8} className="bg-muted/20 py-3 pl-10 pr-4">
+          <TableCell colSpan={8}
+                     className="bg-muted/20 py-3 pl-10 pr-4 border-l-2 border-muted-foreground/20">
             <MatrixCoveragePanel matrixId={matrixId} variantsTotal={variantsTotal} />
           </TableCell>
         </TableRow>
