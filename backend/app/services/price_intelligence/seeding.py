@@ -546,9 +546,24 @@ def _manual_pin_merge(where_source: str, params: list) -> int:
         )
     """
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    result = client.query(merge_query, job_config=job_config).result()
+    job = client.query(merge_query, job_config=job_config)
+    job.result()
+    affected = job.num_dml_affected_rows
+
+    # The QueryJob is the authoritative DML-statistics object. Some client/API
+    # combinations leave the RowIterator count unset (or report zero for an otherwise
+    # successful MERGE), which previously made every real matrix look absent. Only on
+    # that exceptional path, verify the source count directly; normal matrix adds still
+    # pay for a single snapshot scan.
+    if not affected:
+        count_rows = list(client.query(
+            f"SELECT COUNT(*) AS source_count FROM ({source_query})",
+            job_config=bigquery.QueryJobConfig(query_parameters=params),
+        ).result())
+        affected = count_rows[0]["source_count"] if count_rows else 0
+
     repository.invalidate_pi_caches()
-    return getattr(result, "num_dml_affected_rows", 0) or 0
+    return int(affected or 0)
 
 
 def add_manual_tracked_product(item_id: str) -> dict:

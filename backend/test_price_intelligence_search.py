@@ -168,5 +168,37 @@ class SeedRebuildsIndexTests(unittest.TestCase):
         self.assertEqual("partial", seeding._refresh_status["status"])
 
 
+class ManualPinMergeTests(unittest.TestCase):
+    def test_uses_query_job_dml_count(self):
+        client = MagicMock()
+        merge_job = MagicMock(num_dml_affected_rows=7)
+        client.query.return_value = merge_job
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "invalidate_pi_caches"), \
+             patch.object(seeding, "get_bq_client", return_value=client):
+            affected = seeding._manual_pin_merge(
+                "u.item_matrix_id = @matrix_id",
+                [bigquery.ScalarQueryParameter("matrix_id", "STRING", "123")],
+            )
+        self.assertEqual(7, affected)
+        self.assertEqual(1, client.query.call_count)
+
+    def test_verifies_source_when_dml_count_is_zero(self):
+        client = MagicMock()
+        merge_job = MagicMock(num_dml_affected_rows=0)
+        count_job = MagicMock()
+        count_job.result.return_value = [{"source_count": 7}]
+        client.query.side_effect = [merge_job, count_job]
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "invalidate_pi_caches"), \
+             patch.object(seeding, "get_bq_client", return_value=client):
+            affected = seeding._manual_pin_merge(
+                "u.item_matrix_id = @matrix_id",
+                [bigquery.ScalarQueryParameter("matrix_id", "STRING", "123")],
+            )
+        self.assertEqual(7, affected)
+        self.assertEqual(2, client.query.call_count)
+        self.assertIn("SELECT COUNT(*) AS source_count", client.query.call_args.args[0])
+
 if __name__ == "__main__":
     unittest.main()
