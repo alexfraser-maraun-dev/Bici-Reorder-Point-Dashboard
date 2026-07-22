@@ -185,7 +185,10 @@ class SearchTagFilterTests(unittest.TestCase):
         self.assertIn("has_search_tag", sql)
         # Matrix stays fully searchable when any one variant is tagged.
         self.assertIn("add_matrices", sql)
-        self.assertIn("item_matrix_id IN (SELECT item_matrix_id FROM add_matrices)", sql)
+        self.assertIn("LEFT JOIN add_matrices am", sql)
+        self.assertIn("am.item_matrix_id = a.item_matrix_id", sql)
+        self.assertIn("OR am.item_matrix_id IS NOT NULL", sql)
+        self.assertNotIn("IN (SELECT item_matrix_id FROM add_matrices)", sql)
 
     def test_configured_tag_flows_into_the_regex(self):
         with patch.object(repository.config, "SEARCH_TAG", "compare"):
@@ -197,6 +200,7 @@ class SearchTagFilterTests(unittest.TestCase):
         with patch.object(repository.config, "SEARCH_TAG", ""):
             sql = repository._item_search_catalog_query()
         self.assertNotIn("add_matrices", sql)
+        self.assertNotIn("LEFT JOIN add_matrices", sql)
         self.assertNotIn("has_search_tag AND", sql)
         self.assertNotIn("REGEXP_CONTAINS(LOWER(COALESCE(item_tags", sql)
 
@@ -216,6 +220,8 @@ class SearchTagFilterTests(unittest.TestCase):
             live = repository._item_search_live_query()
         for sql in (build, live):
             self.assertIn(r"(^|,)\s*add\s*(,|$)", sql)
+            self.assertIn("LEFT JOIN add_matrices am", sql)
+            self.assertNotIn("IN (SELECT item_matrix_id FROM add_matrices)", sql)
 
 
 class TrackedDedupeTests(unittest.TestCase):

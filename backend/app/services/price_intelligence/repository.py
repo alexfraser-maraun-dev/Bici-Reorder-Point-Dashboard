@@ -1063,13 +1063,22 @@ def _item_search_catalog_query() -> str:
             JOIN attrs a USING (item_id)
             WHERE s.has_search_tag AND a.item_matrix_id IS NOT NULL
         )"""
+        # Keep matrix membership as a join. BigQuery cannot de-correlate the
+        # equivalent IN subquery when it appears under the OR below; because this
+        # catalog feeds both the materialized index and live fallback, that shape
+        # would break both search paths.
+        tag_join = (
+            "LEFT JOIN add_matrices am "
+            "ON am.item_matrix_id = a.item_matrix_id"
+        )
         tag_where = (
             "WHERE s.has_search_tag "
-            "OR a.item_matrix_id IN (SELECT item_matrix_id FROM add_matrices)"
+            "OR am.item_matrix_id IS NOT NULL"
         )
     else:
         has_tag_col = "FALSE AS has_search_tag"
         add_matrices_cte = ""
+        tag_join = ""
         tag_where = ""
     return f"""
         WITH latest AS (
@@ -1116,6 +1125,7 @@ def _item_search_catalog_query() -> str:
         FROM snap s
         LEFT JOIN attrs a USING (item_id)
         LEFT JOIN matrix m ON m.matrix_id = a.item_matrix_id
+        {tag_join}
         {tag_where}
     """
 
