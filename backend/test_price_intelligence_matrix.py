@@ -108,29 +108,36 @@ class ArchiveMatrixSubTests(unittest.TestCase):
 
 
 class SubscribeMatrixRouterTests(unittest.TestCase):
-    def test_subscribe_expands_then_persists(self):
+    def test_subscribe_persists_then_expands_unpinned(self):
+        # Tracking is not pinning: subscribe validates a count, persists the sub, then
+        # expands via the shared self-sync (source='matrix_sub'), never the pin merge.
         order = []
-        with patch.object(seeding, "add_manual_tracked_products_for_matrix",
-                          side_effect=lambda mid: order.append("expand") or 7), \
+        with patch.object(seeding, "count_matrix_snapshot_variants",
+                          side_effect=lambda mid: 7), \
              patch.object(repository, "upsert_tracked_matrix",
-                          side_effect=lambda *a, **k: order.append("persist")):
+                          side_effect=lambda *a, **k: order.append("persist")), \
+             patch.object(seeding, "expand_tracked_matrices",
+                          side_effect=lambda: order.append("expand")), \
+             patch.object(seeding, "add_manual_tracked_products_for_matrix") as pin_merge:
             res = router._subscribe_matrix(
                 {"item_matrix_id": "123", "matrix_description": "Synapse Carbon 2"})
-        self.assertEqual(["expand", "persist"], order)
+        self.assertEqual(["persist", "expand"], order)   # persist BEFORE expand
         self.assertEqual(7, res["variants"])
         self.assertEqual("123", res["item_matrix_id"])
+        pin_merge.assert_not_called()                    # tracking never pins
 
     def test_subscribe_empty_warns_without_persisting(self):
         # Search can offer a matrix the live snapshot no longer has: subscribing must
         # not 404 or create an empty subscription — it returns a plain warning.
-        with patch.object(seeding, "add_manual_tracked_products_for_matrix",
-                          side_effect=ValueError("No snapshot items found for matrix 10783")), \
+        with patch.object(seeding, "count_matrix_snapshot_variants", return_value=0), \
+             patch.object(seeding, "expand_tracked_matrices") as expand, \
              patch.object(repository, "upsert_tracked_matrix") as up:
             res = router._subscribe_matrix({"item_matrix_id": "10783"})
         self.assertEqual("empty", res["status"])
         self.assertEqual(0, res["variants"])
         self.assertIn("warning", res)
         up.assert_not_called()
+        expand.assert_not_called()
 
     def test_subscribe_requires_matrix_id(self):
         from fastapi import HTTPException

@@ -582,7 +582,10 @@ def add_manual_tracked_product(item_id: str) -> dict:
 
 
 def add_manual_tracked_products_for_matrix(item_matrix_id: str) -> int:
-    """Pins every non-archived variant of a matrix ("pin all variants")."""
+    """Pins every non-archived variant of a matrix ("pin all variants"). NOTE: this
+    pins (source='manual', pinned=TRUE) and is NOT used by matrix *tracking* — a
+    tracked matrix expands via expand_tracked_matrices as unpinned source='matrix_sub'
+    rows so it can be untracked. Kept for any explicit pin-all-variants caller."""
     affected = _manual_pin_merge(
         "u.item_matrix_id = @matrix_id",
         [bigquery.ScalarQueryParameter("matrix_id", "STRING", str(item_matrix_id))],
@@ -590,6 +593,22 @@ def add_manual_tracked_products_for_matrix(item_matrix_id: str) -> int:
     if not affected:
         raise ValueError(f"No snapshot items found for matrix {item_matrix_id}")
     return affected
+
+
+def count_matrix_snapshot_variants(item_matrix_id: str) -> int:
+    """Count a matrix's active variants in the latest snapshot WITHOUT tracking or
+    pinning them. Lets subscribe validate a matrix (and report a variant count) before
+    it persists the subscription and expands it via the shared self-sync path."""
+    repository.ensure_pi_tables()
+    client = get_bq_client()
+    source_query = _snapshot_source_query("u.item_matrix_id = @matrix_id")
+    rows = list(client.query(
+        f"SELECT COUNT(*) AS n FROM ({source_query})",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("matrix_id", "STRING", str(item_matrix_id)),
+        ]),
+    ).result())
+    return int(rows[0]["n"]) if rows else 0
 
 
 def expand_tracked_matrices() -> int:

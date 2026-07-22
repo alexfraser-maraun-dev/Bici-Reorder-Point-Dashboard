@@ -34,15 +34,38 @@ async function proxy(req: NextRequest, ctx: { params: Promise<{ path: string[] }
   const method = req.method.toUpperCase()
   const init: RequestInit = { method, headers, redirect: "manual" }
   // Request bodies here are small (JSON, or the capped SKU CSV upload) — buffering
-  // them is simpler and safe. Only the RESPONSE side needs streaming.
+  // them is simpler and safe. Only the RESPONSE side needs streaming. Buffering also
+  // makes the body reusable across the connection retry below (a stream would not be).
   if (method !== "GET" && method !== "HEAD") {
     init.body = await req.arrayBuffer()
   }
 
-  let upstream: Response
-  try {
-    upstream = await fetch(target, init)
-  } catch {
+  // The backend runs on Render's free tier and can spin down / briefly reset, so a
+  // single fetch occasionally throws before it ever reaches FastAPI (the classic
+  // "Backend unreachable" on a DELETE/POST). Retry, but stay safe on mutations: only
+  // retry a non-idempotent method when the connection was NEVER established
+  // (ECONNREFUSED/DNS during cold start) — never on a mid-flight reset, which could
+  // double-apply a write like a price push.
+  const idempotent = method === "GET" || method === "HEAD"
+  const neverConnected = (err: unknown): boolean => {
+    const code = (err as { cause?: { code?: string } } | null)?.cause?.code
+    return code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN"
+  }
+  const MAX_ATTEMPTS = 3
+  let upstream: Response | null = null
+  let lastErr: unknown = null
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      upstream = await fetch(target, init)
+      break
+    } catch (err) {
+      lastErr = err
+      if (attempt >= MAX_ATTEMPTS || !(idempotent || neverConnected(err))) break
+      await new Promise((r) => setTimeout(r, attempt * 400))
+    }
+  }
+  if (!upstream) {
+    console.error(`[backend-proxy] ${method} ${target} unreachable:`, lastErr)
     return NextResponse.json({ detail: "Backend unreachable" }, { status: 502 })
   }
 

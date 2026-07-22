@@ -389,33 +389,44 @@ def pin_item(payload: Dict[str, Any]):
 def _subscribe_matrix(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Record a persistent matrix subscription and do the first expansion now.
     Shared by /tracked/track-matrix and the legacy /tracked/pin-matrix so both
-    paths give the matrix self-syncing (not one-shot) semantics."""
+    paths give the matrix self-syncing (not one-shot) semantics.
+
+    Tracking a matrix is NOT pinning: variants land as source='matrix_sub' (unpinned)
+    via the same expand_tracked_matrices the nightly run uses, so the set stays in sync
+    and untracking can archive them. (Pinning is a separate, explicit per-item action.)"""
     matrix_id = payload.get("item_matrix_id")
     if not matrix_id:
         raise HTTPException(status_code=400, detail="item_matrix_id is required")
     matrix_id = str(matrix_id)
     from . import seeding
     try:
-        affected = seeding.add_manual_tracked_products_for_matrix(matrix_id)
-    except ValueError:
-        affected = 0
+        variants = seeding.count_matrix_snapshot_variants(matrix_id)
+    except Exception:
+        variants = 0
     # Search can offer a matrix the *live* snapshot no longer has (the search index
     # refreshes nightly, so it can lag archival/new items by up to a day). Don't create
     # an empty subscription or throw a scary 404 — report it plainly so the UI can
     # explain and suggest a Re-seed.
-    if not affected:
+    if not variants:
         return {
             "status": "empty", "item_matrix_id": matrix_id, "variants": 0,
             "warning": ("No active items for this matrix in the latest snapshot. If you "
                         "just changed it in Lightspeed, Re-seed the list and try again."),
         }
-    # Persist the subscription only once the matrix is confirmed to have variants.
+    # Persist the subscription first, then expand it through the shared self-sync so the
+    # variants are inserted exactly as the nightly run would (source='matrix_sub').
     repository.upsert_tracked_matrix(
         matrix_id,
         matrix_description=payload.get("matrix_description"),
         brand=payload.get("brand"),
     )
-    return {"status": "success", "variants": affected, "item_matrix_id": matrix_id}
+    try:
+        seeding.expand_tracked_matrices()
+    except Exception as e:
+        # Subscription is persisted; the nightly sync will still expand it. Report the
+        # count we validated rather than failing the whole subscribe.
+        print(f"pi: initial matrix expansion failed (nightly sync will retry): {e}")
+    return {"status": "success", "variants": variants, "item_matrix_id": matrix_id}
 
 
 @router.get("/tracked/matrices")

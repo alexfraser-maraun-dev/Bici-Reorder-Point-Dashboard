@@ -385,40 +385,48 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
     }
   }
 
+  // Backend actions surface a process-specific loading toast that resolves in place
+  // (loading → success/error via the shared toast id), so there's always a visible
+  // "working on it" signal while the request is in flight.
   const pinItem = async (item: ItemSearchResult) => {
+    const tid = toast.loading(`Adding ${item.title} to your tracked list…`)
     try {
       await apiPost('/api/price-intel/tracked/pin', { item_id: item.item_id })
-      toast.success(`Pinned ${item.title}`)
+      toast.success(`Pinned ${item.title}`, { id: tid })
       await mutate()
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to pin item')
+      toast.error(e instanceof Error ? e.message : 'Failed to pin item', { id: tid })
     }
   }
 
   const pinMatrix = async (matrixId: string, description: string | null) => {
+    const label = description ?? 'matrix'
+    const tid = toast.loading(`Adding ${label} variants to your tracked list…`)
     try {
       const res = await apiPost('/api/price-intel/tracked/track-matrix', {
         item_matrix_id: matrixId, matrix_description: description,
       })
       if (res.status === 'empty') {
-        toast.warning(res.warning ?? 'No active items to track for this matrix')
+        toast.warning(res.warning ?? 'No active items to track for this matrix', { id: tid })
         return
       }
-      toast.success(`Now tracking ${res.variants} variants of ${description ?? 'matrix'} — kept in sync each run`)
+      toast.success(`Now tracking ${res.variants} variants of ${label} — kept in sync each run`, { id: tid })
       await Promise.all([mutate(), mutateMatrices()])
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to track matrix')
+      toast.error(e instanceof Error ? e.message : 'Failed to track matrix', { id: tid })
     }
   }
 
   const untrackMatrix = async (matrixId: string, description: string | null) => {
     if (!window.confirm(`Stop tracking ${description ?? 'this matrix'}? Its auto-added variants are archived (pinned ones stay).`)) return
+    const label = description ?? 'matrix'
+    const tid = toast.loading(`Removing ${label} from tracked matrices…`)
     try {
       await apiPost(`/api/price-intel/tracked/track-matrix/${encodeURIComponent(matrixId)}`, undefined, 'DELETE')
-      toast.success(`Stopped tracking ${description ?? 'matrix'}`)
+      toast.success(`Stopped tracking ${label}`, { id: tid })
       await Promise.all([mutate(), mutateMatrices()])
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to untrack matrix')
+      toast.error(e instanceof Error ? e.message : 'Failed to untrack matrix', { id: tid })
     }
   }
 
