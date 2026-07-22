@@ -38,6 +38,13 @@ FLUSH_ROWS = int(os.getenv("PI_FLUSH_ROWS", "2000"))
 SEED_MODE = os.getenv("PI_SEED_MODE", "track_tag").strip().lower()
 TRACK_TAG = os.getenv("PI_TRACK_TAG", "track").strip().lower()
 TOP_REVENUE_COUNT = int(os.getenv("PI_TOP_REVENUE_COUNT", "100"))
+
+# The pin/search picker only surfaces catalog items carrying this Lightspeed tag
+# (comma-separated in item_tags). The tag reliably lives on active *variants* even
+# when the matrix parent isn't tagged, so the filter is applied per variant and a
+# matrix stays fully searchable whenever any one of its active variants is tagged.
+# Set to an empty string to disable the filter (surface the whole catalog).
+SEARCH_TAG = os.getenv("PI_SEARCH_TAG", "add").strip().lower()
 # Optional: restrict auto-seeding to items that have a UPC/EAN. Off by default —
 # competitor catalogs rarely expose barcodes, so this mostly shrinks coverage.
 REQUIRE_UPC = _flag("PI_REQUIRE_UPC")

@@ -82,6 +82,10 @@ def refresh_tracked_products(
             count = refresh_from_track_tag()
         else:
             count = refresh_from_top_revenue(top_n)
+        # Heal any accidental duplicate item_id rows (e.g. two concurrent manual pins)
+        # before the matrix/descriptive MERGEs read the table, so their counts and
+        # per-item joins operate on one row per item. No-op when the table is clean.
+        repository.dedupe_tracked_products()
         # Self-sync subscribed matrices AFTER the primary seed (so its source-scoped
         # archival never fights the tag/top-revenue archival) and BEFORE the
         # descriptive refresh (which then backfills any newly-inserted variant rows).

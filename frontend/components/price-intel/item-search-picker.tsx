@@ -6,11 +6,12 @@
 // distinguishable from its siblings. Used by the pin-search on the tracked
 // table and the "link item" flow on tracked URLs.
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Spinner } from '@/components/ui/spinner'
 import { searchItems } from '@/lib/price-intel/hooks'
 import { itemIdentity } from '@/lib/price-intel/format'
 import type { ItemSearchResult } from '@/lib/price-intel/types'
@@ -49,15 +50,17 @@ function groupByMatrix(results: ItemSearchResult[]): MatrixGroup[] {
   return groups
 }
 
-function VariantRow({ item, actionLabel, onSelect }: {
+function VariantRow({ item, actionLabel, pending, disabled, onSelect }: {
   item: ItemSearchResult
   actionLabel: string
+  pending: boolean
+  disabled: boolean
   onSelect: (item: ItemSearchResult) => void
 }) {
   const variantAttrs = attrs(item)
   return (
-    <button onClick={() => onSelect(item)}
-            className="flex w-full items-center justify-between gap-3 rounded px-2 py-1.5 text-left text-sm hover:bg-muted">
+    <button type="button" disabled={disabled} onClick={() => onSelect(item)}
+            className="flex w-full items-center justify-between gap-3 rounded px-2 py-1.5 text-left text-sm hover:bg-muted disabled:pointer-events-none disabled:opacity-50">
       <span className="flex min-w-0 items-center gap-2">
         <span className="truncate font-medium">{item.title}</span>
         {variantAttrs.map((a) => (
@@ -69,7 +72,9 @@ function VariantRow({ item, actionLabel, onSelect }: {
       </span>
       <span className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
         {fmt(item.current_retail)}
-        <span className="font-medium text-foreground">{actionLabel}</span>
+        {pending
+          ? <Spinner className="h-3.5 w-3.5" />
+          : <span className="font-medium text-foreground">{actionLabel}</span>}
       </span>
     </button>
   )
@@ -96,7 +101,15 @@ export function ItemSearchPicker({
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<ItemSearchResult[]>([])
   const [searching, setSearching] = useState(false)
+  // The query that produced `results` — drives the "no matches for …" empty state so
+  // the user can tell a search actually ran (and returned nothing) vs. never started.
+  const [searchedQuery, setSearchedQuery] = useState<string | null>(null)
   const [openMatrices, setOpenMatrices] = useState<Set<string>>(new Set())
+  // Which row/matrix action is committing (drives the inline spinner). `selectLock`
+  // is a synchronous guard so a double-click or Enter-repeat can't fire the same
+  // pin/track twice before the list clears — the source of the phantom double-pins.
+  const [pendingKey, setPendingKey] = useState<string | null>(null)
+  const selectLock = useRef(false)
 
   const runSearch = async () => {
     if (query.trim().length < 2 || searching) return
@@ -104,11 +117,15 @@ export function ItemSearchPicker({
     try {
       const found = await searchItems(query.trim())
       setResults(found)
+      setSearchedQuery(query.trim())
       // auto-expand when only a couple of matrices come back
       const matrixIds = [...new Set(found.map((r) => r.item_matrix_id).filter(Boolean))] as string[]
       setOpenMatrices(new Set(matrixIds.length <= 2 ? matrixIds : []))
     } catch (e) {
+      // Leave the empty-state off on failure — the toast explains it; showing
+      // "no matches" would wrongly imply the catalog was searched and came back bare.
       setResults([])
+      setSearchedQuery(null)
       toast.error(e instanceof Error ? e.message : 'Item search failed')
     } finally {
       setSearching(false)
@@ -118,14 +135,34 @@ export function ItemSearchPicker({
   const clear = () => {
     setResults([])
     setQuery('')
+    setSearchedQuery(null)
   }
 
-  const select = async (item: ItemSearchResult) => {
-    await onSelect(item)
-    clear()
+  // Single-flight guard shared by variant pins and whole-matrix tracks: the first
+  // activation takes the lock synchronously; any second one (double-click, stray
+  // Enter) is dropped until the first resolves and the list clears.
+  const runGuarded = async (key: string, action: () => void | Promise<void>) => {
+    if (selectLock.current) return
+    selectLock.current = true
+    setPendingKey(key)
+    try {
+      await action()
+      clear()
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Action failed')
+    } finally {
+      selectLock.current = false
+      setPendingKey(null)
+    }
   }
 
+  const select = (item: ItemSearchResult) => runGuarded(item.item_id, () => onSelect(item))
+  const selectMatrix = (group: MatrixGroup) =>
+    runGuarded(`matrix:${group.matrixId}`, () => onSelectMatrix!(group.matrixId!, group.description))
+
+  const busy = pendingKey !== null
   const groups = groupByMatrix(results)
+  const showEmpty = searchedQuery !== null && !searching && results.length === 0
 
   return (
     <div className="space-y-2">
@@ -134,13 +171,25 @@ export function ItemSearchPicker({
                onChange={(e) => setQuery(e.target.value)}
                onKeyDown={(e) => e.key === 'Enter' && runSearch()}
                className="w-80" />
-        <Button variant="outline" size="sm" onClick={runSearch} disabled={searching}>
-          <Search className="h-4 w-4" /> Search
+        <Button variant="outline" size="sm" onClick={runSearch}
+                disabled={searching || query.trim().length < 2}>
+          {searching ? <Spinner className="h-4 w-4" /> : <Search className="h-4 w-4" />}
+          {searching ? 'Searching…' : 'Search'}
         </Button>
-        {results.length > 0 && (
-          <Button variant="ghost" size="sm" onClick={clear}>Clear</Button>
+        {(results.length > 0 || searchedQuery !== null) && (
+          <Button variant="ghost" size="sm" onClick={clear} disabled={busy}>Clear</Button>
         )}
       </div>
+      {searching && (
+        <div className="flex items-center gap-2 rounded-md border border-dashed px-3 py-2 text-sm text-muted-foreground">
+          <Spinner className="h-4 w-4" /> Searching the catalog…
+        </div>
+      )}
+      {showEmpty && (
+        <p className="rounded-md border border-dashed px-3 py-2 text-sm text-muted-foreground">
+          No matches for <span className="font-medium text-foreground">{searchedQuery}</span>.
+        </p>
+      )}
       {results.length > 0 && (
         <div className="space-y-1 rounded-md border p-2">
           {groups.map((group) =>
@@ -148,6 +197,7 @@ export function ItemSearchPicker({
               <div key={`m-${group.matrixId}`} className="rounded border border-dashed">
                 <div className="flex items-center justify-between gap-2 px-2 py-1.5">
                   <button
+                    type="button"
                     className="flex min-w-0 flex-1 items-center gap-2 text-left text-sm"
                     onClick={() =>
                       setOpenMatrices((prev) => {
@@ -172,10 +222,11 @@ export function ItemSearchPicker({
                   </button>
                   {onSelectMatrix && group.items.length > 1 && (
                     <Button variant="outline" size="sm" className="h-7 shrink-0 text-xs"
-                            onClick={async () => {
-                              await onSelectMatrix(group.matrixId!, group.description)
-                              clear()
-                            }}>
+                            disabled={busy}
+                            onClick={() => selectMatrix(group)}>
+                      {pendingKey === `matrix:${group.matrixId}`
+                        ? <Spinner className="h-3.5 w-3.5" />
+                        : null}
                       {matrixLabel} all {group.items.length}
                     </Button>
                   )}
@@ -184,7 +235,8 @@ export function ItemSearchPicker({
                   <div className="space-y-0.5 border-t px-1 py-1">
                     {group.items.map((item) => (
                       <VariantRow key={item.item_id} item={item}
-                                  actionLabel={actionLabel} onSelect={select} />
+                                  actionLabel={actionLabel} onSelect={select}
+                                  pending={pendingKey === item.item_id} disabled={busy} />
                     ))}
                   </div>
                 )}
@@ -192,7 +244,8 @@ export function ItemSearchPicker({
             ) : (
               group.items.map((item) => (
                 <VariantRow key={item.item_id} item={item}
-                            actionLabel={actionLabel} onSelect={select} />
+                            actionLabel={actionLabel} onSelect={select}
+                            pending={pendingKey === item.item_id} disabled={busy} />
               ))
             )
           )}

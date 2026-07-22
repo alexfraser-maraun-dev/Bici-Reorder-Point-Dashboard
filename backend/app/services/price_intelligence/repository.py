@@ -6,6 +6,7 @@ UPDATEs, retention deletes) is never blocked by a streaming buffer. The only
 streaming write is the append-only price-push audit log, mirroring log_writeback.
 """
 import json
+import re
 import threading
 import time
 import uuid
@@ -16,6 +17,7 @@ from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
 
 from app.services.bigquery_sync import get_bq_client, APP_DATASET, LS_DATASET
+from . import config
 
 T_COMPETITORS = f"{APP_DATASET}.pi_competitors"
 T_TRACKED = f"{APP_DATASET}.pi_tracked_products"
@@ -607,6 +609,41 @@ def get_tracked_products(include_excluded: bool = True, include_archived: bool =
     return rows
 
 
+def dedupe_tracked_products() -> int:
+    """Collapse accidental duplicate item_id rows in pi_tracked_products, keeping the
+    best row per item (pinned first, then live over archived, then most-recently
+    updated). Duplicates arise when two manual-pin MERGEs run concurrently and both
+    hit NOT MATCHED before either commits (BigQuery MERGE isn't serializable against
+    concurrent DML). Reads already dedupe defensively; this heals the physical table so
+    counts and downstream MERGEs stay correct. A COUNT guard keeps the clean case free —
+    the table is only rewritten when duplicates actually exist. Returns rows removed."""
+    ensure_pi_tables()
+    client = get_bq_client()
+    rows = list(client.query(
+        f"SELECT COUNT(*) - COUNT(DISTINCT item_id) AS extra FROM `{T_TRACKED}`"
+    ).result())
+    extra = int(rows[0]["extra"] or 0) if rows else 0
+    if extra <= 0:
+        return 0
+    # Single-statement atomic rewrite (table is small and DML-written, no streaming
+    # buffer). Keep exactly one row per item_id by the preference ordering above.
+    client.query(f"""
+        CREATE OR REPLACE TABLE `{T_TRACKED}` AS
+        SELECT * EXCEPT(_dedupe_rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY item_id
+                ORDER BY COALESCE(pinned, FALSE) DESC,
+                         COALESCE(archived, FALSE) ASC,
+                         updated_at DESC
+            ) AS _dedupe_rn
+            FROM `{T_TRACKED}`
+        ) WHERE _dedupe_rn = 1
+    """).result()
+    invalidate_pi_caches()
+    print(f"pi: removed {extra} duplicate tracked-product row(s)")
+    return extra
+
+
 def get_tracked_products_with_market(days: int = 7):
     """Tracked products joined with market min/median from the latest observation
     per (competitor, product) over the trailing window.
@@ -654,6 +691,12 @@ def get_tracked_products_with_market(days: int = 7):
         FROM `{T_TRACKED}` t
         LEFT JOIN market m ON m.item_id = t.item_id
         WHERE COALESCE(t.archived, FALSE) = FALSE
+        -- Collapse any accidental duplicate item_id rows (two concurrent manual-pin
+        -- MERGEs can both hit NOT MATCHED and insert) to exactly one row per item —
+        -- otherwise the UI keys rows by item_id and renders phantom, multiplying rows.
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY t.item_id
+            ORDER BY COALESCE(t.pinned, FALSE) DESC, t.updated_at DESC) = 1
         ORDER BY t.revenue_rank
     """, params=[bigquery.ScalarQueryParameter("days", "INT64", days)])
     _cache_set(cache_key, rows)
@@ -829,7 +872,8 @@ def get_tracked_matrices_with_market(days: int = 7):
             SELECT item_matrix_id AS mid,
                 ANY_VALUE(matrix_description) AS matrix_description,
                 ANY_VALUE(brand) AS brand,
-                COUNT(*) AS variants_total,
+                -- DISTINCT so accidental duplicate item_id rows don't inflate the count.
+                COUNT(DISTINCT item_id) AS variants_total,
                 MIN(current_retail) AS current_retail_min,
                 MAX(current_retail) AS current_retail_max,
                 MIN(revenue_rank) AS revenue_rank
@@ -983,13 +1027,50 @@ _ITEM_SEARCH_COLS = (
 )
 
 
+_TAG_UNSAFE_RE = re.compile(r"[^a-z0-9_-]")
+
+
+def _search_tag_body() -> str:
+    """The configured search tag, sanitized to a bare token safe to embed inside a
+    BigQuery raw-string REGEXP_CONTAINS literal (defends against a hostile env value).
+    Empty when the filter is disabled (PI_SEARCH_TAG blank)."""
+    return _TAG_UNSAFE_RE.sub("", (config.SEARCH_TAG or "").strip().lower())
+
+
 def _item_search_catalog_query() -> str:
-    """One row per active catalog item before search-specific fields are added.
+    """One row per active, `add`-tagged catalog item before search-specific fields.
+
+    Membership is filtered by the Lightspeed search tag (PI_SEARCH_TAG, default
+    'add'). The tag sits on individual variants — matrix parents are not snapshot
+    rows and often aren't tagged — so the filter is per variant AND a matrix stays
+    fully searchable whenever any one active variant carries the tag (add_matrices).
+    Blank PI_SEARCH_TAG disables the filter entirely (whole catalog).
 
     The materialized builder and emergency live fallback share only this source join.
-    Their filtering expressions intentionally stay independent so a builder-specific
+    Their term-matching expressions intentionally stay independent so a builder-specific
     SQL regression cannot break the fallback too.
     """
+    tag = _search_tag_body()
+    if tag:
+        has_tag_col = (
+            "LOGICAL_OR(REGEXP_CONTAINS(LOWER(COALESCE(item_tags, '')), "
+            f"r'(^|,)\\s*{tag}\\s*(,|$)')) AS has_search_tag"
+        )
+        add_matrices_cte = """,
+        add_matrices AS (
+            SELECT DISTINCT a.item_matrix_id
+            FROM snap s
+            JOIN attrs a USING (item_id)
+            WHERE s.has_search_tag AND a.item_matrix_id IS NOT NULL
+        )"""
+        tag_where = (
+            "WHERE s.has_search_tag "
+            "OR a.item_matrix_id IN (SELECT item_matrix_id FROM add_matrices)"
+        )
+    else:
+        has_tag_col = "FALSE AS has_search_tag"
+        add_matrices_cte = ""
+        tag_where = ""
     return f"""
         WITH latest AS (
             SELECT MAX(snapshot_date_local) AS d FROM `{LS_DATASET}.v_master_snapshot_latest`
@@ -1017,12 +1098,13 @@ def _item_search_catalog_query() -> str:
                 ANY_VALUE(CAST(system_sku AS STRING)) AS system_sku,
                 MAX(item_current_price) AS current_retail,
                 MAX(COALESCE(sales_revenue_l90d, 0)) AS rev,
-                ANY_VALUE(latest.d) AS source_snapshot_date
+                ANY_VALUE(latest.d) AS source_snapshot_date,
+                {has_tag_col}
             FROM `{LS_DATASET}.v_master_snapshot_latest` s CROSS JOIN latest
             WHERE s.snapshot_date_local = latest.d
               AND COALESCE(item_archived, FALSE) = FALSE
             GROUP BY item_id
-        )
+        ){add_matrices_cte}
         SELECT
             s.item_id, s.title, s.brand, s.manufacturer_sku, s.system_sku,
             s.current_retail,
@@ -1034,6 +1116,7 @@ def _item_search_catalog_query() -> str:
         FROM snap s
         LEFT JOIN attrs a USING (item_id)
         LEFT JOIN matrix m ON m.matrix_id = a.item_matrix_id
+        {tag_where}
     """
 
 

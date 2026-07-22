@@ -135,6 +135,7 @@ class SeedRebuildsIndexTests(unittest.TestCase):
         with patch.object(seeding.config, "SEED_MODE", "track_tag"), \
              patch.object(seeding, "refresh_from_track_tag",
                           side_effect=lambda: order.append("seed") or 1), \
+             patch.object(repository, "dedupe_tracked_products", return_value=0), \
              patch.object(seeding, "expand_tracked_matrices",
                           side_effect=lambda: order.append("expand")), \
              patch.object(seeding, "refresh_descriptive_fields",
@@ -148,6 +149,7 @@ class SeedRebuildsIndexTests(unittest.TestCase):
     def test_index_failure_does_not_abort_seed(self):
         with patch.object(seeding.config, "SEED_MODE", "track_tag"), \
              patch.object(seeding, "refresh_from_track_tag", return_value=5), \
+             patch.object(repository, "dedupe_tracked_products", return_value=0), \
              patch.object(seeding, "expand_tracked_matrices"), \
              patch.object(seeding, "refresh_descriptive_fields"), \
              patch.object(repository, "refresh_item_search_index",
@@ -159,6 +161,7 @@ class SeedRebuildsIndexTests(unittest.TestCase):
     def test_nightly_can_surface_index_failure_to_scrape_run(self):
         with patch.object(seeding.config, "SEED_MODE", "track_tag"), \
              patch.object(seeding, "refresh_from_track_tag", return_value=5), \
+             patch.object(repository, "dedupe_tracked_products", return_value=0), \
              patch.object(seeding, "expand_tracked_matrices"), \
              patch.object(seeding, "refresh_descriptive_fields"), \
              patch.object(repository, "refresh_item_search_index",
@@ -166,6 +169,131 @@ class SeedRebuildsIndexTests(unittest.TestCase):
             with self.assertRaises(seeding.ItemSearchIndexRefreshError):
                 seeding.refresh_tracked_products(raise_on_index_error=True)
         self.assertEqual("partial", seeding._refresh_status["status"])
+
+
+class SearchTagFilterTests(unittest.TestCase):
+    """The pin/search catalog is restricted to `add`-tagged items, applied per
+    variant so a matrix parent that lacks the tag still surfaces its tagged variants
+    (and, via add_matrices, its untagged sibling variants too)."""
+
+    def test_catalog_filters_by_search_tag_by_default(self):
+        with patch.object(repository.config, "SEARCH_TAG", "add"):
+            sql = repository._item_search_catalog_query()
+        # Per-variant tag membership on item_tags (variants carry the tag, not the parent).
+        self.assertIn("item_tags", sql)
+        self.assertIn(r"(^|,)\s*add\s*(,|$)", sql)
+        self.assertIn("has_search_tag", sql)
+        # Matrix stays fully searchable when any one variant is tagged.
+        self.assertIn("add_matrices", sql)
+        self.assertIn("item_matrix_id IN (SELECT item_matrix_id FROM add_matrices)", sql)
+
+    def test_configured_tag_flows_into_the_regex(self):
+        with patch.object(repository.config, "SEARCH_TAG", "compare"):
+            sql = repository._item_search_catalog_query()
+        self.assertIn(r"(^|,)\s*compare\s*(,|$)", sql)
+        self.assertNotIn(r"\s*add\s*", sql)
+
+    def test_blank_tag_disables_the_filter(self):
+        with patch.object(repository.config, "SEARCH_TAG", ""):
+            sql = repository._item_search_catalog_query()
+        self.assertNotIn("add_matrices", sql)
+        self.assertNotIn("has_search_tag AND", sql)
+        self.assertNotIn("REGEXP_CONTAINS(LOWER(COALESCE(item_tags", sql)
+
+    def test_tag_body_is_sanitized_against_injection(self):
+        for raw, expected in [
+            ("add", "add"), ("  ADD ", "add"), ("add;DROP TABLE x", "adddroptablex"),
+            ("promo-2", "promo-2"), ("a'b", "ab"),
+        ]:
+            with patch.object(repository.config, "SEARCH_TAG", raw):
+                self.assertEqual(expected, repository._search_tag_body())
+
+    def test_index_build_and_live_fallback_both_inherit_the_filter(self):
+        # Both the materialized builder and the emergency live query source the same
+        # tag-filtered catalog, so search membership is consistent across paths.
+        with patch.object(repository.config, "SEARCH_TAG", "add"):
+            build = repository._item_search_build_query()
+            live = repository._item_search_live_query()
+        for sql in (build, live):
+            self.assertIn(r"(^|,)\s*add\s*(,|$)", sql)
+
+
+class TrackedDedupeTests(unittest.TestCase):
+    """Concurrent manual-pin MERGEs can leave duplicate item_id rows in
+    pi_tracked_products; those must never reach the UI (it keys rows by item_id)."""
+
+    def setUp(self):
+        repository._caches.clear()
+
+    def test_tracked_query_dedupes_by_item_id(self):
+        captured = []
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "_rows",
+                          side_effect=lambda q, params=None: captured.append(q) or []):
+            repository.get_tracked_products_with_market()
+        sql = captured[0]
+        self.assertIn("QUALIFY", sql)
+        self.assertIn("PARTITION BY", sql)
+        self.assertIn("t.item_id", sql)
+
+    def test_matrix_rollup_counts_variants_distinct(self):
+        captured = []
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "_rows",
+                          side_effect=lambda q, params=None: captured.append(q) or []):
+            repository.get_tracked_matrices_with_market()
+        self.assertIn("COUNT(DISTINCT item_id) AS variants_total", captured[0])
+
+    def test_dedupe_is_a_noop_when_table_is_clean(self):
+        client = MagicMock()
+        guard_job = MagicMock()
+        guard_job.result.return_value = [{"extra": 0}]
+        client.query.return_value = guard_job
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "get_bq_client", return_value=client), \
+             patch.object(repository, "invalidate_pi_caches") as inval:
+            removed = repository.dedupe_tracked_products()
+        self.assertEqual(0, removed)
+        self.assertEqual(1, client.query.call_count)   # only the cheap COUNT guard ran
+        inval.assert_not_called()
+
+    def test_dedupe_rewrites_table_when_duplicates_exist(self):
+        client = MagicMock()
+        guard_job = MagicMock()
+        guard_job.result.return_value = [{"extra": 3}]
+        rewrite_job = MagicMock()
+        client.query.side_effect = [guard_job, rewrite_job]
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "get_bq_client", return_value=client), \
+             patch.object(repository, "invalidate_pi_caches") as inval:
+            removed = repository.dedupe_tracked_products()
+        self.assertEqual(3, removed)
+        self.assertEqual(2, client.query.call_count)
+        rewrite_sql = client.query.call_args_list[1].args[0]
+        self.assertIn("CREATE OR REPLACE TABLE", rewrite_sql)
+        self.assertIn("ROW_NUMBER() OVER", rewrite_sql)
+        self.assertIn("PARTITION BY item_id", rewrite_sql)
+        inval.assert_called_once()
+
+
+class SeedDedupesTrackedTests(unittest.TestCase):
+    def test_seed_dedupes_before_matrix_and_descriptive(self):
+        order = []
+        with patch.object(seeding.config, "SEED_MODE", "track_tag"), \
+             patch.object(seeding, "refresh_from_track_tag",
+                          side_effect=lambda: order.append("seed") or 1), \
+             patch.object(repository, "dedupe_tracked_products",
+                          side_effect=lambda: order.append("dedupe") or 0), \
+             patch.object(seeding, "expand_tracked_matrices",
+                          side_effect=lambda: order.append("expand")), \
+             patch.object(seeding, "refresh_descriptive_fields",
+                          side_effect=lambda: order.append("descriptive")), \
+             patch.object(repository, "refresh_item_search_index",
+                          side_effect=lambda trigger="unknown":
+                          order.append("search_index") or {"status": "success"}):
+            seeding.refresh_tracked_products()
+        self.assertEqual(
+            ["seed", "dedupe", "expand", "descriptive", "search_index"], order)
 
 
 class ManualPinMergeTests(unittest.TestCase):

@@ -231,7 +231,19 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
   quickFilter?: string | null
   onClearQuickFilter?: () => void
 } = {}) {
-  const { products, isLoading, mutate } = useTrackedProducts()
+  const { products: rawProducts, isLoading, mutate } = useTrackedProducts()
+  // Defensive dedupe by item_id: the backend can rarely emit the same item twice
+  // (two concurrent manual-pin MERGEs both insert). Since rows are keyed by item_id
+  // and share expand state, a duplicate would render as phantom rows that multiply on
+  // expand. Keep one per item — preferring a pinned copy so pin state stays correct.
+  const products = useMemo(() => {
+    const byId = new Map<string, TrackedProduct>()
+    for (const p of rawProducts) {
+      const existing = byId.get(p.item_id)
+      if (!existing || (!existing.pinned && p.pinned)) byId.set(p.item_id, p)
+    }
+    return [...byId.values()]
+  }, [rawProducts])
   const [filter, setFilter] = useState('')
   const [competitorFilter, setCompetitorFilter] = useState<string>('all')
   const [brandFilter, setBrandFilter] = useState<string>('all')

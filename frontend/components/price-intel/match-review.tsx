@@ -5,12 +5,13 @@
 // listing matches instantly on every future scrape; rejecting is a permanent
 // tombstone (the pair is never proposed again).
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { mutate as globalMutate } from 'swr'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -58,11 +59,29 @@ export function MatchReview() {
   const [fixTarget, setFixTarget] = useState<ProductLink | null>(null)
   const [fixUrl, setFixUrl] = useState('')
   const [savingFix, setSavingFix] = useState(false)
+  // Bulk selection (pending tab only): link_ids the user has ticked for a batch
+  // confirm/reject. Cleared whenever the status filter changes so a stale selection
+  // can't leak across tabs.
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+
+  useEffect(() => { setSelected(new Set()) }, [statusFilter])
 
   const competitorById = useMemo(
     () => new Map(competitors.map((c) => [c.competitor_id, c.name])),
     [competitors]
   )
+
+  const selectable = statusFilter === 'pending'
+  const toggleRow = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  const allSelected = selectable && links.length > 0 && links.every((l) => selected.has(l.link_id))
+  const toggleAll = () =>
+    setSelected(allSelected ? new Set() : new Set(links.map((l) => l.link_id)))
 
   // "This match is wrong — here's the right URL": records the pasted URL as
   // the permanent truth for this item at that store and tombstones the
@@ -142,7 +161,20 @@ export function MatchReview() {
         linkIds.forEach((id) => next.delete(id))
         return next
       })
+      setSelected((prev) => {
+        if (prev.size === 0) return prev
+        const next = new Set(prev)
+        linkIds.forEach((id) => next.delete(id))
+        return next
+      })
     }
+  }
+
+  // Batch-apply the current tick selection. Reuses the guarded per-row `decide`
+  // (array form), which already tallies confirm/skip/reject outcomes and refreshes.
+  const decideSelected = (status: 'confirmed' | 'rejected') => {
+    const ids = links.filter((l) => selected.has(l.link_id)).map((l) => l.link_id)
+    if (ids.length > 0) void decide(ids, status)
   }
 
   // "Confirm all high-confidence": pending rows the LLM judged the *same variant*
@@ -184,6 +216,23 @@ export function MatchReview() {
           </div>
         </div>
 
+        {selectable && selected.size > 0 && (
+          <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
+            <span className="text-sm font-medium">{selected.size} selected</span>
+            <div className="ml-auto flex items-center gap-2">
+              <Button size="sm" onClick={() => decideSelected('confirmed')}>
+                <Check className="h-4 w-4" /> Confirm selected
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => decideSelected('rejected')}>
+                <X className="h-4 w-4" /> Reject selected
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setSelected(new Set())}>
+                Clear
+              </Button>
+            </div>
+          </div>
+        )}
+
         {isLoading ? (
           <Skeleton className="h-48 rounded-lg" />
         ) : links.length === 0 ? (
@@ -196,6 +245,14 @@ export function MatchReview() {
           <Table>
             <TableHeader>
               <TableRow>
+                {selectable && (
+                  <TableHead className="w-8">
+                    <Checkbox
+                      checked={allSelected ? true : selected.size > 0 ? 'indeterminate' : false}
+                      onCheckedChange={toggleAll}
+                      aria-label="Select all pending matches" />
+                  </TableHead>
+                )}
                 <TableHead>Our item</TableHead>
                 <TableHead>Competitor listing</TableHead>
                 <TableHead className="text-right">Prices</TableHead>
@@ -210,6 +267,13 @@ export function MatchReview() {
                   .filter((a): a is string => !!a && a.trim() !== '')
                 return (
                   <TableRow key={link.link_id} className={cn(busy && 'opacity-50')}>
+                    {selectable && (
+                      <TableCell className="align-top">
+                        <Checkbox checked={selected.has(link.link_id)} disabled={busy}
+                                  onCheckedChange={() => toggleRow(link.link_id)}
+                                  aria-label="Select match" />
+                      </TableCell>
+                    )}
                     <TableCell className="max-w-80 align-top">
                       {link.item_id ? (
                         <a href={lightspeedItemUrl(link.item_id)} target="_blank"

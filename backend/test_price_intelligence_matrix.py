@@ -49,6 +49,8 @@ class ExpandTrackedMatricesTests(unittest.TestCase):
         with patch.object(seeding.config, "SEED_MODE", "track_tag"), \
              patch.object(seeding, "refresh_from_track_tag",
                           side_effect=lambda: order.append("seed") or 1), \
+             patch.object(repository, "dedupe_tracked_products",
+                          side_effect=lambda: order.append("dedupe") or 0), \
              patch.object(seeding, "expand_tracked_matrices",
                           side_effect=lambda: order.append("expand")), \
              patch.object(seeding, "refresh_descriptive_fields",
@@ -56,7 +58,7 @@ class ExpandTrackedMatricesTests(unittest.TestCase):
              patch.object(repository, "refresh_item_search_index",
                           return_value={"status": "success"}):
             seeding.refresh_tracked_products()
-        self.assertEqual(["seed", "expand", "descriptive"], order)
+        self.assertEqual(["seed", "dedupe", "expand", "descriptive"], order)
 
 
 class MatrixQueryShapeTests(unittest.TestCase):
