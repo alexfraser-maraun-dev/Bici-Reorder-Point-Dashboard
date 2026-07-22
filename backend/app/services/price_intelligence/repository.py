@@ -1854,10 +1854,132 @@ def decide_link(link_id: str, status: str, decided_by: str = "Dashboard"):
     invalidate_pi_caches()
 
 
+def _update_link_decisions(confirmed_ids: list, rejected_ids: list,
+                           decided_by: str) -> None:
+    """Apply any number of human link decisions with one BigQuery DML statement.
+
+    The Match tab can select hundreds of rows. Issuing one UPDATE per row in
+    parallel exceeds BigQuery's per-table outstanding-DML and mutation-rate
+    limits, and concurrent updates can also fail serialization. Array parameters
+    keep the whole decision set in a single atomic table mutation.
+    """
+    confirmed_ids = [str(link_id) for link_id in confirmed_ids]
+    rejected_ids = [str(link_id) for link_id in rejected_ids]
+    decided_ids = confirmed_ids + rejected_ids
+    if not decided_ids:
+        return
+    get_bq_client().query(
+        f"""
+        UPDATE `{T_LINKS}` SET
+            status = IF(link_id IN UNNEST(@confirmed_ids), 'confirmed', 'rejected'),
+            decided_by = @actor,
+            confidence = IF(link_id IN UNNEST(@confirmed_ids), 1.0, confidence),
+            updated_at = CURRENT_TIMESTAMP()
+        WHERE link_id IN UNNEST(@decided_ids)
+        """,
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("confirmed_ids", "STRING", confirmed_ids),
+            bigquery.ArrayQueryParameter("decided_ids", "STRING", decided_ids),
+            bigquery.ScalarQueryParameter("actor", "STRING", decided_by),
+        ]),
+    ).result()
+    invalidate_pi_caches()
+
+
+def decide_links_bulk(link_ids: list, status: str,
+                      decided_by: str = "Dashboard") -> dict:
+    """Guard and persist a Match-tab selection without concurrent per-row DML.
+
+    Results remain aligned with the caller's de-duplicated input order. Confirm
+    decisions preserve the same variant-conflict and one-link-per-item/store
+    rules as ``confirm_link``; later selected candidates for an already-occupied
+    item/store pair are skipped. Reject decisions need no per-row guard.
+    """
+    from .matcher import parse_variant_options, attributes_conflict
+
+    ensure_pi_tables()
+    ids = list(dict.fromkeys(str(link_id) for link_id in link_ids if link_id))
+    if not ids:
+        return {"results": [], "confirmed_link_ids": []}
+    if len(ids) > 500:
+        raise ValueError("A maximum of 500 link decisions can be applied at once")
+    if status not in ("confirmed", "rejected"):
+        raise ValueError("status must be confirmed or rejected")
+
+    if status == "rejected":
+        _update_link_decisions([], ids, decided_by)
+        return {
+            "results": [{"link_id": link_id, "status": "rejected"} for link_id in ids],
+            "confirmed_link_ids": [],
+        }
+
+    selected_rows = _rows(f"""
+        SELECT l.link_id, l.item_id, l.competitor_id, l.competitor_title, l.status,
+               t.attribute_1 AS a1, t.attribute_2 AS a2, t.attribute_3 AS a3
+        FROM `{T_LINKS}` l
+        LEFT JOIN `{T_TRACKED}` t ON t.item_id = l.item_id
+        WHERE l.link_id IN UNNEST(@ids)
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY l.link_id ORDER BY t.updated_at DESC
+        ) = 1
+    """, params=[bigquery.ArrayQueryParameter("ids", "STRING", ids)])
+    selected_by_id = {}
+    for row in selected_rows:
+        selected_by_id.setdefault(str(row["link_id"]), row)
+
+    item_ids = list(dict.fromkeys(
+        str(row["item_id"]) for row in selected_rows if row.get("item_id") is not None
+    ))
+    existing_rows = _rows(f"""
+        SELECT link_id, item_id, COALESCE(competitor_id, '') AS competitor_id
+        FROM `{T_LINKS}`
+        WHERE status = 'confirmed' AND item_id IN UNNEST(@item_ids)
+    """, params=[bigquery.ArrayQueryParameter("item_ids", "STRING", item_ids)]) \
+        if item_ids else []
+    occupied = {}
+    for row in existing_rows:
+        pair = (str(row["item_id"]), str(row.get("competitor_id") or ""))
+        occupied.setdefault(pair, set()).add(str(row["link_id"]))
+
+    confirmed_ids, rejected_ids, results = [], [], []
+    for link_id in ids:
+        row = selected_by_id.get(link_id)
+        if row is None:
+            results.append({"link_id": link_id, "status": "error",
+                            "reason": "link not found"})
+            continue
+        pair = (str(row.get("item_id") or ""),
+                str(row.get("competitor_id") or ""))
+        if row.get("status") == "confirmed":
+            occupied.setdefault(pair, set()).add(link_id)
+            results.append({"link_id": link_id, "status": "confirmed",
+                            "reason": "already confirmed"})
+            continue
+        if attributes_conflict(parse_variant_options(row.get("competitor_title")),
+                               [row.get("a1"), row.get("a2"), row.get("a3")]):
+            rejected_ids.append(link_id)
+            results.append({"link_id": link_id, "status": "rejected",
+                            "reason": "color/size mismatch with the item"})
+            continue
+        other_confirmed = occupied.get(pair, set()) - {link_id}
+        if other_confirmed:
+            results.append({
+                "link_id": link_id, "status": "skipped", "can_replace": True,
+                "reason": "item already has a confirmed link at this store",
+            })
+            continue
+        confirmed_ids.append(link_id)
+        occupied.setdefault(pair, set()).add(link_id)
+        results.append({"link_id": link_id, "status": "confirmed", "replaced": 0})
+
+    _update_link_decisions(confirmed_ids, rejected_ids, decided_by)
+    return {"results": results, "confirmed_link_ids": confirmed_ids}
+
+
 def confirm_link(link_id: str, decided_by: str = "Dashboard", replace: bool = False) -> dict:
-    """Guarded confirm — the single choke point for both single-row and bulk
-    confirms. Enforces the invariant that one of our items links to exactly one
-    competitor variant per store:
+    """Guarded single-row/override confirm. Bulk decisions mirror these rules in
+    ``decide_links_bulk``. Enforces the invariant that one of our items links to
+    exactly one competitor variant per store:
       - a competitor variant whose color/size conflicts with the item is rejected
         (it's the wrong variant, not ours);
       - if the item already has a confirmed link at that store, the confirm is

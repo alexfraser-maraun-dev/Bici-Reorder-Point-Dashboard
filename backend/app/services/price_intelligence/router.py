@@ -550,6 +550,27 @@ def decide_link(link_id: str, payload: Dict[str, Any], background_tasks: Backgro
     return {"status": "rejected"}
 
 
+@router.post("/links/decisions")
+def decide_links(payload: Dict[str, Any], background_tasks: BackgroundTasks):
+    """Apply a Match-tab selection as one guarded BigQuery mutation."""
+    raw_ids = payload.get("link_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(status_code=400, detail="link_ids must be a non-empty list")
+    link_ids = list(dict.fromkeys(str(link_id) for link_id in raw_ids if link_id))
+    if not link_ids:
+        raise HTTPException(status_code=400, detail="link_ids must contain valid IDs")
+    if len(link_ids) > 500:
+        raise HTTPException(status_code=400, detail="A maximum of 500 links can be decided at once")
+    status = payload.get("status")
+    if status not in ("confirmed", "rejected"):
+        raise HTTPException(status_code=400, detail="status must be confirmed or rejected")
+    actor = payload.get("actor") or "Dashboard"
+    result = repository.decide_links_bulk(link_ids, status, decided_by=actor)
+    for link_id in result.get("confirmed_link_ids", []):
+        background_tasks.add_task(repository.fetch_and_record_link, link_id)
+    return result
+
+
 # --- scraping ------------------------------------------------------------------
 
 @router.post("/scrape")

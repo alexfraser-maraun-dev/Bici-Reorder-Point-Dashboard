@@ -119,9 +119,16 @@ export function MatchReview() {
     try {
       // The confirm endpoint is guarded: it may reject (color/size mismatch) or
       // skip (item already linked at that store), so tally the real outcomes.
-      let results = await Promise.all(
-        linkIds.map((id) => apiPost(`/api/price-intel/links/${id}/decision`, { status }))
-      )
+      let results: Array<{ status?: string; can_replace?: boolean }>
+      if (linkIds.length > 1) {
+        const batch = await apiPost('/api/price-intel/links/decisions', {
+          link_ids: linkIds,
+          status,
+        })
+        results = Array.isArray(batch.results) ? batch.results : []
+      } else {
+        results = [await apiPost(`/api/price-intel/links/${linkIds[0]}/decision`, { status })]
+      }
       // Single confirm blocked by an existing match at that store → offer to override.
       if (status === 'confirmed' && linkIds.length === 1 && results[0]?.status === 'skipped'
           && results[0]?.can_replace) {
