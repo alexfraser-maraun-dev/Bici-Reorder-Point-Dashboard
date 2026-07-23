@@ -80,6 +80,7 @@ def build_digest_stats(run_id: str) -> dict:
             FROM `{repository.T_OBSERVATIONS}` o
             JOIN `{repository.T_TRACKED}` t ON t.item_id = o.match_item_id
             WHERE o.run_id = @run_id AND o.price IS NOT NULL
+              AND {repository.sql_cad_only("o")}
               AND (COALESCE(o.price_scope, 'variant') = 'variant'
                    OR (o.price_scope = 'product' AND t.item_matrix_id IS NULL))
             GROUP BY o.match_item_id
@@ -113,6 +114,7 @@ def build_digest_stats(run_id: str) -> dict:
             FROM `{repository.T_OBSERVATIONS}` o
             JOIN `{repository.T_TRACKED}` t ON t.item_id = o.match_item_id
             WHERE o.run_id = @run_id AND o.price IS NOT NULL
+              AND {repository.sql_cad_only("o")}
               AND (COALESCE(o.price_scope, 'variant') = 'variant'
                    OR (o.price_scope = 'product' AND t.item_matrix_id IS NULL))
             GROUP BY o.match_item_id
@@ -136,6 +138,7 @@ def build_digest_stats(run_id: str) -> dict:
             FROM `{repository.T_OBSERVATIONS}` o
             JOIN `{repository.T_TRACKED}` t ON t.item_id = o.match_item_id
             WHERE o.run_id = @run_id AND o.price IS NOT NULL
+              AND {repository.sql_cad_only("o")}
               AND (COALESCE(o.price_scope, 'variant') = 'variant'
                    OR (o.price_scope = 'product' AND t.item_matrix_id IS NULL))
             GROUP BY o.match_item_id

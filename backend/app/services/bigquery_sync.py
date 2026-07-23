@@ -4,6 +4,7 @@ import os
 import json
 import time
 import statistics
+import uuid
 from datetime import datetime
 
 # Initialize BigQuery client lazily to avoid startup crashes
@@ -200,9 +201,10 @@ def get_managed_skus():
 def upsert_managed_skus(skus: list):
     """Upserts managed SKUs into BigQuery using MERGE."""
     table_id = f"{APP_DATASET}.replen_managed_skus"
-    # Create temp table for merge
+    # Stage into a per-call unique table: a shared _temp name lets two concurrent
+    # uploads WRITE_TRUNCATE each other's rows between the load and the MERGE.
     job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-    temp_table_id = f"{table_id}_temp"
+    temp_table_id = f"{table_id}_tmp_{uuid.uuid4().hex[:12]}"
     client = get_bq_client()
     client.load_table_from_json(skus, temp_table_id, job_config=job_config).result()
 
@@ -211,14 +213,16 @@ def upsert_managed_skus(skus: list):
         USING `{temp_table_id}` S
         ON T.sku = S.sku
         WHEN MATCHED THEN
-            UPDATE SET T.product = S.product, T.brand = S.brand, T.vendor = S.vendor, 
+            UPDATE SET T.product = S.product, T.brand = S.brand, T.vendor = S.vendor,
                        T.category = S.category, T.updated_at = CURRENT_TIMESTAMP()
         WHEN NOT MATCHED THEN
             INSERT (sku, item_id, product, brand, vendor, category, added_by, created_at, updated_at)
             VALUES (S.sku, S.item_id, S.product, S.brand, S.vendor, S.category, S.added_by, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
     """
-    client.query(merge_query).result()
-    client.delete_table(temp_table_id)
+    try:
+        client.query(merge_query).result()
+    finally:
+        client.delete_table(temp_table_id, not_found_ok=True)
 
 def get_sku_overrides():
     """Fetches manual overrides from BigQuery."""

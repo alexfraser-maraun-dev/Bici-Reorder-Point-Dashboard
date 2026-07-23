@@ -72,5 +72,72 @@ class BulkLinkDecisionTests(unittest.TestCase):
         self.assertEqual(1, client.query.call_count)
 
 
+class StagingTableTests(unittest.TestCase):
+    """MERGE staging tables must be unique per call — a shared `<table>_temp`
+    name lets concurrent writers WRITE_TRUNCATE each other's staged rows."""
+
+    def _run_merge(self, client):
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "get_bq_client", return_value=client):
+            repository._merge_upsert(
+                "ds.pi_product_links", [{"match_key": "k", "status": "pending"}],
+                "match_key", update_cols=["status"],
+                insert_cols=["match_key", "status"])
+
+    def _staged_name(self, client):
+        return client.load_table_from_json.call_args.args[1]
+
+    def test_staging_names_unique_across_calls(self):
+        c1, c2 = MagicMock(), MagicMock()
+        self._run_merge(c1)
+        self._run_merge(c2)
+        n1, n2 = self._staged_name(c1), self._staged_name(c2)
+        self.assertNotEqual(n1, n2)
+        for name in (n1, n2):
+            self.assertTrue(name.startswith("ds.pi_product_links_tmp_"))
+
+    def test_staging_table_deleted_even_when_merge_fails(self):
+        client = MagicMock()
+        client.query.side_effect = RuntimeError("merge failed")
+        with self.assertRaises(RuntimeError):
+            self._run_merge(client)
+        client.delete_table.assert_called_once_with(
+            self._staged_name(client), not_found_ok=True)
+
+    def test_insert_product_links_and_verdicts_use_unique_staging(self):
+        client = MagicMock()
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "get_bq_client", return_value=client), \
+             patch.object(repository, "invalidate_pi_caches"):
+            repository.insert_product_links([{"match_key": "k", "fuzzy_score": 0.9}])
+            first = self._staged_name(client)
+            repository.update_link_verdicts([{"link_id": "l1", "llm_verdict": "match"}])
+            second = self._staged_name(client)
+        self.assertNotEqual(first, second)
+        self.assertIn("_tmp_", first)
+        self.assertIn("_tmp_", second)
+        self.assertEqual(2, client.delete_table.call_count)
+
+
+class TrackedJoinDedupeTests(unittest.TestCase):
+    """Reads that join pi_tracked_products must collapse duplicate item_id rows
+    (concurrent manual-pin MERGEs can insert two) — otherwise URLs are scraped
+    twice, the Match queue shows phantom links, and the pending badge inflates."""
+
+    def _captured_sql(self, fn, *args, **kwargs):
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "_rows", return_value=[]) as mock_rows:
+            fn(*args, **kwargs)
+        return mock_rows.call_args.args[0]
+
+    def test_tracked_joins_are_deduped(self):
+        for fn in (repository.get_tracked_urls,
+                   repository.get_product_links,
+                   repository.count_pending_links):
+            sql = self._captured_sql(fn)
+            self.assertIn("PARTITION BY item_id", sql,
+                          f"{fn.__name__} joins pi_tracked_products without dedupe")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,8 +8,14 @@ import { RefreshCw } from 'lucide-react'
 
 export function ScrapeStatusButton({ onRunFinished }: { onRunFinished?: () => void }) {
   const [starting, setStarting] = useState(false)
-  const { status, mutate } = useScrapeStatus(true)
+  // Poll only while a run is live (or one was just started) — the mount fetch
+  // still detects an already-running scrape and switches polling on. Passing a
+  // hard-coded `true` here had every open tab hitting the backend every 4s
+  // forever, even fully idle.
+  const [polling, setPolling] = useState(false)
+  const { status, mutate } = useScrapeStatus(polling || starting)
   const running = status?.status === 'running'
+  useEffect(() => { setPolling(running) }, [running])
   const wasRunning = useRef(false)
 
   useEffect(() => {

@@ -50,9 +50,19 @@ export function DigestCard() {
 
   const regenerate = async () => {
     setRegenerating(true)
+    const prevCreatedAt = digest?.created_at ?? null
     try {
       await apiPost('/api/price-intel/digest/generate')
-      toast.success('Regenerating digest from the latest run — check back shortly')
+      toast.success('Regenerating digest from the latest run — this takes a moment')
+      // Generation runs in a server-side background task, so an immediate
+      // refetch would just re-show the old digest. Poll until a newer one
+      // lands (keeping the button disabled so a second click can't queue a
+      // duplicate generation), giving up quietly after ~1 minute.
+      for (let i = 0; i < 15; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 4000))
+        const fresh = await mutate()
+        if (fresh?.created_at && fresh.created_at !== prevCreatedAt) return
+      }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to regenerate digest')
     } finally {
@@ -74,9 +84,9 @@ export function DigestCard() {
               </span>
             )}
           </div>
-          <Button variant="outline" size="sm" onClick={() => { void regenerate(); void mutate() }}
+          <Button variant="outline" size="sm" onClick={() => void regenerate()}
                   disabled={regenerating}>
-            <RefreshCw className="h-4 w-4" /> Regenerate
+            <RefreshCw className={regenerating ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} /> Regenerate
           </Button>
         </div>
         {isLoading ? (

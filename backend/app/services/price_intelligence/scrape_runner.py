@@ -166,11 +166,18 @@ def _build_events(prev_map, obs, competitor_name, item_lookup):
         if prev_stock is not None and new_stock is not None and prev_stock != new_stock:
             event("back_in_stock" if new_stock else "out_of_stock", old_price, new_price)
 
+    # MAP/undercut compare the listing against OUR CAD retail, so a listing
+    # that self-reports another currency must not fire them (a USD price reads
+    # ~35% cheaper than reality). Unreported currency → CAD, like the market
+    # SQL's sql_cad_only guard. Price drop/increase above compare the listing
+    # to itself, so they stay currency-safe without this.
+    foreign_currency = ((obs.get("currency") or "CAD").strip().upper() or "CAD") != "CAD"
+
     # MAP intel: flag a competitor advertising below our MAP floor, on the
     # transition only (first sighting below, or a move from >= floor to < floor).
     # MAP == our retail price for tagged items (map_price override wins if set).
     map_floor = (item.get("map_price") or item.get("current_retail")) if item and item.get("is_map") else None
-    if map_floor and new_price is not None:
+    if map_floor and new_price is not None and not foreign_currency:
         map_floor = float(map_floor)
         was_below = old_price is not None and old_price < map_floor - PRICE_EPSILON
         is_below = new_price < map_floor - PRICE_EPSILON
@@ -183,7 +190,7 @@ def _build_events(prev_map, obs, competitor_name, item_lookup):
     # already below us alerts once. Skipped for MAP-tagged items, where the
     # map_violation above is the sharper signal for the same crossing.
     our_price = item.get("current_retail") if item and not item.get("is_map") else None
-    if our_price and new_price is not None:
+    if our_price and new_price is not None and not foreign_currency:
         our_price = float(our_price)
         was_below = old_price is not None and old_price < our_price - PRICE_EPSILON
         is_below = new_price < our_price - PRICE_EPSILON
@@ -336,6 +343,9 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
               f"confirmed links={len(confirmed_links)})")
 
         # --- catalog scrape, one competitor at a time -----------------------
+        # Competitors whose catalog actually got crawled this run — the
+        # confirmed-link phase below re-checks links on everyone else.
+        crawled_competitor_ids = set()
         for competitor in competitors if full_scan else []:
             cid = competitor["competitor_id"]
             _set_status(phase=f"scraping {competitor['name']}")
@@ -351,6 +361,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                     counters["competitors_done"] += 1
                     _set_status(competitors_done=counters["competitors_done"])
                     continue
+                crawled_competitor_ids.add(cid)
 
                 obs_buffer, event_buffer = [], []
                 obs_before = counters["observations"]
@@ -470,72 +481,77 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 errors.append(f"serp discovery: {e}")
                 print(f"pi: serp discovery failed: {e}")
 
-        # --- targeted mode: re-check each confirmed link's URL ---------------
+        # --- re-check each confirmed link's URL ------------------------------
+        # Targeted mode re-checks every confirmed link. Full-scan mode still
+        # re-checks the links whose competitor's catalog was NOT crawled this
+        # run (connector-less SERP/manual matches, or no competitor at all) —
+        # otherwise those prices silently go stale on every full-scan night.
         scraper = PageScraper()
         competitor_names = {c["competitor_id"]: c["name"] for c in repository.get_competitors()}
-        if not full_scan:
-            # Tracked-URL rows are scraped in their own phase below; skip links
-            # that would fetch the same page twice.
-            tracked_url_items = {(u["url"], str(u.get("item_id") or "")) for u in urls}
-            link_targets = [
-                l for l in confirmed_links
-                if l.get("competitor_url") and l.get("item_id")
-                and str(l["item_id"]) in item_lookup
-                and (l["competitor_url"], str(l.get("item_id") or "")) not in tracked_url_items
-            ]
-            _set_status(phase="scraping confirmed links", links_total=len(link_targets))
-            obs_buffer, event_buffer = [], []
-            links_done, per_competitor = 0, {}
-            for link in link_targets:
-                try:
-                    # Pass the known SKU so Shopify variant resolution works even for
-                    # older links stored as the base (non-?variant) product URL.
-                    parsed = scraper.fetch(
-                        link["competitor_url"], sku=link.get("competitor_sku"),
-                        gtin=link.get("gtin"), variant_id=link.get("variant_id"),
-                        variant_options=json.loads(link.get("variant_options_json") or "[]"),
-                    )
-                    if parsed is not None and parsed.get("price") is not None:
-                        if parsed.get("_matched_by") in ("sku", "gtin", "variant_id", "variant_options"):
-                            parsed["price_scope"] = "variant"
-                        _count_extraction(counters, parsed)
-                        obs = {
-                            "observed_at": _now_iso(),
-                            "run_id": run_id,
-                            "source": "link",
-                            "diff_key": f"link:{link['link_id']}",
-                            "competitor_id": link.get("competitor_id"),
-                            "url": link["competitor_url"],
-                            "competitor_title": parsed.get("title") or link.get("competitor_title"),
-                            "competitor_sku": parsed.get("sku") or link.get("competitor_sku"),
-                            "gtin": parsed.get("gtin") or link.get("gtin"),
-                            "match_item_id": str(link["item_id"]),
-                            "match_method": "link",
-                            "match_confidence": link.get("confidence"),
-                            "price": parsed.get("price"),
-                            "compare_at_price": parsed.get("compare_at_price"),
-                            "currency": parsed.get("currency"),
-                            "in_stock": parsed.get("in_stock"),
-                            **_extraction_fields(parsed),
-                        }
-                        obs_buffer.append(obs)
-                        name = (competitor_names.get(link.get("competitor_id"))
-                                or urlparse_domain(link["competitor_url"]))
-                        event_buffer.extend(_build_events(prev_map, obs, name, item_lookup))
-                        cid = link.get("competitor_id")
-                        if cid:
-                            per_competitor[cid] = per_competitor.get(cid, 0) + 1
-                except Exception as e:
-                    errors.append(f"link {link['competitor_url']}: {e}")
-                links_done += 1
-                _set_status(links_done=links_done)
-            repository.load_rows(repository.T_OBSERVATIONS, obs_buffer)
-            counters["observations"] += len(obs_buffer)
-            repository.load_rows(repository.T_EVENTS, event_buffer)
-            counters["changes"] += sum(1 for e in event_buffer if not e["acknowledged"])
-            _set_status(observations=counters["observations"], changes=counters["changes"])
-            for cid, n in per_competitor.items():
-                repository.mark_competitor_scraped(cid, f"targeted ({n} links)")
+        # Tracked-URL rows are scraped in their own phase below; skip links
+        # that would fetch the same page twice.
+        tracked_url_items = {(u["url"], str(u.get("item_id") or "")) for u in urls}
+        link_targets = [
+            l for l in confirmed_links
+            if l.get("competitor_url") and l.get("item_id")
+            and str(l["item_id"]) in item_lookup
+            and (l["competitor_url"], str(l.get("item_id") or "")) not in tracked_url_items
+            and not (full_scan and l.get("competitor_id")
+                     and l["competitor_id"] in crawled_competitor_ids)
+        ]
+        _set_status(phase="scraping confirmed links", links_total=len(link_targets))
+        obs_buffer, event_buffer = [], []
+        links_done, per_competitor = 0, {}
+        for link in link_targets:
+            try:
+                # Pass the known SKU so Shopify variant resolution works even for
+                # older links stored as the base (non-?variant) product URL.
+                parsed = scraper.fetch(
+                    link["competitor_url"], sku=link.get("competitor_sku"),
+                    gtin=link.get("gtin"), variant_id=link.get("variant_id"),
+                    variant_options=json.loads(link.get("variant_options_json") or "[]"),
+                )
+                if parsed is not None and parsed.get("price") is not None:
+                    if parsed.get("_matched_by") in ("sku", "gtin", "variant_id", "variant_options"):
+                        parsed["price_scope"] = "variant"
+                    _count_extraction(counters, parsed)
+                    obs = {
+                        "observed_at": _now_iso(),
+                        "run_id": run_id,
+                        "source": "link",
+                        "diff_key": f"link:{link['link_id']}",
+                        "competitor_id": link.get("competitor_id"),
+                        "url": link["competitor_url"],
+                        "competitor_title": parsed.get("title") or link.get("competitor_title"),
+                        "competitor_sku": parsed.get("sku") or link.get("competitor_sku"),
+                        "gtin": parsed.get("gtin") or link.get("gtin"),
+                        "match_item_id": str(link["item_id"]),
+                        "match_method": "link",
+                        "match_confidence": link.get("confidence"),
+                        "price": parsed.get("price"),
+                        "compare_at_price": parsed.get("compare_at_price"),
+                        "currency": parsed.get("currency"),
+                        "in_stock": parsed.get("in_stock"),
+                        **_extraction_fields(parsed),
+                    }
+                    obs_buffer.append(obs)
+                    name = (competitor_names.get(link.get("competitor_id"))
+                            or urlparse_domain(link["competitor_url"]))
+                    event_buffer.extend(_build_events(prev_map, obs, name, item_lookup))
+                    cid = link.get("competitor_id")
+                    if cid:
+                        per_competitor[cid] = per_competitor.get(cid, 0) + 1
+            except Exception as e:
+                errors.append(f"link {link['competitor_url']}: {e}")
+            links_done += 1
+            _set_status(links_done=links_done)
+        repository.load_rows(repository.T_OBSERVATIONS, obs_buffer)
+        counters["observations"] += len(obs_buffer)
+        repository.load_rows(repository.T_EVENTS, event_buffer)
+        counters["changes"] += sum(1 for e in event_buffer if not e["acknowledged"])
+        _set_status(observations=counters["observations"], changes=counters["changes"])
+        for cid, n in per_competitor.items():
+            repository.mark_competitor_scraped(cid, f"targeted ({n} links)")
 
         # --- tracked URLs (feature a) ---------------------------------------
         _set_status(phase="scraping tracked URLs")
@@ -704,6 +720,10 @@ def start_scheduler():
 
 def _scheduler_loop():
     from . import settings
+    # In-process one-attempt-per-day marker. The BQ guard below is the
+    # restart-safe primary; this also holds when BigQuery itself is down (the
+    # failed run's row can't be saved, so only this stops a 60s retry storm).
+    last_attempt_date = None
     while True:
         try:
             if settings.get("schedule_enabled"):
@@ -714,8 +734,11 @@ def _scheduler_loop():
                 )
                 if due and get_status().get("status") != "running":
                     today = now.strftime("%Y-%m-%d")
-                    # BQ-backed guard so restarts/redeploys can't double-run a night.
-                    if not repository.has_successful_run_on(today, tz_name):
+                    # BQ-backed guard so restarts/redeploys can't double-run a
+                    # night; counts failed scheduled attempts as terminal too.
+                    if last_attempt_date != today and \
+                            not repository.has_scheduler_blocking_run_on(today, tz_name):
+                        last_attempt_date = today
                         print(f"pi: scheduler firing nightly scrape for {today}")
                         start_scrape(trigger="scheduled")
         except Exception as e:

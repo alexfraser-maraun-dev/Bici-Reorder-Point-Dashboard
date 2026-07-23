@@ -254,6 +254,10 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
   const [showExcluded, setShowExcluded] = useState(false)
 
   // A KPI tile click drives the table's filters (e.g. "MAP violations" tile).
+  // Consume-and-clear: clearing the parent's quickFilter right after applying
+  // makes it a one-shot event — otherwise it re-forces these filters whenever
+  // the tab remounts (Radix unmounts inactive tabs), silently discarding any
+  // manual filter changes, and a second click on the same tile does nothing.
   useEffect(() => {
     if (!quickFilter) return
     if (quickFilter === 'map') { setMapFilter('tagged'); setPositionFilter('all') }
@@ -261,7 +265,8 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
     else if (['cheaper', 'parity', 'pricier'].includes(quickFilter)) {
       setPositionFilter(quickFilter); setMapFilter('all')
     }
-  }, [quickFilter])
+    onClearQuickFilter?.()
+  }, [quickFilter, onClearQuickFilter])
   const [pushTarget, setPushTarget] = useState<TrackedProduct | null>(null)
   // Set when the push was opened from a competitor row ("match variant") so the
   // dialog pre-fills that competitor's price instead of the market min.
@@ -375,13 +380,25 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
     </button>
   )
 
+  // Per-item in-flight guard: pin/exclude compute their new value from the
+  // rendered row, so a rapid double-click would send the same (stale) value
+  // twice and double-toast. One update per item at a time.
+  const [patching, setPatching] = useState<Set<string>>(new Set())
   const patch = async (itemId: string, fields: Record<string, unknown>, label: string) => {
+    if (patching.has(itemId)) return
+    setPatching((prev) => new Set(prev).add(itemId))
     try {
       await apiPost(`/api/price-intel/tracked/${itemId}`, fields, 'PUT')
       toast.success(label)
       await mutate()
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Update failed')
+    } finally {
+      setPatching((prev) => {
+        const next = new Set(prev)
+        next.delete(itemId)
+        return next
+      })
     }
   }
 
@@ -588,12 +605,12 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
                     onClick={() => setMapPrice(p)}>
               <ShieldCheck className={cn('h-4 w-4', p.map_price != null ? 'text-violet-600' : 'text-muted-foreground')} />
             </Button>
-            <Button variant="ghost" size="sm"
+            <Button variant="ghost" size="sm" disabled={patching.has(p.item_id)}
                     title={p.pinned ? 'Unpin' : 'Pin (survives re-seeding)'}
                     onClick={() => patch(p.item_id, { pinned: !p.pinned }, p.pinned ? 'Unpinned' : 'Pinned')}>
               {p.pinned ? <PinOff className="h-4 w-4" /> : <Pin className="h-4 w-4 text-muted-foreground" />}
             </Button>
-            <Button variant="ghost" size="sm"
+            <Button variant="ghost" size="sm" disabled={patching.has(p.item_id)}
                     title={p.excluded ? 'Re-include in matching' : 'Exclude from matching'}
                     onClick={() => patch(p.item_id, { excluded: !p.excluded }, p.excluded ? 'Re-included' : 'Excluded')}>
               {p.excluded ? <Undo2 className="h-4 w-4" /> : <EyeOff className="h-4 w-4 text-muted-foreground" />}

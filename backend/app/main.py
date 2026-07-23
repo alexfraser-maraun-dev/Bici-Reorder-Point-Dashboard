@@ -713,6 +713,27 @@ def get_forward_coverage(
         for lf in ("category_top_level", "category_level_2", "category_path"):
             merged_profiles.update(profiles.get(lf, {}))
 
+        # rec["category"] below is the snapshot's leaf category_name, which is
+        # not a profile key (those are category-tree values), so a direct .get
+        # almost always misses and the heatmap silently projects flat, defeating
+        # its purpose. Map each leaf name (the deepest non-null level of a
+        # history row) to its highest-volume category_path so lookups land on
+        # the right seasonal shape; volume breaks ties between same-named
+        # leaves under different parents.
+        leaf_volume: dict = {}
+        for row in history_records:
+            leaf = next((row.get(f) for f in
+                         ("category_level_4", "category_level_3",
+                          "category_level_2", "category_top_level")
+                         if isinstance(row.get(f), str) and row.get(f)), None)
+            path = row.get("category_path")
+            if leaf and isinstance(path, str) and path:
+                units = float(row.get("total_units_sold") or 0)
+                leaf_volume[(leaf, path)] = leaf_volume.get((leaf, path), 0.0) + units
+        leaf_to_path = {}
+        for (leaf, path), _units in sorted(leaf_volume.items(), key=lambda kv: kv[1]):
+            leaf_to_path[leaf] = path  # ascending, so the highest-volume path wins
+
         # Forecast from the last complete month so the projection lines up with the
         # history+forecast chart (which excludes the in-progress month).
         last_complete_month = datetime.now().month - 1 or 12
@@ -723,7 +744,10 @@ def get_forward_coverage(
         for rec in recommendations:
             if target_location is not None and rec.get("location") != target_location:
                 continue
-            indices = merged_profiles.get(rec.get("category"))
+            category = rec.get("category")
+            indices = merged_profiles.get(category)
+            if indices is None and category:
+                indices = merged_profiles.get(leaf_to_path.get(category))
             cover = project_weeks_of_cover(
                 on_hand=rec.get("on_hand") or 0,
                 on_order=rec.get("on_order") or 0,

@@ -114,7 +114,11 @@ export function MatchReview() {
     }
   }
 
-  const decide = async (linkIds: string[], status: 'confirmed' | 'rejected') => {
+  const decide = async (rawLinkIds: string[], status: 'confirmed' | 'rejected') => {
+    // Drop ids already in flight so a double-click can't fire a second
+    // identical batch POST (and double toast) before the first settles.
+    const linkIds = rawLinkIds.filter((id) => !deciding.has(id))
+    if (linkIds.length === 0) return
     setDeciding((prev) => new Set([...prev, ...linkIds]))
     try {
       // The confirm endpoint is guarded: it may reject (color/size mismatch) or
@@ -214,7 +218,7 @@ export function MatchReview() {
               </SelectContent>
             </Select>
             {highConfidence.length > 0 && (
-              <Button variant="outline" size="sm"
+              <Button variant="outline" size="sm" disabled={deciding.size > 0}
                       onClick={() => decide(highConfidence.map((l) => l.link_id), 'confirmed')}>
                 <CheckCheck className="h-4 w-4" />
                 Confirm {highConfidence.length} high-confidence
@@ -227,10 +231,12 @@ export function MatchReview() {
           <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
             <span className="text-sm font-medium">{selected.size} selected</span>
             <div className="ml-auto flex items-center gap-2">
-              <Button size="sm" onClick={() => decideSelected('confirmed')}>
+              <Button size="sm" disabled={deciding.size > 0}
+                      onClick={() => decideSelected('confirmed')}>
                 <Check className="h-4 w-4" /> Confirm selected
               </Button>
-              <Button variant="outline" size="sm" onClick={() => decideSelected('rejected')}>
+              <Button variant="outline" size="sm" disabled={deciding.size > 0}
+                      onClick={() => decideSelected('rejected')}>
                 <X className="h-4 w-4" /> Reject selected
               </Button>
               <Button variant="ghost" size="sm" onClick={() => setSelected(new Set())}>

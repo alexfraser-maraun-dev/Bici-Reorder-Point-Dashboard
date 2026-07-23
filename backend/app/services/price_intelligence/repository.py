@@ -5,13 +5,14 @@ rows go through batch load jobs, never streaming inserts, so later DML (ack
 UPDATEs, retention deletes) is never blocked by a streaming buffer. The only
 streaming write is the append-only price-push audit log, mirroring log_writeback.
 """
+import contextlib
 import json
 import re
 import threading
 import time
 import uuid
 from collections import OrderedDict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
@@ -35,6 +36,26 @@ T_RUNS = f"{APP_DATASET}.pi_scrape_runs"
 T_LINKS = f"{APP_DATASET}.pi_product_links"
 T_OUR_PRICE_HISTORY = f"{APP_DATASET}.pi_our_price_history"
 T_SETTINGS = f"{APP_DATASET}.pi_settings"
+
+# Comparison math treats competitor prices as CAD (all competitors are Canadian
+# storefronts). A listing that self-reports another currency must not enter
+# market mins / undercut / MAP / price-index math — a USD price would read ~35%
+# cheaper than reality. NULL/blank means the site didn't report one → CAD.
+def sql_cad_only(alias: str = "") -> str:
+    col = f"{alias}.currency" if alias else "currency"
+    return f"COALESCE(NULLIF(UPPER(TRIM({col})), ''), 'CAD') = 'CAD'"
+
+
+# Join target for pi_tracked_products that collapses accidental duplicate
+# item_id rows (two concurrent manual-pin MERGEs can both hit NOT MATCHED and
+# insert). Joining the raw table instead fans out every joined row — URLs get
+# scraped twice, the Match queue shows phantom links, counts inflate.
+SQL_TRACKED_DEDUPED = """(
+    SELECT * FROM `{table}`
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY item_id
+        ORDER BY COALESCE(pinned, FALSE) DESC, updated_at DESC) = 1
+)"""
 
 _tables_ensured = False
 _ensure_lock = threading.Lock()
@@ -359,14 +380,19 @@ def load_rows(table_id: str, rows: list):
     get_bq_client().load_table_from_json(rows, table_id, job_config=job_config).result()
 
 
-def _merge_upsert(table_id: str, rows: list, key: str, update_cols: list, insert_cols: list):
-    """Generic temp-table MERGE (mirrors upsert_managed_skus). The temp load uses
-    the target table's schema — autodetect would type ISO timestamp strings as
-    STRING and the MERGE insert would then fail against TIMESTAMP columns."""
-    ensure_pi_tables()
-    _json_ready(rows)
+@contextlib.contextmanager
+def _staging_table(table_id: str, rows: list):
+    """Loads rows into a uniquely named staging table and yields its id.
+
+    The name must be unique per call: two concurrent writers staging into a
+    shared `<table>_temp` WRITE_TRUNCATE each other's rows between the load
+    and the MERGE, silently losing one write. The temp load uses the target
+    table's schema — autodetect would type ISO timestamp strings as STRING
+    and the MERGE insert would then fail against TIMESTAMP columns. The
+    staging table is deleted on exit; the 1h expiration backstops a process
+    dying mid-MERGE."""
     client = get_bq_client()
-    temp_table_id = f"{table_id}_temp"
+    temp_table_id = f"{table_id}_tmp_{uuid.uuid4().hex[:12]}"
     target_schema = client.get_table(table_id).schema
     row_keys = set(rows[0].keys())
     job_config = bigquery.LoadJobConfig(
@@ -374,16 +400,34 @@ def _merge_upsert(table_id: str, rows: list, key: str, update_cols: list, insert
         schema=[f for f in target_schema if f.name in row_keys],
     )
     client.load_table_from_json(rows, temp_table_id, job_config=job_config).result()
+    try:
+        temp = client.get_table(temp_table_id)
+        temp.expires = datetime.now(timezone.utc) + timedelta(hours=1)
+        client.update_table(temp, ["expires"])
+    except Exception:
+        pass  # expiration is a leak backstop only; the finally-delete is primary
+    try:
+        yield temp_table_id
+    finally:
+        client.delete_table(temp_table_id, not_found_ok=True)
+
+
+def _merge_upsert(table_id: str, rows: list, key: str, update_cols: list, insert_cols: list):
+    """Generic staging-table MERGE (mirrors upsert_managed_skus)."""
+    ensure_pi_tables()
+    _json_ready(rows)
+    client = get_bq_client()
     set_clause = ", ".join(f"T.{c} = S.{c}" for c in update_cols)
     cols = ", ".join(insert_cols)
     vals = ", ".join(f"S.{c}" for c in insert_cols)
-    client.query(f"""
-        MERGE `{table_id}` T
-        USING `{temp_table_id}` S
-        ON T.{key} = S.{key}
-        WHEN MATCHED THEN UPDATE SET {set_clause}
-        WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({vals})
-    """).result()
+    with _staging_table(table_id, rows) as temp_table_id:
+        client.query(f"""
+            MERGE `{table_id}` T
+            USING `{temp_table_id}` S
+            ON T.{key} = S.{key}
+            WHEN MATCHED THEN UPDATE SET {set_clause}
+            WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({vals})
+        """).result()
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +464,8 @@ def upsert_setting(key: str, value, updated_by: str = "Dashboard"):
         update_cols=["value_json", "updated_at", "updated_by"],
         insert_cols=list(row.keys()),
     )
-    _caches.pop("pi_settings", None)
+    with _cache_lock:
+        _caches.pop("pi_settings", None)
 
 
 def delete_setting(key: str):
@@ -432,7 +477,8 @@ def delete_setting(key: str):
             bigquery.ScalarQueryParameter("key", "STRING", key),
         ]),
     ).result()
-    _caches.pop("pi_settings", None)
+    with _cache_lock:
+        _caches.pop("pi_settings", None)
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +544,10 @@ def mark_competitor_scraped(competitor_id: str, status: str):
                 bigquery.ScalarQueryParameter("cid", "STRING", competitor_id),
             ]),
         ).result()
+        # Drop the cached competitor list so scrape-health reads see this
+        # status now, not after the TTL / end-of-run invalidation.
+        with _cache_lock:
+            _caches.pop("competitors", None)
     except Exception as e:
         print(f"pi: failed to mark competitor scraped: {e}")
 
@@ -512,7 +562,8 @@ def get_tracked_urls(include_disabled: bool = True):
         SELECT u.*, t.title AS item_title, t.brand AS item_brand,
                t.upc_normalized AS item_upc, t.system_sku AS item_system_sku
         FROM `{T_URLS}` u
-        LEFT JOIN `{T_TRACKED}` t ON t.item_id = u.item_id
+        LEFT JOIN {SQL_TRACKED_DEDUPED.format(table=T_TRACKED)} t
+          ON t.item_id = u.item_id
         ORDER BY u.created_at DESC
     """)
     if not include_disabled:
@@ -661,6 +712,7 @@ def get_tracked_products_with_market(days: int = 7):
             FROM `{T_OBSERVATIONS}` o
             WHERE observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND match_item_id IS NOT NULL AND price IS NOT NULL
+              AND {sql_cad_only("o")}
               AND (COALESCE(price_scope, 'variant') = 'variant'
                    OR (price_scope = 'product' AND NOT EXISTS (
                        SELECT 1 FROM `{T_TRACKED}` mt
@@ -714,6 +766,7 @@ def get_item_competitor_prices(item_id: str, days: int = 45):
             WHERE o.match_item_id = @item_id
               AND o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND o.price IS NOT NULL
+              AND {sql_cad_only("o")}
               AND (COALESCE(o.price_scope, 'variant') = 'variant'
                    OR (o.price_scope = 'product' AND NOT EXISTS (
                        SELECT 1 FROM `{T_TRACKED}` mt
@@ -839,6 +892,7 @@ def get_tracked_matrices_with_market(days: int = 7):
             FROM `{T_OBSERVATIONS}` o
             WHERE observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND match_item_id IS NOT NULL AND price IS NOT NULL
+              AND {sql_cad_only("o")}
               AND (COALESCE(price_scope, 'variant') = 'variant'
                    OR (price_scope = 'product' AND NOT EXISTS (
                        SELECT 1 FROM `{T_TRACKED}` mt
@@ -912,6 +966,7 @@ def get_matrix_coverage(matrix_id: str, days: int = 45):
             WHERE t.item_matrix_id = @mid
               AND o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND o.price IS NOT NULL
+              AND {sql_cad_only("o")}
               AND (COALESCE(o.price_scope, 'variant') = 'variant'
                    OR (o.price_scope = 'product' AND NOT EXISTS (
                        SELECT 1 FROM `{T_TRACKED}` mt
@@ -1589,7 +1644,8 @@ def get_product_links(status=None, item_id=None, unverified_only=False,
                t.attribute_3 AS item_attribute_3,
                t.upc_normalized AS item_upc, t.system_sku AS item_system_sku
         FROM `{T_LINKS}` l
-        LEFT JOIN `{T_TRACKED}` t ON t.item_id = l.item_id
+        LEFT JOIN {SQL_TRACKED_DEDUPED.format(table=T_TRACKED)} t
+          ON t.item_id = l.item_id
         {clause}
         ORDER BY l.fuzzy_score DESC, l.created_at DESC
         LIMIT {int(limit)}
@@ -1777,25 +1833,18 @@ def insert_product_links(rows: list):
     ensure_pi_tables()
     _json_ready(rows)
     client = get_bq_client()
-    temp_table_id = f"{T_LINKS}_temp"
-    target_schema = client.get_table(T_LINKS).schema
-    row_keys = set(rows[0].keys())
-    job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_TRUNCATE",
-        schema=[f for f in target_schema if f.name in row_keys],
-    )
-    client.load_table_from_json(rows, temp_table_id, job_config=job_config).result()
     cols = ", ".join(rows[0].keys())
     vals = ", ".join(f"S.{c}" for c in rows[0].keys())
-    client.query(f"""
-        MERGE `{T_LINKS}` T
-        USING (
-            SELECT * FROM `{temp_table_id}`
-            QUALIFY ROW_NUMBER() OVER (PARTITION BY match_key ORDER BY fuzzy_score DESC) = 1
-        ) S
-        ON T.match_key = S.match_key
-        WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({vals})
-    """).result()
+    with _staging_table(T_LINKS, rows) as temp_table_id:
+        client.query(f"""
+            MERGE `{T_LINKS}` T
+            USING (
+                SELECT * FROM `{temp_table_id}`
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY match_key ORDER BY fuzzy_score DESC) = 1
+            ) S
+            ON T.match_key = S.match_key
+            WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({vals})
+        """).result()
     invalidate_pi_caches()
 
 
@@ -1819,22 +1868,15 @@ def update_link_verdicts(rows: list):
         return
     ensure_pi_tables()
     client = get_bq_client()
-    temp_table_id = f"{T_LINKS}_verdicts_temp"
-    target_schema = client.get_table(T_LINKS).schema
-    row_keys = set(rows[0].keys())
-    job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_TRUNCATE",
-        schema=[f for f in target_schema if f.name in row_keys],
-    )
-    client.load_table_from_json(rows, temp_table_id, job_config=job_config).result()
-    set_clause = ", ".join(f"T.{c} = S.{c}" for c in row_keys if c != "link_id")
-    client.query(f"""
-        MERGE `{T_LINKS}` T
-        USING `{temp_table_id}` S
-        ON T.link_id = S.link_id
-        WHEN MATCHED AND T.decided_by IS NULL AND T.source NOT IN ('human', 'manual_url')
-        THEN UPDATE SET {set_clause}
-    """).result()
+    set_clause = ", ".join(f"T.{c} = S.{c}" for c in rows[0].keys() if c != "link_id")
+    with _staging_table(T_LINKS, rows) as temp_table_id:
+        client.query(f"""
+            MERGE `{T_LINKS}` T
+            USING `{temp_table_id}` S
+            ON T.link_id = S.link_id
+            WHEN MATCHED AND T.decided_by IS NULL AND T.source NOT IN ('human', 'manual_url')
+            THEN UPDATE SET {set_clause}
+        """).result()
     invalidate_pi_caches()
 
 
@@ -2255,7 +2297,8 @@ def count_pending_links() -> int:
     rows = _rows(f"""
         SELECT COUNT(*) AS n
         FROM `{T_LINKS}` l
-        LEFT JOIN `{T_TRACKED}` t ON t.item_id = l.item_id
+        LEFT JOIN {SQL_TRACKED_DEDUPED.format(table=T_TRACKED)} t
+          ON t.item_id = l.item_id
         WHERE l.status = 'pending' AND COALESCE(t.archived, FALSE) = FALSE
     """)
     n = rows[0]["n"] if rows else 0
@@ -2373,13 +2416,16 @@ def get_scrape_health() -> dict:
     }
 
 
-def has_successful_run_on(local_date_str: str, timezone_name: str) -> bool:
-    """True if a success/partial run already started on the given local date —
-    the scheduler's double-run guard across restarts."""
+def has_scheduler_blocking_run_on(local_date_str: str, timezone_name: str) -> bool:
+    """True if the scheduler should not fire on the given local date: any
+    success/partial run (manual or scheduled) already covered the day, or a
+    scheduled attempt already ran — including a *failed* one. Counting failed
+    scheduled attempts matters: the scheduler's `due` window spans the rest of
+    the day, so without it a systemic failure re-fires a full run every tick."""
     ensure_pi_tables()
     rows = _rows(f"""
         SELECT COUNT(*) AS n FROM `{T_RUNS}`
-        WHERE status IN ('success', 'partial')
+        WHERE (status IN ('success', 'partial') OR trigger = 'scheduled')
           AND FORMAT_DATE('%Y-%m-%d', DATE(started_at, @tz)) = @d
     """, params=[
         bigquery.ScalarQueryParameter("tz", "STRING", timezone_name),
