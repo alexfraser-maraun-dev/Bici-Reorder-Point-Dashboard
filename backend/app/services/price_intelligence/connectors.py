@@ -782,13 +782,22 @@ class ShopifyHtmlConnector:
                     yield loc
 
     def iter_products(self) -> Iterator[dict]:
-        fetched = 0
+        # Same locale confinement as GenericSitemapConnector: Shopify Markets
+        # stores emit localized URL variants (/fr-ca/products/…, /en-us/…) in
+        # their sitemaps; crawl only the English CA/neutral ones.
+        candidates = []
         for url in self._product_urls():
+            slug = urlparse(url).path.lower()
+            if NON_ENGLISH_PATH_RE.search(slug):
+                continue
+            if self.brand_tokens and not any(tok in slug for tok in self.brand_tokens):
+                continue
+            candidates.append(url)
+        fetched = 0
+        for url in prefer_ca_english(candidates):
             if fetched >= config.MAX_HTML_PRODUCT_PAGES:
                 return
             slug = urlparse(url).path.lower()
-            if self.brand_tokens and not any(tok in slug for tok in self.brand_tokens):
-                continue
             resp = polite_get(url)
             if resp is None or resp.status_code != 200:
                 continue
@@ -802,12 +811,46 @@ class ShopifyHtmlConnector:
                 yield parsed
 
 
+# Locale confinement for multi-geo/multi-language storefronts. We sell in
+# English CAD, so: non-English locales are never crawled, and when a site
+# publishes the same catalog under several English geos (/en-ca/, /en-us/, …)
+# only the Canadian/neutral one is — a US page's price would be USD and (since
+# the sql_cad_only guard) discarded anyway, so fetching it wastes page budget.
+#
+# Two strictness levels. Page-URL paths only match a *complete* path segment
+# ("/fr/", "/fr-ca/", "/en_ca/") — product slugs like /de-rosa-frame or
+# /no-tubes-sealant must never read as German/Norwegian. Sitemap filenames use
+# the looser delimiter form so "sitemap_fr.xml" / "1_fr_0.xml" / ".fr/" hit.
+_NON_ENGLISH_LANGS = r"(?:fr|de|es|it|nl|pt|pl|sv|da|fi|no|ja|ko|zh)(?:[-_][a-z]{2})?"
+NON_ENGLISH_PATH_RE = re.compile(rf"(?:^|/){_NON_ENGLISH_LANGS}(?=/|$)", re.I)
+NON_ENGLISH_SITEMAP_RE = re.compile(rf"[/_.-]{_NON_ENGLISH_LANGS}(?=[/_.-]|$)", re.I)
+# English-but-not-Canadian geo prefixes (en-us, en-gb, …); bare /en/ is kept.
+NON_CA_EN_PATH_RE = re.compile(r"(?:^|/)en[-_](?!ca(?=/|$))[a-z]{2}(?=/|$)", re.I)
+NON_CA_EN_SITEMAP_RE = re.compile(r"[/_.-]en[-_](?!ca(?=[/_.-]|$))[a-z]{2}(?=[/_.-]|$)", re.I)
+CA_HINT_RE = re.compile(r"[/_.-](?:en[-_]ca|ca)(?=[/_.-]|$)", re.I)
+
+
+def prefer_ca_english(urls: list, non_ca_re=NON_CA_EN_PATH_RE) -> list:
+    """Keeps the Canadian/neutral-English subset of a multi-geo URL list.
+
+    Other-geo English URLs (/en-us/…) are dropped only when CA/neutral
+    counterparts exist, so a store that publishes exclusively under /en-us/
+    still gets crawled. (Non-English URLs are filtered before this point.)
+    Pass NON_CA_EN_SITEMAP_RE when the list holds sitemap-file URLs."""
+    non_ca = [u for u in urls if non_ca_re.search(u)]
+    if non_ca and len(non_ca) < len(urls):
+        dropped = set(non_ca)
+        return [u for u in urls if u not in dropped]
+    return urls
+
+
 class GenericSitemapConnector:
     """Catalog crawl for non-Shopify stores (Magento, headless storefronts, ...)
     via their public sitemaps: robots.txt `Sitemap:` lines + /sitemap.xml, one
     level of <sitemapindex> nesting. Page URLs are filtered to tracked-brand
-    slugs and parsed with parse_product_page, so it behaves exactly like the
-    shopify_html crawl — one request per candidate page, capped."""
+    slugs and the Canadian/English locale, then parsed with parse_product_page,
+    so it behaves exactly like the shopify_html crawl — one request per
+    candidate page, capped."""
 
     connector_type = "sitemap_html"
 
@@ -838,8 +881,14 @@ class GenericSitemapConnector:
                 ordered.append(url)
         product_maps = [u for u in ordered if "product" in u.lower()]
         maps = product_maps or ordered
-        if any("_en" in u.lower() for u in maps):
-            maps = [u for u in maps if "_fr" not in u.lower()]
+        # Locale confinement: drop non-English sitemap files when an English or
+        # locale-neutral one exists, drop other-geo English duplicates when a
+        # CA/neutral one exists, and spend the fetch budget on Canadian-hinting
+        # maps first.
+        english = [u for u in maps if not NON_ENGLISH_SITEMAP_RE.search(u)]
+        maps = english or maps
+        maps = prefer_ca_english(maps, NON_CA_EN_SITEMAP_RE)
+        maps.sort(key=lambda u: 0 if CA_HINT_RE.search(u) else 1)
         return maps
 
     def _iter_page_urls(self) -> Iterator[str]:
@@ -854,9 +903,15 @@ class GenericSitemapConnector:
                 continue
             locs = re.findall(r"<loc>([^<]+)</loc>", resp.text)
             if "<sitemapindex" in resp.text:
-                # One level of nesting: children go on the queue (product-
-                # hinting first so the fetch budget is spent well).
-                locs.sort(key=lambda u: "product" not in u.lower())
+                # One level of nesting: children go on the queue with the same
+                # locale confinement as the top-level sources, product-hinting
+                # and Canadian-hinting first so the fetch budget is spent well.
+                english = [u for u in locs if not NON_ENGLISH_SITEMAP_RE.search(u)]
+                locs = prefer_ca_english(english or locs, NON_CA_EN_SITEMAP_RE)
+                locs.sort(key=lambda u: (
+                    "product" not in u.lower(),
+                    0 if CA_HINT_RE.search(u) else 1,
+                ))
                 queue.extend(locs)
                 continue
             for loc in locs:
@@ -866,16 +921,29 @@ class GenericSitemapConnector:
                 seen_pages.add(loc)
                 yield loc
 
-    def iter_products(self) -> Iterator[dict]:
-        fetched = 0
+    def _candidate_page_urls(self) -> list:
+        """Sitemap page URLs worth fetching: product-shaped, tracked-brand,
+        English, and geo-deduped. Materialized (URLs only, a few MB worst case)
+        so the CA-vs-other-geo preference can see the whole list before the
+        page fetch budget is spent."""
+        urls = []
         for url in self._iter_page_urls():
-            if fetched >= config.MAX_HTML_PRODUCT_PAGES:
-                return
             path = urlparse(url).path.lower()
             if not path or path == "/" or self.NON_PRODUCT_RE.search(path):
                 continue
+            if NON_ENGLISH_PATH_RE.search(path):
+                continue
             if self.brand_tokens and not any(tok in path for tok in self.brand_tokens):
                 continue
+            urls.append(url)
+        return prefer_ca_english(urls)
+
+    def iter_products(self) -> Iterator[dict]:
+        fetched = 0
+        for url in self._candidate_page_urls():
+            if fetched >= config.MAX_HTML_PRODUCT_PAGES:
+                return
+            path = urlparse(url).path.lower()
             resp = polite_get(url)
             if resp is None or resp.status_code != 200:
                 continue

@@ -16,11 +16,12 @@ PRICE_INTEL_ENABLED = _flag("PRICE_INTEL_ENABLED")
 SCRAPE_TOKEN = os.getenv("PRICE_INTEL_SCRAPE_TOKEN", "")
 REQUIRE_SCRAPE_TOKEN = _flag("PRICE_INTEL_REQUIRE_TOKEN")
 
-# Scraper politeness. The UA is deliberately identifiable so storefronts can
-# contact/block us rather than mistake us for an attack.
+# Scraper politeness. The UA names the tool but deliberately not the company —
+# it still reads as a well-behaved bot (sites can write UA-specific robots.txt
+# rules against it) without tying crawls back to BICI.
 USER_AGENT = os.getenv(
     "PI_USER_AGENT",
-    "BiciPriceIntel/1.0 (+https://bici.cc; retail price comparison; contact info@bici.cc)",
+    "MAPTrackSheet/1.0 (retail price comparison)",
 )
 REQUEST_INTERVAL_SECONDS = float(os.getenv("PI_REQUEST_INTERVAL_SECONDS", "1.0"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("PI_REQUEST_TIMEOUT_SECONDS", "20"))

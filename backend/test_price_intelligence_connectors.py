@@ -159,3 +159,69 @@ class DecisionSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocaleConfinementTests(unittest.TestCase):
+    """Multi-geo crawls stay English + Canadian: non-English locales are never
+    fetched, other-geo English duplicates are dropped when CA/neutral exist,
+    and brand slugs that merely look like language codes are never filtered."""
+
+    def test_non_english_path_segments_are_filtered(self):
+        from app.services.price_intelligence.connectors import NON_ENGLISH_PATH_RE
+        for path in ("/fr/velo-route", "/fr-ca/products/x", "/de/rennrad",
+                     "/en/fr/x", "/zh-cn/bikes"):
+            self.assertTrue(NON_ENGLISH_PATH_RE.search(path), path)
+
+    def test_brand_slugs_are_not_mistaken_for_languages(self):
+        from app.services.price_intelligence.connectors import NON_ENGLISH_PATH_RE
+        for path in ("/products/de-rosa-frame", "/no-tubes-sealant",
+                     "/products/fresh-frame", "/en-ca/products/de-rosa",
+                     "/it-clips-here/x", "/pt-cruiser-parts"):
+            self.assertFalse(NON_ENGLISH_PATH_RE.search(path), path)
+
+    def test_prefer_ca_english_drops_other_geos_only_when_ca_exists(self):
+        from app.services.price_intelligence.connectors import prefer_ca_english
+        mixed = [
+            "https://s.com/en-us/products/a",
+            "https://s.com/en-ca/products/a",
+            "https://s.com/products/b",
+        ]
+        self.assertEqual(
+            ["https://s.com/en-ca/products/a", "https://s.com/products/b"],
+            prefer_ca_english(mixed))
+        # A store publishing ONLY under /en-us/ still gets crawled.
+        us_only = ["https://s.com/en-us/products/a", "https://s.com/en-us/products/b"]
+        self.assertEqual(us_only, prefer_ca_english(us_only))
+
+    def test_sitemap_sources_prefer_english_canadian(self):
+        from app.services.price_intelligence import connectors
+
+        class Robots:
+            status_code = 200
+            text = ("Sitemap: https://s.com/sitemap_products_fr-ca.xml\n"
+                    "Sitemap: https://s.com/sitemap_products_en-us.xml\n"
+                    "Sitemap: https://s.com/sitemap_products_en-ca.xml\n")
+
+        conn = connectors.GenericSitemapConnector("https://s.com")
+        with patch.object(connectors, "polite_get", return_value=Robots()):
+            maps = conn._sitemap_sources()
+        self.assertEqual("https://s.com/sitemap_products_en-ca.xml", maps[0])
+        self.assertNotIn("https://s.com/sitemap_products_fr-ca.xml", maps)
+        self.assertNotIn("https://s.com/sitemap_products_en-us.xml", maps)
+
+    def test_candidate_page_urls_confine_locale(self):
+        from app.services.price_intelligence import connectors
+        conn = connectors.GenericSitemapConnector("https://s.com")
+        pages = [
+            "https://s.com/fr-ca/produits/velo",
+            "https://s.com/en-us/products/bike",
+            "https://s.com/en-ca/products/bike",
+            "https://s.com/products/de-rosa-frame",
+            "https://s.com/blogs/news",
+        ]
+        with patch.object(conn, "_iter_page_urls", return_value=iter(pages)):
+            out = conn._candidate_page_urls()
+        self.assertEqual(
+            ["https://s.com/en-ca/products/bike",
+             "https://s.com/products/de-rosa-frame"],
+            out)
