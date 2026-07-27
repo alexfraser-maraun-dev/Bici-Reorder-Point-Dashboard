@@ -651,17 +651,45 @@ class PageScraper:
 # Catalog connectors
 # ---------------------------------------------------------------------------
 
-class ShopifyJsonConnector:
+class _CrawlStatsMixin:
+    """Cursor + consumption counters every catalog connector exposes after
+    iter_products finishes. The runner persists them per competitor
+    (pi_competitors.crawl_state_json) so the next night's crawl resumes where
+    this one stopped instead of re-crawling the same first slice forever."""
+
+    def _init_stats(self, start_cursor):
+        self.pages_done = 0        # pages/product-pages actually fetched
+        self.products_seen = 0     # products (JSON) / listings (HTML) yielded
+        self.cap_hit = False       # budget exhausted before the catalog ended
+        self.next_cursor = start_cursor  # where tomorrow's crawl should start
+
+
+def _rotate(urls: list, offset: int) -> list:
+    """urls[offset:] + urls[:offset] with a safe modulo — rotation order for
+    cursor-based crawls over a (sorted, deterministic) candidate list."""
+    if not urls:
+        return urls
+    offset = offset % len(urls)
+    return urls[offset:] + urls[:offset]
+
+
+class ShopifyJsonConnector(_CrawlStatsMixin):
     """Iterates a Shopify store's public /products.json, yielding one record per
-    variant. Generator-paginated so at most one page (250 products) is in memory."""
+    variant. Generator-paginated so at most one page (250 products) is in memory.
+    `start_page` (from the stored crawl cursor) rotates the MAX_CATALOG_PAGES
+    budget through catalogs larger than the cap."""
 
     connector_type = "shopify_json"
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, start_page: int = 1):
         self.base_url = base_url.rstrip("/")
+        self.start_page = max(1, int(start_page or 1))
 
     def iter_products(self) -> Iterator[dict]:
-        for page in range(1, config.MAX_CATALOG_PAGES + 1):
+        self._init_stats(start_cursor=self.start_page)  # error mid-run → retry same slice
+        page = self.start_page
+        budget = config.MAX_CATALOG_PAGES
+        while budget > 0:
             url = f"{self.base_url}/products.json?limit=250&page={page}"
             resp = polite_get(url)
             if resp is None or resp.status_code != 200:
@@ -671,7 +699,17 @@ class ShopifyJsonConnector:
             except ValueError:
                 return
             if not products:
+                if page > 1 and page == self.start_page:
+                    # Catalog shrank below the stored cursor: restart from the
+                    # front tonight instead of wasting the night on empty pages.
+                    page = 1
+                    continue
+                self.next_cursor = 1  # catalog ended — wrap for tomorrow
                 return
+            self.pages_done += 1
+            self.products_seen += len(products)
+            budget -= 1
+            page += 1
             for product in products:
                 brand = product.get("vendor")
                 title = product.get("title")
@@ -711,6 +749,9 @@ class ShopifyJsonConnector:
                         "price_scope": "variant",
                         "extraction_method": "shopify_json",
                     }
+        # Budget consumed without seeing the catalog end: resume here tomorrow.
+        self.cap_hit = True
+        self.next_cursor = page
 
 
 def _brand_slug_tokens(brands) -> list:
@@ -753,19 +794,61 @@ def _slug_brand(path: str, brand_names) -> Optional[str]:
     return None
 
 
-class ShopifyHtmlConnector:
+class _HtmlPageCrawler(_CrawlStatsMixin):
+    """Shared fetch/parse loop for connectors that crawl individual product
+    pages from a candidate URL list. Sorts the list so its order is stable
+    across nights, rotates it by the stored cursor (`start_offset`), fetches up
+    to MAX_HTML_PRODUCT_PAGES, and tracks cursor/consumption for the runner to
+    persist — so catalogs bigger than the nightly budget are covered over
+    successive nights instead of the same first slice being re-crawled forever."""
+
+    # Hard guard on the materialized candidate list (raw URL strings) so a
+    # pathological sitemap can't balloon memory; brand/locale filters normally
+    # keep this list far smaller.
+    MAX_CANDIDATE_URLS = 20000
+
+    def _crawl_candidates(self, candidates: list) -> Iterator[dict]:
+        candidates = sorted(candidates)
+        total = len(candidates)
+        self._init_stats(start_cursor=(self.start_offset % total) if total else 0)
+        attempted = 0
+        for url in _rotate(candidates, self.start_offset):
+            if self.pages_done >= config.MAX_HTML_PRODUCT_PAGES:
+                self.cap_hit = True
+                self.next_cursor = (self.start_offset + attempted) % total
+                return
+            attempted += 1
+            slug = urlparse(url).path.lower()
+            resp = polite_get(url)
+            if resp is None or resp.status_code != 200:
+                continue
+            self.pages_done += 1
+            for parsed in (_magento_graphql_listings(resp.text, url)
+                           or extract_listings(resp.text, url)):
+                if not parsed.get("brand"):
+                    parsed["brand"] = _slug_brand(slug, self._brand_names)
+                parsed["url"] = url
+                parsed.setdefault("compare_at_price", None)
+                self.products_seen += 1
+                yield parsed
+        self.next_cursor = 0  # whole list visited — start at the front next time
+
+
+class ShopifyHtmlConnector(_HtmlPageCrawler):
     """Fallback for stores that block /products.json: walk the products sitemap and
     parse each product page's JSON-LD (which usually includes a real GTIN).
 
     One request per product, so URLs are pre-filtered to slugs mentioning a tracked
-    brand and the crawl is capped at MAX_HTML_PRODUCT_PAGES."""
+    brand and the crawl is capped at MAX_HTML_PRODUCT_PAGES per night, rotating
+    via `start_offset`."""
 
     connector_type = "shopify_html"
 
-    def __init__(self, base_url: str, brand_tokens=None):
+    def __init__(self, base_url: str, brand_tokens=None, start_offset: int = 0):
         self.base_url = base_url.rstrip("/")
         self._brand_names = [b for b in (brand_tokens or []) if b]
         self.brand_tokens = _brand_slug_tokens(brand_tokens)
+        self.start_offset = max(0, int(start_offset or 0))
 
     def _product_urls(self) -> Iterator[str]:
         resp = polite_get(f"{self.base_url}/sitemap.xml")
@@ -793,22 +876,9 @@ class ShopifyHtmlConnector:
             if self.brand_tokens and not any(tok in slug for tok in self.brand_tokens):
                 continue
             candidates.append(url)
-        fetched = 0
-        for url in prefer_ca_english(candidates):
-            if fetched >= config.MAX_HTML_PRODUCT_PAGES:
-                return
-            slug = urlparse(url).path.lower()
-            resp = polite_get(url)
-            if resp is None or resp.status_code != 200:
-                continue
-            fetched += 1
-            for parsed in (_magento_graphql_listings(resp.text, url)
-                           or extract_listings(resp.text, url)):
-                if not parsed.get("brand"):
-                    parsed["brand"] = _slug_brand(slug, self._brand_names)
-                parsed["url"] = url
-                parsed.setdefault("compare_at_price", None)
-                yield parsed
+            if len(candidates) >= self.MAX_CANDIDATE_URLS:
+                break
+        yield from self._crawl_candidates(prefer_ca_english(candidates))
 
 
 # Locale confinement for multi-geo/multi-language storefronts. We sell in
@@ -844,7 +914,7 @@ def prefer_ca_english(urls: list, non_ca_re=NON_CA_EN_PATH_RE) -> list:
     return urls
 
 
-class GenericSitemapConnector:
+class GenericSitemapConnector(_HtmlPageCrawler):
     """Catalog crawl for non-Shopify stores (Magento, headless storefronts, ...)
     via their public sitemaps: robots.txt `Sitemap:` lines + /sitemap.xml, one
     level of <sitemapindex> nesting. Page URLs are filtered to tracked-brand
@@ -860,10 +930,11 @@ class GenericSitemapConnector:
     )
     MAX_SITEMAP_FETCHES = 15
 
-    def __init__(self, base_url: str, brand_tokens=None):
+    def __init__(self, base_url: str, brand_tokens=None, start_offset: int = 0):
         self.base_url = base_url.rstrip("/")
         self._brand_names = [b for b in (brand_tokens or []) if b]
         self.brand_tokens = _brand_slug_tokens(brand_tokens)
+        self.start_offset = max(0, int(start_offset or 0))
 
     def _sitemap_sources(self) -> list:
         """Sitemap URLs from robots.txt plus the conventional /sitemap.xml.
@@ -936,25 +1007,12 @@ class GenericSitemapConnector:
             if self.brand_tokens and not any(tok in path for tok in self.brand_tokens):
                 continue
             urls.append(url)
+            if len(urls) >= self.MAX_CANDIDATE_URLS:
+                break
         return prefer_ca_english(urls)
 
     def iter_products(self) -> Iterator[dict]:
-        fetched = 0
-        for url in self._candidate_page_urls():
-            if fetched >= config.MAX_HTML_PRODUCT_PAGES:
-                return
-            path = urlparse(url).path.lower()
-            resp = polite_get(url)
-            if resp is None or resp.status_code != 200:
-                continue
-            fetched += 1
-            for parsed in (_magento_graphql_listings(resp.text, url)
-                           or extract_listings(resp.text, url)):
-                if not parsed.get("brand"):
-                    parsed["brand"] = _slug_brand(path, self._brand_names)
-                parsed["url"] = url
-                parsed.setdefault("compare_at_price", None)
-                yield parsed
+        yield from self._crawl_candidates(self._candidate_page_urls())
 
 
 def detect_connector_type(base_url: str) -> str:
@@ -979,13 +1037,18 @@ def detect_connector_type(base_url: str) -> str:
     return "unknown"
 
 
-def build_connector(competitor: dict, brand_tokens=None):
+def build_connector(competitor: dict, brand_tokens=None, cursor: int = 0):
+    """`cursor` is the stored per-competitor crawl position (crawl_state_json):
+    a 1-based /products.json page for shopify_json, a candidate-list offset for
+    the HTML crawls. 0/absent means start from the front."""
     ctype = competitor.get("connector_type")
     base_url = competitor["base_url"]
     if ctype == "shopify_json":
-        return ShopifyJsonConnector(base_url)
+        return ShopifyJsonConnector(base_url, start_page=cursor or 1)
     if ctype == "shopify_html":
-        return ShopifyHtmlConnector(base_url, brand_tokens=brand_tokens)
+        return ShopifyHtmlConnector(base_url, brand_tokens=brand_tokens,
+                                    start_offset=cursor)
     if ctype == "sitemap_html":
-        return GenericSitemapConnector(base_url, brand_tokens=brand_tokens)
+        return GenericSitemapConnector(base_url, brand_tokens=brand_tokens,
+                                       start_offset=cursor)
     return None

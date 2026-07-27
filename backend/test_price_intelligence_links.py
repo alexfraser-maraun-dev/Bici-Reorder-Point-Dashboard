@@ -139,5 +139,43 @@ class TrackedJoinDedupeTests(unittest.TestCase):
                           f"{fn.__name__} joins pi_tracked_products without dedupe")
 
 
+class CrawlStateRepositoryTests(unittest.TestCase):
+    def test_mark_competitor_scraped_writes_crawl_state_in_same_update(self):
+        client = MagicMock()
+        state = {"cursor": 41, "cap_hit": True, "products_seen": 9000}
+        with patch.object(repository, "get_bq_client", return_value=client), \
+             patch.object(repository, "_cache_lock"), \
+             patch.object(repository, "_caches", {}):
+            repository.mark_competitor_scraped("c1", "success (cap hit — rotating)", state)
+        sql = client.query.call_args.args[0]
+        self.assertIn("crawl_state_json = @crawl_state", sql)
+        params = {p.name: p.value
+                  for p in client.query.call_args.kwargs["job_config"].query_parameters}
+        self.assertEqual(state, __import__("json").loads(params["crawl_state"]))
+
+    def test_mark_competitor_scraped_without_state_leaves_cursor_untouched(self):
+        client = MagicMock()
+        with patch.object(repository, "get_bq_client", return_value=client), \
+             patch.object(repository, "_cache_lock"), \
+             patch.object(repository, "_caches", {}):
+            repository.mark_competitor_scraped("c1", "failed: boom")
+        self.assertNotIn("crawl_state_json", client.query.call_args.args[0])
+
+    def test_latest_observation_map_prefix_filter(self):
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "_rows", return_value=[]) as mock_rows:
+            repository.get_latest_observation_map(diff_key_prefix="cat:c1:")
+        sql = mock_rows.call_args.args[0]
+        self.assertIn("STARTS_WITH(diff_key, @prefix)", sql)
+        params = {p.name: p.value for p in mock_rows.call_args.kwargs["params"]}
+        self.assertEqual("cat:c1:", params["prefix"])
+
+    def test_latest_observation_map_no_prefix_unfiltered(self):
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "_rows", return_value=[]) as mock_rows:
+            repository.get_latest_observation_map()
+        self.assertNotIn("STARTS_WITH", mock_rows.call_args.args[0])
+
+
 if __name__ == "__main__":
     unittest.main()

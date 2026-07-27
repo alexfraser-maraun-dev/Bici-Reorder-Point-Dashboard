@@ -88,11 +88,21 @@ export function ScrapeHealthPill({ health }: { health: ScrapeHealth | undefined 
           {health.competitors.map((c) => {
             const b = BUCKET[c.bucket] ?? BUCKET.unknown
             const B = b.Icon
+            const coverage = c.products_seen != null
+              ? `${c.products_seen.toLocaleString()} products seen${c.cap_hit ? ' — cap hit, rotating' : ''}`
+              : null
             return (
               <div key={c.competitor_id ?? c.name} className="flex items-center gap-2 rounded px-1.5 py-1">
                 <B className={`h-3.5 w-3.5 shrink-0 ${b.dot}`} />
                 <span className="min-w-0 flex-1 truncate">{c.name}</span>
-                <span className="shrink-0 text-xs text-muted-foreground" title={c.status ?? undefined}>
+                {c.cap_hit && (
+                  <span className="shrink-0 rounded bg-sky-50 px-1 text-[10px] font-medium text-sky-700"
+                        title="Catalog is larger than the nightly page budget — each night crawls the next slice">
+                    rotating
+                  </span>
+                )}
+                <span className="shrink-0 text-xs text-muted-foreground"
+                      title={[c.status, coverage].filter(Boolean).join(' · ') || undefined}>
                   {b.label}
                 </span>
               </div>

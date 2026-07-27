@@ -35,6 +35,20 @@ function ConnectorBadge({ type }: { type: string | null }) {
   return <Badge variant="outline" className={meta.tone}>{meta.label}</Badge>
 }
 
+// Last catalog-crawl coverage from crawl_state_json. `rotating` = the store is
+// larger than the nightly page budget, so each night crawls the next slice.
+function crawlCoverage(json: string | null | undefined):
+    { products: number; rotating: boolean } | null {
+  if (!json) return null
+  try {
+    const s = JSON.parse(json)
+    if (typeof s?.products_seen !== 'number') return null
+    return { products: s.products_seen, rotating: !!s.cap_hit }
+  } catch {
+    return null
+  }
+}
+
 export function CompetitorManager() {
   const { competitors, isLoading, mutate } = useCompetitors()
   const { urls, isLoading: urlsLoading, mutate: mutateUrls } = useTrackedUrls()
@@ -172,6 +186,7 @@ export function CompetitorManager() {
                   <TableHead>Store</TableHead>
                   <TableHead>Connector</TableHead>
                   <TableHead>Last scraped</TableHead>
+                  <TableHead>Coverage</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="w-10" />
                 </TableRow>
@@ -190,6 +205,24 @@ export function CompetitorManager() {
                     <TableCell><ConnectorBadge type={c.connector_type} /></TableCell>
                     <TableCell className="text-sm text-muted-foreground">
                       {c.last_scraped_at ? new Date(c.last_scraped_at).toLocaleString() : 'never'}
+                    </TableCell>
+                    <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+                      {(() => {
+                        const cov = crawlCoverage(c.crawl_state_json)
+                        if (!cov) return '—'
+                        return (
+                          <span className="inline-flex items-center gap-1.5">
+                            {cov.products.toLocaleString()} products
+                            {cov.rotating && (
+                              <Badge variant="outline"
+                                     className="border-sky-200 bg-sky-50 px-1 py-0 text-[10px] text-sky-700"
+                                     title="Catalog exceeds the nightly page budget — each night crawls the next slice">
+                                rotating
+                              </Badge>
+                            )}
+                          </span>
+                        )
+                      })()}
                     </TableCell>
                     <TableCell className="max-w-40 truncate text-xs text-muted-foreground"
                                title={c.last_scrape_status ?? undefined}>

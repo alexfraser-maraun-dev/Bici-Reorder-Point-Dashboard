@@ -258,7 +258,10 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
 
         index = MatchIndex.load()
         item_lookup = index.items
-        prev_map = repository.get_latest_observation_map()
+        # prev_map (for change-event diffing) is loaded per phase/competitor by
+        # diff_key prefix — peak memory is one store's listings, never every
+        # store's trailing-45-day history. Namespaces ('cat:{cid}:', 'link:',
+        # 'url:') don't overlap, so event semantics are unchanged.
         brand_tokens = sorted({(r.get("brand") or "") for r in item_lookup.values()} - {""})
 
         # Candidate links for LLM/human verification. Collection is generous
@@ -350,18 +353,31 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             cid = competitor["competitor_id"]
             _set_status(phase=f"scraping {competitor['name']}")
             comp_status = "success"
+            # None = leave the stored cursor untouched (a failed crawl retries
+            # the same slice); set after a completed iteration below.
+            crawl_state = None
             try:
                 if not competitor.get("connector_type") or competitor["connector_type"] == "unknown":
                     detected = detect_connector_type(competitor["base_url"])
                     competitor["connector_type"] = detected
                     repository.upsert_competitor(competitor)
-                connector = build_connector(competitor, brand_tokens=brand_tokens)
+                try:
+                    cursor = int(json.loads(
+                        competitor.get("crawl_state_json") or "{}").get("cursor") or 0)
+                except (TypeError, ValueError):
+                    cursor = 0
+                connector = build_connector(competitor, brand_tokens=brand_tokens,
+                                            cursor=cursor)
                 if connector is None:
                     repository.mark_competitor_scraped(cid, "skipped_no_connector")
                     counters["competitors_done"] += 1
                     _set_status(competitors_done=counters["competitors_done"])
                     continue
                 crawled_competitor_ids.add(cid)
+                # This store's slice of the diff map only — see the note at the
+                # top of the run about per-phase prev_map loading.
+                prev_map = repository.get_latest_observation_map(
+                    diff_key_prefix=f"cat:{cid}:")
 
                 obs_buffer, event_buffer = [], []
                 obs_before = counters["observations"]
@@ -449,11 +465,24 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                     comp_status = "success_no_products"
                 elif obs_added == 0:
                     comp_status = "success_no_matches"
+                # Persist the rotation cursor + coverage. cap_hit means the
+                # catalog is bigger than the nightly budget: tomorrow resumes
+                # at next_cursor instead of re-crawling the same slice.
+                if getattr(connector, "cap_hit", False):
+                    comp_status += " (cap hit — rotating)"
+                crawl_state = {
+                    "cursor": getattr(connector, "next_cursor", 0),
+                    "pages_done": getattr(connector, "pages_done", 0),
+                    "products_seen": getattr(connector, "products_seen", 0),
+                    "cap_hit": bool(getattr(connector, "cap_hit", False)),
+                    "catalog_exhausted": not getattr(connector, "cap_hit", False),
+                    "updated_at": _now_iso(),
+                }
             except Exception as e:
                 comp_status = f"failed: {e}"
                 errors.append(f"{competitor['name']}: {e}")
                 print(f"pi: competitor {competitor['name']} failed: {e}")
-            repository.mark_competitor_scraped(cid, comp_status[:200])
+            repository.mark_competitor_scraped(cid, comp_status[:200], crawl_state)
             counters["competitors_done"] += 1
             _set_status(competitors_done=counters["competitors_done"],
                         observations=counters["observations"], changes=counters["changes"],
@@ -500,6 +529,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                      and l["competitor_id"] in crawled_competitor_ids)
         ]
         _set_status(phase="scraping confirmed links", links_total=len(link_targets))
+        prev_map = repository.get_latest_observation_map(diff_key_prefix="link:")
         obs_buffer, event_buffer = [], []
         links_done, per_competitor = 0, {}
         for link in link_targets:
@@ -555,6 +585,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
 
         # --- tracked URLs (feature a) ---------------------------------------
         _set_status(phase="scraping tracked URLs")
+        prev_map = repository.get_latest_observation_map(diff_key_prefix="url:")
         obs_buffer, event_buffer = [], []
         for url_row in urls:
             url = url_row["url"]

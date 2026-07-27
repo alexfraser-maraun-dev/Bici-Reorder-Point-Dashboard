@@ -285,6 +285,10 @@ def ensure_pi_tables():
             "variant_options_json": "STRING",
         })
         _ensure_columns(client, T_RUNS, {"stats_json": "STRING"})
+        # Per-competitor crawl cursor + last-crawl coverage (JSON: cursor,
+        # pages_done, products_seen, cap_hit, catalog_exhausted, updated_at) —
+        # lets nightly full scans rotate through catalogs larger than the caps.
+        _ensure_columns(client, T_COMPETITORS, {"crawl_state_json": "STRING"})
         _tables_ensured = True
 
 
@@ -534,15 +538,24 @@ def set_competitor_enabled(competitor_id: str, enabled: bool):
     invalidate_pi_caches()
 
 
-def mark_competitor_scraped(competitor_id: str, status: str):
+def mark_competitor_scraped(competitor_id: str, status: str, crawl_state: dict = None):
+    """Updates a competitor's last-scrape status and, when given, its crawl
+    state (cursor/coverage JSON) in the same UPDATE. crawl_state=None leaves
+    the stored state untouched — a failed crawl retries the same slice."""
     try:
+        sets = ("last_scraped_at = CURRENT_TIMESTAMP(), "
+                "last_scrape_status = @status")
+        params = [
+            bigquery.ScalarQueryParameter("status", "STRING", status),
+            bigquery.ScalarQueryParameter("cid", "STRING", competitor_id),
+        ]
+        if crawl_state is not None:
+            sets += ", crawl_state_json = @crawl_state"
+            params.append(bigquery.ScalarQueryParameter(
+                "crawl_state", "STRING", json.dumps(crawl_state)))
         get_bq_client().query(
-            f"UPDATE `{T_COMPETITORS}` SET last_scraped_at = CURRENT_TIMESTAMP(), "
-            "last_scrape_status = @status WHERE competitor_id = @cid",
-            job_config=bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter("status", "STRING", status),
-                bigquery.ScalarQueryParameter("cid", "STRING", competitor_id),
-            ]),
+            f"UPDATE `{T_COMPETITORS}` SET {sets} WHERE competitor_id = @cid",
+            job_config=bigquery.QueryJobConfig(query_parameters=params),
         ).result()
         # Drop the cached competitor list so scrape-health reads see this
         # status now, not after the TTL / end-of-run invalidation.
@@ -1389,17 +1402,24 @@ def search_snapshot_items(q: str, limit: int = 40):
 # Observations / diffing
 # ---------------------------------------------------------------------------
 
-def get_latest_observation_map(days: int = 45):
+def get_latest_observation_map(days: int = 45, diff_key_prefix: str = None):
     """Latest observation per diff_key, as {diff_key: {price, in_stock}}. Bounded
-    to a trailing window so the dict stays small on the 512MB instance."""
+    to a trailing window, and optionally to a diff_key prefix — the scrape
+    runner loads one competitor's slice ('cat:{cid}:') at a time so peak memory
+    is one store's listings, not every store's 45-day history."""
     ensure_pi_tables()
+    prefix_clause = "AND STARTS_WITH(diff_key, @prefix)" if diff_key_prefix else ""
+    params = [bigquery.ScalarQueryParameter("days", "INT64", days)]
+    if diff_key_prefix:
+        params.append(bigquery.ScalarQueryParameter("prefix", "STRING", diff_key_prefix))
     rows = _rows(f"""
         SELECT diff_key, price, in_stock
         FROM `{T_OBSERVATIONS}`
         WHERE observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
           AND COALESCE(price_scope, 'variant') IN ('variant', 'product')
+          {prefix_clause}
         QUALIFY ROW_NUMBER() OVER (PARTITION BY diff_key ORDER BY observed_at DESC) = 1
-    """, params=[bigquery.ScalarQueryParameter("days", "INT64", days)])
+    """, params=params)
     return {r["diff_key"]: r for r in rows if r.get("diff_key")}
 
 
@@ -2384,6 +2404,10 @@ def get_scrape_health() -> dict:
     for c in competitors:
         bucket = _scrape_status_bucket(c.get("last_scrape_status"))
         counts[bucket] = counts.get(bucket, 0) + 1
+        try:
+            crawl_state = json.loads(c.get("crawl_state_json") or "{}")
+        except (TypeError, ValueError):
+            crawl_state = {}
         per.append({
             "competitor_id": c.get("competitor_id"),
             "name": c.get("name"),
@@ -2391,6 +2415,11 @@ def get_scrape_health() -> dict:
             "status": c.get("last_scrape_status"),
             "bucket": bucket,
             "last_scraped_at": c.get("last_scraped_at"),
+            # Last catalog-crawl coverage: cap_hit=True means the store is
+            # bigger than the nightly budget and the crawl is rotating.
+            "products_seen": crawl_state.get("products_seen"),
+            "pages_done": crawl_state.get("pages_done"),
+            "cap_hit": bool(crawl_state.get("cap_hit")),
         })
     per.sort(key=lambda p: ({"failed": 0, "empty": 1, "no_matches": 2,
                              "skipped": 3, "unknown": 4, "ok": 5}.get(p["bucket"], 6),

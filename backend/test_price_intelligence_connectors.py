@@ -225,3 +225,113 @@ class LocaleConfinementTests(unittest.TestCase):
             ["https://s.com/en-ca/products/bike",
              "https://s.com/products/de-rosa-frame"],
             out)
+
+
+class CrawlRotationTests(unittest.TestCase):
+    """Cursor rotation: catalogs bigger than the nightly cap are covered over
+    successive nights instead of the same first slice being re-crawled forever."""
+
+    def _json_resp(self, products):
+        class R:
+            status_code = 200
+            def __init__(self, payload):
+                self._payload = payload
+            def json(self):
+                return self._payload
+        return R({"products": products})
+
+    def test_shopify_json_resumes_at_start_page_and_reports_cap_hit(self):
+        from app.services.price_intelligence import connectors
+        product = {"title": "Bike", "vendor": "X", "handle": "bike",
+                   "variants": [{"id": 1, "title": "Default Title", "price": "9.99"}]}
+        requested = []
+
+        def fake_get(url, **kw):
+            requested.append(url)
+            return self._json_resp([product])  # never-empty catalog → cap hit
+
+        conn = connectors.ShopifyJsonConnector("https://s.com", start_page=3)
+        with patch.object(connectors, "polite_get", side_effect=fake_get), \
+             patch.object(connectors.config, "MAX_CATALOG_PAGES", 2):
+            list(conn.iter_products())
+        self.assertEqual(["https://s.com/products.json?limit=250&page=3",
+                          "https://s.com/products.json?limit=250&page=4"], requested)
+        self.assertTrue(conn.cap_hit)
+        self.assertEqual(5, conn.next_cursor)  # resume at page 5 tomorrow
+        self.assertEqual(2, conn.pages_done)
+        self.assertEqual(2, conn.products_seen)
+
+    def test_shopify_json_wraps_cursor_when_catalog_ends(self):
+        from app.services.price_intelligence import connectors
+        product = {"title": "Bike", "vendor": "X", "handle": "bike",
+                   "variants": [{"id": 1, "title": "Default Title", "price": "9.99"}]}
+
+        def fake_get(url, **kw):
+            page = int(url.rsplit("page=", 1)[1])
+            return self._json_resp([product] if page <= 3 else [])
+
+        conn = connectors.ShopifyJsonConnector("https://s.com", start_page=3)
+        with patch.object(connectors, "polite_get", side_effect=fake_get), \
+             patch.object(connectors.config, "MAX_CATALOG_PAGES", 10):
+            list(conn.iter_products())
+        self.assertFalse(conn.cap_hit)
+        self.assertEqual(1, conn.next_cursor)  # catalog ended — wrap to front
+
+    def test_shopify_json_restarts_when_catalog_shrank_below_cursor(self):
+        from app.services.price_intelligence import connectors
+        product = {"title": "Bike", "vendor": "X", "handle": "bike",
+                   "variants": [{"id": 1, "title": "Default Title", "price": "9.99"}]}
+
+        def fake_get(url, **kw):
+            page = int(url.rsplit("page=", 1)[1])
+            return self._json_resp([product] if page <= 2 else [])
+
+        conn = connectors.ShopifyJsonConnector("https://s.com", start_page=8)
+        with patch.object(connectors, "polite_get", side_effect=fake_get), \
+             patch.object(connectors.config, "MAX_CATALOG_PAGES", 10):
+            n = len(list(conn.iter_products()))
+        self.assertEqual(2, n)          # restarted from page 1 tonight
+        self.assertEqual(1, conn.next_cursor)
+
+    def test_html_crawl_rotates_sorted_candidates(self):
+        from app.services.price_intelligence import connectors
+        conn = connectors.GenericSitemapConnector("https://s.com", start_offset=3)
+        # Unsorted input: rotation must apply to the SORTED list for a stable
+        # cross-night order.
+        pages = [f"https://s.com/products/x-{i}" for i in (4, 0, 2, 1, 3)]
+        fetched = []
+
+        def fake_get(url, **kw):
+            fetched.append(url)
+            class R:
+                status_code = 200
+                text = "<html></html>"  # parses to zero listings; fetch still counts
+            return R()
+
+        with patch.object(conn, "_candidate_page_urls", return_value=pages), \
+             patch.object(connectors, "polite_get", side_effect=fake_get), \
+             patch.object(connectors.config, "MAX_HTML_PRODUCT_PAGES", 2):
+            list(conn.iter_products())
+        self.assertEqual(["https://s.com/products/x-3",
+                          "https://s.com/products/x-4"], fetched)
+        self.assertTrue(conn.cap_hit)
+        self.assertEqual(0, conn.next_cursor)  # (3 + 2) % 5
+
+    def test_html_crawl_finishing_list_resets_cursor(self):
+        from app.services.price_intelligence import connectors
+        conn = connectors.GenericSitemapConnector("https://s.com", start_offset=1)
+        pages = [f"https://s.com/products/x-{i}" for i in range(3)]
+
+        def fake_get(url, **kw):
+            class R:
+                status_code = 200
+                text = "<html></html>"
+            return R()
+
+        with patch.object(conn, "_candidate_page_urls", return_value=pages), \
+             patch.object(connectors, "polite_get", side_effect=fake_get), \
+             patch.object(connectors.config, "MAX_HTML_PRODUCT_PAGES", 300):
+            list(conn.iter_products())
+        self.assertFalse(conn.cap_hit)
+        self.assertEqual(0, conn.next_cursor)
+        self.assertEqual(3, conn.pages_done)

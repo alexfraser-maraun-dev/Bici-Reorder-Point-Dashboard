@@ -11,6 +11,9 @@ export interface Competitor {
   updated_at: string | null
   last_scraped_at: string | null
   last_scrape_status: string | null
+  // JSON: {cursor, pages_done, products_seen, cap_hit, catalog_exhausted,
+  // updated_at} — last catalog-crawl coverage + rotation cursor.
+  crawl_state_json?: string | null
 }
 
 export interface TrackedUrl {
@@ -183,6 +186,12 @@ export interface ScrapeHealthCompetitor {
   status: string | null
   bucket: 'ok' | 'empty' | 'no_matches' | 'failed' | 'skipped' | 'unknown'
   last_scraped_at: string | null
+  // Last catalog-crawl coverage (from crawl_state_json). cap_hit means the
+  // store is bigger than the nightly page budget and the crawl is rotating
+  // through it across nights.
+  products_seen?: number | null
+  pages_done?: number | null
+  cap_hit?: boolean
 }
 
 export interface ScrapeHealth {
