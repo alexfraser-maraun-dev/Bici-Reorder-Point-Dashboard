@@ -482,13 +482,22 @@ class MatchIndex:
                     verdict, target = self._resolve_by_attributes(options, best[1])
                     if verdict == "suppress":
                         return None, None, 0.0, None
-                    if verdict == "confirm" and config.ATTR_AUTO_CONFIRM and auto_confirm:
+                    # Colour/size agreement only proves "same variant" when the
+                    # model anchor it was resolved against is itself credible.
+                    # Against a weak anchor (a different model that merely shares
+                    # a brand) the agreement is a coincidence, so the pair keeps
+                    # its real fuzzy score and competes honestly for the review
+                    # queue's per-item/per-run budget instead of topping the sort.
+                    anchor_trusted = best[2] >= config.ATTR_ANCHOR_MIN_SCORE
+                    if (verdict == "confirm" and anchor_trusted
+                            and config.ATTR_AUTO_CONFIRM and auto_confirm):
                         return target, "attr_exact", 0.97, None
                     if verdict in ("confirm", "candidate"):
                         return None, None, 0.0, {
                             "item_id": target,
                             "method": "attr",
-                            "confidence": 0.97 if verdict == "confirm" else None,
+                            "confidence": (0.97 if verdict == "confirm" and anchor_trusted
+                                           else None),
                             "fuzzy_score": round(float(best[2]), 1),
                             "level": "variant",
                         }

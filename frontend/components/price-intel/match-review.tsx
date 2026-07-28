@@ -26,9 +26,11 @@ import {
 import { cn } from '@/lib/utils'
 import { itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
 import {
-  apiPost, useCompetitors, usePriceIntelSummary, useProductLinks,
+  ApiError, apiPost, useCompetitors, usePriceIntelSummary, useProductLinks,
 } from '@/lib/price-intel/hooks'
-import type { ProductLink } from '@/lib/price-intel/types'
+import type {
+  ProductLink, VariantCandidate, VariantSelectionRequired,
+} from '@/lib/price-intel/types'
 import { Check, CheckCheck, ExternalLink, Layers, Link2, X } from 'lucide-react'
 
 const fmt = (v: number | null | undefined) => (v == null ? '—' : `$${Number(v).toFixed(2)}`)
@@ -59,6 +61,10 @@ export function MatchReview() {
   const [fixTarget, setFixTarget] = useState<ProductLink | null>(null)
   const [fixUrl, setFixUrl] = useState('')
   const [savingFix, setSavingFix] = useState(false)
+  // Populated when the pasted URL is a multi-variant page the backend can't
+  // resolve on its own (409 variant_selection_required) — the user picks the
+  // matching variant from this list.
+  const [fixCandidates, setFixCandidates] = useState<VariantCandidate[]>([])
   // Bulk selection (pending tab only): link_ids the user has ticked for a batch
   // confirm/reject. Cleared whenever the status filter changes so a stale selection
   // can't leak across tabs.
@@ -86,7 +92,7 @@ export function MatchReview() {
   // "This match is wrong — here's the right URL": records the pasted URL as
   // the permanent truth for this item at that store and tombstones the
   // conflicting auto-matches (including this one).
-  const saveCorrectUrl = async () => {
+  const saveCorrectUrl = async (candidate?: VariantCandidate) => {
     if (!fixTarget?.item_id) return
     const url = fixUrl.trim()
     if (!/^https?:\/\//.test(url)) {
@@ -100,14 +106,32 @@ export function MatchReview() {
         item_id: fixTarget.item_id,
         competitor_id: fixTarget.competitor_id,
         label: fixTarget.item_title,
+        competitor_sku: candidate?.sku,
+        competitor_variant_id: candidate?.variant_id,
+        competitor_gtin: candidate?.gtin,
+        variant_options: candidate?.variant_options,
       })
       toast.success('Correct URL locked in — rejecting the wrong match and fetching the price')
       setFixTarget(null)
       setFixUrl('')
+      setFixCandidates([])
       await Promise.all([mutate(), mutateSummary()])
       // rejection + first fetch happen in a background task server-side
       setTimeout(() => { void mutate(); void mutateSummary() }, 6000)
     } catch (e) {
+      // Multi-variant page: the backend can't tell which variant is ours —
+      // surface its candidate list so the user picks one (mirrors the
+      // tracked-products override dialog).
+      if (e instanceof ApiError && e.status === 409) {
+        const detail = e.detail as VariantSelectionRequired
+        if (detail?.code === 'variant_selection_required') {
+          setFixCandidates(detail.candidates ?? [])
+          if (!detail.candidates?.length) {
+            toast.error('No variants could be read from that page — paste the variant-specific URL instead')
+          }
+          return
+        }
+      }
       toast.error(e instanceof Error ? e.message : 'Failed to save URL')
     } finally {
       setSavingFix(false)
@@ -399,7 +423,10 @@ export function MatchReview() {
         )}
       </CardContent>
 
-      <Dialog open={fixTarget !== null} onOpenChange={(open) => !open && setFixTarget(null)}>
+      <Dialog open={fixTarget !== null}
+              onOpenChange={(open) => {
+                if (!open) { setFixTarget(null); setFixCandidates([]) }
+              }}>
         <DialogContent className="max-w-xl">
           <DialogHeader>
             <DialogTitle>Paste the correct competitor URL</DialogTitle>
@@ -415,12 +442,36 @@ export function MatchReview() {
           </p>
           <div className="flex items-center gap-2">
             <Input placeholder="https://store.example.com/products/…" value={fixUrl}
-                   onChange={(e) => setFixUrl(e.target.value)}
+                   onChange={(e) => { setFixUrl(e.target.value); setFixCandidates([]) }}
                    onKeyDown={(e) => e.key === 'Enter' && saveCorrectUrl()} />
-            <Button size="sm" onClick={saveCorrectUrl} disabled={savingFix}>
+            <Button size="sm" onClick={() => void saveCorrectUrl()} disabled={savingFix}>
               <Link2 className="h-4 w-4" /> Lock in
             </Button>
           </div>
+          {fixCandidates.length > 0 && (
+            <div className="space-y-2 rounded-md border p-3">
+              <p className="text-sm font-medium">Choose the matching variant</p>
+              <div className="max-h-64 space-y-1 overflow-y-auto">
+                {fixCandidates.map((candidate, i) => (
+                  <button key={`${candidate.variant_id ?? candidate.sku ?? i}`}
+                          type="button" onClick={() => void saveCorrectUrl(candidate)}
+                          disabled={savingFix}
+                          className="flex w-full items-center justify-between rounded border px-3 py-2 text-left text-sm hover:bg-muted">
+                    <span>
+                      <span className="block font-medium">
+                        {candidate.variant_options.join(' / ') || candidate.title || 'Variant'}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {candidate.sku ? `SKU ${candidate.sku}` : candidate.gtin ? `UPC ${candidate.gtin}` : 'No SKU'}
+                        {' · '}{candidate.in_stock === false ? 'out of stock' : 'in stock'}
+                      </span>
+                    </span>
+                    <span className="font-semibold tabular-nums">{fmt(candidate.price)}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </DialogContent>
       </Dialog>
     </Card>

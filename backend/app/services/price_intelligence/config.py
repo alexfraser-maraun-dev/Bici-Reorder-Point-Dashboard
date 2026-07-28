@@ -121,3 +121,11 @@ MATCH_MAX_TOKENS = int(os.getenv("PI_MATCH_MAX_TOKENS", "2000"))
 # high-confidence candidates you approve; on = they're confirmed without review.
 ATTR_MATCH_ENABLED = os.getenv("PI_ATTR_MATCH_ENABLED", "true").lower() == "true"
 ATTR_AUTO_CONFIRM = os.getenv("PI_ATTR_AUTO_CONFIRM", "false").lower() == "true"
+# Attribute resolution compares colour/size against the *model anchor* the fuzzy
+# pass picked. Below this title-similarity score that anchor isn't trustworthy —
+# our "Fluxer Mips Helmet" scores ~66 against their "Falconer 2Vi MIPS Helmet",
+# so matching Matte Black / M-L against it is a coincidence, not a variant hit.
+# Weak-anchor pairs keep their real fuzzy score instead of the 0.97 exact-match
+# confidence, which would otherwise outrank every genuine candidate in the
+# review queue's priority sort (and burn the per-item / per-run LLM budget).
+ATTR_ANCHOR_MIN_SCORE = float(os.getenv("PI_ATTR_ANCHOR_MIN_SCORE", "80"))
