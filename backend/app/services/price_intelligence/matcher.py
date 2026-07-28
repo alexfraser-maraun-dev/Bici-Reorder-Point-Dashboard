@@ -15,6 +15,7 @@ storefront aliases/suffixes ("Trek Bikes" -> "trek").
 import re
 import unicodedata
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 from rapidfuzz import fuzz, process
 
@@ -140,13 +141,28 @@ def _size_value_matches(a, b) -> bool:
     return ca is not None and ca == cb
 
 
+# Finish/sheen words that qualify a colourway without naming it. Nearly every
+# helmet colour a brand ships is "Matte something", so leaving these in the token
+# set makes "Matte Ano Blue" and "Matte White" share a token and read as the same
+# colour — which is how a wrong-colour listing reaches the review queue.
+_FINISH_WORDS = {"matte", "matt", "gloss", "glossy", "satin", "metallic",
+                 "fluo", "fluoro", "neon", "pearl"}
+
+
+def _color_tokens(value) -> set:
+    """Colour-naming tokens: finish words dropped, unless that empties the set
+    (an item genuinely called just "Matte" keeps its only token)."""
+    tokens = _attr_tokens(value)
+    return (tokens - _FINISH_WORDS) or tokens
+
+
 def _color_match(a, b) -> bool:
-    """Whether two color values plausibly refer to the same color. Shares a word
-    token, OR one alnum-only spelling contains the other so spacing/camelCase
-    variants agree ('blackSeries' == 'Black Series', 'Green' ~ 'Steel Green').
-    Deliberately lenient: a false 'match' just keeps a link for human review;
-    a false 'mismatch' would wrongly tombstone a real match."""
-    if _attr_tokens(a) & _attr_tokens(b):
+    """Whether two color values plausibly refer to the same color. Shares a
+    colour-naming token, OR one alnum-only spelling contains the other so
+    spacing/camelCase variants agree ('blackSeries' == 'Black Series', 'Green' ~
+    'Steel Green'). Deliberately lenient: a false 'match' just keeps a link for
+    human review; a false 'mismatch' would wrongly tombstone a real match."""
+    if _color_tokens(a) & _color_tokens(b):
         return True
     ca = re.sub(r"[^a-z0-9]", "", _fold(a))
     cb = re.sub(r"[^a-z0-9]", "", _fold(b))
@@ -171,8 +187,11 @@ def attribute_match_score(options, attrs) -> float:
     if o_sz and a_sz:
         score += 1.0 if any(_size_value_matches(o, a) for o in o_sz for a in a_sz) else -2.0
     if o_col and a_col:
-        ot = set().union(*[_attr_tokens(o) for o in o_col])
-        at = set().union(*[_attr_tokens(a) for a in a_col])
+        # Finish words excluded on both sides, as in _color_match: otherwise
+        # their "Matte Black/Frequency Orange" never reads as an exact match for
+        # our "Black/Frequency Orange" and ties with plain "Matte Black".
+        ot = set().union(*[_color_tokens(o) for o in o_col])
+        at = set().union(*[_color_tokens(a) for a in a_col])
         if ot == at:
             score += 1.0        # exact color
         elif ot & at:
@@ -236,6 +255,28 @@ def size_matches_item(competitor_title, item_attrs):
     return any(_size_value_matches(o, a) for o in o_sz for a in a_sz)
 
 
+def page_key(url) -> Optional[str]:
+    """A URL reduced to the page it addresses — scheme/host/path, query dropped.
+
+    Sibling variants of one model share a page and differ only by '?variant=', so
+    this is the grain at which "the store already sells our model here" is true."""
+    if not url:
+        return None
+    parsed = urlparse(str(url))
+    if not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}".lower()
+
+
+def model_group_key(item: dict) -> str:
+    """The unit a competitor product page corresponds to: a matrix when the item
+    belongs to one (their page holds every colour/size, same as ours), else the
+    item itself. Keyed on so "this store sells our model here" is a statement
+    about the model, not one variant of it."""
+    matrix_id = item.get("item_matrix_id")
+    return f"matrix:{matrix_id}" if matrix_id else f"item:{item.get('item_id')}"
+
+
 def build_match_key(competitor_id, scraped: dict) -> str:
     """Stable identity for one scraped competitor listing — the key pi_product_links
     dedupes and re-attaches on. Prefers a real SKU (survives URL/handle renames),
@@ -267,6 +308,8 @@ class MatchIndex:
         self.model_items = []
         self.items = {}
         self.variants_by_matrix = {}  # matrix_id -> tracked sibling rows
+        # (model group, competitor) -> pages already confirmed to sell it there.
+        self.matrix_pages = {}
         self.brands = set()
         seen_matrices = set()
         for row in tracked_rows:
@@ -308,14 +351,71 @@ class MatchIndex:
         for link in links or []:
             if (
                 link.get("status") == "confirmed"
-                and link.get("match_key")
                 and link.get("item_id")
                 # Links follow their item's lifecycle: an archived item's links
                 # are frozen (no matching, no events) until it's re-tracked.
                 and str(link["item_id"]) in self.items
             ):
-                confidence = float(link.get("confidence") or 0.9)
-                self.by_link[link["match_key"]] = (str(link["item_id"]), confidence)
+                if link.get("match_key"):
+                    confidence = float(link.get("confidence") or 0.9)
+                    self.by_link[link["match_key"]] = (str(link["item_id"]), confidence)
+                page = page_key(link.get("competitor_url"))
+                if page and link.get("competitor_id"):
+                    group = model_group_key(self.items[str(link["item_id"])])
+                    self.matrix_pages.setdefault(
+                        (group, link["competitor_id"]), set()).add(page)
+
+    def known_pages(self, item_id, competitor_id) -> set:
+        """Pages at `competitor_id` already confirmed to hold this item's model.
+        Empty when we've never matched the model at that store."""
+        item = self.items.get(str(item_id))
+        if not item or not competitor_id:
+            return set()
+        return self.matrix_pages.get((model_group_key(item), competitor_id), set())
+
+    def _item_attrs(self, item_id) -> list:
+        item = self.items.get(str(item_id)) or {}
+        return [a for a in (item.get("attribute_1"), item.get("attribute_2"),
+                            item.get("attribute_3")) if a and str(a).strip()]
+
+    def _link_names_this_listing(self, item_id, scraped: dict) -> bool:
+        """Whether a PAGE-keyed confirmed link can be this listing's identity.
+
+        build_match_key falls back to the URL when a listing carries no usable
+        SKU, so on a storefront that hangs a dozen colourways off one page every
+        one of them hits the same key and inherits a link meant for a single
+        variant — 16 Oak Bay colourways all reporting as our Matte Black / M.
+        A page key names a page, so it may not settle which variant this is:
+        decline when the listing's colour/size contradicts the linked item, or
+        when a sibling variant fits it strictly better. The listing then falls
+        through to the normal cascade, which routes or suppresses it.
+
+        Only reachable for page-keyed links; a SKU- or GTIN-keyed link IS a
+        per-variant assertion and is never second-guessed here."""
+        options = scraped.get("variant_options")
+        attrs = self._item_attrs(item_id)
+        if not options or not attrs:
+            return True          # nothing to judge on — trust the link
+        if attributes_conflict(options, attrs):
+            return False
+        best = attribute_match_score(options, attrs)
+        item = self.items.get(str(item_id)) or {}
+        matrix_id = item.get("item_matrix_id")
+        for sibling in (self.variants_by_matrix.get(str(matrix_id), []) if matrix_id else []):
+            if str(sibling["item_id"]) == str(item_id):
+                continue
+            if attribute_match_score(options, self._item_attrs(sibling["item_id"])) > best:
+                return False
+        return True
+
+    def _off_page(self, item_id, competitor_id, url) -> bool:
+        """True when this store already sells the model on a DIFFERENT page.
+        Their product page holds the whole model, as our matrix does, so a
+        listing elsewhere is more likely a neighbouring model (a trim tier, an
+        older model year) than a second home for ours. Evidence, not a rule —
+        callers demote, never drop."""
+        known = self.known_pages(item_id, competitor_id)
+        return bool(known) and page_key(url) not in known
 
     @classmethod
     def load(cls) -> "MatchIndex":
@@ -390,7 +490,7 @@ class MatchIndex:
             return ("suppress", None)
         return (None, None)
 
-    def match(self, scraped: dict, match_key: str = None):
+    def match(self, scraped: dict, match_key: str = None, competitor_id=None):
         """Returns (item_id, method, confidence, candidate).
 
         Confirmed links always match. The other tiers (GTIN / brand+SKU /
@@ -405,7 +505,13 @@ class MatchIndex:
 
         if match_key and match_key in self.by_link:
             item_id, confidence = self.by_link[match_key]
-            return item_id, "link", confidence, None
+            # A key built from the URL (no usable SKU on the listing) identifies
+            # the page, so on a multi-variant page it can't be trusted to name
+            # the variant — see _link_names_this_listing.
+            page_keyed = (_identifying_sku(scraped.get("sku")) is None
+                          and bool(scraped.get("url")))
+            if not page_keyed or self._link_names_this_listing(item_id, scraped):
+                return item_id, "link", confidence, None
 
         # Runtime-editable via the admin console; defaults to PI_AUTO_CONFIRM.
         auto_confirm = settings.get("auto_confirm")
@@ -448,12 +554,18 @@ class MatchIndex:
             # fuzzy scoring can't distinguish. Demote to a review candidate instead.
             sc, tc = _model_codes(title), _model_codes(self.titles[idx])
             if not (sc and tc and sc.isdisjoint(tc)):
-                if auto_confirm:
+                # A near-identical title on a page that isn't the model's known
+                # home at this store is the model-year/trim trap ("… Eclipse Pro"
+                # 2025 vs 2026 as two pages), so it goes to review, not straight in.
+                off_page = self._off_page(self.title_items[idx], competitor_id,
+                                          scraped.get("url"))
+                if auto_confirm and not off_page:
                     return self.title_items[idx], "fuzzy_title", round(score / 100 * 0.8, 3), None
                 return None, None, 0.0, {
                     "item_id": self.title_items[idx], "method": "fuzzy_title",
                     "confidence": round(score / 100 * 0.8, 3),
                     "fuzzy_score": round(float(score), 1), "level": "variant",
+                    "off_page": off_page,
                 }
 
         # No auto-match: surface the best near-miss (variant or model grain) as
@@ -474,6 +586,7 @@ class MatchIndex:
             elif variant_best:
                 best = ("variant", self.title_items[variant_best[2]], variant_best[1])
             if best:
+                off_page = self._off_page(best[1], competitor_id, scraped.get("url"))
                 # Structured attribute pass (Shopify variants): route to the exact
                 # tracked variant, or suppress a clear color/size mismatch, before
                 # falling back to the fuzzy model/variant candidate.
@@ -488,7 +601,8 @@ class MatchIndex:
                     # a brand) the agreement is a coincidence, so the pair keeps
                     # its real fuzzy score and competes honestly for the review
                     # queue's per-item/per-run budget instead of topping the sort.
-                    anchor_trusted = best[2] >= config.ATTR_ANCHOR_MIN_SCORE
+                    anchor_trusted = (best[2] >= config.ATTR_ANCHOR_MIN_SCORE
+                                      and not off_page)
                     if (verdict == "confirm" and anchor_trusted
                             and config.ATTR_AUTO_CONFIRM and auto_confirm):
                         return target, "attr_exact", 0.97, None
@@ -500,10 +614,12 @@ class MatchIndex:
                                            else None),
                             "fuzzy_score": round(float(best[2]), 1),
                             "level": "variant",
+                            "off_page": off_page,
                         }
                 candidate = {
                     "item_id": best[1],
                     "fuzzy_score": round(float(best[2]), 1),
                     "level": best[0],
+                    "off_page": off_page,
                 }
         return None, None, 0.0, candidate

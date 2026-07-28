@@ -225,6 +225,57 @@ def _brand_name(value):
     return value.get("name") if isinstance(value, dict) else value
 
 
+# A variant label is "<Colour> / <Size>" — the separator is a SPACED slash, so a
+# colourway that itself contains a slash ("Matte Black/Frequency Orange / Medium")
+# survives intact.
+_OPTION_SEPARATOR = " / "
+
+
+def _options_from_label(label) -> list:
+    """Splits a storefront variant label into option values, or [] when the
+    string isn't a variant label at all.
+
+    Real SKUs ("GR-7202216", "0058217001") never carry the spaced slash, so
+    requiring it keeps genuine SKUs out of the option channel — a SKU misread as
+    an option would hand the matcher an imaginary colour/size to conflict on."""
+    text = str(label or "").strip()
+    if _OPTION_SEPARATOR not in text:
+        return []
+    return [part.strip() for part in text.split(_OPTION_SEPARATOR) if part.strip()]
+
+
+def _gtin_key(value) -> str:
+    """Digits-only, leading zeros stripped — the same convention matcher.normalize_upc
+    uses, so a 12-digit UPC in the spec table matches its zero-padded EAN form."""
+    return re.sub(r"\D", "", str(value or "")).lstrip("0")
+
+
+def _spec_table_options(soup: BeautifulSoup) -> dict:
+    """Maps GTIN -> variant label from a SmartEtailing product page's spec table.
+
+    Those storefronts (Oak Bay Bikes, The Bike Zone, ...) publish one JSON-LD
+    Offer per purchasable variant carrying *only* a gtin — no colour, no size —
+    but the same page renders a table that names each one:
+
+        <tr><td data-th="Option">Matte White / Small</td>
+            <td data-th="UPC">199270032023</td> ...
+
+    Recovering that label is what lets the matcher tell a store's variants apart
+    at all; without it every variant of a model looks identical and only the
+    model-grain fuzzy pass can fire."""
+    labels = {}
+    for row in soup.find_all("tr"):
+        option = row.find("td", attrs={"data-th": "Option"})
+        upc = row.find("td", attrs={"data-th": "UPC"})
+        if not option or not upc:
+            continue
+        digits = _gtin_key(upc.get_text(strip=True))
+        label = option.get_text(strip=True)
+        if digits and label:
+            labels[digits] = label
+    return labels
+
+
 def _gtin(*objects):
     for obj in objects:
         if not isinstance(obj, dict):
@@ -329,47 +380,76 @@ def _magento_listings(soup: BeautifulSoup, url: str) -> list:
 
 def _jsonld_listings(soup: BeautifulSoup, url: str) -> list:
     rows = []
+    spec_labels = _spec_table_options(soup)
     for product in _iter_jsonld_products(soup):
         brand = _brand_name(product.get("brand"))
         variants = product.get("hasVariant") or []
         if isinstance(variants, dict):
             variants = [variants]
         sources = variants if variants else [product]
+        # (source, offer) pairs up front: whether this node describes ONE thing
+        # or a whole variant set decides if the product-level gtin may be
+        # inherited (see below), and that can't be known mid-loop.
+        pairs = []
         for source in sources:
             if not isinstance(source, dict):
                 continue
-            source_brand = _brand_name(source.get("brand")) or brand
             offers = source.get("offers")
             if isinstance(offers, dict) and isinstance(offers.get("offers"), list):
                 offers = offers.get("offers")
             offer_list = offers if isinstance(offers, list) else ([offers] if isinstance(offers, dict) else [])
-            if not offer_list:
-                continue
             for offer in offer_list:
-                if not isinstance(offer, dict):
-                    continue
-                fields = _offer_fields(offer)
-                low, high = fields.pop("price_low"), fields.pop("price_high")
-                is_range = (low is not None and high is not None and abs(low - high) > .005
-                            and not offer.get("sku") and source is product)
-                price = fields.pop("price")
-                if price is None and low is None:
-                    continue
-                sku = offer.get("sku") or source.get("sku")
-                variant_options = []
-                for key in ("color", "size"):
-                    if source.get(key):
-                        variant_options.append(str(source[key]))
-                rows.append(_normalized_listing(
-                    title=source.get("name") or product.get("name"), brand=source_brand,
-                    sku=str(sku) if sku else None, gtin=_gtin(offer, source, product),
-                    variant_id=str(source.get("productID")) if source.get("productID") else None,
-                    variant_options=variant_options,
-                    price=low if is_range else price, price_low=low, price_high=high,
-                    currency=fields.get("currency"), in_stock=fields.get("in_stock"),
-                    price_scope="range" if is_range else ("variant" if (variants or len(offer_list) > 1) else "product"),
-                    extraction_method="jsonld", url=url,
-                ))
+                if isinstance(offer, dict):
+                    pairs.append((source, offer, len(offer_list)))
+        # A product-level gtin identifies the product, not any one variant. When
+        # the node yields several listings, inheriting it stamps every variant
+        # with the same barcode — which then collapses them onto one match_key
+        # and one price-history diff_key (Enroute: 30 sizes/colours sharing one
+        # barcode and two prices, so every run reads as a price swing), and
+        # would GTIN-match all of them to a single item at confidence 1.0.
+        sole_listing = len(pairs) == 1
+        for source, offer, offers_in_source in pairs:
+            fields = _offer_fields(offer)
+            low, high = fields.pop("price_low"), fields.pop("price_high")
+            is_range = (low is not None and high is not None and abs(low - high) > .005
+                        and not offer.get("sku") and source is product)
+            price = fields.pop("price")
+            if price is None and low is None:
+                continue
+            sku = offer.get("sku") or source.get("sku")
+            # Offer first, then the variant node; the product node only when it
+            # IS this listing (`source is product` means there were no
+            # hasVariant children, so a product-level gtin would otherwise be
+            # copied onto every offer on the page).
+            chain = [offer]
+            if source is not product:
+                chain.append(source)
+            if sole_listing:
+                chain.append(product)
+            gtin = _gtin(*chain)
+            variant_options = []
+            for key in ("color", "size"):
+                if source.get(key):
+                    variant_options.append(str(source[key]))
+            if not variant_options:
+                # Storefronts that don't use schema.org color/size still name the
+                # variant somewhere: Shopify themes put the label in the offer's
+                # SKU slot ("Deep Navy / XL"), SmartEtailing keeps it in the
+                # page's spec table keyed by UPC.
+                variant_options = (
+                    _options_from_label(sku)
+                    or _options_from_label(spec_labels.get(_gtin_key(gtin)))
+                )
+            rows.append(_normalized_listing(
+                title=source.get("name") or product.get("name"), brand=_brand_name(source.get("brand")) or brand,
+                sku=str(sku) if sku else None, gtin=gtin,
+                variant_id=str(source.get("productID")) if source.get("productID") else None,
+                variant_options=variant_options,
+                price=low if is_range else price, price_low=low, price_high=high,
+                currency=fields.get("currency"), in_stock=fields.get("in_stock"),
+                price_scope="range" if is_range else ("variant" if (variants or offers_in_source > 1) else "product"),
+                extraction_method="jsonld", url=url,
+            ))
     # ProductGroup children are often repeated as standalone Product nodes in
     # @graph. Collapse only truly identical records; differing seller prices for
     # the same SKU remain ambiguous rather than becoming order-dependent.

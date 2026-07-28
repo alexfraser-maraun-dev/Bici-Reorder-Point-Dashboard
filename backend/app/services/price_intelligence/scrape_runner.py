@@ -28,6 +28,10 @@ _status = {"status": "idle"}
 
 PRICE_EPSILON = 0.005
 
+# Ranking multiplier for a candidate at a store where the model is already
+# confirmed on a different page (matcher's `off_page`). Demotion, not exclusion.
+OFF_PAGE_RANK_PENALTY = 0.5
+
 
 def get_status() -> dict:
     with _status_lock:
@@ -295,6 +299,18 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             if not is_confirmed and len(pending_links) >= MAX_COLLECTED_CANDIDATES:
                 return
             item = item_lookup.get(target_id) or {}
+            level = "variant" if is_confirmed else (candidate or {}).get("level", "variant")
+            # A model-grain proposal identifies the model, not the variant: the
+            # page's variant identifiers belong to whichever listing happened to
+            # propose first, so storing one would assert a variant we haven't
+            # established (and would later be re-scraped as though it were ours).
+            model_grain = not is_confirmed and level == "model"
+            if (candidate or {}).get("off_page"):
+                # Ranked below clean candidates so the per-item/per-run review
+                # budget goes to them first — still eligible, just not ahead.
+                base = confidence if confidence is not None \
+                    else (candidate.get("fuzzy_score") or 0) / 100
+                confidence = round(base * OFF_PAGE_RANK_PENALTY, 3)
             row = {
                 "link_id": str(uuid.uuid4()),
                 "item_id": target_id,
@@ -303,10 +319,10 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 "competitor_url": product.get("url"),
                 "competitor_sku": product.get("sku"),
                 "competitor_title": product.get("title"),
-                "gtin": product.get("gtin"),
-                "variant_id": product.get("variant_id"),
+                "gtin": None if model_grain else product.get("gtin"),
+                "variant_id": None if model_grain else product.get("variant_id"),
                 "variant_options_json": json.dumps(product.get("variant_options") or []),
-                "level": "variant" if is_confirmed else (candidate or {}).get("level", "variant"),
+                "level": level,
                 "status": "confirmed" if is_confirmed else "pending",
                 "source": ("gtin" if method == "gtin"
                            else "attr" if method in ("attr", "attr_exact")
@@ -386,7 +402,8 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                     products_seen += 1
                     _count_extraction(counters, product)
                     match_key = build_match_key(cid, product)
-                    item_id, method, confidence, candidate = index.match(product, match_key)
+                    item_id, method, confidence, candidate = index.match(
+                        product, match_key, competitor_id=cid)
                     if item_id is not None and product.get("price_scope") == "product":
                         item = item_lookup.get(str(item_id)) or {}
                         if item.get("item_matrix_id"):
@@ -607,7 +624,8 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                     method, confidence = ("manual_url", 1.0) if item_id else (None, 0.0)
                     if not item_id:
                         item_id, method, confidence, _cand = index.match(
-                            parsed, f"url:{url}"
+                            parsed, f"url:{url}",
+                            competitor_id=url_row.get("competitor_id"),
                         )
                     obs = {
                         "observed_at": _now_iso(),

@@ -147,7 +147,8 @@ def discover(needy_item_ids: list, competitors: list, index,
                 if match_key in existing_link_keys:
                     continue
                 existing_link_keys.add(match_key)
-                matched_id, method, confidence, _cand = index.match(parsed, match_key)
+                matched_id, method, confidence, _cand = index.match(
+                    parsed, match_key, competitor_id=cid)
                 target_id = str(matched_id or item_id)
                 # One link per (item, competitor): the index can fuzzy-match a
                 # different result of the same search onto the same item.

@@ -38,8 +38,17 @@ SYSTEM_PROMPT = (
     "'Grand Prix 5000 TT TR' vs 'Grand Prix 5000' is 'different', as are "
     "S TR vs TR vs AS TR, tubeless vs clincher vs tubular, disc vs rim, "
     "Di2/AXS/eTap vs mechanical, and trim tiers (SL/Pro/Comp/Expert/Sport). "
-    "When one title carries such a suffix and the other does not, that is "
-    "'different' unless another field proves otherwise. "
+    "TRIM RULE, apply before any other reasoning and without exception: if one "
+    "title carries a trim/edition token the other lacks, the verdict is "
+    "'different' — never 'same_model'. A base model and its uprated version are "
+    "two products that merely share a name. 'Giro Eclipse Pro Spherical Helmet' "
+    "vs 'Eclipse Spherical Helmet' is 'different'. 'Aeroad CF SLX' vs 'Aeroad "
+    "CF SL' is 'different'. Sharing a colour and size does not make them the "
+    "same product, and neither does a plausible price gap. "
+    "If ours.model_already_matched_at_this_store is present, that store sells "
+    "our model on that other page — a listing at a DIFFERENT url is then "
+    "almost certainly a neighbouring model: prefer 'different' unless the "
+    "titles match exactly. "
     "'uncertain' = you cannot tell from the given fields. "
     "Extract the competitor's size token into competitor_size when present "
     "(e.g. '56', 'M', 'XL', '700 x 25c'), else null. Do not guess: prices "
@@ -81,27 +90,33 @@ def _get_anthropic_client():
     return _anthropic_client
 
 
-def _build_pair(link: dict, item: dict) -> dict:
+def _build_pair(link: dict, item: dict, known_page: str = None) -> dict:
+    ours = {
+        "title": item.get("title"),
+        "brand": item.get("brand"),
+        "sku": item.get("sku"),
+        "upc": item.get("upc_normalized"),
+        "price": item.get("current_retail"),
+        "matrix_description": item.get("matrix_description"),
+        # All variant attributes — size can live in any slot (tires keep
+        # color in attribute_1 and "700c x 28mm" in attribute_2).
+        "variant_attributes": [
+            a for a in (item.get("attribute_1"), item.get("attribute_2"),
+                        item.get("attribute_3"))
+            if a and str(a).strip()
+        ],
+    }
+    # Only worth sending when it contradicts the proposal — the page this
+    # listing is on is already the known one otherwise.
+    if known_page and known_page != matcher.page_key(link.get("competitor_url")):
+        ours["model_already_matched_at_this_store"] = known_page
     return {
         "pair_id": link["link_id"],
-        "ours": {
-            "title": item.get("title"),
-            "brand": item.get("brand"),
-            "sku": item.get("sku"),
-            "upc": item.get("upc_normalized"),
-            "price": item.get("current_retail"),
-            "matrix_description": item.get("matrix_description"),
-            # All variant attributes — size can live in any slot (tires keep
-            # color in attribute_1 and "700c x 28mm" in attribute_2).
-            "variant_attributes": [
-                a for a in (item.get("attribute_1"), item.get("attribute_2"),
-                            item.get("attribute_3"))
-                if a and str(a).strip()
-            ],
-        },
+        "ours": ours,
         "theirs": {
             "title": link.get("competitor_title"),
             "sku": link.get("competitor_sku"),
+            "variant_options": json.loads(link.get("variant_options_json") or "[]"),
             "price": link.get("their_price"),
             "url": link.get("competitor_url"),
         },
@@ -120,8 +135,9 @@ def _size_matches(size: str, attr: str) -> bool:
 
 def _resolve_model_anchor(item: dict, competitor_size, tracked_by_matrix: dict):
     """For a same_model verdict, picks the tracked variant the link should attach
-    to. Returns (item_id, resolved) — resolved False means ambiguous (stays
-    pending for a human to pick the variant).
+    to. Returns (item_id, resolved, note) — resolved False means ambiguous (stays
+    pending for a human to pick the variant), and note explains an unresolvable
+    size so the queue row says why our variant is shown next to a different one.
 
     A competitor variant pairs with exactly ONE of our variants, so a matrix
     item only auto-confirms when the extracted size matches exactly one tracked
@@ -132,7 +148,7 @@ def _resolve_model_anchor(item: dict, competitor_size, tracked_by_matrix: dict):
     variants = tracked_by_matrix.get(matrix_id, []) if matrix_id else []
     if not variants:
         # Non-matrix item: there is no other variant it could be.
-        return str(item["item_id"]), True
+        return str(item["item_id"]), True, None
     if competitor_size:
         size = str(competitor_size)
         hits = [
@@ -144,10 +160,15 @@ def _resolve_model_anchor(item: dict, competitor_size, tracked_by_matrix: dict):
             )
         ]
         if len(hits) == 1:
-            return str(hits[0]["item_id"]), True
+            return str(hits[0]["item_id"]), True, None
+        if not hits:
+            # Their size is one we don't stock in this matrix, so the item shown
+            # is the matrix's anchor variant, not a claimed size match.
+            return (str(item["item_id"]), False,
+                    f"we track no '{size}' variant of this model")
     # No unambiguous size resolution: keep the fuzzy anchor but require human
     # confirmation.
-    return str(item["item_id"]), False
+    return str(item["item_id"]), False, None
 
 
 def verify_candidates(max_pairs: int = None) -> dict:
@@ -171,14 +192,30 @@ def verify_candidates(max_pairs: int = None) -> dict:
         if t.get("item_matrix_id"):
             tracked_by_matrix.setdefault(t["item_matrix_id"], []).append(t)
 
+    confirmed_links = repository.get_product_links(status="confirmed", limit=5000)
     # One confirmed link per (item, competitor): a competitor variant pairs
     # with exactly one of our variants, so once a pair is taken, further
     # would-be confirmations stay pending for human review.
     confirmed_pairs = {
         (str(l["item_id"]), l.get("competitor_id"))
-        for l in repository.get_product_links(status="confirmed", limit=5000)
-        if l.get("item_id")
+        for l in confirmed_links if l.get("item_id")
     }
+    # (model group, competitor) -> the page there we've already confirmed sells
+    # it. Given to the model as evidence against a proposal on a different page.
+    known_pages = {}
+    for link in confirmed_links:
+        owner = by_id.get(str(link.get("item_id") or ""))
+        page = matcher.page_key(link.get("competitor_url"))
+        if owner and page and link.get("competitor_id"):
+            known_pages.setdefault(
+                (matcher.model_group_key(owner), link["competitor_id"]), page)
+
+    def _known_page(link: dict):
+        owner = by_id.get(str(link.get("item_id") or ""))
+        if not owner:
+            return None
+        return known_pages.get(
+            (matcher.model_group_key(owner), link.get("competitor_id")))
 
     # Within one run, several candidates can claim the same (item, competitor).
     # The best attribute (color+size) match wins the slot; a lower-scoring one that
@@ -195,8 +232,12 @@ def verify_candidates(max_pairs: int = None) -> dict:
                 "[item already has a confirmed link at this store]"
             ).strip()[:300]
             return False
+        # Structured options when the connector recovered them; the title tail is
+        # the fallback for listings that carry the variant only in their name.
+        options = (json.loads(link.get("variant_options_json") or "[]")
+                   or matcher.parse_variant_options(link.get("competitor_title")))
         score = matcher.attribute_match_score(
-            matcher.parse_variant_options(link.get("competitor_title")),
+            options,
             [item.get("attribute_1"), item.get("attribute_2"), item.get("attribute_3")],
         )
         prev = claimed_in_run.get(pair)
@@ -227,7 +268,8 @@ def verify_candidates(max_pairs: int = None) -> dict:
                  if str(l.get("item_id")) in by_id]
         if not batch:
             continue
-        pairs = [_build_pair(l, by_id[str(l["item_id"])]) for l in batch]
+        pairs = [_build_pair(l, by_id[str(l["item_id"])], _known_page(l))
+                 for l in batch]
         by_link_id = {l["link_id"]: l for l in batch}
         try:
             message = client.messages.create(
@@ -287,12 +329,16 @@ def verify_candidates(max_pairs: int = None) -> dict:
                 else:
                     stats["pending"] += 1
             elif verdict == "same_model":
-                anchor_id, resolved = _resolve_model_anchor(
+                anchor_id, resolved, note = _resolve_model_anchor(
                     item, result.get("competitor_size"), tracked_by_matrix
                 )
                 # Re-anchoring to the size-matched variant is useful triage even
                 # when the confirm itself waits for a human.
                 update.update(item_id=anchor_id, level="model")
+                if note:
+                    update["llm_reason"] = (
+                        f"{update['llm_reason']} [{note}]"
+                    ).strip()[:300]
                 if not (settings.get("auto_confirm") and resolved):
                     stats["pending"] += 1
                 else:
