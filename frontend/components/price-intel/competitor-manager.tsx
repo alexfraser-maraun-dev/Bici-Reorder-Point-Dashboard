@@ -14,13 +14,19 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
 import {
-  Dialog, DialogContent, DialogHeader, DialogTitle,
+  Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog'
+import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 import { ApiError, apiPost, useCompetitors, useTrackedUrls } from '@/lib/price-intel/hooks'
 import { itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
-import type { TrackedUrl, VariantCandidate, VariantSelectionRequired } from '@/lib/price-intel/types'
+import type {
+  Competitor, CompetitorCrawlSettings, TrackedUrl, VariantCandidate,
+  VariantSelectionRequired,
+} from '@/lib/price-intel/types'
 import { ItemSearchPicker } from './item-search-picker'
-import { ExternalLink, Globe, Link2, Plus, Trash2 } from 'lucide-react'
+import { ExternalLink, Globe, Link2, Plus, Settings2, Trash2 } from 'lucide-react'
 
 const CONNECTOR_LABEL: Record<string, { label: string; tone: string }> = {
   shopify_json: { label: 'Shopify (catalog)', tone: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
@@ -55,6 +61,169 @@ function crawlCoverage(json: string | null | undefined):
   }
 }
 
+function parseSettings(json: string | null | undefined): CompetitorCrawlSettings {
+  if (!json) return {}
+  try {
+    const parsed = JSON.parse(json)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Per-competitor crawl overrides. Every field is optional and blank means "use
+ * the global default", so the dialog only ever sends the keys that were filled
+ * in — a store with nothing set behaves exactly as it did before.
+ */
+function CrawlSettingsDialog(
+  { competitor, onClose, onSaved }:
+  { competitor: Competitor | null; onClose: () => void; onSaved: () => Promise<unknown> },
+) {
+  const [form, setForm] = useState<CompetitorCrawlSettings>({})
+  const [saving, setSaving] = useState(false)
+  // Re-seed the form whenever a different competitor's dialog is opened.
+  const [seededFor, setSeededFor] = useState<string | null>(null)
+  if (competitor && seededFor !== competitor.competitor_id) {
+    setSeededFor(competitor.competitor_id)
+    setForm(parseSettings(competitor.settings_json))
+  }
+
+  const set = <K extends keyof CompetitorCrawlSettings>(
+    key: K, value: CompetitorCrawlSettings[K],
+  ) => setForm((prev) => {
+    const next = { ...prev }
+    // An emptied field must delete the key, not store '' — the backend treats a
+    // present key as an override and a missing one as "fall back to global".
+    if (value === undefined || value === '' || value === null) delete next[key]
+    else next[key] = value
+    return next
+  })
+
+  const numeric = (key: keyof CompetitorCrawlSettings) => (raw: string) => {
+    const value = raw.trim()
+    if (!value) return set(key, undefined)
+    const parsed = Number(value)
+    if (Number.isFinite(parsed) && parsed > 0) set(key, parsed as never)
+  }
+
+  const save = async () => {
+    if (!competitor) return
+    setSaving(true)
+    try {
+      await apiPost('/api/price-intel/competitors', {
+        ...competitor,
+        settings: form,
+      })
+      toast.success(`Crawl settings saved for ${competitor.name}`)
+      onClose()
+      await onSaved()
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to save crawl settings')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open={competitor !== null} onOpenChange={(open) => { if (!open) onClose() }}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Crawl settings — {competitor?.name}</DialogTitle>
+          <DialogDescription>
+            Leave a field blank to use the global default. These only affect the
+            nightly catalog crawl, not tracked URLs.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Brand filter</Label>
+            <Select value={form.brand_filter ?? 'auto'}
+                    onValueChange={(v) => set('brand_filter',
+                      v === 'auto' ? undefined : (v as 'on' | 'off'))}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">Auto (recommended)</SelectItem>
+                <SelectItem value="on">Always filter to tracked brands</SelectItem>
+                <SelectItem value="off">Never filter on brand</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[11px] text-muted-foreground">
+              Auto drops the brand filter on stores that don&apos;t put brand names in
+              their product URLs — on those, filtering would discard the whole catalog.
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs">Only crawl paths matching</Label>
+            <Input placeholder="/product/" value={form.url_allow_pattern ?? ''}
+                   onChange={(e) => set('url_allow_pattern', e.target.value)} />
+            <p className="text-[11px] text-muted-foreground">
+              Regex against the URL path. Narrows the sitemap to real product pages
+              so the nightly page budget isn&apos;t spent on anything else.
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs">Never crawl paths matching</Label>
+            <Input placeholder="/gift-card|/rental" value={form.url_deny_pattern ?? ''}
+                   onChange={(e) => set('url_deny_pattern', e.target.value)} />
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label className="text-xs">Seconds between requests</Label>
+              <Input inputMode="decimal" placeholder="1.0"
+                     defaultValue={form.request_interval_seconds ?? ''}
+                     onChange={(e) => numeric('request_interval_seconds')(e.target.value)} />
+              <p className="text-[11px] text-muted-foreground">
+                Lower crawls more of the catalog each night. A 429 automatically
+                backs this store off for the rest of the run.
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Max product pages / night</Label>
+              <Input inputMode="numeric" placeholder="300"
+                     defaultValue={form.max_product_pages ?? ''}
+                     onChange={(e) => numeric('max_product_pages')(e.target.value)} />
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs">Sitemap URLs (one per line)</Label>
+            <Textarea rows={2} className="text-xs"
+                      placeholder="https://store.example.com/sitemap_products_1.xml"
+                      defaultValue={(form.sitemap_urls ?? []).join('\n')}
+                      onChange={(e) => {
+                        const lines = e.target.value.split('\n').map((l) => l.trim()).filter(Boolean)
+                        set('sitemap_urls', lines.length ? lines : undefined)
+                      }} />
+            <p className="text-[11px] text-muted-foreground">
+              Only needed when robots.txt and /sitemap.xml don&apos;t reveal the catalog.
+            </p>
+          </div>
+
+          <div className="flex items-center justify-between rounded-md border p-3">
+            <div>
+              <Label className="text-xs">Stay on this domain</Label>
+              <p className="text-[11px] text-muted-foreground">
+                Skip sitemap entries pointing at other hosts. Turn off only for a
+                store that genuinely serves products from a second domain.
+              </p>
+            </div>
+            <Switch checked={form.confine_to_domain !== false}
+                    onCheckedChange={(on) => set('confine_to_domain', on ? undefined : false)} />
+          </div>
+        </div>
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
+          <Button size="sm" onClick={save} disabled={saving}>Save</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function CompetitorManager() {
   const { competitors, isLoading, mutate } = useCompetitors()
   const { urls, isLoading: urlsLoading, mutate: mutateUrls } = useTrackedUrls()
@@ -65,6 +234,7 @@ export function CompetitorManager() {
   const [newUrlCompetitor, setNewUrlCompetitor] = useState<string>('none')
   const [saving, setSaving] = useState(false)
   const [linkTarget, setLinkTarget] = useState<TrackedUrl | null>(null)
+  const [settingsTarget, setSettingsTarget] = useState<Competitor | null>(null)
   const [linkChoice, setLinkChoice] = useState<{
     itemId: string; itemTitle: string | null; candidates: VariantCandidate[]
   } | null>(null)
@@ -194,7 +364,7 @@ export function CompetitorManager() {
                   <TableHead>Last scraped</TableHead>
                   <TableHead>Coverage</TableHead>
                   <TableHead>Status</TableHead>
-                  <TableHead className="w-10" />
+                  <TableHead className="w-20" />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -237,10 +407,17 @@ export function CompetitorManager() {
                     </TableCell>
                     <TableCell>
                       {c.connector_type !== BENCHMARK_CONNECTOR && (
-                        <Button variant="ghost" size="sm" title="Disable"
-                                onClick={() => removeCompetitor(c.competitor_id, c.name)}>
-                          <Trash2 className="h-4 w-4 text-muted-foreground" />
-                        </Button>
+                        <div className="flex items-center">
+                          <Button variant="ghost" size="sm" title="Crawl settings"
+                                  onClick={() => setSettingsTarget(c)}>
+                            <Settings2 className={`h-4 w-4 ${
+                              c.settings_json ? 'text-sky-600' : 'text-muted-foreground'}`} />
+                          </Button>
+                          <Button variant="ghost" size="sm" title="Disable"
+                                  onClick={() => removeCompetitor(c.competitor_id, c.name)}>
+                            <Trash2 className="h-4 w-4 text-muted-foreground" />
+                          </Button>
+                        </div>
                       )}
                     </TableCell>
                   </TableRow>
@@ -349,6 +526,10 @@ export function CompetitorManager() {
           )}
         </CardContent>
       </Card>
+
+      <CrawlSettingsDialog competitor={settingsTarget}
+                           onClose={() => setSettingsTarget(null)}
+                           onSaved={mutate} />
 
       <Dialog open={linkTarget !== null} onOpenChange={(open) => {
         if (!open) { setLinkTarget(null); setLinkChoice(null) }

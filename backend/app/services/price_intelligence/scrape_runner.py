@@ -19,7 +19,8 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from . import config, repository
-from .connectors import PageScraper, build_connector, detect_connector_type
+from .connectors import (ItemTokenIndex, PageScraper, build_connector,
+                         detect_connector_type)
 from .matcher import MatchIndex, build_match_key, _identifying_sku
 
 _scrape_lock = threading.Lock()
@@ -266,7 +267,11 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         # diff_key prefix — peak memory is one store's listings, never every
         # store's trailing-45-day history. Namespaces ('cat:{cid}:', 'link:',
         # 'url:') don't overlap, so event semantics are unchanged.
-        brand_tokens = sorted({(r.get("brand") or "") for r in item_lookup.values()} - {""})
+        # Slug tokens for every tracked item, computed once. Each competitor
+        # then gets targets built from the items it specifically can't price
+        # yet — that's what decides which product pages the nightly page budget
+        # is spent on (see _HtmlPageCrawler._rank_candidates).
+        token_index = ItemTokenIndex(item_lookup)
 
         # Candidate links for LLM/human verification. Collection is generous
         # (competitor catalogs surface thousands of same-brand near-misses);
@@ -388,7 +393,13 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                         competitor.get("crawl_state_json") or "{}").get("cursor") or 0)
                 except (TypeError, ValueError):
                     cursor = 0
-                connector = build_connector(competitor, brand_tokens=brand_tokens,
+                # Items we still can't price *on this competitor* are what the
+                # crawl hunts: their model tokens promote candidate URLs ahead
+                # of the alphabetical sweep. Items already linked here are
+                # re-checked by URL in the confirmed-link phase instead.
+                targets = token_index.targets_for(
+                    {str(i) for i in item_lookup if (str(i), cid) not in confirmed_pairs})
+                connector = build_connector(competitor, brand_tokens=targets,
                                             cursor=cursor)
                 if connector is None:
                     repository.mark_competitor_scraped(cid, "skipped_no_connector")
@@ -484,8 +495,16 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 # but persists none (no tracked-brand overlap) — both looked like
                 # plain "success" before and hid, e.g., the Oak Bay 0-result crawl.
                 obs_added = counters["observations"] - obs_before
+                diagnostics = (connector.diagnostics()
+                               if hasattr(connector, "diagnostics") else {})
                 if products_seen == 0:
-                    comp_status = "success_no_products"
+                    # A zero crawl has several very different causes and they
+                    # used to be indistinguishable. Name the one we can prove:
+                    # the site refusing us outright is not a bad sitemap.
+                    fetches = diagnostics.get("fetches") or 0
+                    blocked = diagnostics.get("blocked_fetches") or 0
+                    comp_status = ("success_blocked" if fetches and blocked >= fetches / 2
+                                   else "success_no_products")
                 elif obs_added == 0:
                     comp_status = "success_no_matches"
                 # Persist the rotation cursor + coverage. cap_hit means the
@@ -500,6 +519,10 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                     "cap_hit": bool(getattr(connector, "cap_hit", False)),
                     "catalog_exhausted": not getattr(connector, "cap_hit", False),
                     "updated_at": _now_iso(),
+                    # Why the crawl went the way it did: HTTP outcomes, how many
+                    # URLs survived each filter, and how much of the budget went
+                    # to relevance-ranked pages vs the alphabetical sweep.
+                    **diagnostics,
                 }
             except Exception as e:
                 comp_status = f"failed: {e}"

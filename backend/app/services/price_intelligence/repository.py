@@ -307,10 +307,17 @@ def ensure_pi_tables():
             "variant_options_json": "STRING",
         })
         _ensure_columns(client, T_RUNS, {"stats_json": "STRING"})
-        # Per-competitor crawl cursor + last-crawl coverage (JSON: cursor,
-        # pages_done, products_seen, cap_hit, catalog_exhausted, updated_at) —
-        # lets nightly full scans rotate through catalogs larger than the caps.
-        _ensure_columns(client, T_COMPETITORS, {"crawl_state_json": "STRING"})
+        # crawl_state_json: per-competitor crawl cursor, last-crawl coverage and
+        # diagnostics (cursor, pages_done, products_seen, cap_hit, HTTP status
+        # histogram, filter funnel) — written by the crawl, read by the health
+        # panel. settings_json: per-competitor crawl *overrides* (URL patterns,
+        # crawl delay, page budget, brand-filter mode), written by the user.
+        # Two columns because one is machine state and one is configuration:
+        # upsert_competitor updates the settings and never the cursor.
+        _ensure_columns(client, T_COMPETITORS, {
+            "crawl_state_json": "STRING",
+            "settings_json": "STRING",
+        })
         _tables_ensured = True
 
 
@@ -524,6 +531,27 @@ def get_competitors(include_disabled: bool = True):
     return rows
 
 
+def _competitor_settings_json(value):
+    """Normalize per-competitor crawl settings to the stored JSON string.
+
+    Accepts a dict (from the API) or an already-serialized string (a row
+    round-tripping back through the runner). Unparseable input is dropped rather
+    than stored — a bad blob would be re-read by every crawl."""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            json.loads(text)
+        except ValueError:
+            print("pi: ignoring unparseable competitor settings_json on write")
+            return None
+        return text
+    if isinstance(value, dict):
+        return json.dumps(value) if value else None
+    return None
+
+
 def upsert_competitor(data: dict) -> dict:
     now = utcnow_iso()
     row = {
@@ -537,10 +565,22 @@ def upsert_competitor(data: dict) -> dict:
         "updated_at": now,
         "last_scraped_at": data.get("last_scraped_at"),
         "last_scrape_status": data.get("last_scrape_status"),
+        "settings_json": _competitor_settings_json(data.get("settings")
+                                                   if "settings" in data
+                                                   else data.get("settings_json")),
     }
+    # crawl_state_json is deliberately absent: it's the crawl's own cursor, and
+    # an edit in the UI must not reset where tonight's crawl resumes.
+    update_cols = ["name", "base_url", "connector_type", "enabled", "notes",
+                   "updated_at"]
+    # Only overwrite settings when the caller actually sent them. The runner
+    # re-upserts a competitor after connector autodetection; that write must not
+    # wipe crawl settings it never looked at.
+    if "settings" in data or "settings_json" in data:
+        update_cols.append("settings_json")
     _merge_upsert(
         T_COMPETITORS, [row], "competitor_id",
-        update_cols=["name", "base_url", "connector_type", "enabled", "notes", "updated_at"],
+        update_cols=update_cols,
         insert_cols=list(row.keys()),
     )
     invalidate_pi_caches()
@@ -2453,9 +2493,11 @@ def _scrape_status_bucket(status: str) -> str:
         return "failed"
     if s == "skipped_no_connector":
         return "skipped"
-    if s == "success_no_products":
-        return "empty"       # connector returned nothing (bad sitemap / blocked)
-    if s == "success_no_matches":
+    if s.startswith("success_blocked"):
+        return "blocked"     # the site refused us (403/429), not a bad sitemap
+    if s.startswith("success_no_products"):
+        return "empty"       # connector returned nothing (bad sitemap / filters)
+    if s.startswith("success_no_matches"):
         return "no_matches"  # products found, none in a tracked brand
     if s.startswith("success"):
         return "ok"
@@ -2495,16 +2537,29 @@ def get_scrape_health() -> dict:
             "products_seen": crawl_state.get("products_seen"),
             "pages_done": crawl_state.get("pages_done"),
             "cap_hit": bool(crawl_state.get("cap_hit")),
+            # Why a crawl underperformed: the filter funnel from sitemap URLs
+            # down to pages actually fetched, how much of the budget went to
+            # relevance-ranked pages, and what the site answered.
+            "sitemap_urls_seen": crawl_state.get("sitemap_urls_seen"),
+            "candidates_crawlable": crawl_state.get("candidates_crawlable"),
+            "brand_hit_rate": crawl_state.get("brand_hit_rate"),
+            "brand_gate_applied": crawl_state.get("brand_gate_applied"),
+            "targeted_candidates": crawl_state.get("targeted_candidates"),
+            "targeted_pages_done": crawl_state.get("targeted_pages_done"),
+            "off_domain_dropped": crawl_state.get("off_domain_dropped"),
+            "blocked_fetches": crawl_state.get("blocked_fetches"),
+            "fetches": crawl_state.get("fetches"),
+            "status_counts": crawl_state.get("status_counts") or {},
         })
-    per.sort(key=lambda p: ({"failed": 0, "empty": 1, "no_matches": 2,
-                             "skipped": 3, "unknown": 4, "ok": 5}.get(p["bucket"], 6),
+    per.sort(key=lambda p: ({"failed": 0, "blocked": 1, "empty": 2, "no_matches": 3,
+                             "skipped": 4, "unknown": 5, "ok": 6}.get(p["bucket"], 7),
                             p["name"] or ""))
     run_status = (run or {}).get("status")
     if run_status == "running":
         overall = "running"
     elif counts.get("failed") or run_status == "failed":
         overall = "failed"
-    elif run_status == "partial" or counts.get("empty"):
+    elif run_status == "partial" or counts.get("empty") or counts.get("blocked"):
         overall = "degraded"
     elif run_status in ("success", "partial") or counts.get("ok"):
         overall = "healthy"
@@ -2515,6 +2570,7 @@ def get_scrape_health() -> dict:
         "last_run": run,
         "counts": {"total": len(per), "ok": counts.get("ok", 0),
                    "empty": counts.get("empty", 0), "no_matches": counts.get("no_matches", 0),
+                   "blocked": counts.get("blocked", 0),
                    "failed": counts.get("failed", 0), "skipped": counts.get("skipped", 0)},
         "competitors": per,
     }

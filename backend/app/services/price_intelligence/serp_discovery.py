@@ -27,15 +27,15 @@ from urllib.parse import urlparse
 import requests
 
 from . import config, repository
-from .connectors import PageScraper
+from .connectors import PageScraper, _same_site, _site_host
 from .matcher import build_match_key, strip_variant_tokens
 
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
 
 def _domain(url: str) -> str:
-    netloc = urlparse(url or "").netloc.lower()
-    return netloc[4:] if netloc.startswith("www.") else netloc
+    """The competitor's bare host, used to build the `site:` query term."""
+    return _site_host(url) or urlparse(url or "").netloc.lower()
 
 
 def _search(query: str) -> list:
@@ -133,10 +133,9 @@ def discover(needy_item_ids: list, competitors: list, index,
                 print(f"pi: serp search failed ({query!r}): {e}")
                 break
             per_competitor[cid] = per_competitor.get(cid, 0)
-            on_domain = [
-                u for u in result_urls
-                if _domain(u) == domain or _domain(u).endswith("." + domain)
-            ]
+            # Google honours `site:` loosely; confine results to the competitor's
+            # own site with the same check the catalog crawl uses.
+            on_domain = [u for u in result_urls if _same_site(u, domain)]
             for url in on_domain[:config.SERP_RESULTS_PER_SEARCH]:
                 parsed = scraper.fetch(url)
                 stats["pages_fetched"] += 1

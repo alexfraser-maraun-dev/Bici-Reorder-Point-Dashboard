@@ -25,6 +25,7 @@ import re
 import threading
 import time
 import unicodedata
+from collections import Counter
 import ipaddress
 import socket
 import urllib.robotparser
@@ -73,17 +74,120 @@ def _is_public_http_url(url: str) -> bool:
 _session.headers.update({"User-Agent": config.USER_AGENT, "Accept": "*/*"})
 
 
+def _site_host(url: str) -> str:
+    """Hostname of a URL, lowercased and with a leading `www.` dropped.
+
+    Accepts a bare host ("example.com") as well as a full URL — callers hold
+    competitor identity in both forms."""
+    try:
+        text = str(url or "").strip()
+        if text and "//" not in text:
+            text = "//" + text  # bare host: make urlparse read it as a netloc
+        host = (urlparse(text).hostname or "").lower()
+    except (ValueError, TypeError):
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _same_site(url: str, base_url: str) -> bool:
+    """True when `url` belongs to `base_url`'s site: the same host, or a
+    subdomain of it.
+
+    Crawl scope, not an SSRF check (that's _is_public_http_url). Sitemaps name
+    whatever hosts they like — `robots.txt` Sitemap: lines and <sitemapindex>
+    children in particular — and a page fetched off-site would still have its
+    price recorded against this competitor_id. The leading dot on the suffix
+    test is load-bearing: it's what stops 'evil-example.com' from passing as
+    'example.com'.
+    """
+    host, base = _site_host(url), _site_host(base_url)
+    if not host or not base:
+        return False
+    return host == base or host.endswith("." + base)
+
+
+class _FetchStats:
+    """HTTP outcomes for one competitor's crawl.
+
+    Without this a competitor at zero products is unexplainable: polite_get
+    hands back 403/429 without retrying and every caller only counts 200s, so
+    "blocked", "sitemap 404s" and "filtered down to nothing" all end the night
+    looking identical. The histogram rides along in crawl_state_json.
+    """
+
+    def __init__(self):
+        self.status_counts: Dict[str, int] = {}
+        self.fetch_errors = 0
+        self.robots_blocked = 0
+        self.unsafe_urls = 0
+
+    def record_status(self, code: int):
+        key = str(int(code))
+        self.status_counts[key] = self.status_counts.get(key, 0) + 1
+
+    @property
+    def blocked(self) -> int:
+        """Fetches refused by the site itself (403/429) — the block signal."""
+        return sum(n for code, n in self.status_counts.items()
+                   if code in ("401", "403", "429"))
+
+    @property
+    def total(self) -> int:
+        return (sum(self.status_counts.values()) + self.fetch_errors
+                + self.robots_blocked + self.unsafe_urls)
+
+    def as_dict(self) -> dict:
+        return {
+            "status_counts": dict(self.status_counts),
+            "fetch_errors": self.fetch_errors,
+            "robots_blocked": self.robots_blocked,
+            "blocked_fetches": self.blocked,
+            "fetches": self.total,
+        }
+
+
 class _DomainThrottle:
-    """Serializes requests per domain at REQUEST_INTERVAL_SECONDS."""
+    """Serializes requests per domain at REQUEST_INTERVAL_SECONDS, or at a
+    per-competitor interval when the caller passes one.
+
+    A 429 raises that host's floor for the rest of the process, so a
+    per-competitor interval tuned too aggressively self-corrects instead of
+    getting us blocked. The clamp keeps a mistyped setting (0, 3600) from
+    hammering a store or stalling the night.
+    """
+
+    MIN_INTERVAL = 0.25
+    MAX_INTERVAL = 30.0
+    PENALTY_FACTOR = 2.0
+    MAX_PENALTY = 8.0
 
     def __init__(self):
         self._last: Dict[str, float] = {}
+        self._penalty: Dict[str, float] = {}
         self._lock = threading.Lock()
 
-    def wait(self, domain: str):
+    def _base_interval(self, interval) -> float:
+        try:
+            value = config.REQUEST_INTERVAL_SECONDS if interval is None else float(interval)
+        except (TypeError, ValueError):
+            value = config.REQUEST_INTERVAL_SECONDS
+        return min(max(value, self.MIN_INTERVAL), self.MAX_INTERVAL)
+
+    def penalize(self, domain: str):
+        """Called on a 429: back this host off for the remainder of the run."""
         with self._lock:
+            current = self._penalty.get(domain, 1.0)
+            self._penalty[domain] = min(current * self.PENALTY_FACTOR, self.MAX_PENALTY)
+
+    def penalty(self, domain: str) -> float:
+        with self._lock:
+            return self._penalty.get(domain, 1.0)
+
+    def wait(self, domain: str, interval=None):
+        with self._lock:
+            target = self._base_interval(interval) * self._penalty.get(domain, 1.0)
             elapsed = time.time() - self._last.get(domain, 0.0)
-            delay = max(0.0, config.REQUEST_INTERVAL_SECONDS - elapsed)
+            delay = max(0.0, target - elapsed)
             # Reserve the slot before sleeping so concurrent callers queue up.
             self._last[domain] = time.time() + delay
         if delay > 0:
@@ -131,28 +235,47 @@ _magento_graphql_capabilities = {}
 _magento_graphql_lock = threading.Lock()
 
 
-def polite_get(url: str, *, respect_robots: bool = True) -> Optional[requests.Response]:
+def polite_get(url: str, *, respect_robots: bool = True, interval=None,
+               stats: Optional[_FetchStats] = None) -> Optional[requests.Response]:
     """GET with throttle, robots check, and backoff on 429/5xx. Returns None when
-    blocked by robots or after exhausting retries."""
+    blocked by robots or after exhausting retries.
+
+    `interval` overrides the global per-domain delay for this request (a
+    per-competitor setting). `stats`, when given, collects the HTTP outcome so a
+    crawl can report *why* it came back empty.
+    """
     if not _is_public_http_url(url):
         print(f"pi: refusing to fetch non-public/unsafe URL {url}")
+        if stats is not None:
+            stats.unsafe_urls += 1
         return None
     if respect_robots and not _robots.can_fetch(url):
         print(f"pi: robots.txt disallows {url}")
+        if stats is not None:
+            stats.robots_blocked += 1
         return None
     domain = urlparse(url).netloc
     backoff = 2.0
     for attempt in range(config.MAX_RETRIES + 1):
-        _throttle.wait(domain)
+        _throttle.wait(domain, interval)
         try:
             resp = _session.get(url, timeout=config.REQUEST_TIMEOUT_SECONDS)
         except Exception as e:
             print(f"pi: request error for {url}: {e}")
             resp = None
+        if stats is not None:
+            if resp is None:
+                stats.fetch_errors += 1
+            else:
+                stats.record_status(resp.status_code)
         if resp is not None and resp.status_code < 400:
             return resp
         if resp is not None and 400 <= resp.status_code < 429:
             return resp  # client error other than throttling: retrying won't help
+        if resp is not None and resp.status_code == 429:
+            # Slow this host down for the rest of the run, not just this retry —
+            # otherwise a too-fast per-competitor interval keeps earning 429s.
+            _throttle.penalize(domain)
         if attempt < config.MAX_RETRIES:
             retry_after = 0.0
             if resp is not None and resp.status_code == 429:
@@ -743,6 +866,34 @@ class _CrawlStatsMixin:
         self.cap_hit = False       # budget exhausted before the catalog ended
         self.next_cursor = start_cursor  # where tomorrow's crawl should start
 
+    @property
+    def stats(self) -> _FetchStats:
+        """HTTP outcomes for this crawl (lazily created so subclasses don't all
+        need to remember to build one in __init__)."""
+        existing = getattr(self, "_stats", None)
+        if existing is None:
+            existing = _FetchStats()
+            self._stats = existing
+        return existing
+
+    def diagnostics(self) -> dict:
+        """Everything the health panel needs to explain a disappointing crawl:
+        how many URLs the sitemaps offered, how many survived each filter, what
+        share carried a tracked brand, and what the site actually answered."""
+        return {
+            **self.stats.as_dict(),
+            "sitemap_urls_seen": getattr(self, "sitemap_urls_seen", 0),
+            "candidates_shape_ok": getattr(self, "candidates_shape_ok", 0),
+            "candidates_crawlable": getattr(self, "candidates_crawlable", 0),
+            "off_domain_dropped": getattr(self, "off_domain_dropped", 0),
+            "brand_hit_rate": getattr(self, "brand_hit_rate", None),
+            "brand_gate_applied": getattr(self, "brand_gate_applied", None),
+            "targeted_candidates": getattr(self, "targeted_candidates", 0),
+            "targeted_pages_done": getattr(self, "targeted_pages_done", 0),
+            # Hunted tokens that turned out to be this store's house vocabulary.
+            "common_tokens_dropped": list(getattr(self, "common_tokens_dropped", [])),
+        }
+
 
 def _rotate(urls: list, offset: int) -> list:
     """urls[offset:] + urls[:offset] with a safe modulo — rotation order for
@@ -761,17 +912,18 @@ class ShopifyJsonConnector(_CrawlStatsMixin):
 
     connector_type = "shopify_json"
 
-    def __init__(self, base_url: str, start_page: int = 1):
+    def __init__(self, base_url: str, start_page: int = 1, settings=None):
         self.base_url = base_url.rstrip("/")
         self.start_page = max(1, int(start_page or 1))
+        self.settings = settings if isinstance(settings, CrawlSettings) else CrawlSettings(settings)
 
     def iter_products(self) -> Iterator[dict]:
         self._init_stats(start_cursor=self.start_page)  # error mid-run → retry same slice
         page = self.start_page
-        budget = config.MAX_CATALOG_PAGES
+        budget = self.settings.max_catalog_pages
         while budget > 0:
             url = f"{self.base_url}/products.json?limit=250&page={page}"
-            resp = polite_get(url)
+            resp = polite_get(url, interval=self.settings.request_interval, stats=self.stats)
             if resp is None or resp.status_code != 200:
                 return
             try:
@@ -874,69 +1026,482 @@ def _slug_brand(path: str, brand_names) -> Optional[str]:
     return None
 
 
-class _HtmlPageCrawler(_CrawlStatsMixin):
-    """Shared fetch/parse loop for connectors that crawl individual product
-    pages from a candidate URL list. Sorts the list so its order is stable
-    across nights, rotates it by the stored cursor (`start_offset`), fetches up
-    to MAX_HTML_PRODUCT_PAGES, and tracks cursor/consumption for the runner to
-    persist — so catalogs bigger than the nightly budget are covered over
-    successive nights instead of the same first slice being re-crawled forever."""
+# ---------------------------------------------------------------------------
+# Crawl targeting: what the nightly page budget should be spent looking for
+# ---------------------------------------------------------------------------
 
-    # Hard guard on the materialized candidate list (raw URL strings) so a
-    # pathological sitemap can't balloon memory; brand/locale filters normally
-    # keep this list far smaller.
-    MAX_CANDIDATE_URLS = 20000
+# Slug tokens that carry no model signal. Half a bike shop's catalog is a black
+# medium 2024 carbon road bike, so scoring on these words would float noise to
+# the top of the crawl order and bury the tokens that actually discriminate.
+# Brand tokens are matched separately and are never stoplisted here.
+_GENERIC_SLUG_TOKENS = frozenset("""
+bike bikes bicycle bicycles cycle cycles cycling road mountain mtb gravel
+hybrid commuter touring electric ebike kids kid youth junior mens womens
+men women unisex adult
+frame frameset fork forks wheel wheels wheelset tire tyre tires tyres tube
+tubes rim rims spoke spokes hub hubs
+helmet helmets glove gloves shoe shoes jersey jerseys short shorts bib bibs
+jacket jackets vest vests sock socks cap caps eyewear glasses
+pedal pedals saddle saddles seatpost seatposts stem stems bar bars handlebar
+handlebars grip grips tape
+chain chains cassette cassettes derailleur derailleurs brake brakes rotor
+rotors pad pads lever levers shifter shifters crank cranks chainring bottom
+bracket headset
+pump pumps light lights lock locks rack racks bag bags bottle bottles cage
+cages tool tools kit kits fender fenders trainer
+new sale clearance used demo sold out shop product products collection item
+black white red blue green grey gray silver yellow orange pink purple brown
+beige tan navy teal olive
+matte gloss glossy carbon alloy aluminum aluminium steel titanium chrome
+xs sm md lg xl xxl xxxl small medium large size sizes wide narrow regular
+and the for with without from plus incl including set pack pair
+pro expert elite comp sport advanced performance premium base core standard
+team edition series gen generation version model unit kit upgrade replacement
+smart wireless bluetooth ant usb charging cable mount adapter spare
+""".split())
+
+# Drivetrain, groupset and spec vocabulary. These read like model names but sit
+# on hundreds of unrelated accessory pages — the Oak Bay crawl surfaced charging
+# cables and brake pads ahead of the bikes we actually track because they name
+# "dura ace ultegra di2". Scoring on them buries the real model tokens.
+_GENERIC_SLUG_TOKENS |= frozenset("""
+shimano sram campagnolo microshift box
+dura ace ultegra tiagra sora claris grx xtr xt slx deore cues
+red force rival apex eagle transmission axs etap di2 epsi
+speed spd hydraulic mechanical electronic tubeless tubetype clincher
+power meter watt torque wrench cadence sensor computer radar
+mips spherical wavecel fidlock boa
+""".split())
+
+# Bare years ("2024") appear on most of a catalog and discriminate nothing.
+_YEAR_TOKEN_RE = re.compile(r"^(?:19|20)\d{2}$")
+
+# Weights. A brand hit says "we stock this brand"; a model token says "this may
+# be the exact item we still can't price", which is the whole point of ranking.
+BRAND_TOKEN_SCORE = 1
+MODEL_TOKEN_SCORE = 3
+
+
+def _slug_tokens(text) -> set:
+    """Distinctive slug tokens from a title or URL path.
+
+    Accent-folded, split on any non-alphanumeric, with generic vocabulary and
+    bare years dropped. Alphanumeric model codes ("gp5000", "slr01", "aeroad")
+    survive deliberately — they're the strongest signal a URL can carry, and
+    they're often present on exactly the stores that leave the brand out of the
+    slug entirely.
+    """
+    tokens = set()
+    for token in re.split(r"[^a-z0-9]+", _fold_slug(text)):
+        if len(token) < 3 or token in _GENERIC_SLUG_TOKENS:
+            continue
+        if _YEAR_TOKEN_RE.match(token):
+            continue
+        if token.isdigit() and len(token) < 5:
+            # Sizes, counts, pack quantities. Longer digit runs can be genuine
+            # model numbers (and product-id URLs), so those are kept.
+            continue
+        tokens.add(token)
+    return tokens
+
+
+class CrawlTargets:
+    """What a catalog crawl is hunting for.
+
+    `brand_tokens` is the long-standing brand-slug signal. `model_tokens` is
+    the new one: distinctive tokens from tracked items that have no confirmed
+    link on this competitor yet, so the nightly page budget goes to the items we
+    still can't price instead of walking the catalog alphabetically.
+    """
+
+    def __init__(self, brand_names=None, model_tokens=None):
+        self.brand_names = sorted({b for b in (brand_names or []) if b})
+        self.brand_tokens = _brand_slug_tokens(self.brand_names)
+        self.model_tokens = frozenset(model_tokens or ())
+
+    @classmethod
+    def from_items(cls, items: dict, unmatched_ids=None) -> "CrawlTargets":
+        """`items` is MatchIndex.items (item_id -> row). `unmatched_ids` limits
+        the model-token side to items still lacking a confirmed link on the
+        competitor about to be crawled; None means every tracked item counts."""
+        return ItemTokenIndex(items).targets_for(unmatched_ids)
+
+    def score_parts(self, path: str):
+        """(brand hit as 0/1, distinct model-token hits) for a candidate path.
+
+        Kept separate because the two mean different things to the crawl order:
+        a brand hit is already the gate, so on its own it can't promote a URL
+        past the rotation sweep — only a model hit can.
+        """
+        brand = 1 if self.has_brand(path) else 0
+        models = len(_slug_tokens(path) & self.model_tokens) if self.model_tokens else 0
+        return brand, models
+
+    def score(self, path: str) -> int:
+        """Relevance of a candidate product URL to what we still need to price."""
+        brand, models = self.score_parts(path)
+        return brand * BRAND_TOKEN_SCORE + models * MODEL_TOKEN_SCORE
+
+    def has_brand(self, path: str) -> bool:
+        return bool(self.brand_tokens) and any(tok in path for tok in self.brand_tokens)
+
+
+class ItemTokenIndex:
+    """Per-item slug tokens, computed once per run.
+
+    Crawl targets are per competitor (an item linked on store A is still being
+    hunted on store B), so without this the whole tracked list would be
+    re-tokenized for every store in the loop."""
+
+    def __init__(self, items: dict):
+        self.brands = sorted({(row.get("brand") or "").strip()
+                              for row in (items or {}).values()} - {""})
+        # A brand name is not a model signal: it scores every page of that brand
+        # identically and would drown the tokens that actually pick one product
+        # out of the brand's shelf.
+        brand_tokens = {t for brand in self.brands for t in _slug_tokens(brand)}
+        self.tokens_by_item = {
+            str(item_id): _slug_tokens(row.get("title")) - brand_tokens
+            for item_id, row in (items or {}).items()
+        }
+
+    def targets_for(self, unmatched_ids=None) -> "CrawlTargets":
+        """CrawlTargets whose model tokens come from `unmatched_ids` only
+        (None = every tracked item)."""
+        models = set()
+        for item_id, tokens in self.tokens_by_item.items():
+            if unmatched_ids is None or item_id in unmatched_ids:
+                models |= tokens
+        return CrawlTargets(brand_names=self.brands, model_tokens=models)
+
+
+def _compile_pattern(pattern) -> Optional[re.Pattern]:
+    """User-supplied URL regex from the competitor's settings. A bad pattern is
+    ignored with a log line rather than killing the whole run."""
+    if not pattern or not str(pattern).strip():
+        return None
+    try:
+        return re.compile(str(pattern), re.I)
+    except re.error as e:
+        print(f"pi: ignoring invalid crawl URL pattern {pattern!r}: {e}")
+        return None
+
+
+def _positive_number(value, cast):
+    try:
+        parsed = cast(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+class CrawlSettings:
+    """Per-competitor crawl overrides (pi_competitors.settings_json).
+
+    Every key is optional and falls back to its config.py global, so a
+    competitor with no settings behaves exactly as it did before this existed.
+    """
+
+    DEFAULT_MAX_SITEMAP_FETCHES = 15
+    DEFAULT_MAX_CANDIDATE_URLS = 20000
+
+    def __init__(self, raw=None):
+        data = raw
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except ValueError:
+                print("pi: ignoring unparseable competitor settings_json")
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        self.raw = data
+        # Your avenue #1: a positive path shape filter, per competitor. The
+        # global NON_PRODUCT_RE deny-list still applies; url_deny_pattern adds
+        # to it rather than replacing it.
+        self.allow_pattern = _compile_pattern(data.get("url_allow_pattern"))
+        self.deny_pattern = _compile_pattern(data.get("url_deny_pattern"))
+        brand_filter = str(data.get("brand_filter") or "auto").strip().lower()
+        self.brand_filter = brand_filter if brand_filter in ("auto", "on", "off") else "auto"
+        self.request_interval = _positive_number(
+            data.get("request_interval_seconds"), float)
+        # Overrides are resolved eagerly, fallbacks lazily (below) so the global
+        # stays live — env changes and test patches of config.* still take.
+        self._max_product_pages = _positive_number(data.get("max_product_pages"), int)
+        self._max_catalog_pages = _positive_number(data.get("max_catalog_pages"), int)
+        self.max_sitemap_fetches = (_positive_number(data.get("max_sitemap_fetches"), int)
+                                    or self.DEFAULT_MAX_SITEMAP_FETCHES)
+        self.max_candidate_urls = (_positive_number(data.get("max_candidate_urls"), int)
+                                   or self.DEFAULT_MAX_CANDIDATE_URLS)
+        # Escape hatch for stores whose robots.txt/sitemap.xml discovery fails
+        # but whose sitemap lives at a known URL.
+        self.sitemap_urls = [u.strip() for u in (data.get("sitemap_urls") or [])
+                             if isinstance(u, str) and u.strip()]
+        # Off only for the rare store that legitimately serves products from a
+        # second host; on for everyone else.
+        self.confine_to_domain = data.get("confine_to_domain", True) is not False
+
+    @property
+    def max_product_pages(self) -> int:
+        return self._max_product_pages or config.MAX_HTML_PRODUCT_PAGES
+
+    @property
+    def max_catalog_pages(self) -> int:
+        return self._max_catalog_pages or config.MAX_CATALOG_PAGES
+
+    def path_allowed(self, path: str) -> bool:
+        if self.allow_pattern is not None and not self.allow_pattern.search(path):
+            return False
+        if self.deny_pattern is not None and self.deny_pattern.search(path):
+            return False
+        return True
+
+
+class _HtmlPageCrawler(_CrawlStatsMixin):
+    """Shared candidate-selection and fetch/parse loop for the connectors that
+    crawl individual product pages.
+
+    Candidates are filtered by *scope* (same site, product-shaped path, English
+    CA locale), then ordered by *relevance* rather than filtered by it: pages
+    whose slug mentions a tracked item we still can't price are crawled first
+    (the head), and the remainder is swept alphabetically from the stored cursor
+    (the tail) so the rest of the catalog is still covered night over night.
+
+    Brand is a ranking and gating signal, never a hard drop on its own — see
+    _apply_brand_gate for why."""
+
+    # Head/tail budget split. The head is where the value is, but letting it
+    # take the whole night would freeze the sweep, and the sweep is what finds
+    # products whose slug spells the model differently than we do.
+    HEAD_BUDGET_SHARE = 0.6
+
+    # Share/absolute-count floors below which the brand gate is self-defeating.
+    BRAND_HIT_RATE_FLOOR = 0.02
+    BRAND_HIT_ABS_FLOOR = 25
+
+    # A hunted token on more than this share of a store's candidates (but at
+    # least this many pages) is that store's house vocabulary, not a model name.
+    COMMON_TOKEN_SHARE = 0.02
+    COMMON_TOKEN_FLOOR = 20
+
+    # Subclass deny-list for paths that are never product detail pages.
+    NON_PRODUCT_RE = None
+
+    def _init_crawler(self, base_url, brand_tokens=None, start_offset=0, settings=None):
+        """Shared __init__ tail. `brand_tokens` accepts either a plain list of
+        brand names (the long-standing form) or a CrawlTargets carrying model
+        tokens as well."""
+        self.base_url = base_url.rstrip("/")
+        self.settings = settings if isinstance(settings, CrawlSettings) else CrawlSettings(settings)
+        self.targets = (brand_tokens if isinstance(brand_tokens, CrawlTargets)
+                        else CrawlTargets(brand_names=brand_tokens))
+        self._brand_names = self.targets.brand_names
+        self.brand_tokens = self.targets.brand_tokens
+        self.start_offset = max(0, int(start_offset or 0))
+        self.sitemap_urls_seen = 0
+        self.candidates_shape_ok = 0
+        self.candidates_crawlable = 0
+        self.off_domain_dropped = 0
+        self.brand_hit_rate = None
+        self.brand_gate_applied = None
+        self.targeted_candidates = 0
+        self.targeted_pages_done = 0
+        self.common_tokens_dropped = []
+
+    def _get(self, url: str, **kwargs):
+        """polite_get bound to this competitor's crawl delay and stats."""
+        return polite_get(url, interval=self.settings.request_interval,
+                          stats=self.stats, **kwargs)
+
+    # -- candidate selection ------------------------------------------------
+
+    def _url_in_scope(self, url: str) -> bool:
+        """One candidate URL against every scope filter: same site, product-shaped
+        path, English-CA locale, per-competitor allow/deny patterns. Brand is
+        deliberately absent — it's handled later, and conditionally."""
+        if self.settings.confine_to_domain and not _same_site(url, self.base_url):
+            self.off_domain_dropped += 1
+            return False
+        path = urlparse(url).path.lower()
+        if not path or path == "/":
+            return False
+        if self.NON_PRODUCT_RE is not None and self.NON_PRODUCT_RE.search(path):
+            return False
+        if NON_ENGLISH_PATH_RE.search(path):
+            return False
+        if not self.settings.path_allowed(path):
+            return False
+        self.candidates_shape_ok += 1
+        return True
+
+    def _collect_candidates(self, url_iter) -> list:
+        """Scope-filtered candidates, with brand-matching URLs kept preferentially.
+
+        The candidate cap used to apply after the brand filter. Now that the
+        brand gate runs later, a huge catalog could push every brand-relevant URL
+        out of the list before the gate ever saw it — so hits and misses go in
+        separate buckets and the cap bites on the misses first."""
+        hits, misses = [], []
+        cap = self.settings.max_candidate_urls
+        for url in url_iter:
+            self.sitemap_urls_seen += 1
+            if not self._url_in_scope(url):
+                continue
+            if self.targets.has_brand(urlparse(url).path.lower()):
+                hits.append(url)
+            elif len(misses) < cap:
+                misses.append(url)
+            if len(hits) >= cap:
+                break
+        if self.targets.brand_tokens and self.candidates_shape_ok:
+            self.brand_hit_rate = round(len(hits) / self.candidates_shape_ok, 4)
+        return prefer_ca_english(self._apply_brand_gate(hits, misses))
+
+    def _apply_brand_gate(self, hits: list, misses: list) -> list:
+        """The brand gate, applied only where it isn't self-defeating.
+
+        Dropping every URL without a tracked brand in its path is a good filter
+        on stores that put brands in slugs, and catastrophic on stores that don't
+        (/product/12345-carbon-wheelset): it discards the entire catalog, and the
+        run reports "no products", which reads exactly like a broken sitemap. So
+        when almost nothing carries a brand, keep everything and let the shape
+        filter and relevance ranking choose the pages instead."""
+        mode = self.settings.brand_filter
+        if not self.targets.brand_tokens or mode == "off":
+            self.brand_gate_applied = False
+            return hits + misses
+        if mode == "on":
+            self.brand_gate_applied = True
+            return hits
+        gate_is_futile = (len(hits) < self.BRAND_HIT_ABS_FLOOR
+                          and (self.brand_hit_rate or 0.0) < self.BRAND_HIT_RATE_FLOOR)
+        self.brand_gate_applied = not gate_is_futile
+        if gate_is_futile:
+            print(f"pi: {self.base_url} puts almost no tracked brands in its product "
+                  f"URLs ({len(hits)} of {self.candidates_shape_ok}) — crawling on "
+                  "relevance rank instead of the brand filter")
+            return hits + misses
+        return hits
+
+    def _discriminating_tokens(self, paths) -> frozenset:
+        """The hunted model tokens that actually single a page out on this store.
+
+        The stoplist catches vocabulary that's generic everywhere; this catches
+        vocabulary that's generic *here*. A token sitting on a large share of a
+        store's catalog can't distinguish anything on it, and hunting it floods
+        the head with near-identical accessory pages. Measured per store, so no
+        per-store list has to be maintained by hand."""
+        hunted = self.targets.model_tokens
+        if not hunted or not paths:
+            return hunted
+        frequency = Counter()
+        for path in paths:
+            frequency.update(_slug_tokens(path) & hunted)
+        limit = max(self.COMMON_TOKEN_FLOOR, int(len(paths) * self.COMMON_TOKEN_SHARE))
+        common = {token for token, n in frequency.items() if n > limit}
+        self.common_tokens_dropped = sorted(common)
+        return frozenset(hunted - common)
+
+    def _rank_candidates(self, candidates: list):
+        """Split candidates into a relevance head and an alphabetical tail.
+
+        Only a model-token hit promotes a URL into the head. A brand hit alone
+        must not: with the gate on, every candidate carries a brand, so scoring
+        on it would make the head the whole list and the rotation cursor would
+        stop advancing — re-crawling the same alphabetical slice forever, which
+        is the behaviour the cursor exists to prevent."""
+        self.candidates_crawlable = len(candidates)
+        # Paths are re-derived rather than kept alongside a token set per URL:
+        # 20k retained token sets is memory this process doesn't have to spare.
+        paths = [urlparse(url).path.lower() for url in candidates]
+        hunted = self._discriminating_tokens(paths)
+        scored, plain = [], []
+        for url, path in zip(candidates, paths):
+            models = len(_slug_tokens(path) & hunted) if hunted else 0
+            if models:
+                brand = BRAND_TOKEN_SCORE if self.targets.has_brand(path) else 0
+                scored.append((brand + models * MODEL_TOKEN_SCORE, url))
+            else:
+                plain.append(url)
+        # Deterministic across nights: score desc, then URL.
+        scored.sort(key=lambda pair: (-pair[0], pair[1]))
+        return [url for _, url in scored], sorted(plain)
+
+    # -- fetch loop ---------------------------------------------------------
+
+    def _fetch_and_parse(self, url: str) -> Iterator[dict]:
+        slug = urlparse(url).path.lower()
+        resp = polite_get(url, interval=self.settings.request_interval, stats=self.stats)
+        if resp is None or resp.status_code != 200:
+            return
+        self.pages_done += 1
+        for parsed in (_magento_graphql_listings(resp.text, url)
+                       or extract_listings(resp.text, url)):
+            if not parsed.get("brand"):
+                parsed["brand"] = _slug_brand(slug, self._brand_names)
+            parsed["url"] = url
+            parsed.setdefault("compare_at_price", None)
+            self.products_seen += 1
+            yield parsed
 
     def _crawl_candidates(self, candidates: list) -> Iterator[dict]:
-        candidates = sorted(candidates)
-        total = len(candidates)
+        """Fetch and parse candidates, highest relevance first.
+
+        Head then tail, so both jobs get done: the head hunts the specific items
+        we still can't price, the tail keeps sweeping the catalog from the stored
+        cursor. Only tail progress moves the cursor — the head is re-derived from
+        the unmatched set every night, so counting it would drift the cursor and
+        leave stretches of the catalog never visited."""
+        head, tail = self._rank_candidates(candidates)
+        total = len(tail)
         self._init_stats(start_cursor=(self.start_offset % total) if total else 0)
+        self.targeted_candidates = len(head)
+        budget = self.settings.max_product_pages
+
+        # The head gets the whole budget only when there is no tail to starve.
+        head_budget = int(budget * self.HEAD_BUDGET_SHARE) if tail else budget
+        head_truncated = len(head) > head_budget
+        for url in head[:head_budget]:
+            yield from self._fetch_and_parse(url)
+        self.targeted_pages_done = self.pages_done
+
         attempted = 0
-        for url in _rotate(candidates, self.start_offset):
-            if self.pages_done >= config.MAX_HTML_PRODUCT_PAGES:
+        for url in _rotate(tail, self.start_offset):
+            if self.pages_done >= budget:
                 self.cap_hit = True
                 self.next_cursor = (self.start_offset + attempted) % total
                 return
             attempted += 1
-            slug = urlparse(url).path.lower()
-            resp = polite_get(url)
-            if resp is None or resp.status_code != 200:
-                continue
-            self.pages_done += 1
-            for parsed in (_magento_graphql_listings(resp.text, url)
-                           or extract_listings(resp.text, url)):
-                if not parsed.get("brand"):
-                    parsed["brand"] = _slug_brand(slug, self._brand_names)
-                parsed["url"] = url
-                parsed.setdefault("compare_at_price", None)
-                self.products_seen += 1
-                yield parsed
-        self.next_cursor = 0  # whole list visited — start at the front next time
+            yield from self._fetch_and_parse(url)
+        self.next_cursor = 0  # whole tail visited — start at the front next time
+        # A truncated head still means we didn't cover everything we wanted to.
+        self.cap_hit = self.cap_hit or head_truncated
 
 
 class ShopifyHtmlConnector(_HtmlPageCrawler):
     """Fallback for stores that block /products.json: walk the products sitemap and
     parse each product page's JSON-LD (which usually includes a real GTIN).
 
-    One request per product, so URLs are pre-filtered to slugs mentioning a tracked
-    brand and the crawl is capped at MAX_HTML_PRODUCT_PAGES per night, rotating
-    via `start_offset`."""
+    One request per product, so the candidate list is scope-filtered and the
+    crawl is capped per night, spending its budget on the pages most likely to
+    be items we still can't price (see _HtmlPageCrawler)."""
 
     connector_type = "shopify_html"
 
-    def __init__(self, base_url: str, brand_tokens=None, start_offset: int = 0):
-        self.base_url = base_url.rstrip("/")
-        self._brand_names = [b for b in (brand_tokens or []) if b]
-        self.brand_tokens = _brand_slug_tokens(brand_tokens)
-        self.start_offset = max(0, int(start_offset or 0))
+    def __init__(self, base_url: str, brand_tokens=None, start_offset: int = 0,
+                 settings=None):
+        self._init_crawler(base_url, brand_tokens, start_offset, settings)
 
     def _product_urls(self) -> Iterator[str]:
-        resp = polite_get(f"{self.base_url}/sitemap.xml")
-        if resp is None or resp.status_code != 200:
-            return
-        product_sitemaps = re.findall(r"<loc>([^<]*sitemap_products[^<]*)</loc>", resp.text)
+        product_sitemaps = list(self.settings.sitemap_urls)
+        if not product_sitemaps:
+            resp = self._get(f"{self.base_url}/sitemap.xml")
+            if resp is None or resp.status_code != 200:
+                return
+            product_sitemaps = re.findall(
+                r"<loc>([^<]*sitemap_products[^<]*)</loc>", resp.text)
         for sitemap_url in product_sitemaps:
-            sm = polite_get(sitemap_url.strip())
+            sm = self._get(sitemap_url.strip())
             if sm is None or sm.status_code != 200:
                 continue
             for loc in re.findall(r"<loc>([^<]+)</loc>", sm.text):
@@ -945,20 +1510,10 @@ class ShopifyHtmlConnector(_HtmlPageCrawler):
                     yield loc
 
     def iter_products(self) -> Iterator[dict]:
-        # Same locale confinement as GenericSitemapConnector: Shopify Markets
-        # stores emit localized URL variants (/fr-ca/products/…, /en-us/…) in
-        # their sitemaps; crawl only the English CA/neutral ones.
-        candidates = []
-        for url in self._product_urls():
-            slug = urlparse(url).path.lower()
-            if NON_ENGLISH_PATH_RE.search(slug):
-                continue
-            if self.brand_tokens and not any(tok in slug for tok in self.brand_tokens):
-                continue
-            candidates.append(url)
-            if len(candidates) >= self.MAX_CANDIDATE_URLS:
-                break
-        yield from self._crawl_candidates(prefer_ca_english(candidates))
+        # Locale confinement, domain confinement and the brand gate all live in
+        # _collect_candidates now — Shopify Markets stores emit localized URL
+        # variants (/fr-ca/products/…, /en-us/…) that must not be crawled.
+        yield from self._crawl_candidates(self._collect_candidates(self._product_urls()))
 
 
 # Locale confinement for multi-geo/multi-language storefronts. We sell in
@@ -1008,19 +1563,21 @@ class GenericSitemapConnector(_HtmlPageCrawler):
     NON_PRODUCT_RE = re.compile(
         r"/(collections?|categor(y|ies)|cms|blogs?|pages?|news|apps)(/|$)"
     )
-    MAX_SITEMAP_FETCHES = 15
 
-    def __init__(self, base_url: str, brand_tokens=None, start_offset: int = 0):
-        self.base_url = base_url.rstrip("/")
-        self._brand_names = [b for b in (brand_tokens or []) if b]
-        self.brand_tokens = _brand_slug_tokens(brand_tokens)
-        self.start_offset = max(0, int(start_offset or 0))
+    def __init__(self, base_url: str, brand_tokens=None, start_offset: int = 0,
+                 settings=None):
+        self._init_crawler(base_url, brand_tokens, start_offset, settings)
 
     def _sitemap_sources(self) -> list:
         """Sitemap URLs from robots.txt plus the conventional /sitemap.xml.
-        Prefers product-hinting filenames, and _en_ over _fr_ duplicates."""
+        Prefers product-hinting filenames, and _en_ over _fr_ duplicates.
+
+        A per-competitor sitemap_urls override short-circuits discovery entirely
+        — the escape hatch for stores whose robots.txt hides it."""
+        if self.settings.sitemap_urls:
+            return list(self.settings.sitemap_urls)
         sources = []
-        resp = polite_get(f"{self.base_url}/robots.txt", respect_robots=False)
+        resp = self._get(f"{self.base_url}/robots.txt", respect_robots=False)
         if resp is not None and resp.status_code == 200:
             sources = re.findall(r"(?im)^\s*sitemap:\s*(\S+)", resp.text)
         sources.append(f"{self.base_url}/sitemap.xml")
@@ -1046,9 +1603,9 @@ class GenericSitemapConnector(_HtmlPageCrawler):
         fetches = 0
         queue = self._sitemap_sources()
         seen_pages = set()
-        while queue and fetches < self.MAX_SITEMAP_FETCHES:
+        while queue and fetches < self.settings.max_sitemap_fetches:
             sitemap_url = queue.pop(0)
-            resp = polite_get(sitemap_url.strip())
+            resp = self._get(sitemap_url.strip())
             fetches += 1
             if resp is None or resp.status_code != 200 or "<" not in resp.text[:200]:
                 continue
@@ -1073,23 +1630,11 @@ class GenericSitemapConnector(_HtmlPageCrawler):
                 yield loc
 
     def _candidate_page_urls(self) -> list:
-        """Sitemap page URLs worth fetching: product-shaped, tracked-brand,
-        English, and geo-deduped. Materialized (URLs only, a few MB worst case)
-        so the CA-vs-other-geo preference can see the whole list before the
-        page fetch budget is spent."""
-        urls = []
-        for url in self._iter_page_urls():
-            path = urlparse(url).path.lower()
-            if not path or path == "/" or self.NON_PRODUCT_RE.search(path):
-                continue
-            if NON_ENGLISH_PATH_RE.search(path):
-                continue
-            if self.brand_tokens and not any(tok in path for tok in self.brand_tokens):
-                continue
-            urls.append(url)
-            if len(urls) >= self.MAX_CANDIDATE_URLS:
-                break
-        return prefer_ca_english(urls)
+        """Sitemap page URLs worth fetching: on-site, product-shaped, English,
+        and geo-deduped. Materialized (URLs only, a few MB worst case) so the
+        CA-vs-other-geo preference and the brand gate can both see the whole
+        list before the page fetch budget is spent."""
+        return self._collect_candidates(self._iter_page_urls())
 
     def iter_products(self) -> Iterator[dict]:
         yield from self._crawl_candidates(self._candidate_page_urls())
@@ -1119,16 +1664,20 @@ def detect_connector_type(base_url: str) -> str:
 
 def build_connector(competitor: dict, brand_tokens=None, cursor: int = 0):
     """`cursor` is the stored per-competitor crawl position (crawl_state_json):
-    a 1-based /products.json page for shopify_json, a candidate-list offset for
-    the HTML crawls. 0/absent means start from the front."""
+    a 1-based /products.json page for shopify_json, a tail-list offset for the
+    HTML crawls. 0/absent means start from the front.
+
+    `brand_tokens` may be a plain list of brand names or a CrawlTargets carrying
+    the model tokens of items we still can't price on this competitor."""
     ctype = competitor.get("connector_type")
     base_url = competitor["base_url"]
+    settings = CrawlSettings(competitor.get("settings_json"))
     if ctype == "shopify_json":
-        return ShopifyJsonConnector(base_url, start_page=cursor or 1)
+        return ShopifyJsonConnector(base_url, start_page=cursor or 1, settings=settings)
     if ctype == "shopify_html":
         return ShopifyHtmlConnector(base_url, brand_tokens=brand_tokens,
-                                    start_offset=cursor)
+                                    start_offset=cursor, settings=settings)
     if ctype == "sitemap_html":
         return GenericSitemapConnector(base_url, brand_tokens=brand_tokens,
-                                       start_offset=cursor)
+                                       start_offset=cursor, settings=settings)
     return None

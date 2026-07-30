@@ -89,6 +89,47 @@ def get_summary():
 
 # --- competitors (feature f) -------------------------------------------------
 
+# Per-competitor crawl settings the UI may set. Anything else is rejected so a
+# typo ("max_pages") isn't stored as a setting that silently never applies.
+_COMPETITOR_SETTING_KEYS = {
+    "url_allow_pattern", "url_deny_pattern", "brand_filter",
+    "request_interval_seconds", "max_product_pages", "max_catalog_pages",
+    "max_sitemap_fetches", "max_candidate_urls", "sitemap_urls",
+    "confine_to_domain",
+}
+
+
+def _validate_competitor_settings(settings):
+    """Reject unknown keys and unusable values up front. The crawler already
+    degrades safely on bad input, but a 400 tells the user why their setting
+    isn't doing anything."""
+    if settings is None:
+        return
+    if not isinstance(settings, dict):
+        raise HTTPException(status_code=400, detail="settings must be an object")
+    unknown = sorted(set(settings) - _COMPETITOR_SETTING_KEYS)
+    if unknown:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown crawl settings: {', '.join(unknown)}")
+    from .connectors import _compile_pattern
+    for key in ("url_allow_pattern", "url_deny_pattern"):
+        raw = settings.get(key)
+        if raw and _compile_pattern(raw) is None:
+            raise HTTPException(status_code=400, detail=f"{key} is not a valid regex")
+    mode = settings.get("brand_filter")
+    if mode is not None and str(mode).lower() not in ("auto", "on", "off"):
+        raise HTTPException(status_code=400,
+                            detail="brand_filter must be auto, on or off")
+    interval = settings.get("request_interval_seconds")
+    if interval is not None:
+        try:
+            if float(interval) <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400,
+                                detail="request_interval_seconds must be a positive number")
+
+
 @router.get("/competitors")
 def list_competitors():
     return repository.get_competitors()
@@ -98,6 +139,10 @@ def list_competitors():
 def create_or_update_competitor(payload: Dict[str, Any], background_tasks: BackgroundTasks):
     if not payload.get("name") or not payload.get("base_url"):
         raise HTTPException(status_code=400, detail="name and base_url are required")
+    if "settings" in payload:
+        # Fail the request on a bad crawl setting rather than silently storing
+        # something the nightly crawl will ignore.
+        _validate_competitor_settings(payload["settings"])
     row = repository.upsert_competitor(payload)
 
     # Autodetect the connector tier in the background so the POST stays fast.
@@ -105,6 +150,10 @@ def create_or_update_competitor(payload: Dict[str, Any], background_tasks: Backg
         try:
             from .connectors import detect_connector_type
             competitor["connector_type"] = detect_connector_type(competitor["base_url"])
+            # settings_json is dropped from the dict so this write can't clobber
+            # settings the user changed while detection was in flight.
+            competitor.pop("settings_json", None)
+            competitor.pop("settings", None)
             repository.upsert_competitor(competitor)
         except Exception as e:
             print(f"pi: connector detection failed for {competitor['base_url']}: {e}")
@@ -279,11 +328,12 @@ def create_tracked_url(payload: Dict[str, Any], background_tasks: BackgroundTask
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="url must start with http(s)://")
     if not payload.get("competitor_id"):
-        # Infer the competitor from the URL's domain when possible.
-        from urllib.parse import urlparse
-        domain = urlparse(url).netloc.lower().removeprefix("www.")
+        # Infer the competitor from the URL's host. Host equality (or a
+        # subdomain of it), not substring containment — "bike.com" is a
+        # substring of "mybike.commerce.ca".
+        from .connectors import _same_site
         for c in repository.get_competitors(include_disabled=False):
-            if domain and domain in c["base_url"].lower():
+            if _same_site(url, c["base_url"]):
                 payload["competitor_id"] = c["competitor_id"]
                 break
     selected = None

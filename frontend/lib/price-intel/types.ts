@@ -16,8 +16,35 @@ export interface Competitor {
   last_scraped_at: string | null
   last_scrape_status: string | null
   // JSON: {cursor, pages_done, products_seen, cap_hit, catalog_exhausted,
-  // updated_at} — last catalog-crawl coverage + rotation cursor.
+  // updated_at, + crawl diagnostics} — last catalog-crawl coverage, rotation
+  // cursor and why the crawl went the way it did. Written by the crawl.
   crawl_state_json?: string | null
+  // JSON: per-competitor crawl overrides, written by the user. See
+  // CompetitorCrawlSettings. Every key optional; unset falls back to the global.
+  settings_json?: string | null
+}
+
+// Per-competitor crawl overrides (pi_competitors.settings_json). POST
+// /competitors accepts these under a `settings` key and rejects unknown ones.
+export interface CompetitorCrawlSettings {
+  // Only crawl paths matching this regex (e.g. '/product/'). Unset = all.
+  url_allow_pattern?: string
+  // Additional never-a-product paths, on top of the built-in deny-list.
+  url_deny_pattern?: string
+  // 'auto' drops the brand filter on stores that don't put brands in their
+  // URLs; 'on' always filters; 'off' never does.
+  brand_filter?: 'auto' | 'on' | 'off'
+  // Seconds between requests to this store. Lower = deeper nightly coverage;
+  // a 429 automatically backs the store off for the rest of the run.
+  request_interval_seconds?: number
+  max_product_pages?: number
+  max_catalog_pages?: number
+  max_sitemap_fetches?: number
+  max_candidate_urls?: number
+  // Explicit sitemap URLs when robots.txt / sitemap.xml discovery fails.
+  sitemap_urls?: string[]
+  // Off only for a store that legitimately serves products from a second host.
+  confine_to_domain?: boolean
 }
 
 export interface TrackedUrl {
@@ -188,7 +215,9 @@ export interface ScrapeHealthCompetitor {
   name: string | null
   connector_type: string | null
   status: string | null
-  bucket: 'ok' | 'empty' | 'no_matches' | 'failed' | 'skipped' | 'unknown'
+  // 'blocked' is split out of 'empty': the site refused us (403/429) rather
+  // than the sitemap or the filters coming back with nothing.
+  bucket: 'ok' | 'empty' | 'no_matches' | 'blocked' | 'failed' | 'skipped' | 'unknown'
   last_scraped_at: string | null
   // Last catalog-crawl coverage (from crawl_state_json). cap_hit means the
   // store is bigger than the nightly page budget and the crawl is rotating
@@ -196,6 +225,22 @@ export interface ScrapeHealthCompetitor {
   products_seen?: number | null
   pages_done?: number | null
   cap_hit?: boolean
+  // Crawl diagnostics: the funnel from sitemap URLs down to pages fetched, how
+  // much of the budget went to relevance-ranked pages, and what the site
+  // answered. Present from the first run after the diagnostics change.
+  sitemap_urls_seen?: number | null
+  candidates_crawlable?: number | null
+  // Share of candidate URLs carrying a tracked brand. brand_gate_applied is
+  // false when that share was so low the brand filter would have discarded the
+  // whole catalog — the crawl ranked on relevance instead.
+  brand_hit_rate?: number | null
+  brand_gate_applied?: boolean | null
+  targeted_candidates?: number | null
+  targeted_pages_done?: number | null
+  off_domain_dropped?: number | null
+  blocked_fetches?: number | null
+  fetches?: number | null
+  status_counts?: Record<string, number>
 }
 
 export interface ScrapeHealth {
@@ -206,6 +251,7 @@ export interface ScrapeHealth {
     ok: number
     empty: number
     no_matches: number
+    blocked: number
     failed: number
     skipped: number
   }

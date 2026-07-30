@@ -10,6 +10,7 @@ import {
 import { Separator } from '@/components/ui/separator'
 import {
   CheckCircle2, AlertTriangle, XCircle, Loader2, CircleDashed, CircleSlash, HelpCircle,
+  ShieldAlert,
 } from 'lucide-react'
 import type { ScrapeHealth, ScrapeHealthCompetitor } from '@/lib/price-intel/types'
 
@@ -28,9 +29,46 @@ const BUCKET: Record<ScrapeHealthCompetitor['bucket'], { label: string; dot: str
   ok: { label: 'OK', dot: 'text-emerald-500', Icon: CheckCircle2 },
   empty: { label: 'No products returned', dot: 'text-amber-500', Icon: AlertTriangle },
   no_matches: { label: 'Products found, none tracked', dot: 'text-amber-500', Icon: CircleDashed },
+  blocked: { label: 'Blocked by the site', dot: 'text-orange-500', Icon: ShieldAlert },
   failed: { label: 'Failed', dot: 'text-red-500', Icon: XCircle },
   skipped: { label: 'No connector', dot: 'text-muted-foreground', Icon: CircleSlash },
   unknown: { label: 'Not yet crawled', dot: 'text-muted-foreground', Icon: HelpCircle },
+}
+
+/**
+ * The tooltip that answers "why did this store come back with nothing?" —
+ * walks the funnel from sitemap URLs down to pages actually fetched, since any
+ * stage of it can be the one that emptied the crawl.
+ */
+function crawlDetail(c: ScrapeHealthCompetitor): string | undefined {
+  const parts: string[] = []
+  if (c.status) parts.push(c.status)
+  if (c.products_seen != null) {
+    parts.push(`${c.products_seen.toLocaleString()} products seen`
+      + (c.cap_hit ? ' (cap hit, rotating)' : ''))
+  }
+  if (c.sitemap_urls_seen) {
+    parts.push(`${c.sitemap_urls_seen.toLocaleString()} sitemap URLs → `
+      + `${(c.candidates_crawlable ?? 0).toLocaleString()} candidates → `
+      + `${(c.pages_done ?? 0).toLocaleString()} pages fetched`)
+  }
+  if (c.targeted_candidates) {
+    parts.push(`${c.targeted_pages_done ?? 0} of ${c.pages_done ?? 0} pages spent on `
+      + `${c.targeted_candidates.toLocaleString()} items we still can't price`)
+  }
+  if (c.brand_hit_rate != null) {
+    parts.push(c.brand_gate_applied === false
+      ? `only ${(c.brand_hit_rate * 100).toFixed(1)}% of URLs name a tracked brand — `
+        + 'brand filter off, ranking by relevance instead'
+      : `${(c.brand_hit_rate * 100).toFixed(1)}% of URLs name a tracked brand`)
+  }
+  if (c.blocked_fetches) {
+    parts.push(`${c.blocked_fetches} of ${c.fetches ?? 0} requests refused (403/429)`)
+  }
+  if (c.off_domain_dropped) {
+    parts.push(`${c.off_domain_dropped.toLocaleString()} off-domain URLs skipped`)
+  }
+  return parts.length > 0 ? parts.join(' · ') : undefined
 }
 
 function timeAgo(iso: string | null): string {
@@ -88,23 +126,25 @@ export function ScrapeHealthPill({ health }: { health: ScrapeHealth | undefined 
           {health.competitors.map((c) => {
             const b = BUCKET[c.bucket] ?? BUCKET.unknown
             const B = b.Icon
-            const coverage = c.products_seen != null
-              ? `${c.products_seen.toLocaleString()} products seen${c.cap_hit ? ' — cap hit, rotating' : ''}`
-              : null
+            const detail = crawlDetail(c)
             return (
-              <div key={c.competitor_id ?? c.name} className="flex items-center gap-2 rounded px-1.5 py-1">
+              <div key={c.competitor_id ?? c.name}
+                   className="flex items-center gap-2 rounded px-1.5 py-1" title={detail}>
                 <B className={`h-3.5 w-3.5 shrink-0 ${b.dot}`} />
                 <span className="min-w-0 flex-1 truncate">{c.name}</span>
+                {c.brand_gate_applied === false && (
+                  <span className="shrink-0 rounded bg-violet-50 px-1 text-[10px] font-medium text-violet-700"
+                        title="This store doesn't put brand names in its product URLs — the crawl ranks candidates by relevance to untracked items instead of filtering on brand">
+                    no brand slugs
+                  </span>
+                )}
                 {c.cap_hit && (
                   <span className="shrink-0 rounded bg-sky-50 px-1 text-[10px] font-medium text-sky-700"
                         title="Catalog is larger than the nightly page budget — each night crawls the next slice">
                     rotating
                   </span>
                 )}
-                <span className="shrink-0 text-xs text-muted-foreground"
-                      title={[c.status, coverage].filter(Boolean).join(' · ') || undefined}>
-                  {b.label}
-                </span>
+                <span className="shrink-0 text-xs text-muted-foreground">{b.label}</span>
               </div>
             )
           })}
@@ -117,6 +157,7 @@ export function ScrapeHealthPill({ health }: { health: ScrapeHealth | undefined 
           {counts.ok}/{counts.total} stores OK
           {counts.empty > 0 && ` · ${counts.empty} empty`}
           {counts.no_matches > 0 && ` · ${counts.no_matches} no matches`}
+          {counts.blocked > 0 && ` · ${counts.blocked} blocked`}
           {counts.failed > 0 && ` · ${counts.failed} failed`}
         </div>
       </PopoverContent>
