@@ -343,7 +343,13 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             else:
                 pending_links.append(row)
 
-        competitors = [c for c in repository.get_competitors() if c.get("enabled")]
+        # Synthetic sources (Google benchmark/suggested) are pulled by their own
+        # phase below, not crawled — excluded here so they don't inflate
+        # competitors_total (leaving progress stuck short of the total) or get
+        # handed to SERP discovery.
+        competitors = [c for c in repository.get_competitors()
+                       if c.get("enabled")
+                       and c.get("connector_type") != repository.BENCHMARK_CONNECTOR]
         urls = repository.get_tracked_urls(include_disabled=False)
         _set_status(competitors_total=len(competitors), urls_total=len(urls))
 
@@ -660,6 +666,29 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         repository.load_rows(repository.T_EVENTS, event_buffer)
         counters["changes"] += sum(1 for e in event_buffer if not e["acknowledged"])
         _set_status(observations=counters["observations"], changes=counters["changes"])
+
+        # --- Google Merchant benchmark: pulled, not crawled ------------------
+        # Appends this run's market-benchmark / suggested-price snapshot as two
+        # synthetic competitors. Never fails the run — an unconfigured or
+        # unavailable Merchant Center just means no benchmark rows tonight. Emits
+        # no change events by design: these are modelled prices, not shelf prices.
+        from . import google_benchmark, settings as pi_settings
+        if pi_settings.get("google_benchmark_enabled"):
+            _set_status(phase="fetching Google benchmark")
+            try:
+                gb_stats = google_benchmark.run_benchmark_sync(
+                    run_id, observed_at=_now_iso())
+                counters["observations"] += gb_stats.get("observations", 0)
+                counters["google_benchmark"] = gb_stats
+                _set_status(observations=counters["observations"])
+                print(f"pi: google benchmark: {gb_stats}")
+            except google_benchmark.BenchmarkUnavailable as e:
+                counters["google_benchmark"] = {"skipped": str(e)}
+                print(f"pi: google benchmark skipped: {e}")
+            except Exception as e:
+                errors.append(f"google benchmark: {e}")
+                counters["google_benchmark"] = {"error": str(e)[:200]}
+                print(f"pi: google benchmark failed: {e}")
 
         repository.invalidate_pi_caches()
 

@@ -27,7 +27,13 @@ const CONNECTOR_LABEL: Record<string, { label: string; tone: string }> = {
   shopify_html: { label: 'Shopify (pages)', tone: 'bg-sky-50 text-sky-700 border-sky-200' },
   sitemap_html: { label: 'Sitemap (variant-aware)', tone: 'bg-violet-50 text-violet-700 border-violet-200' },
   unknown: { label: 'URL-only', tone: 'bg-slate-100 text-slate-600 border-slate-200' },
+  benchmark: { label: 'Reference feed', tone: 'bg-sky-50 text-sky-700 border-sky-200' },
 }
+
+// Synthetic sources (the Google Merchant Center reference prices) are pulled from
+// an API, not crawled: there's no catalog coverage to report, and disabling them
+// belongs in Admin (the schedule toggle), not behind a per-store delete.
+const BENCHMARK_CONNECTOR = 'benchmark'
 
 function ConnectorBadge({ type }: { type: string | null }) {
   if (!type) return <Badge variant="outline" className="bg-slate-50 text-slate-500">detecting…</Badge>
@@ -208,6 +214,7 @@ export function CompetitorManager() {
                     </TableCell>
                     <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
                       {(() => {
+                        if (c.connector_type === BENCHMARK_CONNECTOR) return 'not crawled'
                         const cov = crawlCoverage(c.crawl_state_json)
                         if (!cov) return '—'
                         return (
@@ -229,10 +236,12 @@ export function CompetitorManager() {
                       {c.last_scrape_status ?? '—'}
                     </TableCell>
                     <TableCell>
-                      <Button variant="ghost" size="sm" title="Disable"
-                              onClick={() => removeCompetitor(c.competitor_id, c.name)}>
-                        <Trash2 className="h-4 w-4 text-muted-foreground" />
-                      </Button>
+                      {c.connector_type !== BENCHMARK_CONNECTOR && (
+                        <Button variant="ghost" size="sm" title="Disable"
+                                onClick={() => removeCompetitor(c.competitor_id, c.name)}>
+                          <Trash2 className="h-4 w-4 text-muted-foreground" />
+                        </Button>
+                      )}
                     </TableCell>
                   </TableRow>
                 ))}

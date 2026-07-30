@@ -52,6 +52,11 @@ _SPECS = {
                                  "min": 0, "max": 100},
     "slack_max_digest_moves": {"kind": "int", "default": lambda: 15,
                                "min": 0, "max": 100},
+    # 5. Google Merchant Center benchmark phase. Toggleable here so the pull can
+    # be stopped without a redeploy; the merchant id and credentials stay env-only
+    # (they're deployment identity, not an operating preference).
+    "google_benchmark_enabled": {"kind": "bool",
+                                 "default": lambda: config.GOOGLE_BENCHMARK_ENABLED},
 }
 
 

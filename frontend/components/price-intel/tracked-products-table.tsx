@@ -17,6 +17,7 @@ import {
 } from '@/lib/price-intel/hooks'
 import type { ItemSearchResult, MatrixCoverage, SeedRefreshStatus, TrackedMatrix, TrackedProduct,
   VariantCandidate, VariantSelectionRequired } from '@/lib/price-intel/types'
+import { isSyntheticSource } from '@/lib/price-intel/types'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog'
@@ -44,6 +45,8 @@ const MATCH_METHOD_LABEL: Record<string, string> = {
   manual_url: 'tracked URL',
   attr_exact: 'color+size',
   attr: 'color+size',
+  google_benchmark: 'Google benchmark',
+  google_suggested: 'Google suggested',
 }
 
 // Expanded-row panel: latest exact price per store for this item only.
@@ -81,9 +84,18 @@ function CompetitorBreakdown({ product, onRejected, onMatchVariant, onMatchMatri
   }
   return (
     <div className="space-y-1 py-1">
-      {prices.map((p, i) => (
+      {prices.map((p, i) => {
+        // Google reference prices: a market statistic, not a storefront. There is
+        // no page to open and no listing to reject, and the stock badge would be
+        // meaningless — so those controls are dropped and the row is tinted to
+        // signal it doesn't count toward market min or position.
+        const synthetic = isSyntheticSource(p.source)
+        return (
         <div key={`${p.competitor_id ?? p.url ?? i}`}
-             className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-1.5 text-sm">
+             className={cn(
+               'flex items-center gap-3 rounded-md border px-3 py-1.5 text-sm',
+               synthetic ? 'border-dashed bg-sky-50/60' : 'bg-muted/30'
+             )}>
           <span className="w-40 shrink-0 truncate font-medium">
             {p.competitor_name ?? 'Unknown store'}
           </span>
@@ -93,14 +105,22 @@ function CompetitorBreakdown({ product, onRejected, onMatchVariant, onMatchMatri
               {fmt(p.compare_at_price)}
             </span>
           )}
-          <Badge variant="outline" className={cn(
-            'px-1.5 py-0 text-[11px]',
-            p.in_stock
-              ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
-              : 'border-slate-200 bg-slate-50 text-slate-500'
-          )}>
-            {p.in_stock == null ? 'stock unknown' : p.in_stock ? 'in stock' : 'out of stock'}
-          </Badge>
+          {synthetic ? (
+            <Badge variant="outline"
+                   className="border-sky-200 bg-sky-50 px-1.5 py-0 text-[11px] text-sky-700"
+                   title="Reference price from Google Merchant Center — not counted in market min, price position, or alerts">
+              reference only
+            </Badge>
+          ) : (
+            <Badge variant="outline" className={cn(
+              'px-1.5 py-0 text-[11px]',
+              p.in_stock
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                : 'border-slate-200 bg-slate-50 text-slate-500'
+            )}>
+              {p.in_stock == null ? 'stock unknown' : p.in_stock ? 'in stock' : 'out of stock'}
+            </Badge>
+          )}
           {p.match_method && (
             <Badge variant="outline" className="px-1.5 py-0 text-[11px] text-muted-foreground">
               {MATCH_METHOD_LABEL[p.match_method] ?? p.match_method}
@@ -135,14 +155,17 @@ function CompetitorBreakdown({ product, onRejected, onMatchVariant, onMatchMatri
               <ExternalLink className="h-3.5 w-3.5" />
             </a>
           )}
-          <button
-            onClick={() => reject(p.competitor_id, p.url, p.competitor_name ?? 'this listing')}
-            className="shrink-0 text-muted-foreground hover:text-rose-600"
-            title="Wrong match? Reject this listing so it won't re-match">
-            <Ban className="h-3.5 w-3.5" />
-          </button>
+          {!synthetic && (
+            <button
+              onClick={() => reject(p.competitor_id, p.url, p.competitor_name ?? 'this listing')}
+              className="shrink-0 text-muted-foreground hover:text-rose-600"
+              title="Wrong match? Reject this listing so it won't re-match">
+              <Ban className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
-      ))}
+        )
+      })}
     </div>
   )
 }

@@ -4,7 +4,11 @@ export interface Competitor {
   competitor_id: string
   name: string
   base_url: string
-  connector_type: 'shopify_json' | 'shopify_html' | 'sitemap_html' | 'unknown' | null
+  // 'benchmark' marks a synthetic, never-crawled source (Google Merchant Center
+  // reference prices) — registered so it renders like a store, but pulled by its
+  // own scrape phase rather than a connector.
+  connector_type: 'shopify_json' | 'shopify_html' | 'sitemap_html' | 'unknown'
+    | 'benchmark' | null
   enabled: boolean
   notes: string | null
   created_at: string | null
@@ -402,10 +406,22 @@ export interface ProductLink {
   item_system_sku: string | null
 }
 
+// 'gmb_benchmark' / 'gmb_suggested' are Google Merchant Center reference prices,
+// not scraped storefronts. They render like a store but are excluded server-side
+// from market-min / position / alerting — see repository.sql_market_sources.
+export type PriceSource = 'catalog' | 'url' | 'link' | 'serp'
+  | 'gmb_benchmark' | 'gmb_suggested'
+
+export const SYNTHETIC_PRICE_SOURCES: PriceSource[] = ['gmb_benchmark', 'gmb_suggested']
+
+export function isSyntheticSource(source: string | null | undefined): boolean {
+  return SYNTHETIC_PRICE_SOURCES.includes(source as PriceSource)
+}
+
 export interface ItemCompetitorPrice {
   competitor_id: string | null
   competitor_name: string | null
-  source: 'catalog' | 'url'
+  source: PriceSource
   url: string | null
   competitor_title: string | null
   price: number | null

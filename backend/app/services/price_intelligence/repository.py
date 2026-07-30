@@ -17,7 +17,9 @@ from datetime import date, datetime, timedelta, timezone
 from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
 
-from app.services.bigquery_sync import get_bq_client, APP_DATASET, LS_DATASET
+from app.services.bigquery_sync import (
+    get_bq_client, APP_DATASET, LS_DATASET, SHOPIFY_DATASET,
+)
 from . import config
 
 T_COMPETITORS = f"{APP_DATASET}.pi_competitors"
@@ -44,6 +46,26 @@ T_SETTINGS = f"{APP_DATASET}.pi_settings"
 def sql_cad_only(alias: str = "") -> str:
     col = f"{alias}.currency" if alias else "currency"
     return f"COALESCE(NULLIF(UPPER(TRIM({col})), ''), 'CAD') = 'CAD'"
+
+
+# Google Merchant Center rows (market benchmark, suggested price) ride
+# pi_price_observations so they render like any other store, but they are modelled
+# prices — a click-weighted average across all merchants, and an ad-performance
+# recommendation — not a competitor's actual shelf price. Letting them into
+# market-min / position / undercut / MAP math would mean alerting on a statistic.
+# So they are display-only: included in the per-store breakdown and the price
+# chart, excluded everywhere a number drives a decision.
+SYNTHETIC_SOURCES = ("gmb_benchmark", "gmb_suggested")
+
+# connector_type marking a pi_competitors row as a synthetic, never-crawled source.
+# build_connector has no branch for it, so the catalog crawl skips these rows.
+BENCHMARK_CONNECTOR = "benchmark"
+
+
+def sql_market_sources(alias: str = "") -> str:
+    col = f"{alias}.source" if alias else "source"
+    quoted = ", ".join(f"'{s}'" for s in SYNTHETIC_SOURCES)
+    return f"COALESCE({col}, '') NOT IN ({quoted})"
 
 
 # Join target for pi_tracked_products that collapses accidental duplicate
@@ -726,6 +748,7 @@ def get_tracked_products_with_market(days: int = 7):
             WHERE observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND match_item_id IS NOT NULL AND price IS NOT NULL
               AND {sql_cad_only("o")}
+              AND {sql_market_sources("o")}
               AND (COALESCE(price_scope, 'variant') = 'variant'
                    OR (price_scope = 'product' AND NOT EXISTS (
                        SELECT 1 FROM `{T_TRACKED}` mt
@@ -906,6 +929,7 @@ def get_tracked_matrices_with_market(days: int = 7):
             WHERE observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND match_item_id IS NOT NULL AND price IS NOT NULL
               AND {sql_cad_only("o")}
+              AND {sql_market_sources("o")}
               AND (COALESCE(price_scope, 'variant') = 'variant'
                    OR (price_scope = 'product' AND NOT EXISTS (
                        SELECT 1 FROM `{T_TRACKED}` mt
@@ -980,6 +1004,7 @@ def get_matrix_coverage(matrix_id: str, days: int = 45):
               AND o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
               AND o.price IS NOT NULL
               AND {sql_cad_only("o")}
+              AND {sql_market_sources("o")}
               AND (COALESCE(o.price_scope, 'variant') = 'variant'
                    OR (o.price_scope = 'product' AND NOT EXISTS (
                        SELECT 1 FROM `{T_TRACKED}` mt
@@ -1018,6 +1043,50 @@ def get_matrix_coverage(matrix_id: str, days: int = 45):
         if not r.get("competitor_name") and r.get("url"):
             r["competitor_name"] = urlparse(r["url"]).netloc
     return rows
+
+
+def get_google_offer_map() -> list:
+    """Shopify variant -> Lightspeed item_id, for resolving Merchant Center offer ids.
+
+    Google's reports identify products by the offer id our Shopify feed submits,
+    which carries no Lightspeed identifier. Shopify's `sku` is the Lightspeed
+    `system_sku`, which is how the rest of the app bridges the two systems
+    (shopify_match.py matches special orders on the same key). Measured on the live
+    catalog that join covers ~84% of active variants with no collisions, so a single
+    exact join is enough — no fuzzy fallback.
+
+    Barcode comes along as a secondary key for offers whose id resolves to neither a
+    variant nor a sku; it is deliberately not part of the join, because barcodes are
+    ambiguous across items (~1k active variants share one) and would fan out.
+    Normalized the same way as everywhere else: digits only, leading zeros stripped,
+    so a 12-digit UPC equals its 13-digit zero-padded EAN."""
+    ensure_pi_tables()
+    return _rows(f"""
+        WITH ls AS (
+            SELECT
+                CAST(id AS STRING) AS item_id,
+                CAST(system_sku AS STRING) AS sys_sku,
+                NULLIF(LTRIM(REGEXP_REPLACE(COALESCE(upc, ''), r'\\D', ''), '0'), '') AS upc_norm,
+                NULLIF(LTRIM(REGEXP_REPLACE(COALESCE(ean, ''), r'\\D', ''), '0'), '') AS ean_norm
+            FROM `{LS_DATASET}.item_history`
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_time DESC) = 1
+        ),
+        sv AS (
+            SELECT CAST(v.id AS STRING) AS variant_id,
+                   TRIM(v.sku) AS sku,
+                   NULLIF(LTRIM(REGEXP_REPLACE(COALESCE(v.barcode, ''), r'\\D', ''), '0'), '')
+                       AS barcode_norm
+            FROM `{SHOPIFY_DATASET}.product_variant` v
+            JOIN `{SHOPIFY_DATASET}.product` p ON p.id = v.product_id
+            WHERE p.status = 'ACTIVE'
+              AND NOT COALESCE(p._fivetran_deleted, FALSE)
+              AND COALESCE(TRIM(v.sku), '') != ''
+        )
+        SELECT sv.variant_id, sv.sku, sv.barcode_norm,
+               COALESCE(ls.upc_norm, ls.ean_norm) AS item_gtin, ls.item_id
+        FROM sv
+        JOIN ls ON sv.sku = ls.sys_sku
+    """)
 
 
 def update_tracked_product(item_id: str, fields: dict):
@@ -2396,10 +2465,16 @@ def _scrape_status_bucket(status: str) -> str:
 def get_scrape_health() -> dict:
     """Compact health overview of the most recent scrape for the UI: the last run
     row plus a per-competitor breakdown bucketed by last_scrape_status, and an
-    overall rollup. Enabled competitors only (disabled ones aren't scraped)."""
+    overall rollup. Enabled competitors only (disabled ones aren't scraped).
+
+    Synthetic sources (the Google benchmark/suggested pseudo-competitors) are left
+    out: they're never crawled, so a crawl-health bucket would be meaningless for
+    them, and counting them would drag the rollup around. The benchmark phase
+    reports its own outcome in the run's stats_json."""
     runs = get_scrape_runs(limit=1)
     run = runs[0] if runs else None
-    competitors = [c for c in get_competitors() if c.get("enabled")]
+    competitors = [c for c in get_competitors()
+                   if c.get("enabled") and c.get("connector_type") != BENCHMARK_CONNECTOR]
     per, counts = [], {}
     for c in competitors:
         bucket = _scrape_status_bucket(c.get("last_scrape_status"))

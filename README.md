@@ -254,14 +254,45 @@ LIGHTSPEED_CLIENT_SECRET
 LIGHTSPEED_REFRESH_TOKEN
 ```
 
+`GOOGLE_APPLICATION_CREDENTIALS` is a *path* to the BigQuery service-account JSON
+key. On Render it must be mounted as a Secret File and this variable pointed at
+the mount path.
+
 Useful optional backend variables:
 
 ```text
 APP_DATASET
 LS_DATASET
+SHOPIFY_DATASET
 QUALIFIED_ITEMS_VIEW
 LS_PO_SNAPSHOT_TTL_SECONDS
 ```
+
+### Google Merchant Center benchmark (price intelligence)
+
+Pulls the market benchmark price and Google's suggested price for products in our
+Merchant Center feed, and records them as two reference-only sources alongside
+scraped competitors. Off unless `PI_GOOGLE_BENCHMARK_ENABLED` is set.
+
+```text
+PI_GOOGLE_BENCHMARK_ENABLED      default false
+PI_GOOGLE_MERCHANT_ID            numeric Merchant Center account id
+PI_GOOGLE_MERCHANT_CREDENTIALS   path to the Merchant Center SA JSON key, OR the JSON inline
+PI_GOOGLE_BENCHMARK_COUNTRY      default CA
+PI_GOOGLE_INSIGHTS_ENABLED       default true (the suggested-price report)
+```
+
+This uses a **separate** service account from `GOOGLE_APPLICATION_CREDENTIALS` —
+the one already registered in Merchant Center, needing at least the Standard role.
+It is loaded explicitly rather than through ADC, so the two never conflict. Because
+`PI_GOOGLE_MERCHANT_CREDENTIALS` also accepts inline JSON, Render can hold it in an
+ordinary environment variable instead of a second Secret File.
+
+`google_benchmark_enabled` is also exposed in the price-intel Admin console, so the
+pull can be stopped without a redeploy.
+
+Merchant Center's terms restrict this data to internal use: it can't be resold,
+publicly displayed, advertised, or aggregated across businesses.
 
 The frontend requires:
 

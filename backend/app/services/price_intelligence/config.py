@@ -76,6 +76,26 @@ SERP_RESULTS_PER_SEARCH = int(os.getenv("PI_SERP_RESULTS_PER_SEARCH", "3"))
 SERP_GL = os.getenv("PI_SERP_GL", "ca")
 SERP_HL = os.getenv("PI_SERP_HL", "en")
 
+# Google Merchant Center market benchmark. Pulls the click-weighted average price
+# other merchants advertise for our GTINs (price_competitiveness_product_view) and
+# Google's modelled suggested price (price_insights_product_view), and writes both
+# into pi_price_observations as two synthetic competitors. Display-only: excluded
+# from market-min/position/undercut/MAP math — see repository.sql_market_sources.
+#
+# Credentials are deliberately NOT ADC: GOOGLE_APPLICATION_CREDENTIALS is the
+# BigQuery service account, which has no Merchant Center access. This is the
+# separate SA already registered in Merchant Center, given either as a path to its
+# JSON key or as the JSON itself (inline suits Render env vars, which can't mount
+# a second secret file as conveniently).
+GOOGLE_BENCHMARK_ENABLED = _flag("PI_GOOGLE_BENCHMARK_ENABLED")
+GOOGLE_MERCHANT_ID = os.getenv("PI_GOOGLE_MERCHANT_ID", "").strip()
+GOOGLE_MERCHANT_CREDENTIALS = os.getenv("PI_GOOGLE_MERCHANT_CREDENTIALS", "")
+# Benchmarks are reported per country of the searching user; we only compare CAD.
+GOOGLE_BENCHMARK_COUNTRY = os.getenv("PI_GOOGLE_BENCHMARK_COUNTRY", "CA").strip().upper()
+# Price Insights is a separate report with sparser coverage (it needs reported
+# conversions), so it can be turned off without losing the benchmark itself.
+GOOGLE_INSIGHTS_ENABLED = _flag("PI_GOOGLE_INSIGHTS_ENABLED", "true")
+
 # Price-push floor: never suggest/allow (without explicit override) a price below
 # cost * (1 + this margin). MAP price and per-item overrides take precedence when set.
 MARGIN_FLOOR_PCT = float(os.getenv("PI_MARGIN_FLOOR_PCT", "0.15"))
