@@ -273,6 +273,137 @@ class ShopifyClient:
             print(f"Failed to fetch Shopify special orders: {e}")
             return []
 
+    # ------------------------------------------------------- arbitrary lookup
+
+    # Everything the manual-link UI needs to show the user *which* order they are about to
+    # link: identity, state, and the full line-item list they confirm against. Deliberately
+    # NOT restricted to `tag:SO` or to open orders — the whole point of this path is to reach
+    # an order the automatic population never considered.
+    _ORDER_DETAIL_FIELDS = """
+      id
+      name
+      email
+      phone
+      createdAt
+      cancelledAt
+      closed
+      test
+      tags
+      displayFulfillmentStatus
+      displayFinancialStatus
+      shippingAddress { name phone }
+      metafield(namespace: "%s", key: "%s") { value }
+      lineItems(first: %d) { nodes { sku title variantTitle quantity } }
+    """ % (_ETA_NAMESPACE, _ETA_KEY, _LINE_ITEMS_PER_PAGE)
+
+    _SEARCH_ORDERS_QUERY = """
+    query SearchOrders($q: String!, $first: Int!) {
+      orders(first: $first, query: $q, sortKey: CREATED_AT, reverse: true) {
+        nodes { %s }
+      }
+    }
+    """ % _ORDER_DETAIL_FIELDS
+
+    _ORDERS_BY_ID_QUERY = """
+    query OrdersByIds($ids: [ID!]!) {
+      nodes(ids: $ids) { ... on Order { %s } }
+    }
+    """ % _ORDER_DETAIL_FIELDS
+
+    @staticmethod
+    def _order_detail(node: Dict[str, Any]) -> Dict[str, Any]:
+        """One GraphQL order node -> the flat detail record the manual-link UI renders."""
+        ship = node.get("shippingAddress") or {}
+        return {
+            "order_id": _gid_to_id(node.get("id")),
+            "order_name": node.get("name"),
+            "customer_email": (node.get("email") or "").strip().lower() or None,
+            "customer_phone": node.get("phone") or ship.get("phone"),
+            "customer_name": ship.get("name"),
+            "created_at": node.get("createdAt"),
+            "shopify_expected_date": (node.get("metafield") or {}).get("value"),
+            "fulfillment_status": node.get("displayFulfillmentStatus"),
+            "financial_status": node.get("displayFinancialStatus"),
+            "cancelled": bool(node.get("cancelledAt")),
+            "closed": bool(node.get("closed")),
+            "test": bool(node.get("test")),
+            "tags": node.get("tags") or [],
+            "line_items": [
+                {
+                    "sku": li.get("sku"),
+                    "title": li.get("title"),
+                    "variant_title": li.get("variantTitle"),
+                    "quantity": li.get("quantity"),
+                }
+                for li in ((node.get("lineItems") or {}).get("nodes") or [])
+            ],
+        }
+
+    def search_orders(self, term: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Finds orders by number (`244786`, `#244786`) or by any other Shopify order-search
+        term (email, customer name), newest first — regardless of tag, fulfillment state or
+        age. This backs the "link this SO to *any* Shopify order" flow, so it must reach
+        orders the `tag:SO` dashboard population deliberately excludes.
+
+        Returns [] (never raises) when Shopify is unconfigured or the search fails; the
+        caller's local candidate list is then all the user sees.
+        """
+        term = (term or "").strip()
+        if not term or not self._configured():
+            return []
+        # A bare/`#`-prefixed number is nearly always an order number — search that field
+        # explicitly so `#244786` doesn't also drag in every order mentioning the digits.
+        digits = term.lstrip("#").strip()
+        query = f"name:{digits}" if digits.isdigit() else term
+        try:
+            data = self._graphql(self._SEARCH_ORDERS_QUERY, {"q": query, "first": max(1, min(limit, 25))})
+        except Exception as e:
+            print(f"Shopify order search failed for {term!r}: {e}")
+            return []
+        return [self._order_detail(n) for n in ((data.get("orders") or {}).get("nodes") or [])]
+
+    def get_orders_by_ids(self, order_ids: List[str]) -> List[Dict[str, Any]]:
+        """
+        Fetches specific orders by numeric id, in the same per-(order x line SKU) row shape
+        as `get_open_special_orders()` so `shopify_match.build_shopify_index` can absorb
+        them. Used to resurrect manually-linked orders that fall outside the open `SO`-tagged
+        population (a fulfilled or untagged order a human deliberately linked) — none of the
+        open-population exclusions apply here, because the link is an explicit human decision.
+
+        Returns [] on any failure, which simply lets those links lapse to auto-matching.
+        """
+        ids = sorted({str(o).strip() for o in order_ids if str(o or "").strip()})
+        if not ids or not self._configured():
+            return []
+        try:
+            data = self._graphql(
+                self._ORDERS_BY_ID_QUERY,
+                {"ids": [f"gid://shopify/Order/{oid}" for oid in ids]},
+            )
+        except Exception as e:
+            print(f"Failed to fetch Shopify orders by id: {e}")
+            return []
+        rows: List[Dict[str, Any]] = []
+        for node in data.get("nodes") or []:
+            if not node:  # a deleted / inaccessible id comes back as null
+                continue
+            detail = self._order_detail(node)
+            base = {
+                "order_id": detail["order_id"],
+                "order_name": detail["order_name"],
+                "email": detail["customer_email"],
+                "phone": detail["customer_phone"],
+                "customer_name": detail["customer_name"],
+                "fulfillment_status": detail["fulfillment_status"],
+                "financial_status": detail["financial_status"],
+                "created_at": detail["created_at"],
+                "eta": detail["shopify_expected_date"],
+            }
+            skus = [li["sku"] for li in detail["line_items"]] or [None]
+            rows.extend({**base, "sku": sku} for sku in skus)
+        return rows
+
     # ----------------------------------------------------------------- write
 
     _SET_ETA_MUTATION = """

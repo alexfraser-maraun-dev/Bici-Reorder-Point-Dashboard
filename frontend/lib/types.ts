@@ -436,6 +436,35 @@ export interface ShopifyOnlyOrder {
   ambiguous_candidate?: boolean
 }
 
+// One line of a Shopify order, as shown in the manual-link confirmation step.
+export interface ShopifyLineItem {
+  sku: string | null
+  title: string | null
+  variant_title: string | null
+  quantity: number | null
+}
+
+// A Shopify order found by free-text lookup (`/api/special-orders/shopify-lookup`).
+// Unlike ShopifyOnlyOrder this can be ANY order — fulfilled, untagged, cancelled, years old
+// — so the state flags matter: the UI shows them before the user confirms the link.
+export interface ShopifyOrderLookup {
+  order_id: string
+  order_name: string | null
+  customer_email: string | null
+  customer_phone: string | null
+  customer_name: string | null
+  created_at: string | null
+  shopify_expected_date: string | null
+  fulfillment_status: string | null
+  financial_status: string | null
+  cancelled: boolean
+  closed: boolean
+  test: boolean
+  tags: string[]
+  line_items: ShopifyLineItem[]
+  shopify_order_url: string | null
+}
+
 // A vendor that can supply a SKU's brand, with its median lead time to the SO's store.
 export interface AvailableVendor {
   vendor_id: string
@@ -472,6 +501,9 @@ export interface SpecialOrder {
   order_id: string | null
   vendor_id: string | null
   vendor_name: string | null
+  // The PO's "Order Type v2" Lightspeed custom field: 'Booking' | 'Replenishment', or null
+  // when the buyer never tagged the PO (most of them).
+  order_type: string | null
   expected_date: string | null
   ordered_date: string | null
   po_ordered: boolean
@@ -492,9 +524,16 @@ export interface SpecialOrder {
   shopify_order_url: string | null
   shopify_expected_date: string | null   // the customer-promised ETA from Shopify
   shopify_candidates: ShopifyCandidate[] // ambiguous only: the orders it could be
-  // Attached service workorder (when the SO was raised from the bench)
+  // Attached service workorder (when the SO was raised from the bench), with the bench's
+  // own notes: `note` is customer-facing, `internal_note` staff-only, `hook_in` the tag
+  // written when the bike came in.
   workorder_id: string | null
   workorder_status: string | null
+  workorder_note: string | null
+  workorder_internal_note: string | null
+  workorder_hook_in: string | null
+  workorder_eta_out: string | null
+  workorder_time_in: string | null
   workorder_url: string | null
   // Deep links into Lightspeed
   ls_item_url: string | null

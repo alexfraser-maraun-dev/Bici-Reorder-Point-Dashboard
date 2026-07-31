@@ -314,6 +314,20 @@ async function postSoMatchOverride(
   return res.json()
 }
 
+// Looks up ANY Shopify order by number (or email / customer name) — including fulfilled,
+// untagged and old orders the dashboard's `SO`-tagged population never sees. Returns each
+// order with its line items so the user can confirm before committing the link.
+export async function lookupShopifyOrders(term: string): Promise<import('./types').ShopifyOrderLookup[]> {
+  const baseUrl = '/backend'
+  const res = await fetch(`${baseUrl}/api/special-orders/shopify-lookup?q=${encodeURIComponent(term)}`)
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || 'Shopify lookup failed')
+  }
+  const data = await res.json()
+  return data?.orders ?? []
+}
+
 export const matchSpecialOrder = (input: { special_order_id: string; shopify_order_id: string; updated_by?: string }) =>
   postSoMatchOverride('match', input)
 

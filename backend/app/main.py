@@ -1459,6 +1459,32 @@ def update_special_order_eta(payload: Dict[str, Any]):
     return {"status": "success", "shopify_order_id": order_id, "eta": eta}
 
 
+@app.get("/api/special-orders/shopify-lookup")
+def lookup_shopify_order(q: str, limit: int = 10):
+    """
+    Searches ALL Shopify orders (any tag, any fulfillment state, any age) by order number
+    — or by email / customer name — so an SO can be linked to an order the automatic
+    `SO`-tagged population never considered.
+
+    Returns { "orders": [ { order_id, order_name, customer_*, created_at,
+    shopify_expected_date, fulfillment_status, financial_status, cancelled, closed, test,
+    tags, line_items: [{sku, title, variant_title, quantity}], shopify_order_url } ] },
+    with the line items the UI shows for confirmation before the link is committed.
+    Never 500s on a Shopify hiccup — an empty list just means "nothing found".
+    """
+    from app.services.special_order_service import shopify_order_url
+    from app.services.shopify_client import ShopifyClient
+
+    term = (q or "").strip()
+    if not term:
+        raise HTTPException(status_code=400, detail="q is required")
+
+    orders = ShopifyClient().search_orders(term, limit=limit)
+    for o in orders:
+        o["shopify_order_url"] = shopify_order_url(o["order_id"])
+    return {"orders": orders}
+
+
 def _so_override_request(payload: Dict[str, Any], action: str) -> Dict[str, Any]:
     """Shared body for the manual match/unmatch endpoints: persist the override, then
     rebuild the cached dashboard so the pairing is live on the next read."""

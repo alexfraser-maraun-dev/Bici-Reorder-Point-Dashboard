@@ -727,19 +727,51 @@ class LightspeedClient:
         Fetches the purchase orders (Order entity) behind a set of special orders and
         returns, keyed by orderID, just the fields the triage logic needs:
           { orderID: { "arrivalDate", "orderedDate", "complete", "vendor_id",
-                       "vendor_name", "received_started" } }
+                       "vendor_name", "received_started", "order_type" } }
         `arrivalDate` is the PO's expected date; `orderedDate` is the date the PO was
-        actually placed with the vendor (empty/None until the PO is ordered); and
+        actually placed with the vendor (empty/None until the PO is ordered);
         `received_started` is True if any line shows receiving progress
-        (numReceived / checkedIn > 0).
+        (numReceived / checkedIn > 0); and `order_type` is the "Order Type v2" custom
+        field (see _order_type_from_custom_fields).
         """
         unique_ids = sorted({str(o) for o in order_ids if o and str(o) != "0"})
         return self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_order_chunk)
 
+    # The single-choice Order custom field that separates replenishment buys from
+    # pre-season bookings. Matched by NAME rather than by its customFieldID (9 on this
+    # account) so re-creating the field in Lightspeed doesn't silently blank the column.
+    _ORDER_TYPE_FIELD = "order type v2"
+
+    @classmethod
+    def _order_type_from_custom_fields(cls, order: Dict[str, Any]) -> Optional[str]:
+        """
+        The PO's "Order Type v2" choice ("Booking" / "Replenishment"), or None when the
+        field was never set on this PO.
+
+        A single_choice CustomFieldValue nests the chosen CustomFieldChoice under `value`:
+            {"customFieldID": "9", "name": "Order Type v2", "type": "single_choice",
+             "value": {"customFieldChoiceID": "8", "name": "Booking", ...}}
+        Only POs a human actually tagged carry a value at all — an untagged PO returns None
+        rather than the field's Lightspeed-side default, so the UI never claims a
+        classification nobody made.
+        """
+        wrap = order.get("CustomFieldValues")
+        if not isinstance(wrap, dict):
+            return None
+        for field in cls._as_list(wrap.get("CustomFieldValue")):
+            if str(field.get("name") or "").strip().lower() != cls._ORDER_TYPE_FIELD:
+                continue
+            value = field.get("value")
+            # single_choice -> nested choice object; any other shape -> plain scalar.
+            name = value.get("name") if isinstance(value, dict) else value
+            # Choice names carry the operator's stray whitespace ("Replenishment ").
+            return str(name).strip() or None if name else None
+        return None
+
     def _fetch_order_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
         params = {
             "orderID": f"IN,[{','.join(chunk)}]",
-            "load_relations": '["Vendor","OrderLines"]',
+            "load_relations": '["Vendor","OrderLines","CustomFieldValues"]',
             "limit": "100",
         }
         out: Dict[str, Dict[str, Any]] = {}
@@ -764,6 +796,7 @@ class LightspeedClient:
                 "vendor_id": order.get("vendorID"),
                 "vendor_name": vendor.get("name"),
                 "received_started": received_started,
+                "order_type": self._order_type_from_custom_fields(order),
             }
         return out
 
@@ -814,7 +847,8 @@ class LightspeedClient:
         """
         Resolves which special orders are attached to service workorders, keyed by the SO's
         saleLineID:
-          { saleLineID: { "workorder_id", "status", "eta_out" } }
+          { saleLineID: { "workorder_id", "status", "eta_out", "time_in",
+                          "note", "internal_note", "hook_in" } }
 
         The join is WorkorderItem.saleLineID == SpecialOrder.saleLineID (the part line a
         workorder-raised SO hangs off). It must NOT go through Workorder.saleID: a
@@ -824,6 +858,11 @@ class LightspeedClient:
         `status` is the human name resolved via /WorkorderStatus.json (the Workorder row
         itself only carries workorderStatusID). Failures (including a token without the
         workorder scope) degrade to {} so the dashboard just shows no workorder badge.
+
+        The three note fields are the bench's own record of why the part is on order and
+        what has been chased so far — `note` (customer-facing), `internalNote` (staff), and
+        `hookIn` (the tag written when the bike came in). They ride along on the same
+        /Workorder.json fetch, so surfacing them costs no extra request.
         """
         unique_ids = sorted({str(s) for s in sale_line_ids if s and str(s) != "0"})
         if not unique_ids:
@@ -841,6 +880,10 @@ class LightspeedClient:
                 "workorder_id": link["workorder_id"],
                 "status": status_names.get(detail.get("status_id")),
                 "eta_out": detail.get("eta_out"),
+                "time_in": detail.get("time_in"),
+                "note": detail.get("note"),
+                "internal_note": detail.get("internal_note"),
+                "hook_in": detail.get("hook_in"),
             }
         return out
 
@@ -866,7 +909,7 @@ class LightspeedClient:
         return out
 
     def _fetch_workorder_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
-        """workorderID -> {status_id, eta_out} details for the linked workorders."""
+        """workorderID -> {status_id, eta_out, time_in, note, internal_note, hook_in}."""
         params = {
             "workorderID": f"IN,[{','.join(chunk)}]",
             "limit": "100",
@@ -881,6 +924,12 @@ class LightspeedClient:
             out[str(wo.get("workorderID"))] = {
                 "status_id": str(wo.get("workorderStatusID")) if wo.get("workorderStatusID") else None,
                 "eta_out": wo.get("etaOut") or None,
+                "time_in": wo.get("timeIn") or None,
+                # Empty strings are the API's "unset" for these — normalize to None so the
+                # UI can tell "no note" from a note that happens to be blank-looking.
+                "note": (wo.get("note") or "").strip() or None,
+                "internal_note": (wo.get("internalNote") or "").strip() or None,
+                "hook_in": (wo.get("hookIn") or "").strip() or None,
             }
         return out
 

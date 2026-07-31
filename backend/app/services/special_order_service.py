@@ -40,9 +40,10 @@ from app.services import shopify_match
 from app.services.shopify_client import ShopifyClient
 
 # merchantOS (Lightspeed Retail web UI) deep-link views. The item view (matches
-# build_lightspeed_item_url in main.py) and the purchase-order view (purchase.views.purchase,
-# &tab=main) are confirmed against the live UI; the customer view still follows the same
-# pattern and should be confirmed.
+# build_lightspeed_item_url in main.py), the purchase-order view (purchase.views.purchase,
+# &tab=main) and the workorder view (workbench.views.beta_workorder, &tab=details) are
+# confirmed against the live UI; the customer view still follows the same pattern and
+# should be confirmed.
 _MERCHANTOS = "https://us.merchantos.com/?name={view}&form_name=view&id={id}"
 
 # Overdue thresholds (days "into trouble"). Three escalating tiers, tunable:
@@ -342,6 +343,9 @@ def _normalize(
         "order_id": order_id,
         "vendor_id": po.get("vendor_id"),
         "vendor_name": po.get("vendor_name"),
+        # The PO's "Order Type v2" custom field: "Booking" | "Replenishment" | None
+        # (None = the buyer never tagged this PO — most of them, historically).
+        "order_type": po.get("order_type"),
         "expected_date": expected_date.isoformat() if expected_date else None,
         "ordered_date": ordered_date.isoformat() if ordered_date else None,
         "po_ordered": ordered_date is not None,
@@ -353,17 +357,24 @@ def _normalize(
         "flag": triage["flag"],
         "days_overdue": triage["days_overdue"],
         "is_overdue": triage["flag"] in _OVERDUE_FLAGS,
-        # Attached service workorder (via SaleLine.saleID), when the SO came off the bench.
+        # Attached service workorder (via WorkorderItem.saleLineID), when the SO came off
+        # the bench — plus the bench's notes, so the buyer can see what service already
+        # knows about the part without leaving the dashboard.
         "workorder_id": workorder_id,
         "workorder_status": workorder.get("status"),
+        "workorder_note": workorder.get("note"),
+        "workorder_internal_note": workorder.get("internal_note"),
+        "workorder_hook_in": workorder.get("hook_in"),
+        "workorder_eta_out": workorder.get("eta_out"),
+        "workorder_time_in": workorder.get("time_in"),
         # Deep links into Lightspeed
         "ls_item_url": _ls_url("item.views.item", item_id),
         "ls_customer_url": _ls_url("customer.views.customer", customer_id),
         # PO deep link: the Retail web UI purchase-order view (confirmed against the live UI).
         "ls_order_url": _ls_url("purchase.views.purchase", order_id, extra="&tab=main"),
-        # Workorder deep link follows the same merchantOS pattern (workbench module);
-        # unconfirmed against the live UI — same caveat as the customer view.
-        "workorder_url": _ls_url("workbench.views.workorder", workorder_id),
+        # Workorder deep link: the beta workorder view, details tab (confirmed against the
+        # live UI — the older `workbench.views.workorder` guess did not resolve).
+        "workorder_url": _ls_url("workbench.views.beta_workorder", workorder_id, extra="&tab=details"),
     }
 
 
@@ -423,7 +434,7 @@ def _shopify_rows() -> List[Dict[str, Any]]:
     return rows
 
 
-def _shopify_order_url(order_id: Optional[str]) -> Optional[str]:
+def shopify_order_url(order_id: Optional[str]) -> Optional[str]:
     """Admin deep link, only when SHOPIFY_ADMIN_STORE_HANDLE is configured."""
     handle = os.getenv("SHOPIFY_ADMIN_STORE_HANDLE")
     if not handle or not order_id:
@@ -441,7 +452,7 @@ def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> N
     o["shopify_order_id"] = m["shopify_order_id"]
     o["shopify_order_name"] = m["shopify_order_name"]
     o["shopify_expected_date"] = m["shopify_expected_date"]
-    o["shopify_order_url"] = _shopify_order_url(m["shopify_order_id"])
+    o["shopify_order_url"] = shopify_order_url(m["shopify_order_id"])
     o["shopify_candidates"] = m.get("shopify_candidates") or []
 
     shopify_eta = _parse_ls_date(m["shopify_expected_date"])
@@ -455,6 +466,26 @@ def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> N
 
 
 _EMPTY_OVERRIDES = {"links": {}, "blocked": set()}
+
+
+def _manual_link_index(index: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    A SEPARATE index over the Shopify orders a human manually linked that the open
+    `SO`-tagged population doesn't contain — a fulfilled order, an untagged one, or one
+    older than the pull window. Without this, such a link silently lapsed back to
+    auto-matching (`resolve` could only honour ids present in the main index).
+
+    Kept separate on purpose: folding these orders into the main index would make them
+    eligible for *automatic* matching by other SOs, and would float any unclaimed one into
+    the "Unmatched" Shopify population — a years-old fulfilled order has no business
+    appearing there. Empty (no fetch at all) when every link already resolves.
+    """
+    links = (overrides.get("links") or {}).values()
+    missing = sorted({oid for oid in links if oid not in index["orders"]})
+    if not missing:
+        return shopify_match.build_shopify_index([])
+    rows = _safe(lambda: ShopifyClient().get_orders_by_ids(missing), [])
+    return shopify_match.build_shopify_index(rows)
 
 
 def _enrich_with_shopify(
@@ -473,7 +504,8 @@ def _enrich_with_shopify(
     appended to `orders` in place for the ones that adopt something.
 
     `overrides` carries the human decisions: `links` (SO -> Shopify order forced matches,
-    basis 'manual') and `blocked` (SO, order) pairs invisible to auto-matching.
+    basis 'manual') and `blocked` (SO, order) pairs invisible to auto-matching. A link may
+    point at an order outside this population entirely (see `_manual_link_index`).
 
     Only DEFINITE matches consume a Shopify order. An ambiguous SO's candidates still
     surface in the returned Shopify-only population (marked `ambiguous_candidate`) so an
@@ -491,13 +523,17 @@ def _enrich_with_shopify(
 
     consumed: set = set()        # definitively claimed -> excluded from "Unmatched"
     ambiguous_ids: set = set()   # candidates of some ambiguous SO -> "possible match"
+    # Orders linked by hand that live outside the open population (fulfilled/untagged/old).
+    external = _manual_link_index(index, ov)
 
     def resolve(o: Dict[str, Any]) -> Dict[str, Any]:
         so_id = str(o.get("special_order_id"))
         manual_oid = links.get(so_id)
         if manual_oid and manual_oid in index["orders"]:
             return shopify_match.manual_match(index, manual_oid)
-        # A manual link whose Shopify order has since closed simply lapses to auto-matching.
+        if manual_oid and manual_oid in external["orders"]:
+            return shopify_match.manual_match(external, manual_oid)
+        # A manual link Shopify no longer returns at all lapses to auto-matching.
         return shopify_match.match_special_order(
             o.get("customer_email"),
             o.get("system_sku"),
@@ -527,7 +563,7 @@ def _enrich_with_shopify(
 
     unmatched = shopify_match.shopify_only_orders(index, consumed)
     for u in unmatched:
-        u["shopify_order_url"] = _shopify_order_url(u["order_id"])
+        u["shopify_order_url"] = shopify_order_url(u["order_id"])
         u["ambiguous_candidate"] = u["order_id"] in ambiguous_ids
     return unmatched
 
