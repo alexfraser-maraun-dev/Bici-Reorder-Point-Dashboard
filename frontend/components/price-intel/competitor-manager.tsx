@@ -26,7 +26,7 @@ import type {
   VariantSelectionRequired,
 } from '@/lib/price-intel/types'
 import { ItemSearchPicker } from './item-search-picker'
-import { ExternalLink, Globe, Link2, Plus, Settings2, Trash2 } from 'lucide-react'
+import { BellOff, ExternalLink, Globe, Link2, Plus, Settings2, Trash2 } from 'lucide-react'
 
 const CONNECTOR_LABEL: Record<string, { label: string; tone: string }> = {
   shopify_json: { label: 'Shopify (catalog)', tone: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
@@ -71,12 +71,31 @@ function parseSettings(json: string | null | undefined): CompetitorCrawlSettings
   }
 }
 
+// Muting is invisible until you open the dialog, so the row says so — otherwise
+// a store that stopped appearing in the feed just looks broken.
+function MutedBadge({ settings }: { settings: CompetitorCrawlSettings }) {
+  const muted = [
+    settings.mute_price_alerts && 'price',
+    settings.mute_stock_alerts && 'stock',
+  ].filter(Boolean) as string[]
+  if (muted.length === 0) return null
+  return (
+    <Badge variant="outline"
+           className="gap-1 border-slate-200 bg-slate-50 px-1.5 py-0 text-[11px] text-slate-500"
+           title={`${muted.join(' & ')} change alerts are muted for this store — they stay out of the change feed and Slack`}>
+      <BellOff className="h-3 w-3" />
+      {muted.join(' & ')} muted
+    </Badge>
+  )
+}
+
 /**
- * Per-competitor crawl overrides. Every field is optional and blank means "use
- * the global default", so the dialog only ever sends the keys that were filled
- * in — a store with nothing set behaves exactly as it did before.
+ * Per-competitor settings: notification mutes plus crawl overrides. Every field
+ * is optional and blank/off means "use the global default", so the dialog only
+ * ever sends the keys that were actually set — a store with nothing set behaves
+ * exactly as it did before.
  */
-function CrawlSettingsDialog(
+function CompetitorSettingsDialog(
   { competitor, onClose, onSaved }:
   { competitor: Competitor | null; onClose: () => void; onSaved: () => Promise<unknown> },
 ) {
@@ -115,11 +134,11 @@ function CrawlSettingsDialog(
         ...competitor,
         settings: form,
       })
-      toast.success(`Crawl settings saved for ${competitor.name}`)
+      toast.success(`Settings saved for ${competitor.name}`)
       onClose()
       await onSaved()
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to save crawl settings')
+      toast.error(e instanceof Error ? e.message : 'Failed to save settings')
     } finally {
       setSaving(false)
     }
@@ -127,15 +146,53 @@ function CrawlSettingsDialog(
 
   return (
     <Dialog open={competitor !== null} onOpenChange={(open) => { if (!open) onClose() }}>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="max-h-[85vh] max-w-lg overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Crawl settings — {competitor?.name}</DialogTitle>
+          <DialogTitle>Settings — {competitor?.name}</DialogTitle>
           <DialogDescription>
-            Leave a field blank to use the global default. These only affect the
-            nightly catalog crawl, not tracked URLs.
+            Notification mutes apply everywhere; crawl fields left blank use the
+            global default and only affect the nightly catalog crawl.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
+          <div className="space-y-2">
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Notifications
+            </p>
+            <div className="flex items-center justify-between rounded-md border p-3">
+              <div className="pr-3">
+                <Label className="text-xs">Price change alerts</Label>
+                <p className="text-[11px] text-muted-foreground">
+                  Off hides this store&apos;s price drops and increases from the
+                  change feed, the unread badge and the Slack digest.
+                </p>
+              </div>
+              <Switch checked={form.mute_price_alerts !== true}
+                      onCheckedChange={(on) =>
+                        set('mute_price_alerts', on ? undefined : true)} />
+            </div>
+            <div className="flex items-center justify-between rounded-md border p-3">
+              <div className="pr-3">
+                <Label className="text-xs">Stock change alerts</Label>
+                <p className="text-[11px] text-muted-foreground">
+                  Off hides this store&apos;s in-stock / out-of-stock changes.
+                </p>
+              </div>
+              <Switch checked={form.mute_stock_alerts !== true}
+                      onCheckedChange={(on) =>
+                        set('mute_stock_alerts', on ? undefined : true)} />
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Muting only hides events — they keep being recorded, so turning an
+              alert back on restores this store&apos;s history. MAP violations and
+              undercuts are never muted.
+            </p>
+          </div>
+
+          <p className="border-t pt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Crawl
+          </p>
+
           <div className="space-y-1.5">
             <Label className="text-xs">Brand filter</Label>
             <Select value={form.brand_filter ?? 'auto'}
@@ -370,7 +427,12 @@ export function CompetitorManager() {
               <TableBody>
                 {enabledCompetitors.map((c) => (
                   <TableRow key={c.competitor_id}>
-                    <TableCell className="font-medium">{c.name}</TableCell>
+                    <TableCell className="font-medium">
+                      <span className="flex items-center gap-1.5">
+                        {c.name}
+                        <MutedBadge settings={parseSettings(c.settings_json)} />
+                      </span>
+                    </TableCell>
                     <TableCell>
                       <a href={c.base_url} target="_blank" rel="noopener noreferrer"
                          className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
@@ -408,7 +470,8 @@ export function CompetitorManager() {
                     <TableCell>
                       {c.connector_type !== BENCHMARK_CONNECTOR && (
                         <div className="flex items-center">
-                          <Button variant="ghost" size="sm" title="Crawl settings"
+                          <Button variant="ghost" size="sm"
+                                  title="Settings — notification mutes and crawl overrides"
                                   onClick={() => setSettingsTarget(c)}>
                             <Settings2 className={`h-4 w-4 ${
                               c.settings_json ? 'text-sky-600' : 'text-muted-foreground'}`} />
@@ -527,9 +590,9 @@ export function CompetitorManager() {
         </CardContent>
       </Card>
 
-      <CrawlSettingsDialog competitor={settingsTarget}
-                           onClose={() => setSettingsTarget(null)}
-                           onSaved={mutate} />
+      <CompetitorSettingsDialog competitor={settingsTarget}
+                                onClose={() => setSettingsTarget(null)}
+                                onSaved={mutate} />
 
       <Dialog open={linkTarget !== null} onOpenChange={(open) => {
         if (!open) { setLinkTarget(null); setLinkChoice(null) }

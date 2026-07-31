@@ -96,6 +96,8 @@ _COMPETITOR_SETTING_KEYS = {
     "request_interval_seconds", "max_product_pages", "max_catalog_pages",
     "max_sitemap_fetches", "max_candidate_urls", "sitemap_urls",
     "confine_to_domain",
+    # notification mutes (repository.MUTABLE_EVENT_GROUPS)
+    *repository.MUTABLE_EVENT_GROUPS,
 }
 
 
@@ -128,6 +130,11 @@ def _validate_competitor_settings(settings):
         except (TypeError, ValueError):
             raise HTTPException(status_code=400,
                                 detail="request_interval_seconds must be a positive number")
+    for key in repository.MUTABLE_EVENT_GROUPS:
+        # Only a literal true mutes (see repository.muted_event_competitors), so a
+        # string "false" would silently read as "not muted" — reject it outright.
+        if key in settings and not isinstance(settings[key], bool):
+            raise HTTPException(status_code=400, detail=f"{key} must be true or false")
 
 
 @router.get("/competitors")

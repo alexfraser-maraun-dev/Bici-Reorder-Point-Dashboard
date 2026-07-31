@@ -61,6 +61,16 @@ SYNTHETIC_SOURCES = ("gmb_benchmark", "gmb_suggested")
 # build_connector has no branch for it, so the catalog crawl skips these rows.
 BENCHMARK_CONNECTOR = "benchmark"
 
+# Change-event families a single store can be muted for (Competitors tab → the
+# per-store settings dialog). Muting is a *display* rule: the events are still
+# recorded, they're just hidden from the change feed, the unread badge and Slack,
+# so un-muting brings the store's history straight back. MAP violations and
+# undercuts are deliberately not mutable — those are the decision signals.
+MUTABLE_EVENT_GROUPS = {
+    "mute_price_alerts": ("price_drop", "price_increase"),
+    "mute_stock_alerts": ("out_of_stock", "back_in_stock"),
+}
+
 
 def sql_market_sources(alias: str = "") -> str:
     col = f"{alias}.source" if alias else "source"
@@ -531,6 +541,50 @@ def get_competitors(include_disabled: bool = True):
     return rows
 
 
+def muted_event_competitors() -> dict:
+    """{mute key: [competitor_id, ...]} for stores muted in the Competitors tab.
+
+    Reads the cached competitor list, so this costs nothing on the hot path."""
+    out = {key: [] for key in MUTABLE_EVENT_GROUPS}
+    for c in get_competitors():
+        raw = c.get("settings_json")
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for key in MUTABLE_EVENT_GROUPS:
+            if data.get(key) is True:
+                out[key].append(str(c["competitor_id"]))
+    return out
+
+
+def sql_event_mute_filter(alias: str = "", groups=None):
+    """(predicate, params) dropping muted competitors' events from an event query.
+
+    Returns ("", []) when nothing is muted, so the common case adds no SQL and no
+    parameters. `groups` limits which mute keys apply (the digest only carries
+    price events, so it never needs the stock clause)."""
+    muted = muted_event_competitors()
+    prefix = f"{alias}." if alias else ""
+    clauses, params = [], []
+    for i, (key, types) in enumerate(MUTABLE_EVENT_GROUPS.items()):
+        if groups is not None and key not in groups:
+            continue
+        ids = muted.get(key) or []
+        if not ids:
+            continue
+        name = f"muted_{i}"
+        quoted = ", ".join(f"'{t}'" for t in types)
+        clauses.append(f"NOT ({prefix}competitor_id IN UNNEST(@{name})"
+                       f" AND {prefix}event_type IN ({quoted}))")
+        params.append(bigquery.ArrayQueryParameter(name, "STRING", ids))
+    return " AND ".join(clauses), params
+
+
 def _competitor_settings_json(value):
     """Normalize per-competitor crawl settings to the stored JSON string.
 
@@ -877,7 +931,12 @@ def get_item_competitor_prices(item_id: str, days: int = 45):
         if not best.get("competitor_name") and best.get("url"):
             best["competitor_name"] = urlparse(best["url"]).netloc
         out.append(best)
-    out.sort(key=lambda r: r.get("price") or 0.0)
+    # Google Merchant Center rows (benchmark + suggested price) sort together at
+    # the top: they're reference statistics rather than a store's shelf price, so
+    # reading them as the two cheapest/priciest "stores" mid-list is misleading.
+    # Real stores keep their cheapest-first order underneath.
+    out.sort(key=lambda r: (0 if (r.get("source") in SYNTHETIC_SOURCES) else 1,
+                            r.get("price") or 0.0))
     return out
 
 
@@ -1691,6 +1750,12 @@ def get_change_events(days: int = 14, acknowledged=None, competitor_id=None,
     if brand:
         where += " AND LOWER(COALESCE(item_brand, '')) = @brand"
         params.append(bigquery.ScalarQueryParameter("brand", "STRING", str(brand).lower()))
+    # Muted stores are filtered in SQL, not after the fetch, so the LIMIT still
+    # returns a full page of events the user actually wants to see.
+    mute_sql, mute_params = sql_event_mute_filter()
+    if mute_sql:
+        where += f" AND {mute_sql}"
+        params += mute_params
     return _rows(f"""
         SELECT * FROM `{T_EVENTS}` {where}
         ORDER BY occurred_at DESC LIMIT {int(limit)}
@@ -1702,11 +1767,14 @@ def count_unacknowledged_events() -> int:
     cached = _cache_get("unack_count")
     if cached is not None:
         return cached
+    # Same mute rule as the feed — a muted store must not drive the nav badge.
+    mute_sql, mute_params = sql_event_mute_filter()
     rows = _rows(f"""
         SELECT COUNT(*) AS n FROM `{T_EVENTS}`
         WHERE COALESCE(acknowledged, FALSE) = FALSE
           AND occurred_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
-    """)
+          {f'AND {mute_sql}' if mute_sql else ''}
+    """, params=mute_params)
     n = rows[0]["n"] if rows else 0
     _cache_set("unack_count", n)
     return n

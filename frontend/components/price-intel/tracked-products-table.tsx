@@ -170,6 +170,13 @@ function CompetitorBreakdown({ product, onRejected, onMatchVariant, onMatchMatri
   )
 }
 
+// Lightspeed System IDs are numeric strings; a numeric sort keeps 9 before 10.
+// Items without one sort last rather than colliding at 0.
+const systemIdOrder = (p: TrackedProduct): number => {
+  const n = Number(p.system_sku)
+  return p.system_sku && Number.isFinite(n) ? n : Number.POSITIVE_INFINITY
+}
+
 type MarketPosition = 'cheaper' | 'parity' | 'pricier' | 'none'
 
 function marketPosition(product: TrackedProduct): MarketPosition {
@@ -674,8 +681,17 @@ export function TrackedProductsTable({ quickFilter, onClearQuickFilter }: {
   // A matrix rendered as one expandable parent row (rollup) over its variant rows.
   // Rollup numbers come from the backend matrix aggregate when present (authoritative,
   // whole-matrix); children are the filtered variants currently visible.
-  const renderMatrixGroup = (matrixId: string, variants: TrackedProduct[]) => {
+  const renderMatrixGroup = (matrixId: string, rawVariants: TrackedProduct[]) => {
     const roll = matrixById.get(matrixId)
+    // Variants always read in System ID order regardless of the table's sort —
+    // that's the order the same matrix lists in Lightspeed, so the two line up
+    // when you check a size against the back office. IDs are numeric strings.
+    const variants = [...rawVariants].sort((a, b) => {
+      const av = systemIdOrder(a)
+      const bv = systemIdOrder(b)
+      if (av !== bv) return av < bv ? -1 : 1
+      return (a.system_sku ?? '').localeCompare(b.system_sku ?? '')
+    })
     const first = variants[0]
     const isOpen = expandedMatrices.has(matrixId)
     const retails = variants.map((v) => v.current_retail).filter((x): x is number => x != null)
