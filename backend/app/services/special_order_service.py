@@ -343,8 +343,10 @@ def _normalize(
         "order_id": order_id,
         "vendor_id": po.get("vendor_id"),
         "vendor_name": po.get("vendor_name"),
-        # The PO's "Order Type v2" custom field: "Booking" | "Replenishment" | None
-        # (None = the buyer never tagged this PO — most of them, historically).
+        # The PO's "Order Type v2" custom field ("Replenishment" | "Booking"). Lightspeed
+        # only records a value when the non-default choice is picked, so this is the stored
+        # value where there is one and the field's default otherwise. None only when the SO
+        # has no PO attached at all.
         "order_type": po.get("order_type"),
         "expected_date": expected_date.isoformat() if expected_date else None,
         "ordered_date": ordered_date.isoformat() if ordered_date else None,

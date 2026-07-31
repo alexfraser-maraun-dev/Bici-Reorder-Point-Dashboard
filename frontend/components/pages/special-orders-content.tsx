@@ -194,6 +194,7 @@ export function SpecialOrdersContent() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [search, setSearch] = useState('')
   const [storeFilter, setStoreFilter] = useState<string>('all')
+  const [orderTypeFilter, setOrderTypeFilter] = useState<string>('all')
   const [liveOnly, setLiveOnly] = useState(true)
   const [flaggedOnly, setFlaggedOnly] = useState(false)
 
@@ -214,19 +215,30 @@ export function SpecialOrdersContent() {
     return Array.from(names).sort()
   }, [orders])
 
+  // Order types come from the data rather than a hardcoded Replenishment/Booking pair, so
+  // renaming or adding a choice in Lightspeed shows up here without a code change.
+  const orderTypes = useMemo(() => {
+    const names = new Set<string>()
+    orders.forEach((o) => { if (o.order_type) names.add(o.order_type) })
+    return Array.from(names).sort()
+  }, [orders])
+
   // Base set: everything EXCEPT the tile selection — so the tile counts react to the toggles.
   const base = useMemo(() => {
     const term = search.trim().toLowerCase()
     return allRows.filter((o) => {
       if (flaggedOnly && o.flag === 'none') return false
       if (storeFilter !== 'all' && o.store !== storeFilter) return false
+      // 'none' = the SO has no PO yet, so it has no order type to speak of.
+      if (orderTypeFilter === 'none' && o.order_type) return false
+      if (orderTypeFilter !== 'all' && orderTypeFilter !== 'none' && o.order_type !== orderTypeFilter) return false
       if (liveOnly && o.days_since_creation !== null && o.days_since_creation > LIVE_SO_MAX_DAYS) return false
       if (!term) return true
       return [o.customer_name, o.customer_email, o.description, o.system_sku, o.upc, o.brand, o.vendor_name, o.order_id, o.special_order_id, o.shopify_order_name, o.workorder_id,
         ...o.available_vendors.map((v) => v.vendor_name)]
         .some((v) => v && String(v).toLowerCase().includes(term))
     })
-  }, [allRows, flaggedOnly, storeFilter, liveOnly, search])
+  }, [allRows, flaggedOnly, storeFilter, orderTypeFilter, liveOnly, search])
 
   // The tiles that currently have ≥1 selected sub-triage. A tile is "active" once you pick any of
   // its buckets; selection combines as AND across tiles, OR within a tile.
@@ -276,7 +288,8 @@ export function SpecialOrdersContent() {
     })
   }
 
-  const filtersActive = selected.size > 0 || storeFilter !== 'all' || search || flaggedOnly || !liveOnly
+  const filtersActive =
+    selected.size > 0 || storeFilter !== 'all' || orderTypeFilter !== 'all' || search || flaggedOnly || !liveOnly
 
   return (
     <div className="space-y-4">
@@ -408,6 +421,20 @@ export function SpecialOrdersContent() {
             ))}
           </SelectContent>
         </Select>
+        {orderTypes.length > 0 && (
+          <Select value={orderTypeFilter} onValueChange={setOrderTypeFilter}>
+            <SelectTrigger className="w-[170px]">
+              <SelectValue placeholder="All order types" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All order types</SelectItem>
+              {orderTypes.map((t) => (
+                <SelectItem key={t} value={t}>{t}</SelectItem>
+              ))}
+              <SelectItem value="none">No PO yet</SelectItem>
+            </SelectContent>
+          </Select>
+        )}
         <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
           <Checkbox checked={flaggedOnly} onCheckedChange={(v) => setFlaggedOnly(v === true)} />
           Flagged only
@@ -421,7 +448,7 @@ export function SpecialOrdersContent() {
             variant="ghost"
             size="sm"
             className="text-muted-foreground"
-            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setSearch(''); setFlaggedOnly(false); setLiveOnly(true) }}
+            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setOrderTypeFilter('all'); setSearch(''); setFlaggedOnly(false); setLiveOnly(true) }}
           >
             Clear filters
           </Button>

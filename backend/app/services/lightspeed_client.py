@@ -732,15 +732,61 @@ class LightspeedClient:
         actually placed with the vendor (empty/None until the PO is ordered);
         `received_started` is True if any line shows receiving progress
         (numReceived / checkedIn > 0); and `order_type` is the "Order Type v2" custom
-        field (see _order_type_from_custom_fields).
+        field, falling back to the field's account-level default (see `order_type_default`).
         """
         unique_ids = sorted({str(o) for o in order_ids if o and str(o) != "0"})
-        return self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_order_chunk)
+        orders = self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_order_chunk)
+
+        # Lightspeed stores a CustomFieldValue row only when someone picks the NON-default
+        # choice, so an untouched PO carries no value at all while Lightspeed's own UI still
+        # shows it as the default. Mirror that exactly: the default IS the type until a buyer
+        # says otherwise, which is how the buyers use the field.
+        default = self.order_type_default()
+        for po in orders.values():
+            if po["order_type"] is None:
+                po["order_type"] = default
+        return orders
 
     # The single-choice Order custom field that separates replenishment buys from
     # pre-season bookings. Matched by NAME rather than by its customFieldID (9 on this
     # account) so re-creating the field in Lightspeed doesn't silently blank the column.
     _ORDER_TYPE_FIELD = "order type v2"
+
+    # The field definition changes about never, so cache its default choice for the process
+    # rather than paying a request per dashboard build.
+    _order_type_default_cache: Dict[str, Any] = {"value": None, "fetched_at": 0.0}
+    _ORDER_TYPE_DEFAULT_TTL = 3600.0
+
+    def order_type_default(self) -> Optional[str]:
+        """
+        The choice Lightspeed pre-selects for "Order Type v2" ("Replenishment" here), which
+        is what its own UI shows on a PO nobody has tagged — and therefore the type such a
+        PO effectively has.
+
+        Read from the field definition rather than hardcoded, so changing the default on the
+        Lightspeed side carries through here without a code change. Returns None (column
+        falls back to blank) on any failure.
+        """
+        cache = LightspeedClient._order_type_default_cache
+        if cache["value"] is not None and time.time() - cache["fetched_at"] < self._ORDER_TYPE_DEFAULT_TTL:
+            return cache["value"]
+        response = self._request("GET", "/Order/CustomField.json", params={"limit": "100"})
+        if response is None or response.status_code != 200:
+            return cache["value"]
+        try:
+            fields = self._as_list(response.json().get("CustomField"))
+        except ValueError:
+            return cache["value"]
+        for field in fields:
+            if str(field.get("name") or "").strip().lower() != self._ORDER_TYPE_FIELD:
+                continue
+            default = field.get("default")
+            name = default.get("name") if isinstance(default, dict) else default
+            value = str(name).strip() or None if name else None
+            cache["value"] = value
+            cache["fetched_at"] = time.time()
+            return value
+        return cache["value"]
 
     @classmethod
     def _order_type_from_custom_fields(cls, order: Dict[str, Any]) -> Optional[str]:
@@ -751,9 +797,12 @@ class LightspeedClient:
         A single_choice CustomFieldValue nests the chosen CustomFieldChoice under `value`:
             {"customFieldID": "9", "name": "Order Type v2", "type": "single_choice",
              "value": {"customFieldChoiceID": "8", "name": "Booking", ...}}
-        Only POs a human actually tagged carry a value at all — an untagged PO returns None
-        rather than the field's Lightspeed-side default, so the UI never claims a
-        classification nobody made.
+
+        Lightspeed writes a value row ONLY when the non-default choice is picked: verified
+        across every PO created since the field existed, all 13 stored values are "Booking"
+        and not one "Replenishment" row exists. None therefore means "still the default",
+        which `get_orders_by_ids` fills in — the workflow is that buyers flip a PO to
+        "Booking" when it is one and leave the rest alone.
         """
         wrap = order.get("CustomFieldValues")
         if not isinstance(wrap, dict):

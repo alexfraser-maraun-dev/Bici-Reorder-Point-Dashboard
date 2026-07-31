@@ -501,8 +501,9 @@ export interface SpecialOrder {
   order_id: string | null
   vendor_id: string | null
   vendor_name: string | null
-  // The PO's "Order Type v2" Lightspeed custom field: 'Booking' | 'Replenishment', or null
-  // when the buyer never tagged the PO (most of them).
+  // The PO's "Order Type v2" ('Replenishment' | 'Booking'). Lightspeed only stores the
+  // non-default choice, so this is the stored value where there is one and the field's
+  // default ('Replenishment') otherwise. Null only when no PO is attached yet.
   order_type: string | null
   expected_date: string | null
   ordered_date: string | null
