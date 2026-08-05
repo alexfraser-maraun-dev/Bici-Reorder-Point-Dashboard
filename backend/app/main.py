@@ -1195,6 +1195,18 @@ def _start_po_watch_scheduler() -> None:
         start_scheduler()
 
 
+@app.on_event("startup")
+def _warm_hlc_tracking_cache() -> None:
+    """Build the HLC tracking map on boot so the first PO tracker request doesn't
+    pay HLC's ~10s order-history walk. The import stays inside the flag guard so
+    a deployment without HLC never loads the package."""
+    from app.services.hlc import config as hlc_config
+    if not hlc_config.HLC_ENABLED:
+        return
+    from app.services.hlc.service import warm_cache
+    threading.Thread(target=warm_cache, daemon=True).start()
+
+
 def _warm_po_snapshot_cache() -> None:
     """Populate the read-only PO header cache before the buyer opens a draft."""
     try:

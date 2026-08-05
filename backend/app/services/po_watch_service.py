@@ -24,7 +24,7 @@ import os
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from app.services.lightspeed_client import LightspeedClient, _to_number
@@ -279,6 +279,25 @@ def _build_watchlist(ordered_within_days: int) -> Dict[str, Any]:
     }
 
 
+def _hlc_tracking() -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """HLC shipment tracking keyed by Lightspeed order id, best-effort.
+
+    Deliberately fail-soft and deliberately *outside* the cached Lightspeed walk:
+    HLC's order history call takes ~10s, so folding it into _build_watchlist
+    would couple the two caches and stall the tracker whenever HLC is cold. If
+    HLC is disabled, slow or down, the tracker renders exactly as it did before.
+    """
+    try:
+        from app.services.hlc import config as hlc_config
+        if not hlc_config.HLC_ENABLED:
+            return {}, None
+        from app.services.hlc.service import get_tracking_by_lightspeed_order, get_tracking_meta
+        return get_tracking_by_lightspeed_order(), get_tracking_meta()
+    except Exception as e:
+        print(f"po-watch: HLC tracking lookup failed: {e}")
+        return {}, {"error": "unavailable"}
+
+
 def get_po_watchlist(ordered_within_days: int = 300, force_refresh: bool = False) -> Dict[str, Any]:
     """Cached watchlist + per-request ack/alert overlay and triage summary.
 
@@ -302,6 +321,7 @@ def get_po_watchlist(ordered_within_days: int = 300, force_refresh: bool = False
     except Exception as e:
         print(f"po-watch: ack lookup failed: {e}")
         acks = {}
+    tracking, tracking_meta = _hlc_tracking()
     today = date.today()
     threshold = alert_days_late_threshold()
     summary: Dict[str, Any] = {tier: 0 for tier in TRIAGE_ORDER}
@@ -316,6 +336,9 @@ def get_po_watchlist(ordered_within_days: int = 300, force_refresh: bool = False
             "snooze_until": ack.get("snooze_until"),
             "active": active,
         } if ack else None
+        # None for every PO the vendor doesn't ship (or that HLC has no boxes
+        # for yet), so the field is always present for the frontend.
+        order["tracking"] = tracking.get(order["order_id"])
         # Slack-alertable = late AND nothing received yet AND not snoozed. Once a
         # first receipt lands the vendor has delivered (that moment IS the lead
         # time), so partially/fully received POs never page the channel — they
@@ -332,6 +355,7 @@ def get_po_watchlist(ordered_within_days: int = 300, force_refresh: bool = False
 
     payload["summary"] = summary
     payload["meta"]["alert_days_late_threshold"] = threshold
+    payload["meta"]["hlc_tracking"] = tracking_meta
     return payload
 
 

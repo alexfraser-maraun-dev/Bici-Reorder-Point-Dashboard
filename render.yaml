@@ -15,6 +15,15 @@ services:
       # Set the value in the Render dashboard; must match the frontend's copy.
       - key: BACKEND_SHARED_SECRET
         sync: false
+      # HLC (Cycles Lambert) shipment tracking on the PO tracker. Off unless
+      # HLC_ENABLED is set; the API key goes in the dashboard, never in git.
+      - key: HLC_ENABLED
+        value: "false"
+      - key: HLC_API_KEY
+        sync: false
+      # Canada runs the v3.0 "legacy" API — the v4.x endpoints 404 here.
+      - key: HLC_BASE_URL
+        value: https://api.hlc.bike/ca/v3.0
 
   # Frontend Dashboard
   - type: web
