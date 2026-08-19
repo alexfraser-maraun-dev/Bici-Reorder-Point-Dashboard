@@ -3,17 +3,24 @@
 import { useEffect, useState } from 'react'
 import { RefreshCw } from 'lucide-react'
 import { AppShell } from '@/components/layout/app-shell'
+import { FeatureGate } from '@/components/layout/feature-gate'
 import { Button } from '@/components/ui/button'
 import { Toaster } from '@/components/ui/sonner'
 import { useReplenishmentData } from '@/lib/hooks'
 import { cn } from '@/lib/utils'
-import { DashboardContent, SHOW_INVENTORY_DASHBOARD, type DashboardTab } from './dashboard-content'
+import { DashboardContent, useVisibleDashboardTabs, type DashboardTab } from './dashboard-content'
 import type { AdjustmentMode, DemandWeights } from './sheets-replenishment'
 
+// Where the app opens. Falls back to the first tab still switched on if this one
+// has been turned off.
+const DEFAULT_TAB: DashboardTab = 'po-tracker'
+
 export function DashboardPageClient() {
-  // Procurement is the primary cockpit. The legacy inventory engine remains
-  // available, but its BigQuery/Pandas workload starts only when explicitly opened.
-  const [activeTab, setActiveTab] = useState<DashboardTab>('purchase-orders')
+  // PO Tracker is the landing surface. The rest of the cockpit — and the legacy
+  // inventory engine with its BigQuery/Pandas workload — opens only on demand,
+  // and only for tabs switched on in the Admin page.
+  const [activeTab, setActiveTab] = useState<DashboardTab>(DEFAULT_TAB)
+  const { tabs: visibleTabs, isLoading: accessLoading } = useVisibleDashboardTabs()
   const [forecastPeriod, setForecastPeriod] = useState(60)
   const [safetyDays, setSafetyDays] = useState(7)
   const [growthMultiplier, setGrowthMultiplier] = useState(1.0)
@@ -39,15 +46,28 @@ export function DashboardPageClient() {
     return () => clearTimeout(timer)
   }, [forecastPeriod, safetyDays, demandWeights, isDemandWeightValid])
 
+  // If the active tab gets switched off (or was never on for this user), land on
+  // the default, else the first tab they do have. Keyed on the tab list itself so
+  // this settles once when access resolves rather than on every render.
+  const visibleTabKeys = visibleTabs.map((tab) => tab.value).join(',')
+  useEffect(() => {
+    if (accessLoading || !visibleTabKeys) return
+    const keys = visibleTabKeys.split(',') as DashboardTab[]
+    if (keys.includes(activeTab)) return
+    setActiveTab(keys.includes(DEFAULT_TAB) ? DEFAULT_TAB : keys[0])
+  }, [accessLoading, visibleTabKeys, activeTab])
+
+  const inventoryVisible = visibleTabs.some((tab) => tab.value === 'inventory')
+
   const { data, isLoading, refetch } = useReplenishmentData(
     debouncedForecast,
     debouncedSafety,
     growthMultiplier,
     debouncedDemandWeights,
     adjustmentMode,
-    SHOW_INVENTORY_DASHBOARD && isDemandWeightValid && activeTab === 'inventory'
+    inventoryVisible && isDemandWeightValid && activeTab === 'inventory'
   )
-  const headerActions = SHOW_INVENTORY_DASHBOARD && activeTab === 'inventory' ? (
+  const headerActions = inventoryVisible && activeTab === 'inventory' ? (
     <Button
       variant="secondary"
       className="h-8 gap-2 text-xs font-semibold border"
@@ -61,6 +81,7 @@ export function DashboardPageClient() {
 
   return (
     <AppShell headerActions={headerActions} mainClassName="p-2 lg:p-3">
+      <FeatureGate feature="ordering">
       <DashboardContent
         activeTab={activeTab}
         setActiveTab={setActiveTab}
@@ -80,6 +101,7 @@ export function DashboardPageClient() {
         adjustmentMode={adjustmentMode}
         setAdjustmentMode={setAdjustmentMode}
       />
+      </FeatureGate>
       <Toaster position="bottom-right" />
     </AppShell>
   )

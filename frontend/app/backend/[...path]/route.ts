@@ -30,6 +30,10 @@ async function proxy(req: NextRequest, ctx: { params: Promise<{ path: string[] }
   const contentType = req.headers.get("content-type")
   if (contentType) headers.set("content-type", contentType)
   if (SHARED_SECRET) headers.set("x-internal-secret", SHARED_SECRET)
+  // Identity for the backend's feature-access checks. Read from the server-side
+  // session, never from the incoming request, so the browser cannot spoof it.
+  const email = session.user?.email
+  if (email) headers.set("x-user-email", email)
 
   const method = req.method.toUpperCase()
   const init: RequestInit = { method, headers, redirect: "manual" }

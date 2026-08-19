@@ -10,8 +10,11 @@ import {
   CircleHelp,
   LogOut,
   TrendingUp,
+  ShieldCheck,
 } from 'lucide-react'
 import { PriceIntelNavBadge } from '@/components/price-intel/nav-badge'
+import { useAccess } from '@/lib/access/hooks'
+import type { FeatureKey } from '@/lib/access/types'
 import { signOut, useSession } from 'next-auth/react'
 import { APP_VERSION, APP_VERSION_SUMMARY, APP_GIT_SHA, APP_GIT_DATE } from '@/lib/version'
 import { ConnectionIndicators } from '@/components/layout/connection-indicators'
@@ -24,14 +27,18 @@ import {
 } from '@/components/ui/sheet'
 import { useState } from 'react'
 
-const navigation = [
-  { name: 'Ordering', href: '/', icon: LayoutDashboard },
-  { name: 'Special Orders', href: '/special-orders', icon: PackageSearch },
-  // Feature-flagged: set NEXT_PUBLIC_PRICE_INTEL_ENABLED=true (build-time) to show.
+// Every entry is gated on its feature key (see lib/access). A page whose feature
+// is off never renders a link and its route redirects, so nothing behind it loads.
+const navigation: { name: string; href: string; icon: typeof LayoutDashboard; feature: FeatureKey }[] = [
+  { name: 'Ordering', href: '/', icon: LayoutDashboard, feature: 'ordering' },
+  { name: 'Special Orders', href: '/special-orders', icon: PackageSearch, feature: 'special_orders' },
+  // Also requires NEXT_PUBLIC_PRICE_INTEL_ENABLED at build time; the Admin page
+  // can only hide it further, never turn on a build that shipped without it.
   ...(process.env.NEXT_PUBLIC_PRICE_INTEL_ENABLED === 'true'
-    ? [{ name: 'Price Intel', href: '/price-intelligence', icon: TrendingUp }]
+    ? [{ name: 'Price Intel', href: '/price-intelligence', icon: TrendingUp, feature: 'price_intel' as FeatureKey }]
     : []),
-  { name: 'How it Works', href: '/how-to-use', icon: CircleHelp },
+  { name: 'How it Works', href: '/how-to-use', icon: CircleHelp, feature: 'how_to_use' },
+  { name: 'Admin', href: '/admin', icon: ShieldCheck, feature: 'admin' },
 ]
 
 interface AppShellProps {
@@ -44,6 +51,13 @@ export function AppShell({ children, headerActions, mainClassName }: AppShellPro
   const pathname = usePathname()
   const { data: session } = useSession()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const { isEnabled, isAdmin } = useAccess()
+  // isEnabled is optimistic while access loads (better than flashing an empty
+  // nav at everyone), but Admin is the one link that must not appear to a
+  // non-admin even for a moment, so it waits for the confirmed answer.
+  const visibleNavigation = navigation.filter((item) =>
+    item.feature === 'admin' ? isAdmin : isEnabled(item.feature)
+  )
 
   return (
     <div className="bg-background min-h-screen">
@@ -63,7 +77,7 @@ export function AppShell({ children, headerActions, mainClassName }: AppShellPro
                 <span className="text-lg font-semibold">SKU Automation</span>
               </div>
               <nav className="space-y-1 p-2">
-                {navigation.map((item) => {
+                {visibleNavigation.map((item) => {
                   const isActive = pathname === item.href
                   return (
                     <Link
@@ -121,7 +135,7 @@ export function AppShell({ children, headerActions, mainClassName }: AppShellPro
 
           {/* Desktop navigation */}
           <nav className="ml-8 hidden items-center gap-1 lg:flex">
-            {navigation.map((item) => {
+            {visibleNavigation.map((item) => {
               const isActive = pathname === item.href
               return (
                 <Link

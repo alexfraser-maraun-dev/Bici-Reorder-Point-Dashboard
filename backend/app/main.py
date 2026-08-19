@@ -63,6 +63,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Feature access control. A feature switched off in the Admin page must be truly
+# dormant, not merely hidden — so requests to endpoints that feature exclusively
+# owns are refused here, before any BigQuery/Lightspeed work starts. Endpoints
+# shared by several features aren't claimed by any of them and stay open.
+#
+# The caller's identity comes from X-User-Email, which the Next.js proxy sets
+# server-side from the NextAuth session. The shared-secret gate below means only
+# that proxy can reach this API, so the header is trustworthy here. Registering
+# this middleware first is deliberate: Starlette runs the last-registered http
+# middleware outermost, so the secret check still happens before this one.
+from app.services.access.router import USER_EMAIL_HEADER as _USER_EMAIL_HEADER
+from app.services.access.router import router as access_router
+from app.services.access import service as access_service
+
+app.include_router(access_router)
+
+
+@app.middleware("http")
+async def _enforce_feature_access(request: Request, call_next):
+    if request.method != "OPTIONS":
+        feature_key = access_service.feature_for_path(request.url.path)
+        if feature_key is not None:
+            email = (request.headers.get(_USER_EMAIL_HEADER) or "").strip().lower() or None
+            try:
+                allowed = access_service.can_access(email, feature_key)
+            except Exception as e:
+                # Never let a settings-store hiccup black-hole the whole API.
+                print(f"access: could not resolve '{feature_key}', allowing request: {e}")
+                allowed = True
+            if not allowed:
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": f"The '{feature_key}' feature is turned off.",
+                             "feature": feature_key},
+                )
+    return await call_next(request)
+
+
 # Shared-secret gate. The frontend never calls this API directly from the browser;
 # it goes through a same-origin Next.js proxy that (a) enforces the NextAuth session
 # and (b) injects this secret server-side. So every legitimate request carries the

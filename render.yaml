@@ -15,6 +15,10 @@ services:
       # Set the value in the Render dashboard; must match the frontend's copy.
       - key: BACKEND_SHARED_SECRET
         sync: false
+      # Comma-separated emails that are always admins on the /admin page,
+      # regardless of stored settings. Set the value in the Render dashboard.
+      - key: APP_ADMIN_EMAILS
+        sync: false
 
   # Frontend Dashboard
   - type: web

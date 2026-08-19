@@ -77,14 +77,18 @@ function MutedBadge({ settings }: { settings: CompetitorCrawlSettings }) {
   const muted = [
     settings.mute_price_alerts && 'price',
     settings.mute_stock_alerts && 'stock',
+    settings.mute_map_alerts && 'MAP',
   ].filter(Boolean) as string[]
   if (muted.length === 0) return null
+  const label = muted.length > 1
+    ? `${muted.slice(0, -1).join(', ')} & ${muted[muted.length - 1]}`
+    : muted[0]
   return (
     <Badge variant="outline"
            className="gap-1 border-slate-200 bg-slate-50 px-1.5 py-0 text-[11px] text-slate-500"
-           title={`${muted.join(' & ')} change alerts are muted for this store — they stay out of the change feed and Slack`}>
+           title={`${label} alerts are muted for this store — they stay out of the change feed and Slack`}>
       <BellOff className="h-3 w-3" />
-      {muted.join(' & ')} muted
+      {label} muted
     </Badge>
   )
 }
@@ -182,10 +186,23 @@ function CompetitorSettingsDialog(
                       onCheckedChange={(on) =>
                         set('mute_stock_alerts', on ? undefined : true)} />
             </div>
+            <div className="flex items-center justify-between rounded-md border p-3">
+              <div className="pr-3">
+                <Label className="text-xs">MAP violation alerts</Label>
+                <p className="text-[11px] text-muted-foreground">
+                  Off hides this store&apos;s MAP violations from the change feed
+                  and stops its red Slack pings.
+                </p>
+              </div>
+              <Switch checked={form.mute_map_alerts !== true}
+                      onCheckedChange={(on) =>
+                        set('mute_map_alerts', on ? undefined : true)} />
+            </div>
             <p className="text-[11px] text-muted-foreground">
               Muting only hides events — they keep being recorded, so turning an
-              alert back on restores this store&apos;s history. MAP violations and
-              undercuts are never muted.
+              alert back on restores this store&apos;s history. Muting MAP never
+              hides the MAP violation badge or KPI tile on tracked products: those
+              are read live from the market min, not from alerts.
             </p>
           </div>
 

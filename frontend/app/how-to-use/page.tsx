@@ -1,6 +1,7 @@
 'use client'
 
 import { AppShell } from '@/components/layout/app-shell'
+import { FeatureGate } from '@/components/layout/feature-gate'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { 
   Zap, 
@@ -17,6 +18,7 @@ import {
 export default function HowToUsePage() {
   return (
     <AppShell>
+      <FeatureGate feature="how_to_use">
       <div className="max-w-4xl mx-auto space-y-8 py-4 animate-in fade-in slide-in-from-bottom-4 duration-700">
         <div className="space-y-2">
           <h1 className="text-3xl font-bold tracking-tight">How the Config Tool Works</h1>
@@ -245,6 +247,7 @@ export default function HowToUsePage() {
           </p>
         </div>
       </div>
+      </FeatureGate>
     </AppShell>
   )
 }

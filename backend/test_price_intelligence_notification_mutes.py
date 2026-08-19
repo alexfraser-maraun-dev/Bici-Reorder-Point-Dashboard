@@ -37,18 +37,20 @@ class MutedCompetitorTests(unittest.TestCase):
             _competitor("d", {"mute_stock_alerts": True}),
             _competitor("e"),
             _competitor("f", {"url_allow_pattern": "/product/"}),
+            _competitor("g", {"mute_map_alerts": True}),
         ]
         with patch.object(repository, "get_competitors", return_value=competitors):
             muted = repository.muted_event_competitors()
         self.assertEqual(["a"], muted["mute_price_alerts"])
         self.assertEqual(["d"], muted["mute_stock_alerts"])
+        self.assertEqual(["g"], muted["mute_map_alerts"])
 
     def test_unparseable_settings_are_ignored(self):
         competitors = [{"competitor_id": "a", "settings_json": "{not json"},
                        {"competitor_id": "b", "settings_json": "[1, 2]"}]
         with patch.object(repository, "get_competitors", return_value=competitors):
             muted = repository.muted_event_competitors()
-        self.assertEqual({"mute_price_alerts": [], "mute_stock_alerts": []}, muted)
+        self.assertEqual({k: [] for k in repository.MUTABLE_EVENT_GROUPS}, muted)
 
     def test_no_mutes_emits_no_sql_and_no_params(self):
         with patch.object(repository, "get_competitors",
@@ -61,17 +63,29 @@ class MutedCompetitorTests(unittest.TestCase):
         with patch.object(repository, "get_competitors", return_value=[
             _competitor("a", {"mute_price_alerts": True}),
             _competitor("b", {"mute_stock_alerts": True}),
+            _competitor("c", {"mute_map_alerts": True}),
         ]):
             sql, params = repository.sql_event_mute_filter()
         # Each clause pairs its own competitors with its own event types, so a
-        # price-muted store keeps its stock events (and vice versa), and neither
-        # mute touches map_violation / undercut.
+        # price-muted store keeps its stock and MAP events, and so on.
         self.assertIn("'price_drop', 'price_increase'", sql)
         self.assertIn("'out_of_stock', 'back_in_stock'", sql)
-        self.assertNotIn("map_violation", sql)
+        self.assertIn("'map_violation'", sql)
+        # Undercut is not a mutable family at all.
         self.assertNotIn("undercut", sql)
         by_name = {p.name: list(p.values) for p in params}
-        self.assertEqual([["a"], ["b"]], [by_name["muted_0"], by_name["muted_1"]])
+        self.assertEqual([["a"], ["b"], ["c"]],
+                         [by_name["muted_0"], by_name["muted_1"], by_name["muted_2"]])
+
+    def test_map_mute_is_independent_of_the_price_mute(self):
+        """A store muted for price noise must still raise MAP violations —
+        that's the whole point of keeping the families separate."""
+        with patch.object(repository, "get_competitors", return_value=[
+            _competitor("a", {"mute_price_alerts": True}),
+        ]):
+            sql, params = repository.sql_event_mute_filter()
+        self.assertNotIn("map_violation", sql)
+        self.assertEqual(1, len(params))
 
     def test_groups_argument_limits_the_predicate(self):
         with patch.object(repository, "get_competitors", return_value=[
@@ -145,12 +159,32 @@ class MuteReachesEveryReadPathTests(unittest.TestCase):
         sql, cfg = changes[0]
         self.assertIn("NOT (competitor_id IN UNNEST(@muted_0)", sql)
         self.assertIn("'price_drop', 'price_increase'", sql)
-        # Only the price family: a price mute must never suppress MAP violations
-        # or undercuts, which the same query carries.
+        # Stock events never reach the digest, so that clause must not appear.
         self.assertNotIn("out_of_stock", sql)
         names = [p.name for p in cfg.query_parameters]
         # run_id still rides along — the mute params are additive, not a swap.
+        # Exactly one mute clause: this store muted price only, so its MAP
+        # violations still reach the LLM.
         self.assertEqual(["run_id", "muted_0"], names)
+
+    def test_map_mute_reaches_the_digest_and_the_slack_pings(self):
+        """MAP is the one family with its own red Slack ping (notify._ALERT_META).
+        Those pings read through get_change_events, so the feed filter is what
+        silences them — and the digest query has to drop the store too."""
+        map_muted = [_competitor("a", {"mute_map_alerts": True})]
+        with patch.object(repository, "get_competitors", return_value=map_muted):
+            sql, params = repository.sql_event_mute_filter(
+                groups=("mute_price_alerts", "mute_map_alerts"))
+        self.assertIn("'map_violation'", sql)
+        self.assertNotIn("price_drop", sql)
+        self.assertEqual(1, len(params))
+
+        # …and the same predicate lands on the query notify.dispatch_run reads.
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "get_competitors", return_value=map_muted), \
+             patch.object(repository, "_rows", return_value=[]) as rows:
+            repository.get_change_events(days=2, run_id="run-1", limit=1000)
+        self.assertIn("'map_violation'", rows.call_args.args[0])
 
 
 class BreakdownOrderingTests(unittest.TestCase):

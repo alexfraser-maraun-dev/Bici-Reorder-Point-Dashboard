@@ -179,6 +179,30 @@ class PlanningStore:
                     value TEXT
                 )
             """)
+            # --- Feature access control (see services/access/) -----------------
+            # One row per feature key the admin has explicitly toggled. Absence of
+            # a row means "use the registry default", so a fresh deployment behaves
+            # exactly as the code ships and clearing a row reverts to that default.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS app_feature_flags (
+                    feature_key {id_type} PRIMARY KEY,
+                    enabled INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    updated_by TEXT
+                )
+            """)
+            # One row per user the admin has configured. role is 'admin' or 'member';
+            # overrides_json is a {feature_key: bool} map applied on top of the global
+            # flags for that user only. Users with no row get the default role.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS app_user_access (
+                    email {id_type} PRIMARY KEY,
+                    role TEXT NOT NULL,
+                    overrides_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    updated_by TEXT
+                )
+            """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_po_draft_lines_draft ON po_draft_lines(draft_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_po_drafts_status ON po_drafts(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_planning_runs_created ON planning_runs(created_at)")
@@ -494,6 +518,67 @@ class PlanningStore:
         with self.transaction(immediate=True) as conn:
             conn.execute(self._sql("DELETE FROM po_watch_meta WHERE key = ?"), (key,))
             conn.execute(self._sql("INSERT INTO po_watch_meta (key,value) VALUES (?,?)"), (key, value))
+
+    # ------------------------------------------------------------------
+    # Feature access control
+    # ------------------------------------------------------------------
+
+    def list_feature_flags(self) -> Dict[str, bool]:
+        """Explicitly-set feature toggles, {feature_key: enabled}. Keys absent
+        here fall back to the registry default."""
+        with self.transaction() as conn:
+            rows = conn.execute("SELECT feature_key, enabled FROM app_feature_flags").fetchall()
+        return {row["feature_key"]: bool(row["enabled"]) for row in rows}
+
+    def set_feature_flag(self, feature_key: str, enabled: bool, updated_by: str = "Dashboard") -> None:
+        now = self._now()
+        with self.transaction(immediate=True) as conn:
+            conn.execute(self._sql("DELETE FROM app_feature_flags WHERE feature_key = ?"), (feature_key,))
+            conn.execute(self._sql(
+                "INSERT INTO app_feature_flags (feature_key,enabled,updated_at,updated_by) VALUES (?,?,?,?)"
+            ), (feature_key, 1 if enabled else 0, now, updated_by))
+
+    def clear_feature_flag(self, feature_key: str) -> None:
+        """Drops the override so the feature reverts to its registry default."""
+        with self.transaction(immediate=True) as conn:
+            conn.execute(self._sql("DELETE FROM app_feature_flags WHERE feature_key=?"), (feature_key,))
+
+    def list_user_access(self) -> List[Dict[str, Any]]:
+        with self.transaction() as conn:
+            rows = conn.execute(
+                "SELECT email, role, overrides_json, updated_at, updated_by FROM app_user_access ORDER BY email"
+            ).fetchall()
+        out = []
+        for row in rows:
+            record = dict(row)
+            try:
+                record["overrides"] = json.loads(record.pop("overrides_json") or "{}")
+            except (TypeError, ValueError):
+                record["overrides"] = {}
+                record.pop("overrides_json", None)
+            out.append(record)
+        return out
+
+    def upsert_user_access(
+        self,
+        email: str,
+        role: str,
+        overrides: Optional[Dict[str, bool]] = None,
+        updated_by: str = "Dashboard",
+    ) -> Dict[str, Any]:
+        now = self._now()
+        payload = json.dumps(overrides or {}, sort_keys=True)
+        with self.transaction(immediate=True) as conn:
+            conn.execute(self._sql("DELETE FROM app_user_access WHERE email = ?"), (email,))
+            conn.execute(self._sql(
+                "INSERT INTO app_user_access (email,role,overrides_json,updated_at,updated_by) VALUES (?,?,?,?,?)"
+            ), (email, role, payload, now, updated_by))
+        return {"email": email, "role": role, "overrides": overrides or {},
+                "updated_at": now, "updated_by": updated_by}
+
+    def delete_user_access(self, email: str) -> None:
+        with self.transaction(immediate=True) as conn:
+            conn.execute(self._sql("DELETE FROM app_user_access WHERE email=?"), (email,))
 
     def create_override(self, override: Dict[str, Any]) -> Dict[str, Any]:
         required = ("scope_type", "scope_id", "measure", "override_value", "reason", "created_by")

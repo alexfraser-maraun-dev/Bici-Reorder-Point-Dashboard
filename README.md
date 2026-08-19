@@ -268,6 +268,40 @@ QUALIFIED_ITEMS_VIEW
 LS_PO_SNAPSHOT_TTL_SECONDS
 ```
 
+### Feature access control
+
+Every page and Ordering tab is a *feature* declared once in
+`backend/app/services/access/registry.py`. The Admin page (`/admin`) switches
+them on or off at runtime and sets per-user permissions by login email.
+
+A feature that is off is genuinely dormant, not merely hidden:
+
+* the nav entry and tab don't render, so their components never mount and never
+  fetch;
+* the route renders a short "turned off" panel instead of the page;
+* the backend refuses that feature's own endpoints with a 403 before any
+  BigQuery or Lightspeed work starts (`access/service.feature_for_path`).
+
+Storage is the same Postgres/SQLite store the PO workflow uses
+(`app_feature_flags`, `app_user_access`). A feature with no stored row falls
+back to `default_enabled` in the registry, so a fresh or reset database behaves
+exactly as the code ships.
+
+```text
+APP_ADMIN_EMAILS   comma-separated emails that are always admins, whatever the
+                   database says. Set at least one — it is how the first admin
+                   gets in, and the way back in if the last admin is demoted.
+```
+
+Two things worth knowing:
+
+* Per-user rules only subdivide features that are globally on. Switching a
+  feature off turns it off for everyone, admins included.
+* The Admin page itself can never be switched off (`registry.ALWAYS_ON`).
+* `DATABASE_URL` must point at Postgres in production. Without it the store
+  falls back to a local SQLite file, which on Render is ephemeral — settings
+  would revert to the registry defaults on each deploy.
+
 ### Google Merchant Center benchmark (price intelligence)
 
 Pulls the market benchmark price and Google's suggested price for products in our

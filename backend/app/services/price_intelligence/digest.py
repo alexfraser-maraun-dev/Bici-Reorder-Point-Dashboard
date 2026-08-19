@@ -96,10 +96,11 @@ def build_digest_stats(run_id: str) -> dict:
         FROM matched WHERE market_min IS NOT NULL AND our_price IS NOT NULL
     """)
 
-    # A store muted for price alerts is kept out of the LLM's input too —
-    # otherwise the narrative would still talk about the moves the user silenced.
+    # A muted store is kept out of the LLM's input too — otherwise the narrative
+    # would still talk about the moves the user silenced. Only the families this
+    # query actually carries; stock events never reach the digest.
     mute_sql, mute_params = repository.sql_event_mute_filter(
-        groups=("mute_price_alerts",))
+        groups=("mute_price_alerts", "mute_map_alerts"))
     changes = rows(f"""
         SELECT event_type, item_title AS item, competitor_name AS competitor,
                old_price, new_price, pct_change

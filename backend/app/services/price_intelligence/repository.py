@@ -64,11 +64,14 @@ BENCHMARK_CONNECTOR = "benchmark"
 # Change-event families a single store can be muted for (Competitors tab → the
 # per-store settings dialog). Muting is a *display* rule: the events are still
 # recorded, they're just hidden from the change feed, the unread badge and Slack,
-# so un-muting brings the store's history straight back. MAP violations and
-# undercuts are deliberately not mutable — those are the decision signals.
+# so un-muting brings the store's history straight back. Muting MAP also stops
+# that store's red Slack pings (notify._ALERT_META) — it does NOT touch the MAP
+# violation badge or KPI tile in the tracked table, which are computed live from
+# market min vs. our floor rather than from events.
 MUTABLE_EVENT_GROUPS = {
     "mute_price_alerts": ("price_drop", "price_increase"),
     "mute_stock_alerts": ("out_of_stock", "back_in_stock"),
+    "mute_map_alerts": ("map_violation",),
 }
 
 

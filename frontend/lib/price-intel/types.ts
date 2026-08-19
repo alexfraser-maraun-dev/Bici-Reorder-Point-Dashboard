@@ -45,12 +45,14 @@ export interface CompetitorCrawlSettings {
   sitemap_urls?: string[]
   // Off only for a store that legitimately serves products from a second host.
   confine_to_domain?: boolean
-  // Notification mutes. True hides this store's price-change / stock-change
-  // events from the change feed, the unread badge and Slack. The events are
-  // still recorded, so un-muting brings the history back. MAP violations and
-  // undercuts are never muted — they're the decision signals.
+  // Notification mutes. True hides this store's events of that family from the
+  // change feed, the unread badge and Slack (mute_map_alerts also stops its red
+  // Slack pings). The events are still recorded, so un-muting brings the history
+  // back — and the MAP violation badge / KPI tile in the tracked table are
+  // computed live from market min, so a MAP mute never hides them.
   mute_price_alerts?: boolean
   mute_stock_alerts?: boolean
+  mute_map_alerts?: boolean
 }
 
 export interface TrackedUrl {
