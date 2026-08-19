@@ -5,7 +5,6 @@ export type FeatureKey =
   | 'ordering'
   | 'special_orders'
   | 'price_intel'
-  | 'how_to_use'
   | 'admin'
   | 'ordering.inventory'
   | 'ordering.demand'
@@ -18,6 +17,8 @@ export interface AccessState {
   email: string | null
   role: 'admin' | 'member'
   is_admin: boolean
+  /** True while no admin exists anywhere, so everyone signed in is treated as one. */
+  bootstrap_mode: boolean
   features: Record<string, boolean>
   default_ordering_tab: FeatureKey
 }

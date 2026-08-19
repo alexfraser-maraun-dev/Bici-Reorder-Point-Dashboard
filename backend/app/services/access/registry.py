@@ -84,13 +84,6 @@ FEATURES: List[Feature] = [
         api_prefixes=["/api/price-intel"],
     ),
     Feature(
-        key="how_to_use",
-        label="How it Works",
-        description="The in-app explainer of how the numbers are calculated.",
-        group="Pages",
-        kind="page",
-    ),
-    Feature(
         key="admin",
         label="Admin",
         description="This page. Always available to admins so access can never be locked out.",

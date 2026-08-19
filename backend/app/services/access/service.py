@@ -35,6 +35,23 @@ def bootstrap_admins() -> set:
     return {e.strip().lower() for e in raw.split(",") if e.strip()}
 
 
+def bootstrap_mode() -> bool:
+    """True when no admin exists anywhere — no APP_ADMIN_EMAILS and no stored row
+    with role 'admin'.
+
+    In that state every signed-in user is treated as an admin, so a fresh
+    deployment is never locked out of its own settings. This is safe because the
+    whole app already sits behind Google OAuth restricted to the company domain:
+    reaching here at all means the visitor is staff. The Admin page says loudly
+    that it is in this state, and naming the first admin ends it.
+    """
+    if bootstrap_admins():
+        return False
+    return not any(
+        (u.get("role") or "").lower() == "admin" for u in _load()["users"].values()
+    )
+
+
 def _store():
     from ..planning_store import get_planning_store
     return get_planning_store()
@@ -77,10 +94,17 @@ def _user_record(email: Optional[str]) -> Dict[str, Any]:
 
 
 def role_for(email: Optional[str]) -> str:
-    if email and email.lower() in bootstrap_admins():
+    if not email:
+        return DEFAULT_ROLE
+    if email.lower() in bootstrap_admins():
         return "admin"
     role = (_user_record(email).get("role") or DEFAULT_ROLE).lower()
-    return role if role in ROLES else DEFAULT_ROLE
+    if role not in ROLES:
+        role = DEFAULT_ROLE
+    # First run: nobody is an admin yet, so everyone is, until one is named.
+    if role != "admin" and bootstrap_mode():
+        return "admin"
+    return role
 
 
 def is_admin(email: Optional[str]) -> bool:
@@ -116,6 +140,7 @@ def resolve(email: Optional[str]) -> Dict[str, Any]:
         "email": email,
         "role": "admin" if admin else role_for(email),
         "is_admin": admin,
+        "bootstrap_mode": bootstrap_mode(),
         "features": features,
         "default_ordering_tab": registry.DEFAULT_ORDERING_TAB,
     }

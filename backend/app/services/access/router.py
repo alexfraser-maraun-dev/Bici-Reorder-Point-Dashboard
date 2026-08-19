@@ -66,7 +66,12 @@ def get_users(request: Request):
     require_admin(request)
     return {
         "status": "success",
-        "data": {"users": service.list_users(), "roles": list(service.ROLES)},
+        "data": {
+            "users": service.list_users(),
+            "roles": list(service.ROLES),
+            # True while no admin exists anywhere; the page warns about it.
+            "bootstrap_mode": service.bootstrap_mode(),
+        },
     }
 
 

@@ -287,17 +287,28 @@ Storage is the same Postgres/SQLite store the PO workflow uses
 back to `default_enabled` in the registry, so a fresh or reset database behaves
 exactly as the code ships.
 
+**First run.** While no admin exists anywhere — no `APP_ADMIN_EMAILS` and no
+stored row with role `admin` — every signed-in user is treated as an admin, and
+the Admin page says so in a banner. This is what stops a fresh deployment from
+being locked out of its own settings; it is safe because the app already sits
+behind Google OAuth restricted to `@bici.cc`, so reaching the page at all means
+the visitor is staff. Naming the first admin under **People** ends it.
+
 ```text
 APP_ADMIN_EMAILS   comma-separated emails that are always admins, whatever the
-                   database says. Set at least one — it is how the first admin
-                   gets in, and the way back in if the last admin is demoted.
+                   database says. Optional, but setting it pins admin access
+                   across a database reset and is the way back in if the last
+                   admin is demoted.
 ```
 
-Two things worth knowing:
+Other things worth knowing:
 
 * Per-user rules only subdivide features that are globally on. Switching a
   feature off turns it off for everyone, admins included.
-* The Admin page itself can never be switched off (`registry.ALWAYS_ON`).
+* The Admin page itself can never be switched off (`registry.ALWAYS_ON`), and
+  its nav link stays visible when the access API is unreachable — hiding it
+  would strand the one page that can diagnose the outage. Its endpoints are
+  admin-gated server-side, so showing the link grants nothing.
 * `DATABASE_URL` must point at Postgres in production. Without it the store
   falls back to a local SQLite file, which on Render is ephemeral — settings
   would revert to the registry defaults on each deploy.

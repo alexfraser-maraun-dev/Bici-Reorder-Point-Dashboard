@@ -19,7 +19,6 @@ const HOME_CANDIDATES: { feature: FeatureKey; href: string; label: string }[] = 
   { feature: 'ordering', href: '/', label: 'Ordering' },
   { feature: 'special_orders', href: '/special-orders', label: 'Special Orders' },
   { feature: 'price_intel', href: '/price-intelligence', label: 'Price Intel' },
-  { feature: 'how_to_use', href: '/how-to-use', label: 'How it Works' },
   { feature: 'admin', href: '/admin', label: 'Admin' },
 ]
 

@@ -7,7 +7,6 @@ import {
   LayoutDashboard,
   PackageSearch,
   Menu,
-  CircleHelp,
   LogOut,
   TrendingUp,
   ShieldCheck,
@@ -37,7 +36,6 @@ const navigation: { name: string; href: string; icon: typeof LayoutDashboard; fe
   ...(process.env.NEXT_PUBLIC_PRICE_INTEL_ENABLED === 'true'
     ? [{ name: 'Price Intel', href: '/price-intelligence', icon: TrendingUp, feature: 'price_intel' as FeatureKey }]
     : []),
-  { name: 'How it Works', href: '/how-to-use', icon: CircleHelp, feature: 'how_to_use' },
   { name: 'Admin', href: '/admin', icon: ShieldCheck, feature: 'admin' },
 ]
 
@@ -51,12 +49,14 @@ export function AppShell({ children, headerActions, mainClassName }: AppShellPro
   const pathname = usePathname()
   const { data: session } = useSession()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
-  const { isEnabled, isAdmin } = useAccess()
+  const { isEnabled, isAdmin, accessUnavailable } = useAccess()
   // isEnabled is optimistic while access loads (better than flashing an empty
-  // nav at everyone), but Admin is the one link that must not appear to a
-  // non-admin even for a moment, so it waits for the confirmed answer.
+  // nav at everyone). Admin waits for a confirmed yes so it doesn't blink at
+  // non-admins — except when the access call outright failed, where hiding it
+  // would strand the only page that can diagnose the problem. Its endpoints are
+  // admin-gated server-side, so showing the link grants nothing.
   const visibleNavigation = navigation.filter((item) =>
-    item.feature === 'admin' ? isAdmin : isEnabled(item.feature)
+    item.feature === 'admin' ? isAdmin || accessUnavailable : isEnabled(item.feature)
   )
 
   return (

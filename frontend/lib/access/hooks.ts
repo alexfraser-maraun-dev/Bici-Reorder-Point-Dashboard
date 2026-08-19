@@ -40,6 +40,10 @@ export function useAccess() {
     access,
     isEnabled,
     isAdmin: access?.is_admin ?? false,
+    bootstrapMode: access?.bootstrap_mode ?? false,
+    // The access call itself failed (backend down, not deployed, 401). Callers
+    // use this to avoid hiding things merely because the answer never arrived.
+    accessUnavailable: Boolean(error) && !access,
     defaultOrderingTab: access?.default_ordering_tab ?? 'ordering.po_tracker',
     isLoading,
     error,
@@ -65,6 +69,7 @@ export function useAdminUsers() {
   )
   return {
     users: (data?.data?.users ?? []) as UserAccessRecord[],
+    bootstrapMode: Boolean(data?.data?.bootstrap_mode),
     isLoading,
     error,
     mutate,

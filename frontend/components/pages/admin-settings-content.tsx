@@ -16,7 +16,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import {
-  Layers, Loader2, Plus, RotateCcw, Save, ShieldCheck, Trash2, User,
+  AlertTriangle, Layers, Loader2, Plus, RotateCcw, Save, ShieldCheck, Trash2, User,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -73,7 +73,9 @@ function FeaturesPanel() {
     }
   }
 
-  if (isLoading) {
+  // Skeleton only when there is genuinely nothing to show. Gating on isLoading
+  // alone would re-skeleton over data SWR already has cached on a revalidate.
+  if (isLoading && features.length === 0) {
     return (
       <div className="space-y-3">
         {[0, 1, 2].map((i) => <Skeleton key={i} className="h-24 w-full" />)}
@@ -346,7 +348,9 @@ function PeoplePanel() {
         </div>
 
         <div className="divide-y border-t">
-          {isLoading && <div className="px-6 py-4"><Skeleton className="h-8 w-full" /></div>}
+          {isLoading && users.length === 0 && (
+            <div className="px-6 py-4"><Skeleton className="h-8 w-full" /></div>
+          )}
           {!isLoading && users.length === 0 && (
             <p className="px-6 py-6 text-sm text-muted-foreground">
               No per-user rules yet — everyone sees the switched-on features.
@@ -365,6 +369,8 @@ function PeoplePanel() {
 // ---------------------------------------------------------------------------
 
 export function AdminSettingsContent() {
+  const { access, isAdmin, bootstrapMode, accessUnavailable } = useAccess()
+
   return (
     <div className="space-y-4 p-4 lg:p-6">
       <div>
@@ -377,7 +383,41 @@ export function AdminSettingsContent() {
           feature that is off is hidden everywhere and its endpoints are refused,
           so it uses no BigQuery, Lightspeed, or scheduler time.
         </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Signed in as{' '}
+          <span className="font-medium text-foreground">{access?.email ?? 'unknown'}</span>
+          {access && <> · role <span className="font-medium text-foreground">{access.role}</span></>}
+        </p>
       </div>
+
+      {accessUnavailable && (
+        <div className="flex items-start gap-3 rounded-md border border-destructive/30 bg-destructive/5 p-3">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+          <div className="text-sm">
+            <p className="font-medium">Couldn’t reach the access settings API</p>
+            <p className="text-muted-foreground">
+              The backend may not have redeployed yet, or it can’t reach its
+              database. Everything below will fail to load until it responds.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {bootstrapMode && isAdmin && (
+        <div className="flex items-start gap-3 rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950/30">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+          <div className="text-sm">
+            <p className="font-medium">No admin is configured yet</p>
+            <p className="text-muted-foreground">
+              Until one exists, everyone who signs in is treated as an admin and
+              can change these settings. Add yourself under <strong>People</strong>{' '}
+              and set your role to Admin — that ends this state and locks the page
+              to real admins. (Setting <code>APP_ADMIN_EMAILS</code> on the backend
+              does the same and survives a database reset.)
+            </p>
+          </div>
+        </div>
+      )}
 
       <Tabs defaultValue="features" className="w-full">
         <TabsList>
