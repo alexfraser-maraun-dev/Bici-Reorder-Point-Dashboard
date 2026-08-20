@@ -1332,7 +1332,10 @@ _brand_sourcing_rules_cache = {}
 _brand_sourcing_rules_map_cache = {}
 _brand_vendor_sourcing_cache = {}
 
-def fetch_item_stock(item_ids):
+_item_stock_cache = {}
+
+
+def fetch_item_stock(item_ids, force_refresh: bool = False):
     """Current sellable stock per (item, shop) for the given items.
 
     Two traps, both hit during verification and both silent if you miss them:
@@ -1344,9 +1347,16 @@ def fetch_item_stock(item_ids):
     Returns {(item_id, shop_id): {sellable, qoh}}. `sellable` is preferred over raw QOH because
     QOH can already be committed to another special order or workorder.
     """
-    ids = [str(i) for i in item_ids if i]
+    ids = sorted({str(i) for i in item_ids if i})
     if not ids:
         return {}
+    # ~6s per call against a large snapshot table, and this now runs on every dashboard read to
+    # supply `days_lost`. Keyed on the item set so a changed population re-queries.
+    cache_key = f"stock:{hash(tuple(ids))}"
+    if not force_refresh:
+        cached = _cache_get(_item_stock_cache, cache_key)
+        if cached is not None:
+            return cached
     query = f"""
         WITH latest AS (
             SELECT MAX(snapshot_date_local) AS d FROM `{LS_DATASET}.v_master_snapshot_latest`
@@ -1370,6 +1380,7 @@ def fetch_item_stock(item_ids):
             "sellable": int(r.sellable or 0),
             "qoh": int(r.qoh or 0),
         }
+    _item_stock_cache[cache_key] = (out, time.time())
     return out
 
 
@@ -1433,9 +1444,16 @@ def fetch_order_cadence(lookback_months: int = 12, force_refresh: bool = False):
     Only DISTINCT order dates count: several POs raised to one vendor on one day is one
     ordering event, and counting them separately would collapse every cadence toward zero.
 
+    **This is CONTEXT, not a schedule.** Measured 2026-08-20: the coefficient of variation of the
+    gap between order days is 1.44 for frequent vendors and 0.67 for sparse ones -- the more
+    active the vendor, the LESS rhythmic. Real gaps run [1,1,7,5,9,13,5,3,...] with order days
+    spread flat across Mon-Fri. Ordering here is demand-driven and near-continuous, so
+    `next_expected_order_date` must never be used to defer a projected landing date; doing so
+    inflates every estimate. Its legitimate use is telling a buyer whether a one-off PO to this
+    vendor is routine ("we order most days") or unusual ("twice this year").
+
     Returns {(shop_id, vendor_id): {cadence_days, modal_weekday, last_order_date,
-    next_expected_order_date, sample_size}}. Cached for ADMIN_CACHE_TTL_SECONDS (15 min) --
-    cadence moves on a scale of days, and this widens the dashboard's BigQuery fan-out.
+    next_expected_order_date, sample_size, is_routine}}. Cached for ADMIN_CACHE_TTL_SECONDS.
     """
     cache_key = f"cadence:{lookback_months}"
     if not force_refresh:
@@ -1505,6 +1523,10 @@ def fetch_order_cadence(lookback_months: int = 12, force_refresh: bool = False):
             "last_order_date": last.isoformat() if last else None,
             "next_expected_order_date": nxt.isoformat() if nxt else None,
             "sample_size": int(r.sample_size),
+            # Roughly fortnightly or better over the window. Distinguishes a vendor procurement
+            # buys from continually (a one-off PO is routine) from one used only when a special
+            # order forces it (a PO is a deliberate act). Affects effort, never the date.
+            "is_routine": int(r.sample_size) >= 24,
         }
     _order_cadence_cache[cache_key] = (out, time.time())
     return out
@@ -1607,6 +1629,20 @@ def build_lead_time_lookup(lookback_months: int = 3, force_refresh: bool = False
             continue
         vid = str(vid)
         lt = float(lt)
+        # A vendor with no id is a bookkeeping artefact, not a source.
+        if vid in ("0", "None", ""):
+            continue
+        # A ZERO median lead time is never a usable sourcing signal, whatever caused it.
+        # Two causes, both fatal if trusted (measured 2026-08-20):
+        #   * vendor 458 "Bici" is the business itself — 8 of 8 POs received the same day, used
+        #     for internal transfers. You cannot order from yourself, yet 0 days made it rank
+        #     FASTEST and win the sourcing recommendation.
+        #   * 3T, Amazon, FELT, Yeti et al. read 0 purely on 1-4 samples that happened to be
+        #     same-day (backdated or received on arrival).
+        # Dropping the sample lets the vendor fall through to its cross-store median, or to the
+        # shared default — "unknown" rather than the false claim that it can be here today.
+        if lt <= 0:
+            continue
         if lid is not None:
             by_vendor_location[(vid, str(lid))] = lt
         per_vendor_samples.setdefault(vid, []).append(lt)

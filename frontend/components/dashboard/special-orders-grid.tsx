@@ -19,6 +19,8 @@ import { ArrowDownNarrowWide, ArrowUpNarrowWide } from 'lucide-react'
 export type { MatchActions }
 
 type SortKey =
+  | 'days_lost'
+  | 'fastest_landing_date'
   | 'sla_severity_rank'
   | 'special_order_id'
   | 'customer_name'
@@ -31,14 +33,15 @@ type SortKey =
   | 'shopify_expected_date'
   | 'created_date'
   | 'procurement_stage_index'
-  | 'flag'
 
 type SortDir = 'asc' | 'desc'
 
 const SORT_OPTIONS: { key: SortKey; label: string }[] = [
-  // Default: the SLA verdict, worst first. This is the order a buyer should work the queue in.
+  // Days lost is the sharpest priority signal — it needs no customer promise, so it works for
+  // the majority of special orders that have none.
+  { key: 'days_lost', label: 'Days lost' },
+  { key: 'fastest_landing_date', label: 'Soonest it can land' },
   { key: 'sla_severity_rank', label: 'SLA severity' },
-  { key: 'flag', label: 'Flag / priority' },
   { key: 'created_date', label: 'Created date' },
   { key: 'expected_date', label: 'LS PO ETA' },
   { key: 'shopify_expected_date', label: 'Shopify ETA' },
@@ -52,19 +55,9 @@ const SORT_OPTIONS: { key: SortKey; label: string }[] = [
   { key: 'special_order_id', label: 'SO #' },
 ]
 
-// Mirrors the backend's _FLAG_RANK so "Flag / priority" sorts by severity, not alphabetically.
-const FLAG_SORT_RANK: Record<SpecialOrder['flag'], number> = {
-  critical: 6,
-  overdue_mid: 5,
-  overdue: 4,
-  no_eta: 3,
-  ready_not_called: 1,
-  none: 0,
-}
-
 function compare(a: SpecialOrder, b: SpecialOrder, key: SortKey, dir: SortDir): number {
-  const av: unknown = key === 'flag' ? FLAG_SORT_RANK[a.flag] : a[key]
-  const bv: unknown = key === 'flag' ? FLAG_SORT_RANK[b.flag] : b[key]
+  const av: unknown = a[key]
+  const bv: unknown = b[key]
 
   // Rows with no value always sink to the bottom, whichever direction is picked.
   const aNull = av === null || av === undefined || av === ''
@@ -105,6 +98,17 @@ export function SpecialOrdersGrid({
   const [sortKey, setSortKey] = useState<SortKey | 'default'>('default')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
 
+  // Sensible default direction per key: worst-first for severity and delay, soonest-first for
+  // dates you are waiting on. Picking a sort should not also require picking a direction.
+  const DEFAULT_DIR: Partial<Record<SortKey, SortDir>> = {
+    days_lost: 'desc',
+    sla_severity_rank: 'asc',
+    fastest_landing_date: 'asc',
+    created_date: 'asc',
+    expected_date: 'asc',
+    shopify_expected_date: 'asc',
+  }
+
   const sorted = useMemo(() => {
     if (sortKey === 'default') return orders
     return [...orders].sort((a, b) => compare(a, b, sortKey, sortDir))
@@ -138,7 +142,11 @@ export function SpecialOrdersGrid({
         <span className="text-muted-foreground text-sm">{sorted.length} orders</span>
         <div className="ml-auto flex items-center gap-2">
           <span className="text-muted-foreground text-xs">Sort by</span>
-          <Select value={sortKey} onValueChange={(v) => setSortKey(v as SortKey | 'default')}>
+          <Select value={sortKey} onValueChange={(v) => {
+              const key = v as SortKey | 'default'
+              setSortKey(key)
+              if (key !== 'default' && DEFAULT_DIR[key]) setSortDir(DEFAULT_DIR[key]!)
+            }}>
             <SelectTrigger className="w-[170px]" size="sm">
               <SelectValue />
             </SelectTrigger>

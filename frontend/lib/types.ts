@@ -470,6 +470,11 @@ export interface PoRecommendationCandidate {
   cadence_days?: number | null
   next_order_date?: string | null
   lead_time_days?: number | null
+  // Whether procurement buys from this vendor continually (a one-off PO is routine) or only
+  // when a special order forces it. Effort context — it never shifts the landing date.
+  is_routine?: boolean | null
+  // When the product would actually be here via this option. The thing being optimised.
+  landing_date?: string | null
 }
 
 export interface PoRecommendation {
@@ -482,6 +487,13 @@ export interface PoRecommendation {
   // False when the Lightspeed PO snapshot was cold, so the draft-PO tier could not be
   // evaluated — "no suitable PO" may just mean "could not see the drafts".
   draft_pos_available: boolean
+  // Soonest the product can be here by any route.
+  fastest_landing_date: string | null
+  // When it could have been here had it been ordered the day the special order appeared.
+  could_have_landed: string | null
+  // The gap between those two: delay we caused. Needs no customer promise, which is why it
+  // works for the ~160 special orders that have none.
+  days_lost: number | null
 }
 
 export interface CandidatePo {
@@ -575,7 +587,8 @@ export interface ShopifyCandidate {
 // The triage tile axis: the Shopify inbound stage and the cross-cutting Recommended Action tile
 // sit left of the four LS procurement stages. Both are "overlay" tiles — a single order can appear
 // in one of them AND in its flow stage, since they're derived from the same per-row state.
-export type TriageStage = 'shopify' | 'recommended_action' | ProcurementStage
+// 'shopify' is the inbound pseudo-stage for orders with no Lightspeed special order yet.
+export type TriageStage = 'shopify' | ProcurementStage
 
 // A Shopify `SO`-tagged order with no matching live LS SO — the "Unmatched" population.
 export interface ShopifyOnlyOrder {
@@ -708,6 +721,13 @@ export interface SpecialOrder {
   days_over_stage_sla: number | null
   missing_promise: boolean
   promise_owner: 'service' | 'cs' | null
+  // Fastest route and delay cost, computed for every row so they can be sorted on. `days_lost`
+  // is the strongest priority signal available: it needs no customer promise, which matters
+  // because most special orders have none.
+  fastest_landing_date: string | null
+  fastest_path_tier: 'in_stock' | 'transfer' | 'inbound_po' | 'new_po' | 'received' | null
+  could_have_landed: string | null
+  days_lost: number | null
   ack: SoAck | null
   ack_active: boolean
   escalation_level: number

@@ -733,8 +733,6 @@ export function useSpecialOrders() {
     orders: data?.orders ?? [],
     summary: data?.summary,
     sla: data?.summary as unknown as import('./types').SpecialOrderSummarySla | undefined,
-    thresholds: (data as { meta?: { thresholds?: import('./special-order-triage').TriageThresholds } } | undefined)
-      ?.meta?.thresholds,
     reasonCodes: data?.reason_codes ?? [],
     shopifyOnly: data?.shopify_only ?? [],
     fetchedAt: data?.fetched_at,

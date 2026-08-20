@@ -4,10 +4,7 @@ import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { useSpecialOrders, matchSpecialOrder, unmatchSpecialOrder } from '@/lib/hooks'
 import type { SpecialOrder, ShopifyOnlyOrder, TriageStage, SpecialOrderFlag } from '@/lib/types'
-import {
-  buildStageSubtriages, DEFAULT_THRESHOLDS, subKeyForOrder,
-  type TriageThresholds, type TriageTone,
-} from '@/lib/special-order-triage'
+import type { TriageTone } from '@/lib/special-order-triage'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -21,6 +18,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
+import { SoLegend } from '@/components/dashboard/so-legend'
 import { SoScoreboard } from '@/components/dashboard/so-scoreboard'
 import { SpecialOrdersGrid } from '@/components/dashboard/special-orders-grid'
 import {
@@ -38,59 +36,92 @@ import {
 // "Live SOs": hide special orders created more than this many days ago (likely abandoned).
 const LIVE_SO_MAX_DAYS = 365
 
-const seg = (stage: TriageStage, subKey: string) => `${stage}::${subKey}`
+const seg = (group: string, subKey: string) => `${group}::${subKey}`
 
 type Sub = { key: string; label: string; tone: TriageTone; pred: (o: SpecialOrder) => boolean }
-// `overlay` marks the cross-cutting tiles (Shopify + Recommended Action): an order can appear in one
-// of these AND in its flow-stage tile, so they get a distinct (dashed/slate) card treatment.
-type Tile = { stage: TriageStage; label: string; icon: typeof Store; color: string; bgColor: string; overlay?: boolean; subs: Sub[] }
+type Tile = { group: string; label: string; icon: typeof Store; color: string; bgColor: string; subs: Sub[] }
 
 const isLs = (o: SpecialOrder) => o.kind !== 'shopify'
+// One definition of "needs a human". The old age-based flag system was removed 2026-08-20: it
+// disagreed with the SLA verdict on 48 of 219 live rows, and drove a second filter, a second
+// sort and its own tiles — two controls answering the same question differently, with no way to
+// tell which was right.
+const needsAction = (o: SpecialOrder) => isLs(o) && o.actionable
 
-// The "late" attention flags an unactioned order can carry, regardless of stage.
-const LATE_FLAGS: SpecialOrderFlag[] = ['overdue', 'overdue_mid', 'critical']
+// POSITIONAL tiles: where every special order sits in the pipeline. Deliberately not "action"
+// tiles — position is a fact about the order, while what to do about it belongs to the tabs.
+// Each splits only into needs-action vs on-track, so the tile never restates the SLA taxonomy.
+const STAGE_TILES: { stage: SpecialOrder['procurement_stage']; label: string; icon: typeof Store; color: string; bgColor: string }[] = [
+  { stage: 'open_pool', label: 'Awaiting a PO', icon: Inbox, color: 'text-foreground', bgColor: 'bg-secondary' },
+  { stage: 'unordered_po', label: 'On an unsent PO', icon: FileClock, color: 'text-orange-600', bgColor: 'bg-orange-50' },
+  { stage: 'ordered', label: 'Placed, in transit', icon: ShoppingCart, color: 'text-blue-600', bgColor: 'bg-blue-50' },
+  { stage: 'received', label: 'Arrived', icon: PackageCheck, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
+]
 
-// Build the tile config (predicate-based so the overlay tiles can overlap the LS flow stages).
-// A function of the backend's thresholds, so a tier boundary change flows into the tile labels
-// instead of leaving them quietly wrong.
-const buildTiles = (thresholds: TriageThresholds = DEFAULT_THRESHOLDS): Tile[] => [
+// SOURCE tile: where the special order came from. 'Unattributed' is a real order type — raised
+// straight into Lightspeed at the counter or by phone — not a data defect: of 57 such live
+// orders, 56 verifiably have no Shopify order behind them.
+const SOURCE_SUBS: { key: SpecialOrder['source']; label: string; tone: TriageTone }[] = [
+  { key: 'shopify', label: 'Shopify', tone: 'ok' },
+  { key: 'workorder', label: 'Workorder', tone: 'ok' },
+  { key: 'neither', label: 'Unattributed', tone: 'warn' },
+]
+
+const buildTiles = (): Tile[] => [
   {
-    stage: 'shopify', label: 'Shopify', icon: Store, color: 'text-violet-600', bgColor: 'bg-violet-50', overlay: true,
+    group: 'source', label: 'Source', icon: Store, color: 'text-violet-600', bgColor: 'bg-violet-50',
+    subs: SOURCE_SUBS.map((s) => ({
+      key: String(s.key), label: s.label, tone: s.tone,
+      pred: (o: SpecialOrder) => (o.source ?? 'neither') === s.key,
+    })),
+  },
+  ...STAGE_TILES.map((t) => ({
+    group: t.stage, label: t.label, icon: t.icon, color: t.color, bgColor: t.bgColor,
     subs: [
-      // A matched LS SO already knows whether it's received (its procurement_stage). Completed
-      // SOs that adopted a still-open Shopify order arrive here as received rows.
-      { key: 'matched_unreceived', label: 'Matched, unreceived', tone: 'warn', pred: (o) => isLs(o) && (o.shopify_match === 'matched' || o.shopify_match === 'ambiguous') && o.procurement_stage !== 'received' },
-      { key: 'matched_received', label: 'Matched, received', tone: 'ok', pred: (o) => isLs(o) && (o.shopify_match === 'matched' || o.shopify_match === 'ambiguous') && o.procurement_stage === 'received' },
-      { key: 'unmatched', label: 'Unmatched', tone: 'danger', pred: (o) => o.kind === 'shopify' },
+      { key: 'needs_action', label: 'Needs action', tone: 'danger' as TriageTone,
+        pred: (o: SpecialOrder) => isLs(o) && o.procurement_stage === t.stage && needsAction(o) },
+      { key: 'on_track', label: 'On track', tone: 'ok' as TriageTone,
+        pred: (o: SpecialOrder) => isLs(o) && o.procurement_stage === t.stage && !needsAction(o) },
     ],
+  })),
+]
+
+// The tabs. Each is a slice of the pipeline plus a plain statement of what removes a row from
+// it — the question people actually have when looking at a list of problems.
+type ViewKey = 'overview' | 'needs_ordering' | 'in_transit' | 'arrived' | 'problems'
+
+// A row has a "problem" when something about its DATA blocks procurement, as opposed to the
+// work simply not being done yet.
+const hasProblem = (o: SpecialOrder) =>
+  !isLs(o) || Boolean(o.link_broken) || o.shopify_match === 'ambiguous' ||
+  (o.missing_promise && o.procurement_stage !== 'received')
+
+const VIEWS: { key: ViewKey; label: string; blurb: string; pred: (o: SpecialOrder) => boolean }[] = [
+  {
+    key: 'overview', label: 'Overview',
+    blurb: 'Every live special order and where it sits. Use the tiles to slice the list; the tabs above narrow it to one kind of work.',
+    pred: () => true,
   },
   {
-    // Cross-cutting "what should I do now?" tile. Action-only — no healthy bucket. Each sub overlaps
-    // a flow stage (an "Order PO today" row is also in its open_pool/unordered_po tile).
-    stage: 'recommended_action', label: 'Recommended Action', icon: ListChecks, color: 'text-slate-600', bgColor: 'bg-slate-100', overlay: true,
-    subs: [
-      { key: 'order_po_today', label: 'Order PO today', tone: 'danger', pred: (o) => isLs(o) && (o.procurement_stage === 'open_pool' || o.procurement_stage === 'unordered_po') && LATE_FLAGS.includes(o.flag) },
-      { key: 'follow_up_po', label: 'Follow up on ordered PO', tone: 'warn', pred: (o) => isLs(o) && o.procurement_stage === 'ordered' && (LATE_FLAGS.includes(o.flag) || o.flag === 'no_eta') },
-    ],
+    key: 'needs_ordering', label: 'Needs ordering',
+    blurb: 'No purchase order yet, or sitting on a draft that was never sent. A row leaves this list once its PO is placed with the vendor — or sooner, if the item turns out to be in stock or already inbound.',
+    pred: (o) => isLs(o) && (o.procurement_stage === 'open_pool' || o.procurement_stage === 'unordered_po'),
   },
-  ...(['open_pool', 'unordered_po', 'ordered', 'received'] as const).map((stage) => {
-    const meta = {
-      open_pool: { label: 'Open Order Pool', icon: Inbox, color: 'text-foreground', bgColor: 'bg-secondary' },
-      unordered_po: { label: 'Unordered PO', icon: FileClock, color: 'text-orange-600', bgColor: 'bg-orange-50' },
-      ordered: { label: 'Ordered', icon: ShoppingCart, color: 'text-blue-600', bgColor: 'bg-blue-50' },
-      received: { label: 'Received', icon: PackageCheck, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
-    }[stage]
-    return {
-      stage,
-      ...meta,
-      subs: buildStageSubtriages(thresholds)[stage].map((s) => ({
-        key: s.key,
-        label: s.label,
-        tone: s.tone,
-        pred: (o: SpecialOrder) => isLs(o) && o.procurement_stage === stage && subKeyForOrder(o) === s.key,
-      })),
-    }
-  }),
+  {
+    key: 'in_transit', label: 'In transit',
+    blurb: 'Placed with the vendor and on its way. A row leaves this list when the item is received against the purchase order. Chase the ones past their expected date.',
+    pred: (o) => isLs(o) && o.procurement_stage === 'ordered',
+  },
+  {
+    key: 'arrived', label: 'Arrived',
+    blurb: 'The item is here and the SLA clock has stopped — nothing on this list is a late delivery. A retail order leaves it when its Shopify order is fulfilled; a service order when the workorder is closed. Untick \u201cLive SOs\u201d to include the long close-out backlog.',
+    pred: (o) => isLs(o) && o.procurement_stage === 'received',
+  },
+  {
+    key: 'problems', label: 'Problems',
+    blurb: 'Data standing in the way of procurement rather than work left undone: Shopify orders with no Lightspeed special order, manual links that no longer resolve, ambiguous matches, and orders nobody ever quoted a date for.',
+    pred: hasProblem,
+  },
 ]
 
 const toneDot: Record<TriageTone, string> = {
@@ -99,7 +130,6 @@ const toneDot: Record<TriageTone, string> = {
   ok: 'bg-emerald-500',
 }
 
-// Adapt a Shopify-only order into a row the unified table can render (kind: 'shopify').
 function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
   const days = o.created_at ? Math.floor((Date.now() - Date.parse(o.created_at)) / 86_400_000) : null
   return {
@@ -149,6 +179,11 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
     link_provenance: null,
     link_broken: null,
     matched_via_closed_order: false,
+    // No Lightspeed special order exists yet, so there is no route to cost out.
+    fastest_landing_date: null,
+    fastest_path_tier: null,
+    could_have_landed: null,
+    days_lost: null,
     // Shopify-only rows have no Lightspeed special order, so the backend computes no SLA
     // verdict for them. They are the intake gap (tagged in Shopify, never created in LS) and
     // are surfaced by the Shopify tile — neutral values here keep them out of the procurement
@@ -200,11 +235,11 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
 }
 
 export function SpecialOrdersContent() {
-  const { orders, shopifyOnly, sla, thresholds, isLoading, isRefreshing, refetch, revalidate, fetchedAt, error } =
+  const { orders, shopifyOnly, sla, isLoading, isRefreshing, refetch, revalidate, fetchedAt, error } =
     useSpecialOrders()
   // Tile labels are derived from the backend's tier boundaries, falling back to the shipped
   // defaults until the first payload lands.
-  const TILES = useMemo(() => buildTiles(thresholds ?? DEFAULT_THRESHOLDS), [thresholds])
+  const TILES = useMemo(() => buildTiles(), [])
 
   const handleSync = async () => {
     try {
@@ -244,13 +279,15 @@ export function SpecialOrdersContent() {
   const [storeFilter, setStoreFilter] = useState<string>('all')
   const [orderTypeFilter, setOrderTypeFilter] = useState<string>('all')
   const [sourceFilter, setSourceFilter] = useState<string>('all')
-  const [needsActionOnly, setNeedsActionOnly] = useState(false)
-  // Close-out is a MODE, not a filter: these orders have arrived, so the SLA clock has already
-  // stopped on them. They are receiving/CS hygiene, and mixing them into the procurement queue
-  // is exactly what let 100+ of them accumulate unnoticed.
-  const [closeoutMode, setCloseoutMode] = useState(false)
+
+  // The active tab. Overview is the landing view; the rest narrow to one kind of work.
+  const [view, setView] = useState<ViewKey>('overview')
+  const activeView = useMemo(() => VIEWS.find((v) => v.key === view) ?? VIEWS[0], [view])
+  // Within a tab, show only rows that still need a human. Replaces both the old 'Flagged only'
+  // and 'Needs action' checkboxes, which disagreed with each other.
+  const [openWorkOnly, setOpenWorkOnly] = useState(false)
   const [liveOnly, setLiveOnly] = useState(true)
-  const [flaggedOnly, setFlaggedOnly] = useState(false)
+
 
   // Unified rows: live LS SOs + Shopify-only ("Unmatched") pseudo-rows.
   const allRows = useMemo(
@@ -281,14 +318,12 @@ export function SpecialOrdersContent() {
   const base = useMemo(() => {
     const term = search.trim().toLowerCase()
     return allRows.filter((o) => {
-      // Close-out mode replaces the normal population rather than narrowing it, and
-      // deliberately ignores the live-SO window — the whole point is the old ones.
-      if (closeoutMode) return o.procurement_stage === 'received'
-      if (o.procurement_stage === 'received' && (o.days_since_creation ?? 0) > LIVE_SO_MAX_DAYS) return false
-      if (flaggedOnly && o.flag === 'none') return false
+      // The tab is the primary slice. Age is handled solely by the 'Live SOs' toggle below —
+      // a second, received-specific age rule here made the Arrived tile and its tab disagree.
+      if (!activeView.pred(o)) return false
+      if (openWorkOnly && !needsAction(o)) return false
       // 'Needs action' = a real SLA breach nobody has parked. Parked rows stay visible
       // under the other filters so the reason and check-back date remain findable.
-      if (needsActionOnly && !o.actionable) return false
       if (storeFilter !== 'all' && o.store !== storeFilter) return false
       // 'none' = the SO has no PO yet, so it has no order type to speak of.
       if (orderTypeFilter === 'none' && o.order_type) return false
@@ -300,19 +335,19 @@ export function SpecialOrdersContent() {
         ...o.available_vendors.map((v) => v.vendor_name)]
         .some((v) => v && String(v).toLowerCase().includes(term))
     })
-  }, [allRows, flaggedOnly, needsActionOnly, closeoutMode, storeFilter, orderTypeFilter, sourceFilter, liveOnly, search])
+  }, [allRows, activeView, view, openWorkOnly, storeFilter, orderTypeFilter, sourceFilter, liveOnly, search])
 
   // The tiles that currently have ≥1 selected sub-triage. A tile is "active" once you pick any of
   // its buckets; selection combines as AND across tiles, OR within a tile.
   const activeTiles = useMemo(
-    () => TILES.filter((t) => t.subs.some((s) => selected.has(seg(t.stage, s.key)))),
+    () => TILES.filter((t) => t.subs.some((s) => selected.has(seg(t.group, s.key)))),
     [selected]
   )
 
   // Does row `o` satisfy a tile's selection? (true when the tile has no selection — it's not a
   // constraint yet.) Within the tile it's an OR over the selected buckets' predicates.
   const matchesTile = (o: SpecialOrder, t: Tile) =>
-    t.subs.some((s) => selected.has(seg(t.stage, s.key)) && s.pred(o))
+    t.subs.some((s) => selected.has(seg(t.group, s.key)) && s.pred(o))
 
   // Table = base narrowed to rows passing EVERY active tile (AND across tiles).
   const filtered = useMemo(() => {
@@ -325,9 +360,9 @@ export function SpecialOrdersContent() {
   const segCounts = useMemo(() => {
     const counts: Record<string, number> = {}
     for (const t of TILES) {
-      const others = activeTiles.filter((a) => a.stage !== t.stage)
+      const others = activeTiles.filter((a) => a.group !== t.group)
       const rows = others.length === 0 ? base : base.filter((o) => others.every((a) => matchesTile(o, a)))
-      for (const s of t.subs) counts[seg(t.stage, s.key)] = rows.filter(s.pred).length
+      for (const s of t.subs) counts[seg(t.group, s.key)] = rows.filter(s.pred).length
     }
     return counts
   }, [base, activeTiles])
@@ -341,7 +376,7 @@ export function SpecialOrdersContent() {
   }
 
   const toggleStage = (t: Tile) => {
-    const ids = t.subs.map((s) => seg(t.stage, s.key))
+    const ids = t.subs.map((s) => seg(t.group, s.key))
     const allOn = ids.every((id) => selected.has(id))
     setSelected((prev) => {
       const next = new Set(prev)
@@ -350,8 +385,21 @@ export function SpecialOrdersContent() {
     })
   }
 
+  // Counts per tab over the live population (ignoring the tab itself, so each is stable).
+  const viewCounts = useMemo(() => {
+    // Same age rule as the list, so a tab badge never disagrees with its tile.
+    const inWindow = (o: SpecialOrder) =>
+      !liveOnly || o.days_since_creation === null || o.days_since_creation <= LIVE_SO_MAX_DAYS
+    const live = allRows
+    const out: Record<string, number> = {}
+    for (const v of VIEWS) {
+      out[v.key] = live.filter((o) => v.pred(o) && inWindow(o)).length
+    }
+    return out
+  }, [allRows, liveOnly])
+
   const filtersActive =
-    selected.size > 0 || storeFilter !== 'all' || orderTypeFilter !== 'all' || sourceFilter !== 'all' || search || flaggedOnly || needsActionOnly || closeoutMode || !liveOnly
+    selected.size > 0 || storeFilter !== 'all' || orderTypeFilter !== 'all' || sourceFilter !== 'all' || search || openWorkOnly || !liveOnly
 
   return (
     <div className="space-y-4">
@@ -400,7 +448,7 @@ export function SpecialOrdersContent() {
       {isLoading ? (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-6">
           {TILES.map((t) => (
-            <Card key={t.stage} className="py-3">
+            <Card key={t.group} className="py-3">
               <CardContent className="px-4 py-0">
                 <Skeleton className="mb-2 h-4 w-24" />
                 <Skeleton className="h-7 w-12" />
@@ -414,11 +462,11 @@ export function SpecialOrdersContent() {
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-6">
           {TILES.map((t) => {
             const Icon = t.icon
-            const ids = t.subs.map((s) => seg(t.stage, s.key))
+            const ids = t.subs.map((s) => seg(t.group, s.key))
             const stageActive = ids.every((id) => selected.has(id))
             const total = ids.reduce((sum, id) => sum + (segCounts[id] ?? 0), 0)
             return (
-              <Card key={t.stage} className={cn('py-3 transition-colors', t.overlay && 'border-dashed bg-slate-50 dark:bg-slate-900/30', stageActive && 'ring-primary ring-2')}>
+              <Card key={t.group} className={cn('py-3 transition-colors', stageActive && 'ring-primary ring-2')}>
                 <CardContent className="px-4 py-0">
                   <button
                     type="button"
@@ -433,7 +481,7 @@ export function SpecialOrdersContent() {
                   </button>
                   <div className="mt-2.5 flex flex-col gap-1 border-t pt-2">
                     {t.subs.map((s) => {
-                      const id = seg(t.stage, s.key)
+                      const id = seg(t.group, s.key)
                       const count = segCounts[id] ?? 0
                       const subActive = selected.has(id)
                       return (
@@ -511,17 +559,8 @@ export function SpecialOrdersContent() {
           </Select>
         )}
         <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
-          <Checkbox checked={needsActionOnly} onCheckedChange={(v) => setNeedsActionOnly(v === true)}
-                    disabled={closeoutMode} />
+          <Checkbox checked={openWorkOnly} onCheckedChange={(v) => setOpenWorkOnly(v === true)} />
           Needs action
-        </label>
-        <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
-          <Checkbox checked={closeoutMode} onCheckedChange={(v) => setCloseoutMode(v === true)} />
-          Close-out backlog
-        </label>
-        <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
-          <Checkbox checked={flaggedOnly} onCheckedChange={(v) => setFlaggedOnly(v === true)} />
-          Flagged only
         </label>
         <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
           <Checkbox checked={liveOnly} onCheckedChange={(v) => setLiveOnly(v === true)} />
@@ -532,21 +571,48 @@ export function SpecialOrdersContent() {
             variant="ghost"
             size="sm"
             className="text-muted-foreground"
-            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setOrderTypeFilter('all'); setSourceFilter('all'); setSearch(''); setFlaggedOnly(false); setNeedsActionOnly(false); setCloseoutMode(false); setLiveOnly(true) }}
+            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setOrderTypeFilter('all'); setSourceFilter('all'); setSearch(''); setOpenWorkOnly(false); setLiveOnly(true) }}
           >
             Clear filters
           </Button>
         )}
       </div>
 
-      {closeoutMode && (
-        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-          <span className="font-medium">Close-out backlog.</span> These special orders have already
-          arrived, so the SLA clock stopped when the item was received — none of them are late
-          deliveries. What is outstanding is the paperwork: a retail order closes when its Shopify
-          order is fulfilled, a service order when the workorder is closed. Oldest first.
-        </div>
-      )}
+      {/* Tabs are the primary navigation: each is one kind of work, with a plain statement of
+          what removes a row from it. Counts are over the live population and do not react to the
+          active tab, so switching tabs never makes a backlog look smaller than it is. */}
+      <div className="flex flex-wrap items-center gap-1 border-b">
+        {VIEWS.map((v) => {
+          const count = viewCounts[v.key] ?? 0
+          const active = v.key === view
+          return (
+            <button
+              key={v.key}
+              type="button"
+              onClick={() => { setView(v.key); setSelected(new Set()) }}
+              className={cn(
+                'flex items-center gap-2 border-b-2 px-3 py-2 text-sm transition-colors',
+                active
+                  ? 'border-primary font-medium text-foreground'
+                  : 'border-transparent text-muted-foreground hover:text-foreground',
+              )}
+            >
+              {v.label}
+              {v.key !== 'overview' && (
+                <span className={cn('rounded-full px-1.5 py-0.5 text-[10px] tabular-nums',
+                  v.key === 'problems' && count > 0 ? 'bg-red-100 text-red-700'
+                    : active ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground')}>
+                  {count}
+                </span>
+              )}
+            </button>
+          )
+        })}
+      </div>
+
+      <p className="text-xs text-muted-foreground">{activeView.blurb}</p>
+
+      <SoLegend />
 
       <SoScoreboard />
 
@@ -556,7 +622,7 @@ export function SpecialOrdersContent() {
         <div className="flex flex-wrap items-center gap-x-5 gap-y-1 rounded-md border bg-muted/40 px-3 py-2 text-xs">
           <button
             type="button"
-            onClick={() => setNeedsActionOnly((v) => !v)}
+            onClick={() => setOpenWorkOnly((v: boolean) => !v)}
             className={cn('font-medium underline-offset-2 hover:underline',
               sla.actionable > 0 ? 'text-red-600' : 'text-emerald-600')}
           >

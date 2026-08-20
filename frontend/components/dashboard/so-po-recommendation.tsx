@@ -34,9 +34,15 @@ function CandidateLine({ c }: { c: PoRecommendationCandidate }) {
         <span className="text-muted-foreground">{c.unallocated_units} free</span>
       )}
       {c.sellable !== undefined && <span className="text-muted-foreground">{c.sellable} sellable</span>}
-      {c.eta && (
-        <span className={cn('font-mono', c.eta_overdue && 'text-red-600')}>
-          {c.eta}{c.eta_overdue ? ' (passed)' : ''}
+      {c.landing_date && <span className="font-mono">lands {c.landing_date}</span>}
+      {c.eta && c.eta !== c.landing_date && (
+        <span className={cn('font-mono text-muted-foreground', c.eta_overdue && 'text-red-600')}>
+          {c.eta_overdue ? `PO ETA ${c.eta} passed` : `PO ETA ${c.eta}`}
+        </span>
+      )}
+      {c.is_routine === false && (
+        <span className="text-muted-foreground" title="Procurement only orders from this vendor occasionally, so this PO is a deliberate send rather than one that rides along">
+          occasional vendor
         </span>
       )}
       {c.meets_promise === false && <span className="text-red-600">misses promise</span>}
@@ -73,6 +79,30 @@ export function PoRecommendationPanel({ order }: { order: SpecialOrder }) {
 
           {recommendation && (
             <>
+              {/* The headline is the landing date, not a promise. Most special orders have no
+                  quoted date at all, so "how fast can this be here" is the only question that
+                  can always be answered — and the only one procurement controls. */}
+              <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+                <span className="text-[10px] uppercase tracking-wider text-muted-foreground/70">
+                  Fastest route
+                </span>
+                {recommendation.fastest_landing_date && (
+                  <span className="font-mono text-sm font-semibold">
+                    lands {recommendation.fastest_landing_date}
+                  </span>
+                )}
+                {!!recommendation.days_lost && (
+                  <span className="text-xs text-red-600" title="Time already lost: it could have been here by the date shown, had it been ordered when the special order appeared.">
+                    {recommendation.days_lost}d lost
+                    {recommendation.could_have_landed && (
+                      <span className="text-muted-foreground">
+                        {' '}(could have landed {recommendation.could_have_landed})
+                      </span>
+                    )}
+                  </span>
+                )}
+              </div>
+
               <div className="rounded-md bg-muted/50 px-3 py-2">
                 <CandidateLine c={recommendation.recommendation} />
                 <p className="mt-1 text-xs text-muted-foreground">{recommendation.reason}</p>

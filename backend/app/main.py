@@ -1534,7 +1534,20 @@ def _sla_view(force: bool = False) -> Dict[str, Any]:
         # A settings-store hiccup must not hide the queue; it just means nothing reads as acked.
         print(f"[so_sla] could not load acks: {e}")
         acks = {}
-    view = so_sla_service.build_escalations(payload.get("orders") or [], acks)
+    rows = payload.get("orders") or []
+    # Annotate every row with its fastest route and the delay already incurred, so `days_lost`
+    # is sortable on the dashboard rather than living only inside the per-row recommendation.
+    # Best-effort: a BigQuery hiccup costs the column, not the page.
+    try:
+        from app.services import po_recommendation_service
+        reco_ctx = _recommendation_context(rows)
+        today = date.today()
+        rows = [{**r, **po_recommendation_service.compute_fastest_path(r, reco_ctx, today)}
+                for r in rows]
+    except Exception as e:
+        print(f"[so_sla] fastest-path annotation skipped: {e}")
+
+    view = so_sla_service.build_escalations(rows, acks)
     view["fetched_at"] = payload.get("fetched_at")
     # Carried through so this endpoint is a strict superset of /api/special-orders and the page
     # needs only one fetch. Shopify-only rows have no LS special order, so they carry no SLA
@@ -1654,8 +1667,9 @@ def _recommendation_context(rows):
 
     # Every special order that could plausibly need a recommendation: nothing allocated yet.
     payload = _special_orders_cache.get("data") or {}
-    universe = [o for o in (payload.get("orders") or [])
-                if o.get("procurement_stage") in ("open_pool", "unordered_po")]
+    # Every row, not just the unallocated ones: `days_lost` is now computed dashboard-wide, and
+    # the lookups are keyed by (item, shop) so covering all of them costs one query either way.
+    universe = payload.get("orders") or []
     item_ids = sorted({str(r.get("item_id")) for r in (universe or rows) if r.get("item_id")})
 
     def _safe(fn, default):
@@ -1665,17 +1679,25 @@ def _recommendation_context(rows):
             print(f"[so_reco] lookup failed ({fn.__name__ if hasattr(fn,'__name__') else fn}): {e}")
             return default
 
+    # The three lookups are independent and BigQuery-bound; running them serially added ~9s to
+    # a cold dashboard read now that this sits on the page's critical path.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_stock = pool.submit(_safe, lambda: bigquery_sync.fetch_item_stock(item_ids), {})
+        f_unalloc = pool.submit(_safe, lambda: bigquery_sync.fetch_unallocated_po_lines(item_ids), {})
+        f_cadence = pool.submit(_safe, lambda: bigquery_sync.fetch_order_cadence(), {})
+
     ctx = po_recommendation_service.build_context(
         rows,
-        stock=_safe(lambda: bigquery_sync.fetch_item_stock(item_ids), {}),
-        unallocated=_safe(lambda: bigquery_sync.fetch_unallocated_po_lines(item_ids), {}),
+        stock=f_stock.result(),
+        unallocated=f_unalloc.result(),
         # peek, not get: a cold snapshot costs a ~40s walk of ~1,850 purchase orders, and a
         # recommendation is not worth making a user wait for that. When it is cold the draft-PO
         # tier is simply unavailable and the engine falls back to in-stock / inbound / new-PO.
         # BigQuery is not an alternative here -- its PO data runs ~10 hours behind, which would
         # hide exactly the drafts a buyer opened this morning.
         open_orders=_safe(lambda: get_po_snapshot_cache().peek_orders() or [], []),
-        cadence=_safe(lambda: bigquery_sync.fetch_order_cadence(), {}),
+        cadence=f_cadence.result(),
     )
     _reco_context_cache["data"] = ctx
     _reco_context_cache["built_at"] = time.time()

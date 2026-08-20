@@ -16,7 +16,6 @@ import {
   StageBadge,
   SourceBadge,
   SeverityBadge,
-  FlagBadge,
   ShopifyMatchBadge,
 } from './special-order-badges'
 import { SoAckMenu, EscalationBadge } from './so-ack-menu'
@@ -30,10 +29,12 @@ import {
 import { ExternalLink, Package, User, FileText, Store, Link2, Wrench } from 'lucide-react'
 
 // Left-edge accent by flag severity — the fastest way to scan a long list for trouble.
-const ACCENT: Partial<Record<SpecialOrder['flag'], string>> = {
-  overdue: 'bg-red-300',
-  overdue_mid: 'bg-red-500',
-  critical: 'bg-red-600',
+const ACCENT: Partial<Record<SpecialOrder['sla_severity'], string>> = {
+  promise_missed: 'bg-red-600',
+  impossible: 'bg-red-500',
+  order_today: 'bg-orange-500',
+  stage_stalled: 'bg-amber-500',
+  at_risk: 'bg-yellow-400',
 }
 export function ShopifyOnlyRow({
   order,
@@ -134,7 +135,7 @@ export function SpecialOrderRow({
   return (
     <Card className="flex-row gap-0 overflow-hidden p-0">
       {/* Flag accent (left edge) */}
-      <div className={cn('w-1 shrink-0 self-stretch', ACCENT[order.flag] ?? 'bg-border')} />
+      <div className={cn('w-1 shrink-0 self-stretch', ACCENT[order.sla_severity] ?? 'bg-border')} />
 
       {/* Main content */}
       <div className="flex min-w-0 flex-1 flex-col gap-3 px-4 py-3">
@@ -150,7 +151,6 @@ export function SpecialOrderRow({
               context without competing with the rows that still need action. */}
           <SeverityBadge severity={order.sla_severity} muted={order.ack_active} />
           <EscalationBadge level={order.escalation_level} />
-          <FlagBadge stage={order.procurement_stage} flag={order.flag} daysOverdue={order.days_overdue} />
           <span className="min-w-0 flex-1 truncate text-sm font-medium" title={order.description ?? ''}>
             {order.description ?? 'Special order'}
           </span>
@@ -235,15 +235,30 @@ export function SpecialOrderRow({
                 ) : null
               }
             />
+            {/* Days lost replaces the old "days overdue", which was measured against the
+                retired age-flag system. This is delay we caused: the gap between when the item
+                could have landed had it been ordered on day one and the soonest it can land
+                now. It needs no customer promise, so it works for every special order. */}
             <Field
-              label="Days overdue"
+              label="Days lost"
               value={
-                order.days_overdue !== null && order.days_overdue > 0 ? (
-                  <span className="font-semibold text-red-600">{order.days_overdue}</span>
+                order.days_lost !== null && order.days_lost > 0 ? (
+                  <span className="font-semibold text-red-600" title={
+                    order.could_have_landed
+                      ? `Could have landed ${order.could_have_landed}; soonest now ${order.fastest_landing_date ?? 'unknown'}`
+                      : undefined}>
+                    {order.days_lost}
+                  </span>
                 ) : (
-                  order.days_overdue ?? '—'
+                  order.days_lost ?? '—'
                 )
               }
+            />
+            <Field
+              label="Soonest it can land"
+              value={order.fastest_landing_date
+                ? <span className="font-mono text-xs">{order.fastest_landing_date}</span>
+                : null}
             />
           </FieldGroup>
         </div>
