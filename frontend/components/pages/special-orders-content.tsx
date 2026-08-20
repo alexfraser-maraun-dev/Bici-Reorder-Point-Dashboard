@@ -128,6 +128,17 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
     received_started: false,
     procurement_stage: 'open_pool', // unused for shopify rows — the table branches on `kind`
     procurement_stage_index: -1,
+    // A tagged Shopify order with no Lightspeed SO behind it yet: the intake case. Source is
+    // 'shopify' because that is genuinely where it came from — the missing piece is the LS SO,
+    // not the derivation.
+    source: 'shopify',
+    days_in_stage: days,
+    po_created_date: null,
+    po_received_date: null,
+    po_ref_num: null,
+    days_po_open: null,
+    sale_line_id: null,
+    order_line_id: null,
     flag: 'none',
     days_overdue: null,
     is_overdue: false,
@@ -195,6 +206,7 @@ export function SpecialOrdersContent() {
   const [search, setSearch] = useState('')
   const [storeFilter, setStoreFilter] = useState<string>('all')
   const [orderTypeFilter, setOrderTypeFilter] = useState<string>('all')
+  const [sourceFilter, setSourceFilter] = useState<string>('all')
   const [liveOnly, setLiveOnly] = useState(true)
   const [flaggedOnly, setFlaggedOnly] = useState(false)
 
@@ -232,13 +244,14 @@ export function SpecialOrdersContent() {
       // 'none' = the SO has no PO yet, so it has no order type to speak of.
       if (orderTypeFilter === 'none' && o.order_type) return false
       if (orderTypeFilter !== 'all' && orderTypeFilter !== 'none' && o.order_type !== orderTypeFilter) return false
+      if (sourceFilter !== 'all' && (o.source ?? 'neither') !== sourceFilter) return false
       if (liveOnly && o.days_since_creation !== null && o.days_since_creation > LIVE_SO_MAX_DAYS) return false
       if (!term) return true
       return [o.customer_name, o.customer_email, o.description, o.system_sku, o.upc, o.brand, o.vendor_name, o.order_id, o.special_order_id, o.shopify_order_name, o.workorder_id,
         ...o.available_vendors.map((v) => v.vendor_name)]
         .some((v) => v && String(v).toLowerCase().includes(term))
     })
-  }, [allRows, flaggedOnly, storeFilter, orderTypeFilter, liveOnly, search])
+  }, [allRows, flaggedOnly, storeFilter, orderTypeFilter, sourceFilter, liveOnly, search])
 
   // The tiles that currently have ≥1 selected sub-triage. A tile is "active" once you pick any of
   // its buckets; selection combines as AND across tiles, OR within a tile.
@@ -289,7 +302,7 @@ export function SpecialOrdersContent() {
   }
 
   const filtersActive =
-    selected.size > 0 || storeFilter !== 'all' || orderTypeFilter !== 'all' || search || flaggedOnly || !liveOnly
+    selected.size > 0 || storeFilter !== 'all' || orderTypeFilter !== 'all' || sourceFilter !== 'all' || search || flaggedOnly || !liveOnly
 
   return (
     <div className="space-y-4">
@@ -421,6 +434,19 @@ export function SpecialOrdersContent() {
             ))}
           </SelectContent>
         </Select>
+        <Select value={sourceFilter} onValueChange={setSourceFilter}>
+          <SelectTrigger className="w-[150px]">
+            <SelectValue placeholder="All sources" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All sources</SelectItem>
+            <SelectItem value="workorder">Workorder</SelectItem>
+            <SelectItem value="shopify">Shopify</SelectItem>
+            {/* Neither a workorder nor a matched Shopify order — raised straight in
+                Lightspeed, or a match that was never resolved. Its own bucket by design. */}
+            <SelectItem value="neither">Unattributed</SelectItem>
+          </SelectContent>
+        </Select>
         {orderTypes.length > 0 && (
           <Select value={orderTypeFilter} onValueChange={setOrderTypeFilter}>
             <SelectTrigger className="w-[170px]">
@@ -448,7 +474,7 @@ export function SpecialOrdersContent() {
             variant="ghost"
             size="sm"
             className="text-muted-foreground"
-            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setOrderTypeFilter('all'); setSearch(''); setFlaggedOnly(false); setLiveOnly(true) }}
+            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setOrderTypeFilter('all'); setSourceFilter('all'); setSearch(''); setFlaggedOnly(false); setLiveOnly(true) }}
           >
             Clear filters
           </Button>

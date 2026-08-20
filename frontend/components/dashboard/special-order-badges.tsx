@@ -2,7 +2,7 @@
 
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
-import type { ProcurementStage, SpecialOrderFlag, ShopifyMatch, ShopifyMatchBasis, TriageStage } from '@/lib/types'
+import type { ProcurementStage, SpecialOrderFlag, ShopifyMatch, ShopifyMatchBasis, SpecialOrderSource, TriageStage } from '@/lib/types'
 import { subTriageLabel } from '@/lib/special-order-triage'
 import {
   AlertTriangle,
@@ -16,6 +16,8 @@ import {
   ListChecks,
   Link2,
   Unlink,
+  Wrench,
+  HelpCircle,
 } from 'lucide-react'
 
 interface BadgeConfig {
@@ -34,6 +36,25 @@ const stageConfig: Record<TriageStage, BadgeConfig> = {
   unordered_po: { label: 'Unordered PO', className: 'bg-orange-100 text-orange-700 border-orange-200', icon: FileClock },
   ordered: { label: 'Ordered', className: 'bg-blue-100 text-blue-700 border-blue-200', icon: ShoppingCart },
   received: { label: 'Received', className: 'bg-emerald-100 text-emerald-700 border-emerald-200', icon: PackageCheck },
+}
+
+// Where the special order came from. Deliberately always rendered (including 'neither') --
+// an unattributed SO is a real bucket that needs chasing, not an absence worth hiding.
+const sourceConfig: Record<SpecialOrderSource, BadgeConfig> = {
+  workorder: { label: 'Workorder', className: 'bg-cyan-100 text-cyan-700 border-cyan-200', icon: Wrench },
+  shopify: { label: 'Shopify', className: 'bg-violet-100 text-violet-700 border-violet-200', icon: Store },
+  neither: { label: 'Unattributed', className: 'bg-amber-100 text-amber-700 border-amber-200', icon: HelpCircle },
+}
+
+export function SourceBadge({ source }: { source: SpecialOrderSource | null | undefined }) {
+  const config = sourceConfig[source ?? 'neither'] ?? sourceConfig.neither
+  const Icon = config.icon
+  return (
+    <Badge variant="outline" className={cn('gap-1 text-[10px] font-medium', config.className)}>
+      <Icon className="h-3 w-3" />
+      {config.label}
+    </Badge>
+  )
 }
 
 export function StageBadge({ stage }: { stage: TriageStage }) {

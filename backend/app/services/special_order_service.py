@@ -283,6 +283,26 @@ def _normalize(
     # the vendor. A present orderedDate is what distinguishes an "ordered" PO from a draft.
     expected_date = _parse_ls_date(po.get("arrivalDate"))
     ordered_date = _parse_ls_date(po.get("orderedDate"))
+    po_created_date = _parse_ls_date(po.get("createTime"))
+    days_po_open = (today - po_created_date).days if po_created_date else None
+
+    # Two clocks, deliberately kept separate (verified against live data 2026-08-19):
+    #   days_since_creation -> total elapsed since the customer asked. Answers "will we miss
+    #                          the promise?"
+    #   days_in_stage       -> dwell in the CURRENT step. Answers "is this step stalling?"
+    # Neither substitutes for the other. An SO can be 92 days old on a PO drafted 2 days ago
+    # (a long pre-allocation wait), or 3 days old on a 48-day-old draft (a stalled draft).
+    # Flagging on stage dwell alone would have read the first case as healthy.
+    if order_id is not None and ordered_date is None:
+        days_in_stage = days_po_open        # sitting on a drafted-but-unplaced PO
+    else:
+        days_in_stage = days_since_creation
+
+    # Where this special order derives from, for the Source badge/filter. A workorder wins over
+    # a Shopify match: the bench is where the request actually originated. `shopify` is applied
+    # later by _apply_shopify_match once a match resolves; until then a Shopify-born SO reads
+    # "neither", which is correct -- nothing links it yet.
+    source = "workorder" if workorder_id else "neither"
 
     triage = _compute_stage_and_flag(
         has_po=order_id is not None,
@@ -350,6 +370,11 @@ def _normalize(
         "order_type": po.get("order_type"),
         "expected_date": expected_date.isoformat() if expected_date else None,
         "ordered_date": ordered_date.isoformat() if ordered_date else None,
+        "po_created_date": po_created_date.isoformat() if po_created_date else None,
+        "po_received_date": (_parse_ls_date(po.get("receivedDate")).isoformat()
+                             if _parse_ls_date(po.get("receivedDate")) else None),
+        "po_ref_num": po.get("refNum"),
+        "days_po_open": days_po_open,
         "po_ordered": ordered_date is not None,
         "po_complete": bool(po.get("complete")),
         "received_started": bool(po.get("received_started")),
@@ -358,7 +383,14 @@ def _normalize(
         "procurement_stage_index": triage["procurement_stage_index"],
         "flag": triage["flag"],
         "days_overdue": triage["days_overdue"],
+        "days_in_stage": days_in_stage,
         "is_overdue": triage["flag"] in _OVERDUE_FLAGS,
+        # Derivation: workorder | shopify | neither. Upgraded to "shopify" by the match step.
+        "source": source,
+        # Identity keys. sale_line_id joins to WorkorderItem; order_line_id is the field the
+        # Lightspeed allocation write-back sets to attach this SO to a PO line.
+        "sale_line_id": str(sale_line_id) if sale_line_id else None,
+        "order_line_id": str(order_line.get("orderLineID")) if order_line.get("orderLineID") else None,
         # Attached service workorder (via WorkorderItem.saleLineID), when the SO came off
         # the bench — plus the bench's notes, so the buyer can see what service already
         # knows about the part without leaving the dashboard.
@@ -456,6 +488,12 @@ def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> N
     o["shopify_expected_date"] = m["shopify_expected_date"]
     o["shopify_order_url"] = shopify_order_url(m["shopify_order_id"])
     o["shopify_candidates"] = m.get("shopify_candidates") or []
+
+    # Source attribution. A definite Shopify link makes this a retail SO -- unless it already
+    # came off the service bench, in which case the workorder remains the true origin. An
+    # ambiguous candidate is NOT a derivation: it stays "neither" until someone resolves it.
+    if m["shopify_match"] not in ("none", "ambiguous") and o.get("source") != "workorder":
+        o["source"] = "shopify"
 
     shopify_eta = _parse_ls_date(m["shopify_expected_date"])
     po_eta = _parse_ls_date(o.get("expected_date"))

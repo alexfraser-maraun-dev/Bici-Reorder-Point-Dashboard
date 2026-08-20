@@ -26,6 +26,13 @@ ALLOWED_DRAFT_TRANSITIONS = {
 }
 
 
+def _opt_str(value: Any) -> Optional[str]:
+    """Coerce an id to TEXT for storage, preserving NULL (0 and "" are not ids here)."""
+    if value is None or value == "" or str(value) == "0":
+        return None
+    return str(value)
+
+
 class PlanningConflict(RuntimeError):
     pass
 
@@ -203,6 +210,74 @@ class PlanningStore:
                     updated_by TEXT
                 )
             """)
+            # --- Special-order SLA (see services/so_stage_log.py, so_sla_service.py) ---
+            # Append-only stage observations. Deliberately NOT one row per (SO, stage): a
+            # special order moves backwards when its PO is deleted or it is re-allocated, and
+            # a unique (so_id, stage) row would corrupt on that bounce. entered_at is the
+            # AUTHORITATIVE Lightspeed timestamp wherever one exists ('derived'); only the
+            # transitions Lightspeed never stamps fall back to 'observed'.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS so_stage_events (
+                    event_id {id_type} PRIMARY KEY,
+                    special_order_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    entered_at TEXT NOT NULL,
+                    entered_source TEXT NOT NULL,
+                    left_at TEXT,
+                    shop_id TEXT,
+                    source TEXT,
+                    order_id TEXT,
+                    vendor_id TEXT,
+                    item_id TEXT,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                )
+            """)
+            # Promise ledger. The headline SLA scores against the ORIGINAL promise, so every
+            # quoted date is kept and superseded rather than overwritten -- otherwise the
+            # number is gameable by sliding the ETA. promise_key is built in Python so the
+            # uniqueness constraint stays portable across SQLite and Postgres.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS so_promises (
+                    promise_id {id_type} PRIMARY KEY,
+                    promise_key TEXT NOT NULL UNIQUE,
+                    special_order_id TEXT,
+                    shopify_order_id TEXT,
+                    promise_date TEXT NOT NULL,
+                    promise_source TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    recorded_by TEXT,
+                    superseded_at TEXT,
+                    revision_index INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            # Manual Shopify<->LS links, plus pre-SO placeholders. A row with a NULL
+            # special_order_id is an intake placeholder: CS has tagged a Shopify order but no
+            # Lightspeed SO exists yet, so there is no id to key a link on. The SLA clock
+            # starts on those, and they retire when a real SO links.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS so_shopify_links (
+                    link_id {id_type} PRIMARY KEY,
+                    special_order_id TEXT,
+                    shopify_order_id TEXT NOT NULL,
+                    shopify_line_item_id TEXT,
+                    action TEXT NOT NULL,
+                    intake_status TEXT,
+                    owner_email TEXT,
+                    note TEXT,
+                    created_at TEXT NOT NULL,
+                    created_by TEXT,
+                    superseded_at TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_so_stage_events_natural
+                ON so_stage_events(special_order_id, stage, entered_at)
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_so_stage_events_open ON so_stage_events(left_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_so_promises_so ON so_promises(special_order_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_so_links_so ON so_shopify_links(special_order_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_so_links_shopify ON so_shopify_links(shopify_order_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_po_draft_lines_draft ON po_draft_lines(draft_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_po_drafts_status ON po_drafts(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_planning_runs_created ON planning_runs(created_at)")
@@ -491,6 +566,119 @@ class PlanningStore:
                 VALUES (?,?,?,?,?,?)
             """), tuple(record.values()))
         return record
+
+    # ------------------------------------------------------------------
+    # Special-order SLA
+    # ------------------------------------------------------------------
+    def record_so_stage_observations(self, observations: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Persist one sweep's worth of stage observations.
+
+        Each observation is ``{special_order_id, stage, entered_at, entered_source, shop_id,
+        source, order_id, vendor_id, item_id}``. Insertion is idempotent on the natural key
+        (special_order_id, stage, entered_at): re-observing the same stage entry only refreshes
+        ``last_seen_at``, so sweeping every five minutes costs nothing and a stage the SO
+        bounces back into later records a genuinely new row.
+        """
+        inserted = touched = 0
+        now = self._now()
+        with self.transaction(immediate=True) as conn:
+            for ob in observations:
+                so_id = str(ob["special_order_id"])
+                key = (so_id, str(ob["stage"]), str(ob["entered_at"]))
+                existing = conn.execute(self._sql(
+                    "SELECT event_id FROM so_stage_events "
+                    "WHERE special_order_id = ? AND stage = ? AND entered_at = ?"
+                ), key).fetchone()
+                if existing:
+                    conn.execute(self._sql(
+                        "UPDATE so_stage_events SET last_seen_at = ? "
+                        "WHERE special_order_id = ? AND stage = ? AND entered_at = ?"
+                    ), (now,) + key)
+                    touched += 1
+                    continue
+                conn.execute(self._sql("""
+                    INSERT INTO so_stage_events (event_id,special_order_id,stage,entered_at,
+                        entered_source,left_at,shop_id,source,order_id,vendor_id,item_id,
+                        first_seen_at,last_seen_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """), (
+                    uuid.uuid4().hex, so_id, str(ob["stage"]), str(ob["entered_at"]),
+                    ob.get("entered_source") or "observed", None,
+                    _opt_str(ob.get("shop_id")), ob.get("source"), _opt_str(ob.get("order_id")),
+                    _opt_str(ob.get("vendor_id")), _opt_str(ob.get("item_id")), now, now,
+                ))
+                inserted += 1
+        return {"inserted": inserted, "touched": touched}
+
+    def list_so_stage_events(self, special_order_ids: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            if special_order_ids is None:
+                rows = conn.execute("SELECT * FROM so_stage_events").fetchall()
+                return [self._dict(r) for r in rows]
+            ids = [str(i) for i in special_order_ids]
+            if not ids:
+                return []
+            out: List[Dict[str, Any]] = []
+            for start in range(0, len(ids), 500):  # keep the IN list under driver limits
+                chunk = ids[start:start + 500]
+                marks = ",".join("?" for _ in chunk)
+                rows = conn.execute(self._sql(
+                    f"SELECT * FROM so_stage_events WHERE special_order_id IN ({marks})"
+                ), tuple(chunk)).fetchall()
+                out.extend(self._dict(r) for r in rows)
+            return out
+        finally:
+            conn.close()
+
+    def record_so_promise(self, *, special_order_id: Optional[str], shopify_order_id: Optional[str],
+                          promise_date: str, promise_source: str,
+                          recorded_by: Optional[str] = None) -> bool:
+        """Append a quoted date to the promise ledger. Returns True when this is a NEW promise.
+
+        The ledger is keyed on the (order, date, source) tuple, so re-observing an unchanged
+        promise on every sweep is a no-op while a genuine re-quote lands as a new revision.
+        The earliest surviving row is the ORIGINAL promise the headline SLA scores against.
+        """
+        key = f"{special_order_id or ''}:{shopify_order_id or ''}:{promise_date}:{promise_source}"
+        with self.transaction(immediate=True) as conn:
+            if conn.execute(self._sql(
+                "SELECT promise_id FROM so_promises WHERE promise_key = ?"
+            ), (key,)).fetchone():
+                return False
+            scope_col = "special_order_id" if special_order_id else "shopify_order_id"
+            scope_val = special_order_id or shopify_order_id
+            prior = conn.execute(self._sql(
+                f"SELECT COUNT(*) AS n FROM so_promises WHERE {scope_col} = ?"
+            ), (str(scope_val),)).fetchone() if scope_val else None
+            revision = int(self._dict(prior)["n"]) if prior else 0
+            if revision:
+                conn.execute(self._sql(
+                    f"UPDATE so_promises SET superseded_at = ? "
+                    f"WHERE {scope_col} = ? AND superseded_at IS NULL"
+                ), (self._now(), str(scope_val)))
+            conn.execute(self._sql("""
+                INSERT INTO so_promises (promise_id,promise_key,special_order_id,shopify_order_id,
+                    promise_date,promise_source,recorded_at,recorded_by,superseded_at,revision_index)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """), (
+                uuid.uuid4().hex, key, _opt_str(special_order_id), _opt_str(shopify_order_id),
+                promise_date, promise_source, self._now(), recorded_by, None, revision,
+            ))
+        return True
+
+    def list_so_promises(self, special_order_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            if special_order_id:
+                rows = conn.execute(self._sql(
+                    "SELECT * FROM so_promises WHERE special_order_id = ? ORDER BY revision_index"
+                ), (str(special_order_id),)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM so_promises ORDER BY recorded_at").fetchall()
+            return [self._dict(r) for r in rows]
+        finally:
+            conn.close()
 
     def delete_po_ack(self, order_id: str) -> None:
         with self.transaction(immediate=True) as conn:

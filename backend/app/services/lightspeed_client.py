@@ -553,9 +553,11 @@ class LightspeedClient:
             }
             response = self._legacy_request("GET", "/SpecialOrder.json", params=params)
             if response is None or response.status_code != 200:
-                if response is not None:
-                    print(f"Error fetching special orders: {response.status_code} {response.text[:300]}")
-                break
+                # Fail closed. Returning the pages gathered so far would look like a genuinely
+                # smaller special-order population, and the SLA sweep persists stage transitions
+                # from this list -- a truncated read would silently "close" every missing SO.
+                detail = f"{response.status_code} {response.text[:300]}" if response is not None else "no response"
+                raise LightspeedReadError(f"Special order read failed at offset {offset}: {detail}")
             page = self._as_list(response.json().get("SpecialOrder"))
             results.extend(page)
             if len(page) < page_limit:
@@ -841,6 +843,15 @@ class LightspeedClient:
             out[order_id] = {
                 "arrivalDate": order.get("arrivalDate") or None,
                 "orderedDate": order.get("orderedDate") or None,
+                # When the PO itself was opened. The SLA clocks the "sitting on an unplaced PO"
+                # stage on PO age, not SO age -- an SO added yesterday to a six-month-old draft
+                # is the failure we are hunting, and SO age hides it completely.
+                "createTime": order.get("createTime") or None,
+                "refNum": order.get("refNum") or None,
+                # Header-level receipt date. Lightspeed does not timestamp individual line
+                # receipts, so this is the best available marker for "the item landed" and is
+                # where the special-order SLA clock stops.
+                "receivedDate": order.get("receivedDate") or None,
                 "complete": str(order.get("complete")).lower() == "true",
                 "vendor_id": order.get("vendorID"),
                 "vendor_name": vendor.get("name"),

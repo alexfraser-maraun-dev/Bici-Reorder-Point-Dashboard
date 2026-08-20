@@ -394,6 +394,11 @@ export type SpecialOrderFlag =
   | 'no_eta'           // ordered, no date to judge against
   | 'ready_not_called' // received but customer not yet contacted
 
+// Where the special order derives from, for the Source badge/filter. A workorder wins over a
+// Shopify match: the service bench is where the request actually originated. 'neither' covers
+// SOs raised directly in Lightspeed with no Shopify order and no workorder behind them.
+export type SpecialOrderSource = 'workorder' | 'shopify' | 'neither'
+
 // Whether a live LS SO was matched to a Shopify `SO`-tagged order.
 export type ShopifyMatch = 'matched' | 'ambiguous' | 'none'
 
@@ -513,6 +518,18 @@ export interface SpecialOrder {
   // Triage: procurement stage + within-stage attention flag
   procurement_stage: ProcurementStage
   procurement_stage_index: number   // 0=open_pool, 1=unordered_po, 2=ordered, 3=received
+  source: SpecialOrderSource
+  // Two clocks, deliberately separate. days_since_creation = total elapsed since the customer
+  // asked ("will we miss the promise?"); days_in_stage = dwell in the CURRENT step ("is this
+  // step stalling?"). An SO can be 92 days old on a PO drafted 2 days ago, or 3 days old on a
+  // 48-day-old draft — neither number alone catches both.
+  days_in_stage: number | null
+  po_created_date: string | null
+  po_received_date: string | null
+  po_ref_num: string | null
+  days_po_open: number | null
+  sale_line_id: string | null
+  order_line_id: string | null
   flag: SpecialOrderFlag
   days_overdue: number | null       // signed; only set for the 'ordered' stage
   is_overdue: boolean               // flag is overdue or critical

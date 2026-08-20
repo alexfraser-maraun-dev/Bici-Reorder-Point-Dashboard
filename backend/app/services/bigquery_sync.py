@@ -66,14 +66,45 @@ def log_writeback(log_data: dict):
     except Exception as e:
         print(f"Failed to log writeback to BigQuery: {e}")
 
+_ETA_WRITEBACK_TABLE = f"{APP_DATASET}.shopify_eta_writeback_logs"
+_eta_writeback_ensured = False
+
+
+def _ensure_eta_writeback_table() -> None:
+    """Create the ETA audit table if it is missing.
+
+    This table never existed: nothing in the codebase created it, and `insert_rows_json`
+    swallows a missing-table error, so every ETA change ever made through the tool was
+    silently discarded. The SLA scores against the ORIGINAL customer promise, which makes
+    that history load-bearing rather than merely nice to have.
+    """
+    global _eta_writeback_ensured
+    if _eta_writeback_ensured:
+        return
+    get_bq_client().query(f"""
+        CREATE TABLE IF NOT EXISTS `{_ETA_WRITEBACK_TABLE}` (
+            shopify_order_id STRING,
+            new_eta STRING,
+            triggered_by STRING,
+            status STRING,
+            error_message STRING,
+            created_at TIMESTAMP
+        )
+    """).result()
+    _eta_writeback_ensured = True
+
+
 def log_shopify_eta_writeback(log_data: dict):
-    """Best-effort audit of a Shopify special-order ETA edit. Streams to a
-    `shopify_eta_writeback_logs` table; swallows all errors (incl. a missing table) so an
-    audit-logging hiccup never fails the user's edit."""
-    table_id = f"{APP_DATASET}.shopify_eta_writeback_logs"
+    """Best-effort audit of a Shopify special-order ETA edit.
+
+    Errors are swallowed so an audit hiccup never fails the user's edit, but the table is now
+    created on first use rather than assumed to exist. The durable promise ledger lives in
+    `so_promises` (PlanningStore); this remains the BigQuery-side append-only audit trail.
+    """
     try:
+        _ensure_eta_writeback_table()
         client = get_bq_client()
-        errors = client.insert_rows_json(table_id, [log_data])
+        errors = client.insert_rows_json(_ETA_WRITEBACK_TABLE, [log_data])
         if errors:
             print(f"BigQuery Shopify ETA Log Errors: {errors}")
     except Exception as e:
@@ -265,9 +296,10 @@ def get_shopify_special_orders():
           JOIN `{SHOPIFY_DATASET}.order_tag` ot ON ot.order_id = o.id
           WHERE LOWER(ot.value) = 'so'
             AND o.display_fulfillment_status != 'FULFILLED'
-            -- Exclude refunded / voided / cancelled / archived / test / deleted orders so the
-            -- Shopify consideration window only holds live, financially-sound special orders.
-            AND o.display_financial_status NOT IN ('REFUNDED', 'PARTIALLY_REFUNDED', 'VOIDED')
+            -- Exclude cancelled / archived / test / deleted orders. Financial status is NOT a
+            -- filter: the money-on-account refund happens in Lightspeed, so a Shopify refund on an
+            -- unfulfilled order means the placeholder repair (stand-in line refunded, real LS SKU
+            -- swapped in), not a dead order. Must mirror ShopifyClient.get_open_special_orders.
             AND o.cancelled_at IS NULL
             AND COALESCE(o.closed, FALSE) = FALSE
             AND COALESCE(o.test, FALSE) = FALSE

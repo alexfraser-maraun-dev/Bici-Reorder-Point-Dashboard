@@ -1354,6 +1354,25 @@ _SPECIAL_ORDERS_TTL_SECONDS = 300
 _special_orders_lock = threading.Lock()
 
 
+def _persist_special_order_sweep(result: Dict[str, Any]) -> None:
+    """Record stage transitions + promises from a completed dashboard rebuild.
+
+    Piggybacks on the rebuild rather than polling: the walk has already been paid for and the
+    payload is exactly what the SLA needs. Best-effort by construction -- persistence must
+    never be able to take the dashboard down, so every failure is swallowed and logged.
+    """
+    try:
+        from app.services import so_stage_log
+        from app.services.planning_store import PlanningStore
+        outcome = so_stage_log.persist_observations(
+            result.get("orders") or [], PlanningStore(), result.get("fetched_at") or ""
+        )
+        if outcome.get("skipped"):
+            print(f"[so_sla] sweep skipped: {outcome['skipped']}")
+    except Exception as e:
+        print(f"[so_sla] sweep failed: {e}")
+
+
 def _rebuild_special_orders_cache(force: bool = False) -> Dict[str, Any]:
     """Runs the live Lightspeed walk under the lock and stores the result. If
     another thread refreshed a still-fresh payload while we waited for the lock,
@@ -1369,6 +1388,7 @@ def _rebuild_special_orders_cache(force: bool = False) -> Dict[str, Any]:
         result["fetched_at"] = datetime.utcnow().isoformat() + "Z"
         _special_orders_cache["data"] = result
         _special_orders_cache["fetched_at"] = time.time()
+        _persist_special_order_sweep(result)
         return result
 
 
@@ -1383,6 +1403,7 @@ def _refresh_special_orders_in_background() -> None:
         result["fetched_at"] = datetime.utcnow().isoformat() + "Z"
         _special_orders_cache["data"] = result
         _special_orders_cache["fetched_at"] = time.time()
+        _persist_special_order_sweep(result)
     except Exception as e:
         print(f"Error refreshing special-order dashboard: {e}")
     finally:
@@ -1394,6 +1415,45 @@ def _warm_special_orders_cache() -> None:
     """Build the special-orders cache on boot in a daemon thread so the first user
     after a deploy/restart doesn't pay the full Lightspeed walk."""
     threading.Thread(target=_refresh_special_orders_in_background, daemon=True).start()
+
+
+_SO_SWEEP_META_KEY = "so_sweep_last_date"
+
+
+def _so_sweep_scheduler_loop() -> None:
+    """Daily floor for special-order SLA metrics.
+
+    The rebuild that normally feeds the sweep is traffic-driven, so a quiet weekend records
+    nothing. This guarantees at least one observation per day. It is a floor, not the primary
+    trigger: on Render's free tier the process can spin down and this thread dies with it,
+    which is why POST /api/special-orders/sweep exists for an external cron.
+    """
+    import time as _time
+    from zoneinfo import ZoneInfo
+    hour = int(os.getenv("SO_SWEEP_HOUR", "6"))
+    minute = int(os.getenv("SO_SWEEP_MINUTE", "0"))
+    tz_name = os.getenv("SO_SWEEP_TIMEZONE", "America/Vancouver")
+    while True:
+        try:
+            now = datetime.now(ZoneInfo(tz_name))
+            if (now.hour, now.minute) >= (hour, minute):
+                today = now.strftime("%Y-%m-%d")
+                from app.services.planning_store import PlanningStore
+                store = PlanningStore()
+                # Persisted day-guard, so a restart cannot re-run the sweep repeatedly.
+                if store.get_po_watch_meta(_SO_SWEEP_META_KEY) != today:
+                    store.set_po_watch_meta(_SO_SWEEP_META_KEY, today)
+                    _rebuild_special_orders_cache(force=True)
+                    print(f"[so_sla] daily sweep completed for {today}")
+        except Exception as e:
+            print(f"[so_sla] daily sweep tick failed: {e}")
+        _time.sleep(60)
+
+
+@app.on_event("startup")
+def _start_so_sweep_scheduler() -> None:
+    if os.getenv("SO_SWEEP_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on"):
+        threading.Thread(target=_so_sweep_scheduler_loop, daemon=True).start()
 
 
 @app.get("/api/special-orders")
@@ -1419,6 +1479,35 @@ def get_special_orders(background_tasks: BackgroundTasks, refresh: bool = False)
     except Exception as e:
         print(f"Error building special-order dashboard: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/special-orders/sweep")
+def sweep_special_orders(force: bool = False):
+    """Force a special-order stage sweep. Intended for an external scheduler.
+
+    The in-process rebuild only runs when someone loads the dashboard, so overnight and at
+    weekends the SLA would otherwise observe nothing at all -- and on Render's free tier the
+    service can spin down entirely, taking any in-process daily timer with it. An external
+    cron hitting this endpoint is therefore the only trigger that is reliable regardless of
+    traffic or hosting plan.
+
+    Idempotent: re-sweeping a stage entry already recorded only refreshes last_seen_at.
+
+    Auth: the caller must send `X-Internal-Secret: $BACKEND_SHARED_SECRET`. It also sits behind
+    the `special_orders` feature gate, so turning the feature off stops metric collection too --
+    deliberate, matching the project's "off means dormant" rule rather than quietly accruing
+    data for a hidden feature.
+    """
+    try:
+        result = _rebuild_special_orders_cache(force=force)
+    except Exception as e:
+        print(f"Error during special-order sweep: {e}")
+        raise HTTPException(status_code=502, detail="Special-order sweep failed")
+    return {
+        "swept_at": result.get("fetched_at"),
+        "orders": len(result.get("orders") or []),
+        "forced": force,
+    }
 
 
 def _refresh_special_orders_after_write() -> None:

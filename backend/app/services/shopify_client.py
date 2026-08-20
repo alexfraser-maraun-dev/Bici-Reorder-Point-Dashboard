@@ -33,9 +33,13 @@ from typing import Any, Dict, List, Optional
 _ETA_NAMESPACE = "custom"
 _ETA_KEY = "special_order_eta"
 
-# Financial states that mean the order is no longer a live, financially-sound special order.
-# Mirrors the exclusions in the BigQuery query so the live read returns the same population.
-_EXCLUDED_FINANCIAL = {"REFUNDED", "PARTIALLY_REFUNDED", "VOIDED"}
+# NOTE: financial status is deliberately NOT used to exclude orders. The money-on-account
+# refund in the special-order flow happens in LIGHTSPEED, not Shopify, so a Shopify refund never
+# means "this special order was paid out". What a refund on an unfulfilled order actually means is
+# the placeholder repair: CS could not find an existing Lightspeed item, so they later refund the
+# stand-in line and swap in the real LS SKU. Filtering on REFUNDED/PARTIALLY_REFUNDED therefore hid
+# precisely the orders that had just been repaired -- ~14% of the live population -- from
+# procurement. An order holds an active special order when it is neither fulfilled nor archived.
 
 # How many orders / line items to pull per page. Orders tagged `SO` are a small population, so
 # a single page is usually enough; pagination is handled anyway for safety.
@@ -231,9 +235,9 @@ class ShopifyClient:
                 conn = data.get("orders") or {}
                 for o in conn.get("nodes") or []:
                     # Mirror the BigQuery exclusions (the `tag:SO` search can't express them all).
+                    # Fulfilled or archived => the special order is done. See the note on
+                    # financial status above for why a refund is NOT an exclusion.
                     if o.get("displayFulfillmentStatus") == "FULFILLED":
-                        continue
-                    if (o.get("displayFinancialStatus") or "") in _EXCLUDED_FINANCIAL:
                         continue
                     if o.get("cancelledAt") or o.get("closed") or o.get("test"):
                         continue

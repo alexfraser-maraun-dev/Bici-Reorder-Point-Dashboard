@@ -30,6 +30,7 @@ import type {
 } from '@/lib/types'
 import {
   StageBadge,
+  SourceBadge,
   FlagBadge,
   ShopifyMatchBadge,
 } from './special-order-badges'
@@ -1031,6 +1032,9 @@ function SpecialOrderRow({
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0 font-mono text-sm font-medium">SO #{order.special_order_id}</span>
           <StageBadge stage={order.procurement_stage} />
+          {/* Where this SO derives from: workorder, Shopify, or neither. Always shown --
+              "Unattributed" is a bucket to chase, not a blank to hide. */}
+          <SourceBadge source={order.source} />
           <FlagBadge stage={order.procurement_stage} flag={order.flag} daysOverdue={order.days_overdue} />
           <span className="min-w-0 flex-1 truncate text-sm font-medium" title={order.description ?? ''}>
             {order.description ?? 'Special order'}
