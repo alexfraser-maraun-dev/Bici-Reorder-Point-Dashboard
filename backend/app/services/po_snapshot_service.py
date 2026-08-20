@@ -71,6 +71,19 @@ class PurchaseOrderSnapshotCache:
             seen.add(order_id)
         return orders
 
+    def peek_orders(self) -> Optional[List[Dict[str, Any]]]:
+        """The cached snapshot if it is already fresh, else None. Never triggers a load.
+
+        A full walk costs ~40s against ~1,850 purchase orders. Callers who merely *benefit* from
+        PO data (the special-order recommendation engine) must not be able to impose that on a
+        user; they degrade gracefully instead, while the workbench and the startup warmer keep
+        the snapshot populated for everyone.
+        """
+        with self._lock:
+            if self._orders is not None and self._is_fresh(self.clock()):
+                return deepcopy(self._orders)
+        return None
+
     def get_orders(
         self,
         vendor_id: Optional[str] = None,

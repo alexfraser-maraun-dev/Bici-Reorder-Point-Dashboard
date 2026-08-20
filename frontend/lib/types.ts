@@ -442,6 +442,59 @@ export interface SpecialOrderSummarySla {
   missing_promise: number
 }
 
+// Which kind of option the recommendation engine found, best first. Ordering reflects the real
+// pool: ~1,700 placed POs with remaining units against ~64 unsent drafts, so joining something
+// already inbound is the common case and adding to a draft is the rarer one.
+export type PoRecommendationTier =
+  | 'in_stock'    // already sellable at this store — do not order
+  | 'transfer'    // sellable at the sister store (Victoria <-> Langford only)
+  | 'inbound_po'  // an ordered PO already carries unclaimed units of this item
+  | 'draft_po'    // an unsent draft at this store for a qualifying vendor
+  | 'new_po'      // nothing suitable; raise one
+
+export interface PoRecommendationCandidate {
+  tier: PoRecommendationTier
+  order_id?: string
+  order_line_id?: string | null
+  reference_number?: string | null
+  vendor_id?: string | null
+  vendor_name?: string | null
+  shop_id?: string
+  store?: string | null
+  sellable?: number
+  qoh?: number
+  unallocated_units?: number
+  eta?: string | null
+  eta_overdue?: boolean
+  meets_promise?: boolean | null
+  cadence_days?: number | null
+  next_order_date?: string | null
+  lead_time_days?: number | null
+}
+
+export interface PoRecommendation {
+  special_order_id: string
+  tier: PoRecommendationTier
+  recommendation: PoRecommendationCandidate
+  alternatives: PoRecommendationCandidate[]
+  reason: string
+  promise_date: string | null
+  // False when the Lightspeed PO snapshot was cold, so the draft-PO tier could not be
+  // evaluated — "no suitable PO" may just mean "could not see the drafts".
+  draft_pos_available: boolean
+}
+
+export interface CandidatePo {
+  order_id: string
+  reference_number: string | null
+  vendor_id: string
+  vendor_name: string | null
+  po_state: string
+  appendable: boolean
+  ordered_date: string | null
+  expected_date: string | null
+}
+
 // Where the special order derives from, for the Source badge/filter. A workorder wins over a
 // Shopify match: the service bench is where the request actually originated. 'neither' covers
 // SOs raised directly in Lightspeed with no Shopify order and no workorder behind them.

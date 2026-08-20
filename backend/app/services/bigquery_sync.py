@@ -1322,6 +1322,184 @@ _brand_sourcing_rules_cache = {}
 _brand_sourcing_rules_map_cache = {}
 _brand_vendor_sourcing_cache = {}
 
+def fetch_item_stock(item_ids):
+    """Current sellable stock per (item, shop) for the given items.
+
+    Two traps, both hit during verification and both silent if you miss them:
+      * `v_master_snapshot_latest` is a DAILY SERIES, not a single snapshot. Without the
+        MAX(snapshot_date_local) filter the join fans out ~70x.
+      * That filter must be a DE-CORRELATED CTE. BigQuery rejects the correlated-subquery
+        form outright ("Correlated subqueries that reference other tables are not supported").
+
+    Returns {(item_id, shop_id): {sellable, qoh}}. `sellable` is preferred over raw QOH because
+    QOH can already be committed to another special order or workorder.
+    """
+    ids = [str(i) for i in item_ids if i]
+    if not ids:
+        return {}
+    query = f"""
+        WITH latest AS (
+            SELECT MAX(snapshot_date_local) AS d FROM `{LS_DATASET}.v_master_snapshot_latest`
+        )
+        SELECT CAST(s.item_id AS STRING) AS item_id, CAST(s.shop_id AS STRING) AS shop_id,
+               s.sellable, s.qoh
+        FROM `{LS_DATASET}.v_master_snapshot_latest` s, latest
+        WHERE s.snapshot_date_local = latest.d
+          AND s.shop_id IN UNNEST(@shop_ids)
+          AND CAST(s.item_id AS STRING) IN UNNEST(@item_ids)
+          AND s.qoh > 0
+    """
+    from google.cloud import bigquery as _bq
+    job_config = _bq.QueryJobConfig(query_parameters=[
+        _bq.ArrayQueryParameter("item_ids", "STRING", ids),
+        _bq.ArrayQueryParameter("shop_ids", "INT64", list(TARGET_SHOP_IDS)),
+    ])
+    out = {}
+    for r in get_bq_client().query(query, job_config=job_config).result():
+        out[(r.item_id, r.shop_id)] = {
+            "sellable": int(r.sellable or 0),
+            "qoh": int(r.qoh or 0),
+        }
+    return out
+
+
+def fetch_unallocated_po_lines(item_ids, shop_ids=None):
+    """Open PO lines with unreceived units NOT already claimed by a confirmed special order.
+
+    This is the highest-value recommendation tier: stock already in flight arrives sooner than
+    anything newly ordered. `remaining_units_not_allocated_to_confirmed_open_special_orders`
+    exists in `v_po_current_lines` for precisely this question.
+
+    Returns {(item_id, shop_id): [line dicts]}, soonest expected arrival first.
+    """
+    ids = [str(i) for i in item_ids if i]
+    if not ids:
+        return {}
+    shops = [int(s) for s in (shop_ids or TARGET_SHOP_IDS)]
+    query = f"""
+        SELECT CAST(item_id AS STRING) AS item_id, CAST(shop_id AS STRING) AS shop_id,
+               order_id, order_line_id, reference_number, vendor_id, vendor_name,
+               po_ordered_at, expected_arrival_at,
+               remaining_units_not_allocated_to_confirmed_open_special_orders AS unallocated_units,
+               net_units_remaining, qty_ordered, qty_received_to_date
+        FROM `{LS_DATASET}.v_po_current_lines`
+        WHERE is_complete = FALSE AND is_archived = FALSE
+          AND shop_id IN UNNEST(@shop_ids)
+          AND CAST(item_id AS STRING) IN UNNEST(@item_ids)
+          AND remaining_units_not_allocated_to_confirmed_open_special_orders > 0
+        ORDER BY expected_arrival_at NULLS LAST
+    """
+    from google.cloud import bigquery as _bq
+    job_config = _bq.QueryJobConfig(query_parameters=[
+        _bq.ArrayQueryParameter("item_ids", "STRING", ids),
+        _bq.ArrayQueryParameter("shop_ids", "INT64", shops),
+    ])
+    out = {}
+    for r in get_bq_client().query(query, job_config=job_config).result():
+        out.setdefault((r.item_id, r.shop_id), []).append({
+            "order_id": str(r.order_id),
+            "order_line_id": str(r.order_line_id) if r.order_line_id is not None else None,
+            "reference_number": r.reference_number,
+            "vendor_id": str(r.vendor_id) if r.vendor_id is not None else None,
+            "vendor_name": r.vendor_name,
+            "ordered_at": r.po_ordered_at.isoformat() if r.po_ordered_at else None,
+            "expected_arrival_at": r.expected_arrival_at.date().isoformat() if r.expected_arrival_at else None,
+            "unallocated_units": int(r.unallocated_units or 0),
+            "units_remaining": int(r.net_units_remaining or 0),
+        })
+    return out
+
+
+_order_cadence_cache = {}
+
+
+def fetch_order_cadence(lookback_months: int = 12, force_refresh: bool = False):
+    """How often each store actually orders from each vendor, and when the next window is due.
+
+    Derived rather than configured: the ordering rhythm is already in the PO history, and a
+    hand-maintained schedule would drift the moment a buyer changed habit. Verified live —
+    median gaps run 1-14 days (Adanac<->HLC 1d, Adanac<->Trek 5d, Victoria<->Shimano 14d).
+
+    Only DISTINCT order dates count: several POs raised to one vendor on one day is one
+    ordering event, and counting them separately would collapse every cadence toward zero.
+
+    Returns {(shop_id, vendor_id): {cadence_days, modal_weekday, last_order_date,
+    next_expected_order_date, sample_size}}. Cached for ADMIN_CACHE_TTL_SECONDS (15 min) --
+    cadence moves on a scale of days, and this widens the dashboard's BigQuery fan-out.
+    """
+    cache_key = f"cadence:{lookback_months}"
+    if not force_refresh:
+        cached = _cache_get(_order_cadence_cache, cache_key)
+        if cached is not None:
+            return cached
+
+    query = f"""
+        WITH order_days AS (
+            -- One row per (store, vendor, day an order was actually placed).
+            SELECT DISTINCT shop_id, vendor_id, DATE(po_ordered_at) AS ordered_on
+            FROM `{LS_DATASET}.v_po_current_state`
+            WHERE po_ordered_at IS NOT NULL
+              AND DATE(po_ordered_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_months MONTH)
+              AND shop_id IS NOT NULL AND vendor_id IS NOT NULL
+        ),
+        gaps AS (
+            SELECT shop_id, vendor_id, ordered_on,
+                   DATE_DIFF(ordered_on,
+                             LAG(ordered_on) OVER (PARTITION BY shop_id, vendor_id ORDER BY ordered_on),
+                             DAY) AS gap_days
+            FROM order_days
+        ),
+        weekday_counts AS (
+            SELECT shop_id, vendor_id, EXTRACT(DAYOFWEEK FROM ordered_on) AS weekday,
+                   COUNT(*) AS n,
+                   ROW_NUMBER() OVER (PARTITION BY shop_id, vendor_id ORDER BY COUNT(*) DESC) AS rn
+            FROM order_days GROUP BY shop_id, vendor_id, weekday
+        )
+        SELECT
+            g.shop_id, g.vendor_id,
+            COUNT(g.ordered_on) AS sample_size,
+            MAX(g.ordered_on) AS last_order_date,
+            -- Median gap, rounded up: half an ordering cycle early is safer than half late.
+            CAST(CEIL(APPROX_QUANTILES(g.gap_days, 2)[OFFSET(1)]) AS INT64) AS cadence_days,
+            ANY_VALUE(w.weekday) AS modal_weekday
+        FROM gaps g
+        LEFT JOIN weekday_counts w
+          ON w.shop_id = g.shop_id AND w.vendor_id = g.vendor_id AND w.rn = 1
+        GROUP BY g.shop_id, g.vendor_id
+        -- Two order days give one gap, which is not a rhythm. Four is the floor for a median
+        -- that means anything.
+        HAVING COUNT(g.ordered_on) >= 4
+    """
+    from google.cloud import bigquery as _bq
+    job_config = _bq.QueryJobConfig(query_parameters=[
+        _bq.ScalarQueryParameter("lookback_months", "INT64", lookback_months)
+    ])
+    rows = get_bq_client().query(query, job_config=job_config).result()
+
+    from datetime import date as _date, timedelta as _timedelta
+    today = _date.today()
+    out = {}
+    for r in rows:
+        cadence = int(r.cadence_days) if r.cadence_days is not None else None
+        last = r.last_order_date
+        nxt = None
+        if cadence and last:
+            nxt = last + _timedelta(days=cadence)
+            # A window that has already lapsed is not "next" -- the buyer is overdue for this
+            # vendor, so the soonest realistic window is today.
+            if nxt < today:
+                nxt = today
+        out[(str(r.shop_id), str(r.vendor_id))] = {
+            "cadence_days": cadence,
+            "modal_weekday": int(r.modal_weekday) if r.modal_weekday is not None else None,
+            "last_order_date": last.isoformat() if last else None,
+            "next_expected_order_date": nxt.isoformat() if nxt else None,
+            "sample_size": int(r.sample_size),
+        }
+    _order_cadence_cache[cache_key] = (out, time.time())
+    return out
+
+
 def _cache_get(cache: dict, key):
     cached = cache.get(key)
     if not cached:

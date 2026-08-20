@@ -661,6 +661,28 @@ export async function unackSpecialOrder(specialOrderId: string) {
   return res.json()
 }
 
+/** The PO recommendation for one special order. Lazy: pass null until the panel is opened.
+ *  The backend caches its shared lookups for 5 minutes, so the first call in a window is slow
+ *  and the rest are effectively free. */
+export function useSoRecommendation(specialOrderId: string | null) {
+  const { data, error, isLoading } = useSWR<import('./types').PoRecommendation>(
+    specialOrderId ? `/backend/api/special-orders/${specialOrderId}/po-recommendation` : null,
+    fetcher,
+    { revalidateOnFocus: false, dedupingInterval: 300000 },
+  )
+  return { recommendation: data, isLoading, error }
+}
+
+/** Open POs at one store, for overriding a recommendation. Lazy on shop id. */
+export function useCandidatePos(shopId: string | null) {
+  const { data, error, isLoading } = useSWR<{ orders: import('./types').CandidatePo[] }>(
+    shopId ? `/backend/api/special-orders/candidate-pos?shop_id=${shopId}` : null,
+    fetcher,
+    { revalidateOnFocus: false, dedupingInterval: 300000 },
+  )
+  return { candidates: data?.orders ?? [], isLoading, error }
+}
+
 export function useSpecialOrders() {
   const baseUrl = '/backend'
   // The escalations endpoint is a strict superset of /api/special-orders: the same rows plus

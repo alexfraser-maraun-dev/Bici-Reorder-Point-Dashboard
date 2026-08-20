@@ -1628,6 +1628,162 @@ def unack_special_order(special_order_id: str):
     return {"ok": True}
 
 
+_reco_context_cache: Dict[str, Any] = {"data": None, "built_at": 0.0}
+_RECO_CONTEXT_TTL_SECONDS = 300
+
+
+def _recommendation_context(rows):
+    """Shared lookups for the recommendation engine, cached across rows.
+
+    Built over EVERY candidate special order rather than the one being asked about, then cached
+    for 5 minutes. The per-row endpoint would otherwise fire three BigQuery queries plus a PO
+    snapshot on every click — walking a 30-order queue meant ~120 queries and took minutes.
+    Since the lookups are keyed by (item, shop), covering them all costs the same as covering
+    one and every subsequent row is a dict hit.
+    """
+    from app.services import bigquery_sync, po_recommendation_service
+    from app.services.po_snapshot_service import get_po_snapshot_cache
+
+    cached = _reco_context_cache.get("data")
+    if cached is not None and time.time() - _reco_context_cache["built_at"] < _RECO_CONTEXT_TTL_SECONDS:
+        return cached
+
+    # Every special order that could plausibly need a recommendation: nothing allocated yet.
+    payload = _special_orders_cache.get("data") or {}
+    universe = [o for o in (payload.get("orders") or [])
+                if o.get("procurement_stage") in ("open_pool", "unordered_po")]
+    item_ids = sorted({str(r.get("item_id")) for r in (universe or rows) if r.get("item_id")})
+
+    def _safe(fn, default):
+        try:
+            return fn()
+        except Exception as e:
+            print(f"[so_reco] lookup failed ({fn.__name__ if hasattr(fn,'__name__') else fn}): {e}")
+            return default
+
+    ctx = po_recommendation_service.build_context(
+        rows,
+        stock=_safe(lambda: bigquery_sync.fetch_item_stock(item_ids), {}),
+        unallocated=_safe(lambda: bigquery_sync.fetch_unallocated_po_lines(item_ids), {}),
+        # peek, not get: a cold snapshot costs a ~40s walk of ~1,850 purchase orders, and a
+        # recommendation is not worth making a user wait for that. When it is cold the draft-PO
+        # tier is simply unavailable and the engine falls back to in-stock / inbound / new-PO.
+        # BigQuery is not an alternative here -- its PO data runs ~10 hours behind, which would
+        # hide exactly the drafts a buyer opened this morning.
+        open_orders=_safe(lambda: get_po_snapshot_cache().peek_orders() or [], []),
+        cadence=_safe(lambda: bigquery_sync.fetch_order_cadence(), {}),
+    )
+    _reco_context_cache["data"] = ctx
+    _reco_context_cache["built_at"] = time.time()
+    return ctx
+
+
+@app.on_event("startup")
+def _warm_recommendation_context() -> None:
+    """Pay the recommendation lookups on a background thread at boot, not on a user's click.
+
+    Runs after the PO snapshot warmer so the draft-PO tier is populated. Best-effort: a failure
+    here only means the first caller rebuilds it.
+    """
+    def _warm():
+        try:
+            payload = _special_orders_cache.get("data") or _rebuild_special_orders_cache()
+            _recommendation_context(payload.get("orders") or [])
+        except Exception as e:
+            print(f"[so_reco] context warm failed: {e}")
+    threading.Thread(target=_warm, daemon=True).start()
+
+
+@app.get("/api/special-orders/{special_order_id}/po-recommendation")
+def get_po_recommendation(special_order_id: str):
+    """Which PO this special order should go on, with ranked alternatives and a reason.
+
+    Deliberately per-order and lazy: the tier-A lookup queries `v_po_current_lines`, and doing
+    that inside the dashboard build would widen an already 7-way BigQuery fan-out on a 512MB
+    instance for data most rows never need.
+    """
+    from app.services import po_recommendation_service, so_sla_service
+
+    payload = _special_orders_cache.get("data") or _rebuild_special_orders_cache()
+    row = next((o for o in (payload.get("orders") or [])
+                if str(o.get("special_order_id")) == str(special_order_id)), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Special order not found")
+
+    # The row from the cache has no SLA verdict on it; the promise date drives "does this
+    # option actually land in time", so compute it here rather than guessing.
+    row = {**row, **so_sla_service.compute_sla(row, date.today())}
+    ctx = _recommendation_context([row])
+    result = po_recommendation_service.recommend(row, ctx)
+    result["special_order_id"] = str(special_order_id)
+    result["promise_date"] = row.get("promise_date")
+    # Told, not hidden: without a warm PO snapshot the draft-PO tier cannot be evaluated, so a
+    # "no suitable PO" answer might just mean "we could not see the drafts".
+    result["draft_pos_available"] = bool(ctx.get("open_orders"))
+    return result
+
+
+@app.get("/api/special-orders/candidate-pos")
+def get_candidate_pos(shop_id: str):
+    """Open POs at one store, for overriding a recommendation."""
+    from app.services import po_recommendation_service
+    from app.services.po_snapshot_service import get_po_snapshot_cache
+    try:
+        orders = get_po_snapshot_cache().get_orders().get("orders", [])
+    except Exception as e:
+        print(f"Error loading candidate POs: {e}")
+        raise HTTPException(status_code=502, detail="Could not load purchase orders")
+    return {"shop_id": shop_id,
+            "orders": po_recommendation_service.list_candidate_pos(orders, shop_id)}
+
+
+@app.get("/api/special-orders/quotable-date")
+def get_quotable_date(shop_id: str, vendor_id: Optional[str] = None, brand: Optional[str] = None):
+    """A defensible ETA for customer service to quote at the point of sale.
+
+    next order window + vendor lead time + receiving buffer, with the arithmetic returned so the
+    number can be explained rather than just asserted. This attacks the root cause of the
+    missing-promise backlog: CS currently has nothing to quote from.
+    """
+    from app.services import bigquery_sync, so_sla_service
+
+    try:
+        cadence = bigquery_sync.fetch_order_cadence()
+        lt_loc, lt_vendor = bigquery_sync.build_lead_time_lookup()
+    except Exception as e:
+        print(f"Error building quotable date: {e}")
+        raise HTTPException(status_code=502, detail="Could not load cadence or lead times")
+
+    candidates = []
+    vendor_ids = [vendor_id] if vendor_id else sorted(
+        {v for (s, v) in cadence.keys() if s == str(shop_id)})
+    for vid in vendor_ids:
+        if not vid:
+            continue
+        cad = cadence.get((str(shop_id), str(vid))) or {}
+        lead = lt_loc.get((str(vid), str(shop_id)))
+        lead_source = "store"
+        if lead is None:
+            lead = lt_vendor.get(str(vid))
+            lead_source = "vendor_median"
+        if lead is None:
+            continue
+        next_order = cad.get("next_expected_order_date") or date.today().isoformat()
+        quote = (date.fromisoformat(next_order)
+                 + timedelta(days=int(round(lead)) + so_sla_service.RECEIVING_BUFFER_DAYS))
+        candidates.append({
+            "vendor_id": str(vid),
+            "next_order_date": next_order,
+            "lead_time_days": int(round(lead)),
+            "lead_time_source": lead_source,
+            "receiving_buffer_days": so_sla_service.RECEIVING_BUFFER_DAYS,
+            "cadence_days": cad.get("cadence_days"),
+            "quotable_date": quote.isoformat(),
+        })
+    candidates.sort(key=lambda c: c["quotable_date"])
+    return {"shop_id": str(shop_id), "brand": brand, "candidates": candidates[:10]}
+
+
 def _refresh_special_orders_after_write() -> None:
     """After a write that only changes the Shopify/matching side (ETA edit, manual
     match/unmatch): rebuild the cached dashboard payload cheaply by re-running matching over

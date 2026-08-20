@@ -36,6 +36,7 @@ import {
   ShopifyMatchBadge,
 } from './special-order-badges'
 import { SoAckMenu, EscalationBadge } from './so-ack-menu'
+import { PoRecommendationPanel } from './so-po-recommendation'
 import {
   ExternalLink,
   Package,
@@ -1164,6 +1165,12 @@ function SpecialOrderRow({
             )}
             <SoAckMenu order={order} onDone={() => { void onEtaSaved?.() }} />
           </div>
+        )}
+
+        {/* Where to order: only for special orders not yet on a placed PO. Once a PO exists the
+            question is answered, and the panel would just be an extra BigQuery round-trip. */}
+        {(order.procurement_stage === 'open_pool' || order.procurement_stage === 'unordered_po') && (
+          <PoRecommendationPanel order={order} />
         )}
 
         {/* Brand-level sourcing options: which vendors carry this SKU's brand and how fast each
