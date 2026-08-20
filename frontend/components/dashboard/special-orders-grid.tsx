@@ -31,9 +31,11 @@ import type {
 import {
   StageBadge,
   SourceBadge,
+  SeverityBadge,
   FlagBadge,
   ShopifyMatchBadge,
 } from './special-order-badges'
+import { SoAckMenu, EscalationBadge } from './so-ack-menu'
 import {
   ExternalLink,
   Package,
@@ -62,6 +64,7 @@ export interface MatchActions {
 }
 
 type SortKey =
+  | 'sla_severity_rank'
   | 'special_order_id'
   | 'customer_name'
   | 'description'
@@ -78,6 +81,8 @@ type SortKey =
 type SortDir = 'asc' | 'desc'
 
 const SORT_OPTIONS: { key: SortKey; label: string }[] = [
+  // Default: the SLA verdict, worst first. This is the order a buyer should work the queue in.
+  { key: 'sla_severity_rank', label: 'SLA severity' },
   { key: 'flag', label: 'Flag / priority' },
   { key: 'created_date', label: 'Created date' },
   { key: 'expected_date', label: 'LS PO ETA' },
@@ -1035,6 +1040,10 @@ function SpecialOrderRow({
           {/* Where this SO derives from: workorder, Shopify, or neither. Always shown --
               "Unattributed" is a bucket to chase, not a blank to hide. */}
           <SourceBadge source={order.source} />
+          {/* The SLA verdict. Muted while parked, so an acknowledged breach stays visible as
+              context without competing with the rows that still need action. */}
+          <SeverityBadge severity={order.sla_severity} muted={order.ack_active} />
+          <EscalationBadge level={order.escalation_level} />
           <FlagBadge stage={order.procurement_stage} flag={order.flag} daysOverdue={order.days_overdue} />
           <span className="min-w-0 flex-1 truncate text-sm font-medium" title={order.description ?? ''}>
             {order.description ?? 'Special order'}
@@ -1132,6 +1141,30 @@ function SpecialOrderRow({
             />
           </FieldGroup>
         </div>
+
+        {/* The SLA line: the backward-schedule arithmetic in plain English, plus the Park
+            control. Only rendered when there is something to say — a reason line on every
+            healthy row would bury the ~37 that need action among ~230. */}
+        {(order.actionable || order.ack_active) && (
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2.5">
+            <span className="text-muted-foreground/70 shrink-0 text-[10px] font-semibold uppercase tracking-wider">
+              SLA
+            </span>
+            <span className="min-w-0 flex-1 text-xs text-muted-foreground">{order.sla_reason}</span>
+            {order.order_by_date && (
+              <span className="shrink-0 font-mono text-xs" title="Latest date this could be ordered and still meet the promise">
+                order by {order.order_by_date}
+                {order.slack_days !== null && (
+                  <span className={cn('ml-1 font-medium',
+                    order.slack_days < 0 ? 'text-red-600' : order.slack_days <= 3 ? 'text-amber-600' : 'text-emerald-600')}>
+                    ({order.slack_days >= 0 ? `${order.slack_days}d slack` : `${Math.abs(order.slack_days)}d late`})
+                  </span>
+                )}
+              </span>
+            )}
+            <SoAckMenu order={order} onDone={() => { void onEtaSaved?.() }} />
+          </div>
+        )}
 
         {/* Brand-level sourcing options: which vendors carry this SKU's brand and how fast each
             is to this store. Full-width so the (variable-length) vendor chips have room to wrap. */}

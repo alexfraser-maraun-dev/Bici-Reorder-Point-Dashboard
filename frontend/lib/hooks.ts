@@ -632,9 +632,41 @@ export function useConnectionStatus() {
 // Live special-order dashboard data (open SOs + derived overdue/aging + summary).
 // Mirrors the live PO-draft hooks above. `refetch()` forces a server-side re-fetch
 // from Lightspeed (bypasses the backend TTL cache).
+/** Park a special order until a check-back date. Both a reason code and a date are required —
+ *  the backend rejects an open-ended dismissal, because an un-categorised snooze is exactly how
+ *  an order gets parked rather than worked. */
+export async function ackSpecialOrder(
+  specialOrderId: string,
+  input: { reason_code: string; note?: string; checkback_days?: number; checkback_date?: string },
+) {
+  const res = await fetch(`/backend/api/special-orders/${specialOrderId}/ack`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => null)
+    throw new Error(err?.detail || 'Failed to acknowledge special order')
+  }
+  return res.json()
+}
+
+/** Return a parked special order to the active queue immediately. */
+export async function unackSpecialOrder(specialOrderId: string) {
+  const res = await fetch(`/backend/api/special-orders/${specialOrderId}/ack`, { method: 'DELETE' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => null)
+    throw new Error(err?.detail || 'Failed to un-acknowledge special order')
+  }
+  return res.json()
+}
+
 export function useSpecialOrders() {
   const baseUrl = '/backend'
-  const url = `${baseUrl}/api/special-orders`
+  // The escalations endpoint is a strict superset of /api/special-orders: the same rows plus
+  // each one's SLA verdict, with acknowledgements merged fresh per request (they must not be
+  // served from the 5-minute dashboard cache, or an ack would appear to do nothing).
+  const url = `${baseUrl}/api/special-orders/escalations`
   const { data, error, mutate, isLoading } = useSWR<import('./types').SpecialOrderDashboard>(
     url,
     fetcher,
@@ -667,6 +699,8 @@ export function useSpecialOrders() {
   return {
     orders: data?.orders ?? [],
     summary: data?.summary,
+    sla: data?.summary as unknown as import('./types').SpecialOrderSummarySla | undefined,
+    reasonCodes: data?.reason_codes ?? [],
     shopifyOnly: data?.shopify_only ?? [],
     fetchedAt: data?.fetched_at,
     isLoading,

@@ -15,8 +15,8 @@ from app.services.bigquery_sync import (
 import pandas as pd
 import io
 import uuid
-from datetime import datetime
-from typing import List, Dict, Any
+from datetime import datetime, date, timedelta
+from typing import List, Dict, Any, Optional
 from fastapi.responses import Response, RedirectResponse, JSONResponse
 
 def build_lightspeed_item_url(item_id: str) -> str:
@@ -1508,6 +1508,124 @@ def sweep_special_orders(force: bool = False):
         "orders": len(result.get("orders") or []),
         "forced": force,
     }
+
+
+def _current_user_email(request: Request) -> Optional[str]:
+    """Who is acting, from the proxy-injected session header.
+
+    Deliberately NOT read from the request body: an accountability feature whose "who acked
+    this" field is client-supplied records whatever the client says. The Next proxy sets this
+    header server-side from the NextAuth session (see frontend/app/backend/[...path]/route.ts).
+    """
+    return (request.headers.get(_USER_EMAIL_HEADER) or "").strip().lower() or None
+
+
+def _sla_view(force: bool = False) -> Dict[str, Any]:
+    """SLA-annotated special orders. Reads the cached dashboard; never re-walks Lightspeed."""
+    from app.services import so_sla_service
+    from app.services.planning_store import PlanningStore
+
+    payload = _rebuild_special_orders_cache(force=force) if force else (
+        _special_orders_cache.get("data") or _rebuild_special_orders_cache()
+    )
+    try:
+        acks = PlanningStore().list_so_acks()
+    except Exception as e:
+        # A settings-store hiccup must not hide the queue; it just means nothing reads as acked.
+        print(f"[so_sla] could not load acks: {e}")
+        acks = {}
+    view = so_sla_service.build_escalations(payload.get("orders") or [], acks)
+    view["fetched_at"] = payload.get("fetched_at")
+    # Carried through so this endpoint is a strict superset of /api/special-orders and the page
+    # needs only one fetch. Shopify-only rows have no LS special order, so they carry no SLA
+    # verdict -- they are the intake bucket, handled separately in the UI.
+    view["shopify_only"] = payload.get("shopify_only") or []
+    return view
+
+
+@app.get("/api/special-orders/escalations")
+def get_special_order_escalations(refresh: bool = False, live_only_days: Optional[int] = 365):
+    """The procurement worklist: every open SO with its SLA verdict, plus tile counts."""
+    try:
+        view = _sla_view(force=refresh)
+    except Exception as e:
+        print(f"Error building special-order escalations: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    if live_only_days:
+        from app.services import so_sla_service
+        from app.services.planning_store import PlanningStore
+        kept = [o for o in view["orders"]
+                if (o.get("days_since_creation") or 0) <= live_only_days]
+        try:
+            acks = PlanningStore().list_so_acks()
+        except Exception:
+            acks = {}
+        rebuilt = so_sla_service.build_escalations(kept, acks)
+        rebuilt["fetched_at"] = view.get("fetched_at")
+        rebuilt["shopify_only"] = view.get("shopify_only") or []
+        view = rebuilt
+    return view
+
+
+@app.post("/api/special-orders/{special_order_id}/ack")
+def ack_special_order(special_order_id: str, payload: Dict[str, Any], request: Request):
+    """Park a special order until a check-back date, with a required reason.
+
+    Both the reason code and the check-back date are mandatory. An open-ended dismissal cannot
+    be reported on and produces exactly the "parked, not worked" pattern that generated the
+    22-92 day tail this feature exists to remove.
+    """
+    from app.services import so_sla_service
+    from app.services.planning_store import PlanningStore
+
+    reason = str(payload.get("reason_code") or "").strip()
+    if reason not in so_sla_service.REASON_CODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"reason_code must be one of: {', '.join(so_sla_service.REASON_CODES)}")
+
+    checkback = str(payload.get("checkback_date") or "").strip()
+    if not checkback:
+        days = payload.get("checkback_days")
+        if days is None:
+            raise HTTPException(status_code=400,
+                                detail="checkback_date or checkback_days is required")
+        try:
+            checkback = (date.today() + timedelta(days=int(days))).isoformat()
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="checkback_days must be an integer")
+    try:
+        datetime.strptime(checkback, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="checkback_date must be ISO (YYYY-MM-DD)")
+
+    # Pin the three re-arm triggers from the CURRENT row, so any later change un-parks it.
+    row = next((o for o in (_special_orders_cache.get("data") or {}).get("orders", [])
+                if str(o.get("special_order_id")) == str(special_order_id)), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Special order not found")
+    promise, _src = so_sla_service.resolve_promise(row)
+
+    record = PlanningStore().upsert_so_ack(
+        special_order_id,
+        acked_by=_current_user_email(request),
+        reason_code=reason,
+        note=(payload.get("note") or None),
+        checkback_date=checkback,
+        pinned_stage=row.get("procurement_stage"),
+        pinned_promise=promise.isoformat() if promise else None,
+        pinned_po_eta=row.get("expected_date"),
+        escalation_level=int(payload.get("escalation_level") or 0),
+    )
+    return {"ok": True, "ack": record}
+
+
+@app.delete("/api/special-orders/{special_order_id}/ack")
+def unack_special_order(special_order_id: str):
+    """Un-park a special order, returning it to the active queue immediately."""
+    from app.services.planning_store import PlanningStore
+    PlanningStore().delete_so_ack(special_order_id)
+    return {"ok": True}
 
 
 def _refresh_special_orders_after_write() -> None:

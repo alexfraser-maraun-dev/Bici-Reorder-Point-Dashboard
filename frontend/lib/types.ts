@@ -394,6 +394,54 @@ export type SpecialOrderFlag =
   | 'no_eta'           // ordered, no date to judge against
   | 'ready_not_called' // received but customer not yet contacted
 
+// The SLA verdict on a special order, worst first. `stage_stalled` covers a step that has
+// overrun its dwell limit even when the customer promise is comfortable (or absent);
+// `closed_out` means the item arrived and the SLA clock has stopped.
+export type SlaSeverity =
+  | 'promise_missed'
+  | 'impossible'
+  | 'order_today'
+  | 'stage_stalled'
+  | 'at_risk'
+  | 'no_promise'
+  | 'on_track'
+  | 'closed_out'
+
+// Why a buyer parked a special order. A code is required on every ack — an un-categorised
+// snooze cannot be reported on, and reporting is the point.
+export type SoReasonCode =
+  | 'vendor_backorder'
+  | 'awaiting_vendor_reply'
+  | 'customer_contacted'
+  | 'item_discontinued'
+  | 'waiting_on_cs'
+  | 'substitute_offered'
+  | 'other'
+
+export interface SoAck {
+  special_order_id: string
+  acked_by: string | null
+  reason_code: SoReasonCode
+  note: string | null
+  acked_at: string
+  checkback_date: string
+  pinned_stage: string | null
+  pinned_promise: string | null
+  pinned_po_eta: string | null
+  escalation_level: number
+}
+
+export interface SpecialOrderSummarySla {
+  by_severity: Record<SlaSeverity, number>
+  by_owner: Record<'procurement' | 'receiving' | 'cs', number>
+  missing_promise_by_owner: Record<'service' | 'cs', number>
+  actionable: number
+  acked: number
+  checkback_due: number
+  escalated: number
+  missing_promise: number
+}
+
 // Where the special order derives from, for the Source badge/filter. A workorder wins over a
 // Shopify match: the service bench is where the request actually originated. 'neither' covers
 // SOs raised directly in Lightspeed with no Shopify order and no workorder behind them.
@@ -530,6 +578,30 @@ export interface SpecialOrder {
   days_po_open: number | null
   sale_line_id: string | null
   order_line_id: string | null
+  vendor_lead_time_days: number | null
+  // --- SLA verdict (from /api/special-orders/escalations) ---
+  sla_severity: SlaSeverity
+  sla_severity_rank: number
+  sla_owner: 'procurement' | 'receiving' | 'cs'
+  sla_reason: string
+  promise_date: string | null
+  promise_source: 'shopify_metafield' | 'workorder_eta_out' | null
+  lead_time_days: number
+  lead_time_source: 'po_vendor' | 'fastest_qualifying_vendor' | 'default'
+  receiving_buffer_days: number
+  // Backward-scheduled: promise − lead time − receiving buffer. Negative slack means the
+  // last date it could have been ordered has passed.
+  order_by_date: string | null
+  slack_days: number | null
+  stage_sla_days: number | null
+  days_over_stage_sla: number | null
+  missing_promise: boolean
+  promise_owner: 'service' | 'cs' | null
+  ack: SoAck | null
+  ack_active: boolean
+  escalation_level: number
+  actionable: boolean
+  checkback_due: boolean
   flag: SpecialOrderFlag
   days_overdue: number | null       // signed; only set for the 'ordered' stage
   is_overdue: boolean               // flag is overdue or critical
@@ -580,6 +652,7 @@ export interface SpecialOrderDashboard {
   summary: SpecialOrderSummary
   shopify_only: ShopifyOnlyOrder[]
   fetched_at?: string
+  reason_codes?: string[]
 }
 
 // ---------------------------------------------------------------------------

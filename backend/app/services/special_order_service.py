@@ -326,6 +326,19 @@ def _normalize(
         ctx.get("lt_by_vendor") or {},
     )
 
+    # Lead time for the SO's ACTUAL vendor at this store, when a PO is already attached. For an
+    # unallocated SO there is no vendor yet, so the SLA falls back to the fastest qualifying
+    # vendor in available_vendors (already sorted fastest-first).
+    vendor_lead_time_days = None
+    if po.get("vendor_id") is not None and shop_id is not None:
+        vid = str(po["vendor_id"])
+        lt_loc = ctx.get("lt_by_vendor_loc") or {}
+        lt_v = ctx.get("lt_by_vendor") or {}
+        lead = lt_loc.get((vid, str(shop_id)))
+        if lead is None:
+            lead = lt_v.get(vid)
+        vendor_lead_time_days = int(round(lead)) if lead is not None else None
+
     return {
         "special_order_id": so.get("specialOrderID"),
         "status": status,
@@ -363,6 +376,7 @@ def _normalize(
         "order_id": order_id,
         "vendor_id": po.get("vendor_id"),
         "vendor_name": po.get("vendor_name"),
+        "vendor_lead_time_days": vendor_lead_time_days,
         # The PO's "Order Type v2" custom field ("Replenishment" | "Booking"). Lightspeed
         # only records a value when the non-default choice is picked, so this is the stored
         # value where there is one and the field's default otherwise. None only when the SO

@@ -270,6 +270,26 @@ class PlanningStore:
                     superseded_at TEXT
                 )
             """)
+            # Reason-coded acknowledgements with a MANDATORY check-back date. Unlike
+            # po_watch_acks (which pins only the expected date), an SO ack pins THREE things:
+            # stage, promise and PO ETA. Pinning one is not enough -- a snoozed SO that
+            # regresses to an earlier stage, or whose customer promise moves, must re-arm or
+            # the snooze silently hides a new problem.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS so_acks (
+                    special_order_id {id_type} PRIMARY KEY,
+                    acked_by TEXT,
+                    reason_code TEXT NOT NULL,
+                    note TEXT,
+                    acked_at TEXT NOT NULL,
+                    checkback_date TEXT NOT NULL,
+                    pinned_stage TEXT,
+                    pinned_promise TEXT,
+                    pinned_po_eta TEXT,
+                    escalation_level INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_so_acks_checkback ON so_acks(checkback_date)")
             conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_so_stage_events_natural
                 ON so_stage_events(special_order_id, stage, entered_at)
@@ -628,6 +648,51 @@ class PlanningStore:
                 ), tuple(chunk)).fetchall()
                 out.extend(self._dict(r) for r in rows)
             return out
+        finally:
+            conn.close()
+
+    def upsert_so_ack(self, special_order_id: str, *, acked_by: Optional[str], reason_code: str,
+                      note: Optional[str], checkback_date: str, pinned_stage: Optional[str],
+                      pinned_promise: Optional[str], pinned_po_eta: Optional[str],
+                      escalation_level: int = 0) -> Dict[str, Any]:
+        """Acknowledge a special-order breach until ``checkback_date``.
+
+        The three pinned values are the re-arm triggers: if the SO's stage, customer promise or
+        PO ETA changes afterwards, the ack stops applying and the row surfaces again. That is
+        what stops a snooze from masking a *new* problem on an SO someone already looked at.
+        """
+        record = {
+            "special_order_id": str(special_order_id),
+            "acked_by": acked_by,
+            "reason_code": reason_code,
+            "note": note,
+            "acked_at": self._now(),
+            "checkback_date": checkback_date,
+            "pinned_stage": pinned_stage,
+            "pinned_promise": pinned_promise,
+            "pinned_po_eta": pinned_po_eta,
+            "escalation_level": int(escalation_level),
+        }
+        with self.transaction(immediate=True) as conn:
+            conn.execute(self._sql("DELETE FROM so_acks WHERE special_order_id = ?"),
+                         (record["special_order_id"],))
+            conn.execute(self._sql("""
+                INSERT INTO so_acks (special_order_id,acked_by,reason_code,note,acked_at,
+                    checkback_date,pinned_stage,pinned_promise,pinned_po_eta,escalation_level)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """), tuple(record.values()))
+        return record
+
+    def delete_so_ack(self, special_order_id: str) -> None:
+        with self.transaction(immediate=True) as conn:
+            conn.execute(self._sql("DELETE FROM so_acks WHERE special_order_id = ?"),
+                         (str(special_order_id),))
+
+    def list_so_acks(self) -> Dict[str, Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT * FROM so_acks").fetchall()
+            return {str(self._dict(r)["special_order_id"]): self._dict(r) for r in rows}
         finally:
             conn.close()
 

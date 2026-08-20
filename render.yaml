@@ -4,7 +4,7 @@ services:
     name: bici-reorder-point-dashboard-b
     runtime: docker
     rootDir: backend
-    plan: free # Ensure it stays on free tier if needed
+    plan: starter 
     envVars:
       # Cap glibc malloc arenas so freed pandas/pyarrow buffers are returned to
       # the OS instead of fragmenting across per-thread arenas. Cheap insurance

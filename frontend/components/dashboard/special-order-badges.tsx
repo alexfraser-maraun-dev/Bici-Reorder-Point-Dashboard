@@ -2,7 +2,7 @@
 
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
-import type { ProcurementStage, SpecialOrderFlag, ShopifyMatch, ShopifyMatchBasis, SpecialOrderSource, TriageStage } from '@/lib/types'
+import type { ProcurementStage, SpecialOrderFlag, ShopifyMatch, ShopifyMatchBasis, SpecialOrderSource, SlaSeverity, TriageStage } from '@/lib/types'
 import { subTriageLabel } from '@/lib/special-order-triage'
 import {
   AlertTriangle,
@@ -18,6 +18,11 @@ import {
   Unlink,
   Wrench,
   HelpCircle,
+  CalendarX,
+  Ban,
+  Zap,
+  Hourglass,
+  ShieldQuestion,
 } from 'lucide-react'
 
 interface BadgeConfig {
@@ -51,6 +56,33 @@ export function SourceBadge({ source }: { source: SpecialOrderSource | null | un
   const Icon = config.icon
   return (
     <Badge variant="outline" className={cn('gap-1 text-[10px] font-medium', config.className)}>
+      <Icon className="h-3 w-3" />
+      {config.label}
+    </Badge>
+  )
+}
+
+// The SLA verdict. Ordered worst-first to match SEVERITY_ORDER in so_sla_service.py.
+// 'on_track' and 'closed_out' render nothing — a badge on every healthy row is noise, and the
+// point of this column is to make the ~37 that need action findable among ~230.
+const severityConfig: Partial<Record<SlaSeverity, BadgeConfig>> = {
+  promise_missed: { label: 'Promise missed', className: 'bg-red-600 text-white border-red-700', icon: CalendarX },
+  impossible: { label: 'Cannot make ETA', className: 'bg-red-100 text-red-700 border-red-200', icon: Ban },
+  order_today: { label: 'Order today', className: 'bg-orange-100 text-orange-700 border-orange-200', icon: Zap },
+  stage_stalled: { label: 'Stalled', className: 'bg-amber-100 text-amber-800 border-amber-200', icon: Hourglass },
+  at_risk: { label: 'At risk', className: 'bg-yellow-100 text-yellow-800 border-yellow-200', icon: AlertTriangle },
+  no_promise: { label: 'No promise', className: 'bg-slate-100 text-slate-600 border-slate-200', icon: ShieldQuestion },
+}
+
+export function SeverityBadge({ severity, muted }: { severity: SlaSeverity; muted?: boolean }) {
+  const config = severityConfig[severity]
+  if (!config) return null
+  const Icon = config.icon
+  return (
+    <Badge
+      variant="outline"
+      className={cn('gap-1 text-[10px] font-medium', config.className, muted && 'opacity-50')}
+    >
       <Icon className="h-3 w-3" />
       {config.label}
     </Badge>

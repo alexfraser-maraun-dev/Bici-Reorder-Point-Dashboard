@@ -139,6 +139,31 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
     days_po_open: null,
     sale_line_id: null,
     order_line_id: null,
+    vendor_lead_time_days: null,
+    // Shopify-only rows have no Lightspeed special order, so the backend computes no SLA
+    // verdict for them. They are the intake gap (tagged in Shopify, never created in LS) and
+    // are surfaced by the Shopify tile — neutral values here keep them out of the procurement
+    // severity counts rather than showing up as fake breaches.
+    sla_severity: 'no_promise',
+    sla_severity_rank: 5,
+    sla_owner: 'cs',
+    sla_reason: 'Tagged in Shopify but no Lightspeed special order exists yet.',
+    promise_date: o.shopify_expected_date ?? null,
+    promise_source: o.shopify_expected_date ? 'shopify_metafield' : null,
+    lead_time_days: 0,
+    lead_time_source: 'default',
+    receiving_buffer_days: 0,
+    order_by_date: null,
+    slack_days: null,
+    stage_sla_days: null,
+    days_over_stage_sla: null,
+    missing_promise: !o.shopify_expected_date,
+    promise_owner: o.shopify_expected_date ? null : 'cs',
+    ack: null,
+    ack_active: false,
+    escalation_level: 0,
+    actionable: false,
+    checkback_due: false,
     flag: 'none',
     days_overdue: null,
     is_overdue: false,
@@ -166,7 +191,7 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
 }
 
 export function SpecialOrdersContent() {
-  const { orders, shopifyOnly, isLoading, isRefreshing, refetch, revalidate, fetchedAt, error } =
+  const { orders, shopifyOnly, sla, isLoading, isRefreshing, refetch, revalidate, fetchedAt, error } =
     useSpecialOrders()
 
   const handleSync = async () => {
@@ -207,6 +232,7 @@ export function SpecialOrdersContent() {
   const [storeFilter, setStoreFilter] = useState<string>('all')
   const [orderTypeFilter, setOrderTypeFilter] = useState<string>('all')
   const [sourceFilter, setSourceFilter] = useState<string>('all')
+  const [needsActionOnly, setNeedsActionOnly] = useState(false)
   const [liveOnly, setLiveOnly] = useState(true)
   const [flaggedOnly, setFlaggedOnly] = useState(false)
 
@@ -240,6 +266,9 @@ export function SpecialOrdersContent() {
     const term = search.trim().toLowerCase()
     return allRows.filter((o) => {
       if (flaggedOnly && o.flag === 'none') return false
+      // 'Needs action' = a real SLA breach nobody has parked. Parked rows stay visible
+      // under the other filters so the reason and check-back date remain findable.
+      if (needsActionOnly && !o.actionable) return false
       if (storeFilter !== 'all' && o.store !== storeFilter) return false
       // 'none' = the SO has no PO yet, so it has no order type to speak of.
       if (orderTypeFilter === 'none' && o.order_type) return false
@@ -251,7 +280,7 @@ export function SpecialOrdersContent() {
         ...o.available_vendors.map((v) => v.vendor_name)]
         .some((v) => v && String(v).toLowerCase().includes(term))
     })
-  }, [allRows, flaggedOnly, storeFilter, orderTypeFilter, sourceFilter, liveOnly, search])
+  }, [allRows, flaggedOnly, needsActionOnly, storeFilter, orderTypeFilter, sourceFilter, liveOnly, search])
 
   // The tiles that currently have ≥1 selected sub-triage. A tile is "active" once you pick any of
   // its buckets; selection combines as AND across tiles, OR within a tile.
@@ -302,7 +331,7 @@ export function SpecialOrdersContent() {
   }
 
   const filtersActive =
-    selected.size > 0 || storeFilter !== 'all' || orderTypeFilter !== 'all' || sourceFilter !== 'all' || search || flaggedOnly || !liveOnly
+    selected.size > 0 || storeFilter !== 'all' || orderTypeFilter !== 'all' || sourceFilter !== 'all' || search || flaggedOnly || needsActionOnly || !liveOnly
 
   return (
     <div className="space-y-4">
@@ -462,6 +491,10 @@ export function SpecialOrdersContent() {
           </Select>
         )}
         <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
+          <Checkbox checked={needsActionOnly} onCheckedChange={(v) => setNeedsActionOnly(v === true)} />
+          Needs action
+        </label>
+        <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
           <Checkbox checked={flaggedOnly} onCheckedChange={(v) => setFlaggedOnly(v === true)} />
           Flagged only
         </label>
@@ -474,12 +507,44 @@ export function SpecialOrdersContent() {
             variant="ghost"
             size="sm"
             className="text-muted-foreground"
-            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setOrderTypeFilter('all'); setSourceFilter('all'); setSearch(''); setFlaggedOnly(false); setLiveOnly(true) }}
+            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setOrderTypeFilter('all'); setSourceFilter('all'); setSearch(''); setFlaggedOnly(false); setNeedsActionOnly(false); setLiveOnly(true) }}
           >
             Clear filters
           </Button>
         )}
       </div>
+
+      {/* Queue state at a glance. Counts come from the backend over the FULL live population,
+          not the current filter, so narrowing the view never makes the backlog look smaller. */}
+      {sla && (
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-1 rounded-md border bg-muted/40 px-3 py-2 text-xs">
+          <button
+            type="button"
+            onClick={() => setNeedsActionOnly((v) => !v)}
+            className={cn('font-medium underline-offset-2 hover:underline',
+              sla.actionable > 0 ? 'text-red-600' : 'text-emerald-600')}
+          >
+            {sla.actionable} need action
+          </button>
+          {sla.checkback_due > 0 && (
+            <span className="text-amber-700">{sla.checkback_due} due for check-back</span>
+          )}
+          {sla.escalated > 0 && (
+            <span className="font-medium text-red-600">{sla.escalated} escalated</span>
+          )}
+          {sla.acked > 0 && <span className="text-muted-foreground">{sla.acked} parked</span>}
+          {sla.missing_promise > 0 && (
+            <span className="text-muted-foreground" title="No customer promise recorded, so there is nothing to schedule against">
+              {sla.missing_promise} without a promised date
+              {sla.missing_promise_by_owner && (
+                <span className="opacity-70">
+                  {' '}({sla.missing_promise_by_owner.service} service · {sla.missing_promise_by_owner.cs} CS)
+                </span>
+              )}
+            </span>
+          )}
+        </div>
+      )}
 
       <SpecialOrdersGrid
         orders={filtered}
