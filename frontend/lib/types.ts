@@ -495,6 +495,57 @@ export interface CandidatePo {
   expected_date: string | null
 }
 
+export interface DwellStat { n: number; median: number; p75: number; max: number }
+
+export interface SoScoreboard {
+  as_of: string
+  population: {
+    live: number
+    open: number
+    received_awaiting_closeout: number
+    stale_beyond_live_window: number
+  }
+  dwell_days: {
+    by_stage: Record<string, DwellStat | null>
+    by_store: Record<string, DwellStat | null>
+    by_source: Record<string, DwellStat | null>
+  }
+  promise: {
+    with_promise: number
+    settled: number
+    met: number
+    missed: number
+    // Denominator is DELIVERED orders only. Counting orders still inside their window as
+    // "on time" would flatter the number — most of the population simply has not had the
+    // chance to fail yet.
+    on_time_pct_vs_original: number | null
+    breached_outstanding: number
+    undetermined: number
+    revised_at_least_once: number
+    missing_promise: number
+    missing_promise_by_owner: Record<'service' | 'cs', number>
+  }
+  queue: {
+    actionable: number
+    by_severity: Record<string, number>
+    by_owner: Record<string, number>
+    acked: number
+    escalated: number
+    checkback_due: number
+    top_blocking_reasons: [string, number][]
+  }
+  history: {
+    lookback_months: number
+    stores: {
+      store: string
+      n: number
+      create_to_place: { p25: number; median: number; p75: number } | null
+      place_to_receive: { p25: number; median: number; p75: number } | null
+      end_to_end: { p25: number; median: number; p75: number } | null
+    }[]
+  } | null
+}
+
 // Where the special order derives from, for the Source badge/filter. A workorder wins over a
 // Shopify match: the service bench is where the request actually originated. 'neither' covers
 // SOs raised directly in Lightspeed with no Shopify order and no workorder behind them.

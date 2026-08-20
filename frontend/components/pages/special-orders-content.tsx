@@ -18,6 +18,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
+import { SoScoreboard } from '@/components/dashboard/so-scoreboard'
 import { SpecialOrdersGrid } from '@/components/dashboard/special-orders-grid'
 import {
   Store,
@@ -513,6 +514,8 @@ export function SpecialOrdersContent() {
           </Button>
         )}
       </div>
+
+      <SoScoreboard />
 
       {/* Queue state at a glance. Counts come from the backend over the FULL live population,
           not the current filter, so narrowing the view never makes the backlog look smaller. */}

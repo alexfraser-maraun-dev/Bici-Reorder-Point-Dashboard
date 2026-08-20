@@ -1723,6 +1723,36 @@ def get_po_recommendation(special_order_id: str):
     return result
 
 
+@app.get("/api/special-orders/scoreboard")
+def get_special_order_scoreboard(include_history: bool = True):
+    """Where special-order time goes, and who owns each failure.
+
+    Current-state metrics work from the first sweep because stage entry timestamps are derived
+    from Lightspeed's own dates rather than observed. Historical cycle times come from real PO
+    timestamps, so the scoreboard is useful immediately instead of after weeks of accumulation.
+    """
+    from app.services import so_scoreboard_service
+    from app.services.planning_store import PlanningStore
+
+    payload = _special_orders_cache.get("data") or _rebuild_special_orders_cache()
+    try:
+        store = PlanningStore()
+        acks, promises = store.list_so_acks(), store.list_so_promises()
+    except Exception as e:
+        print(f"[so_scoreboard] store unavailable: {e}")
+        acks, promises = {}, []
+
+    board = so_scoreboard_service.build_scoreboard(payload.get("orders") or [], acks, promises)
+    if include_history:
+        try:
+            board["history"] = so_scoreboard_service.fetch_historical_cycle_times()
+        except Exception as e:
+            # A BigQuery hiccup must not take the live half of the scoreboard down with it.
+            print(f"[so_scoreboard] history unavailable: {e}")
+            board["history"] = None
+    return board
+
+
 @app.get("/api/special-orders/candidate-pos")
 def get_candidate_pos(shop_id: str):
     """Open POs at one store, for overriding a recommendation."""

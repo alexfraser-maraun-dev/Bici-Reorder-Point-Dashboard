@@ -683,6 +683,17 @@ export function useCandidatePos(shopId: string | null) {
   return { candidates: data?.orders ?? [], isLoading, error }
 }
 
+/** Scoreboard metrics. Lazy — pass false until the panel is opened, since the history half
+ *  costs a BigQuery round-trip. */
+export function useSoScoreboard(enabled: boolean) {
+  const { data, error, isLoading } = useSWR<import('./types').SoScoreboard>(
+    enabled ? '/backend/api/special-orders/scoreboard' : null,
+    fetcher,
+    { revalidateOnFocus: false, dedupingInterval: 300000 },
+  )
+  return { scoreboard: data, isLoading, error }
+}
+
 export function useSpecialOrders() {
   const baseUrl = '/backend'
   // The escalations endpoint is a strict superset of /api/special-orders: the same rows plus

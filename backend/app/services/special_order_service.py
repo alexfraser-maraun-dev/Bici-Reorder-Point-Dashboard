@@ -363,6 +363,9 @@ def _normalize(
         "shopify_order_url": None,
         "shopify_expected_date": None,
         "shopify_candidates": [],
+        # Manual-link audit: who linked it, when, and whether a hand-made link has since broken.
+        "link_provenance": None,
+        "link_broken": None,
         # Item / product
         "item_id": item_id,
         "system_sku": item.get("systemSku"),
@@ -502,6 +505,9 @@ def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> N
     o["shopify_expected_date"] = m["shopify_expected_date"]
     o["shopify_order_url"] = shopify_order_url(m["shopify_order_id"])
     o["shopify_candidates"] = m.get("shopify_candidates") or []
+    # Who linked this and when (manual links only), and whether a hand-made link has broken.
+    o["link_provenance"] = m.get("_link_provenance")
+    o["link_broken"] = m.get("_link_broken")
 
     # Source attribution. A definite Shopify link makes this a retail SO -- unless it already
     # came off the service bench, in which case the workorder remains the true origin. An
@@ -519,7 +525,7 @@ def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> N
     o["is_overdue"] = fl["flag"] in _OVERDUE_FLAGS
 
 
-_EMPTY_OVERRIDES = {"links": {}, "blocked": set()}
+_EMPTY_OVERRIDES = {"links": {}, "blocked": set(), "provenance": {}}
 
 
 def _manual_link_index(index: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
@@ -580,15 +586,20 @@ def _enrich_with_shopify(
     # Orders linked by hand that live outside the open population (fulfilled/untagged/old).
     external = _manual_link_index(index, ov)
 
+    provenance: Dict[str, Any] = ov.get("provenance") or {}
+
     def resolve(o: Dict[str, Any]) -> Dict[str, Any]:
         so_id = str(o.get("special_order_id"))
         manual_oid = links.get(so_id)
         if manual_oid and manual_oid in index["orders"]:
-            return shopify_match.manual_match(index, manual_oid)
+            m = shopify_match.manual_match(index, manual_oid)
+            m["_link_provenance"] = provenance.get(so_id)
+            return m
         if manual_oid and manual_oid in external["orders"]:
-            return shopify_match.manual_match(external, manual_oid)
-        # A manual link Shopify no longer returns at all lapses to auto-matching.
-        return shopify_match.match_special_order(
+            m = shopify_match.manual_match(external, manual_oid)
+            m["_link_provenance"] = provenance.get(so_id)
+            return m
+        m = shopify_match.match_special_order(
             o.get("customer_email"),
             o.get("system_sku"),
             index,
@@ -596,6 +607,14 @@ def _enrich_with_shopify(
             customer_name=o.get("customer_name"),
             blocked=frozenset(blocked_by_so.get(so_id, set())),
         )
+        if manual_oid:
+            # Someone linked this by hand and Shopify no longer returns that order at all
+            # (deleted, or re-created with a new id). It used to lapse silently back to
+            # auto-matching, so a broken link looked exactly like a never-linked one and the
+            # human decision vanished without trace. Flag it instead.
+            m["_link_broken"] = manual_oid
+            m["_link_provenance"] = provenance.get(so_id)
+        return m
 
     for o in orders:
         m = resolve(o)

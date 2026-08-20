@@ -177,6 +177,44 @@ def test_completed_adoption_requires_definite_match():
     print("test_completed_adoption_requires_definite_match OK")
 
 
+def test_broken_manual_link_is_flagged_not_silently_dropped():
+    """A hand-made link whose Shopify order has vanished must surface, not lapse.
+
+    `resolve()` falls back to auto-matching when a manual link no longer resolves. Without a
+    marker the row looks identical to one that was never linked, so a human decision disappears
+    with no trace — the opposite of what an accountability feature should do.
+    """
+    today = date(2026, 7, 13)
+    rows = [_row("100", "SKU1", email="a@b.c")]
+    index = shopify_match.build_shopify_index(rows)
+    prov = {"1": {"shopify_order_id": "GONE", "linked_by": "alex@bici.cc",
+                  "linked_at": "2026-07-01T00:00:00Z"}}
+
+    # The link points at order "GONE", which Shopify no longer returns anywhere.
+    orders = [_ls_order("1", "SKU1", email="a@b.c")]
+    _enrich_with_shopify(index, orders, [], today,
+                         {"links": {"1": "GONE"}, "blocked": set(), "provenance": prov})
+    assert orders[0]["link_broken"] == "GONE", orders[0].get("link_broken")
+    assert orders[0]["link_provenance"]["linked_by"] == "alex@bici.cc"
+
+    # A link that still resolves is NOT flagged broken, and keeps its provenance.
+    orders2 = [_ls_order("1", "SKU1", email="a@b.c")]
+    _enrich_with_shopify(index, orders2, [], today,
+                         {"links": {"1": "100"}, "blocked": set(),
+                          "provenance": {"1": {"shopify_order_id": "100",
+                                               "linked_by": "alex@bici.cc",
+                                               "linked_at": "2026-07-01T00:00:00Z"}}})
+    assert orders2[0]["link_broken"] is None, orders2[0]["link_broken"]
+    assert orders2[0]["link_provenance"]["linked_by"] == "alex@bici.cc"
+
+    # No manual link at all -> neither field set.
+    orders3 = [_ls_order("1", "SKU1", email="a@b.c")]
+    _enrich_with_shopify(index, orders3, [], today)
+    assert orders3[0]["link_broken"] is None
+    assert orders3[0]["link_provenance"] is None
+    print("test_broken_manual_link_is_flagged_not_silently_dropped OK")
+
+
 def test_override_fold():
     """The append-only override log folds to latest-wins state (mirrors
     bigquery_sync.fetch_so_match_overrides without BigQuery)."""
@@ -206,5 +244,6 @@ if __name__ == "__main__":
     test_tiers()
     test_enrich_ambiguity_surfacing_and_overrides()
     test_completed_adoption_requires_definite_match()
+    test_broken_manual_link_is_flagged_not_silently_dropped()
     test_override_fold()
     print("\nAll shopify-match unit tests passed.")

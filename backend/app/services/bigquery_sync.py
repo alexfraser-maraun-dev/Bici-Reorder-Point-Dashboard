@@ -160,11 +160,11 @@ def fetch_so_match_overrides() -> dict:
     Empty state (and no error) when the table doesn't exist yet or the query fails, so the
     dashboard degrades to pure auto-matching.
     """
-    empty = {"links": {}, "blocked": set()}
+    empty = {"links": {}, "blocked": set(), "provenance": {}}
     try:
         client = get_bq_client()
         rows = client.query(f"""
-            SELECT special_order_id, shopify_order_id, action
+            SELECT special_order_id, shopify_order_id, action, created_at, created_by
             FROM `{_SO_OVERRIDES_TABLE}`
             ORDER BY created_at ASC
         """).result()
@@ -173,16 +173,26 @@ def fetch_so_match_overrides() -> dict:
         return empty
     links: dict = {}
     blocked: set = set()
+    # Who linked this and when. Previously discarded during the fold, which left a manual link
+    # indistinguishable from an automatic one in the UI -- unhelpful in general, and actively
+    # wrong for a feature whose whole point is accountability.
+    provenance: dict = {}
     for r in rows:
         so, oid, action = str(r["special_order_id"]), str(r["shopify_order_id"]), r["action"]
         if action == "link":
             links[so] = oid
             blocked.discard((so, oid))
+            provenance[so] = {
+                "shopify_order_id": oid,
+                "linked_by": r["created_by"],
+                "linked_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
         elif action == "unlink":
             blocked.add((so, oid))
             if links.get(so) == oid:
                 del links[so]
-    return {"links": links, "blocked": blocked}
+                provenance.pop(so, None)
+    return {"links": links, "blocked": blocked, "provenance": provenance}
 
 
 def get_recommendation_runs(limit: int = 50):
