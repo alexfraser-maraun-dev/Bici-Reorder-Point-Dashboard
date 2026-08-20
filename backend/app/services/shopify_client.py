@@ -207,6 +207,57 @@ class ShopifyClient:
     }
     """ % (_ORDERS_PER_PAGE, _ETA_NAMESPACE, _ETA_KEY)
 
+    # Same shape as _OPEN_SO_QUERY but WITHOUT the status filters, for the late-match fallback.
+    # The date bound is interpolated rather than parameterised because Shopify's `query:` string
+    # is not a GraphQL variable position.
+    _RECENT_SO_QUERY = """
+    query RecentSpecialOrders($cursor: String, $lineItems: Int!) {
+      orders(first: %d, after: $cursor, query: "tag:SO AND created_at:>%%s", sortKey: CREATED_AT, reverse: true) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          name
+          email
+          phone
+          shippingAddress { name phone }
+          displayFulfillmentStatus
+          displayFinancialStatus
+          createdAt
+          cancelledAt
+          closed
+          test
+          metafield(namespace: "%s", key: "%s") { value }
+          lineItems(first: $lineItems) { nodes { sku } }
+        }
+      }
+    }
+    """ % (_ORDERS_PER_PAGE, _ETA_NAMESPACE, _ETA_KEY)
+
+    def get_recent_special_orders(self, months: int = 12) -> List[Dict[str, Any]]:
+        """Every `SO`-tagged order in the window, INCLUDING fulfilled and archived ones.
+
+        Exists because a Lightspeed special order is routinely created before, or long after,
+        its Shopify order — and because a Shopify order can be fulfilled for its other lines
+        while the special-order line is still outstanding. Verified live: SO 43605 was created
+        2026-04-30, its `SO`-tagged Shopify order #233420 on 2026-05-27, and that order is now
+        FULFILLED, so `get_open_special_orders()` cannot see it and the pair can never match.
+
+        This is a FALLBACK population, never the primary one: 728 of 839 orders in the window
+        are already fulfilled, and folding them into the main index would both manufacture
+        ambiguity and fill the "unmatched Shopify orders" list with orders that are genuinely
+        finished. Callers must consult it only for special orders the normal pass could not
+        match, and must not surface its orders as unmatched.
+
+        Same row shape as `get_open_special_orders`. Returns [] on any failure.
+        """
+        from datetime import date, timedelta
+        since = (date.today() - timedelta(days=int(months) * 31)).isoformat()
+        try:
+            return self._collect_special_orders(self._RECENT_SO_QUERY % since, apply_status_filter=False)
+        except Exception as e:
+            print(f"Shopify recent-special-order fetch failed (fallback disabled): {e}")
+            return []
+
     def get_open_special_orders(self) -> List[Dict[str, Any]]:
         """
         Live equivalent of `bigquery_sync.get_shopify_special_orders()`: open Shopify orders
@@ -222,6 +273,15 @@ class ShopifyClient:
         Lightspeed-based special-order triage never breaks when Shopify is unavailable —
         preserving the resilience guarantee the BigQuery pull had.
         """
+        return self._collect_special_orders(self._OPEN_SO_QUERY, apply_status_filter=True)
+
+    def _collect_special_orders(self, query: str, *, apply_status_filter: bool) -> List[Dict[str, Any]]:
+        """Page a `tag:SO` order query into the flat (order x line SKU) row shape.
+
+        `apply_status_filter` is what separates the live population from the fallback one: the
+        dashboard wants only orders still awaiting their item, while the late-match fallback
+        deliberately wants the fulfilled and archived ones too.
+        """
         if not self._configured():
             print("Shopify not configured; skipping live special-order pull.")
             return []
@@ -230,17 +290,20 @@ class ShopifyClient:
             cursor: Optional[str] = None
             for _ in range(_MAX_PAGES):
                 data = self._graphql(
-                    self._OPEN_SO_QUERY, {"cursor": cursor, "lineItems": _LINE_ITEMS_PER_PAGE}
+                    query, {"cursor": cursor, "lineItems": _LINE_ITEMS_PER_PAGE}
                 )
                 conn = data.get("orders") or {}
                 for o in conn.get("nodes") or []:
                     # Mirror the BigQuery exclusions (the `tag:SO` search can't express them all).
                     # Fulfilled or archived => the special order is done. See the note on
                     # financial status above for why a refund is NOT an exclusion.
-                    if o.get("displayFulfillmentStatus") == "FULFILLED":
-                        continue
-                    if o.get("cancelledAt") or o.get("closed") or o.get("test"):
-                        continue
+                    if apply_status_filter:
+                        if o.get("displayFulfillmentStatus") == "FULFILLED":
+                            continue
+                        if o.get("cancelledAt") or o.get("closed") or o.get("test"):
+                            continue
+                    elif o.get("test"):
+                        continue  # test orders are never real, in either population
 
                     order_id = _gid_to_id(o.get("id"))
                     order_name = o.get("name")

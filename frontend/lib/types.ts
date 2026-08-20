@@ -682,6 +682,13 @@ export interface SpecialOrder {
   days_po_open: number | null
   sale_line_id: string | null
   order_line_id: string | null
+  // Manual-link audit. `link_broken` holds the Shopify order id of a hand-made link that no
+  // longer resolves — previously this lapsed silently back to auto-matching.
+  link_provenance: { shopify_order_id: string; linked_by: string | null; linked_at: string | null } | null
+  link_broken: string | null
+  // Matched against a fulfilled/archived Shopify order via the late-match fallback. Such an
+  // order is deliberately absent from the unmatched list, so say so rather than confuse.
+  matched_via_closed_order: boolean
   vendor_lead_time_days: number | null
   // --- SLA verdict (from /api/special-orders/escalations) ---
   sla_severity: SlaSeverity

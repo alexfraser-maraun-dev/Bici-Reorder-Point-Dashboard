@@ -18,6 +18,61 @@ export interface SubTriage {
 // (open_pool / unordered_po) are AGE-driven — days sitting in stage, after a 5-day grace —
 // while the ordered stage is DATE-driven, judged against the Shopify ETA (customer promise)
 // when present, else the PO's expected date.
+// Tier boundaries as shipped by the backend (`meta.thresholds`), so the labels below are
+// arithmetic on the real constants rather than numbers retyped by hand. The defaults match
+// special_order_service.py at the time of writing and are only used before the payload lands.
+export interface TriageThresholds {
+  grace_days: number
+  overdue_mid_min: number
+  overdue_max: number
+  ordered: { overdue: [number, number]; overdue_mid: [number, number]; critical_from: number }
+  preorder: {
+    healthy_below: number
+    overdue: [number, number]
+    overdue_mid: [number, number]
+    critical_from: number
+  }
+}
+
+export const DEFAULT_THRESHOLDS: TriageThresholds = {
+  grace_days: 5,
+  overdue_mid_min: 3,
+  overdue_max: 7,
+  ordered: { overdue: [1, 2], overdue_mid: [3, 7], critical_from: 8 },
+  preorder: { healthy_below: 5, overdue: [5, 6], overdue_mid: [7, 11], critical_from: 12 },
+}
+
+const range = (r: [number, number]) => `${r[0]}-${r[1]}d`
+
+/** Build the sub-triage config for the given thresholds. Prefer this over STAGE_SUBTRIAGES so a
+ *  backend threshold change flows straight through to the tile labels. */
+export function buildStageSubtriages(t: TriageThresholds = DEFAULT_THRESHOLDS):
+    Record<ProcurementStage, SubTriage[]> {
+  const p = t.preorder
+  const o = t.ordered
+  const preorder = (noun: string): SubTriage[] => [
+    { key: 'critical', label: `${noun} ${p.critical_from}d+`, tone: 'danger' },
+    { key: 'overdue_mid', label: `${noun} ${range(p.overdue_mid)}`, tone: 'danger' },
+    { key: 'overdue', label: `${noun} ${range(p.overdue)}`, tone: 'danger' },
+    { key: 'healthy', label: `Healthy (0-${p.healthy_below - 1}d)`, tone: 'ok' },
+  ]
+  return {
+    open_pool: preorder('Open Order'),
+    unordered_po: preorder('Unordered'),
+    ordered: [
+      { key: 'critical', label: `PO Critically Overdue (${o.critical_from}d+)`, tone: 'danger' },
+      { key: 'overdue_mid', label: `PO Overdue (${range(o.overdue_mid)})`, tone: 'danger' },
+      { key: 'overdue', label: `PO Overdue (${range(o.overdue)})`, tone: 'danger' },
+      { key: 'no_eta', label: 'No ETA', tone: 'warn' },
+      { key: 'healthy', label: 'Healthy', tone: 'ok' },
+    ],
+    received: [
+      { key: 'ready_not_called', label: 'Ready, Not Called', tone: 'warn' },
+      { key: 'healthy', label: 'Healthy', tone: 'ok' },
+    ],
+  }
+}
+
 export const STAGE_SUBTRIAGES: Record<ProcurementStage, SubTriage[]> = {
   open_pool: [
     { key: 'critical', label: 'Open Order 12d+', tone: 'danger' },

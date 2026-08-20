@@ -366,6 +366,7 @@ def _normalize(
         # Manual-link audit: who linked it, when, and whether a hand-made link has since broken.
         "link_provenance": None,
         "link_broken": None,
+        "matched_via_closed_order": False,
         # Item / product
         "item_id": item_id,
         "system_sku": item.get("systemSku"),
@@ -432,6 +433,37 @@ def _normalize(
 _STAGES = ["open_pool", "unordered_po", "ordered", "received"]
 
 
+def triage_thresholds() -> Dict[str, Any]:
+    """The tier boundaries, shipped to the frontend so labels are derived rather than retyped.
+
+    `lib/special-order-triage.ts` previously hardcoded "5-6d" / "7-11d" / "12d+" and
+    "1-2d" / "3-7d" / "8d+", which are arithmetic on the constants below. Changing a constant
+    silently made every tile label wrong. Three copies of these numbers already existed across
+    the codebase; this is the one that stops a fourth.
+
+    Boundaries mirror `_compute_flag` exactly:
+      ordered   -> days past the classification date: 1..(mid-1) / mid..max / >max
+      pre-order -> real age, healthy below the grace window, then the same ramp offset by it
+    """
+    return {
+        "grace_days": _PREORDER_GRACE_DAYS,
+        "overdue_mid_min": _OVERDUE_MID_MIN,
+        "overdue_max": _OVERDUE_MAX,
+        "ordered": {
+            "overdue": [1, _OVERDUE_MID_MIN - 1],
+            "overdue_mid": [_OVERDUE_MID_MIN, _OVERDUE_MAX],
+            "critical_from": _OVERDUE_MAX + 1,
+        },
+        "preorder": {
+            "healthy_below": _PREORDER_GRACE_DAYS,
+            "overdue": [_PREORDER_GRACE_DAYS, _PREORDER_GRACE_DAYS + _OVERDUE_MID_MIN - 2],
+            "overdue_mid": [_PREORDER_GRACE_DAYS + _OVERDUE_MID_MIN - 1,
+                            _PREORDER_GRACE_DAYS + _OVERDUE_MAX - 1],
+            "critical_from": _PREORDER_GRACE_DAYS + _OVERDUE_MAX,
+        },
+    }
+
+
 def _summarize(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Per-stage totals + how many in each stage carry an attention flag, plus a flat
     flag breakdown for convenience tiles."""
@@ -485,6 +517,29 @@ def _shopify_rows() -> List[Dict[str, Any]]:
     return rows
 
 
+# The fallback population changes far more slowly than the open one (it is mostly historical),
+# and costs a separate paginated pull, so it gets its own longer TTL.
+_shopify_fallback_cache: Dict[str, Any] = {"rows": None, "fetched_at": 0.0}
+_SHOPIFY_FALLBACK_TTL_SECONDS = 3600
+
+
+def _shopify_fallback_rows() -> List[Dict[str, Any]]:
+    """`SO`-tagged Shopify orders including fulfilled/archived, for the late-match second pass.
+
+    Kept apart from `_shopify_rows()` on purpose: 728 of ~850 orders in the window are already
+    fulfilled. Folding them into the primary index would manufacture ambiguity and fill the
+    "unmatched Shopify orders" list with orders that are genuinely finished.
+    """
+    now = time.time()
+    cached = _shopify_fallback_cache["rows"]
+    if cached is not None and (now - _shopify_fallback_cache["fetched_at"]) < _SHOPIFY_FALLBACK_TTL_SECONDS:
+        return cached
+    rows = ShopifyClient().get_recent_special_orders()
+    _shopify_fallback_cache["rows"] = rows
+    _shopify_fallback_cache["fetched_at"] = now
+    return rows
+
+
 def shopify_order_url(order_id: Optional[str]) -> Optional[str]:
     """Admin deep link, only when SHOPIFY_ADMIN_STORE_HANDLE is configured."""
     handle = os.getenv("SHOPIFY_ADMIN_STORE_HANDLE")
@@ -508,6 +563,9 @@ def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> N
     # Who linked this and when (manual links only), and whether a hand-made link has broken.
     o["link_provenance"] = m.get("_link_provenance")
     o["link_broken"] = m.get("_link_broken")
+    # True when the match came from the fallback population -- the Shopify order is fulfilled or
+    # archived, so it is NOT in the unmatched list and must never be offered as a link target.
+    o["matched_via_closed_order"] = bool(m.get("_matched_via_closed_order"))
 
     # Source attribution. A definite Shopify link makes this a retail SO -- unless it already
     # came off the service bench, in which case the workorder remains the true origin. An
@@ -554,6 +612,7 @@ def _enrich_with_shopify(
     completed_orders: List[Dict[str, Any]],
     today: date,
     overrides: Optional[Dict[str, Any]] = None,
+    fallback_index: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Matches LS SOs to Shopify `SO`-tagged orders and returns the Shopify-only ("Unmatched")
@@ -614,6 +673,29 @@ def _enrich_with_shopify(
             # human decision vanished without trace. Flag it instead.
             m["_link_broken"] = manual_oid
             m["_link_provenance"] = provenance.get(so_id)
+            return m
+
+        # Second pass: a Lightspeed special order is routinely created before, or long after,
+        # its Shopify order, and a Shopify order can be FULFILLED for its other lines while the
+        # special-order line is still outstanding. Either way the order has left the open
+        # population and the first pass cannot see it (verified: SO 43605 created 2026-04-30,
+        # its SO-tagged order #233420 created 2026-05-27 and now fulfilled).
+        #
+        # Only the identity-backed tiers are honoured here. SKU-only matching across ~850
+        # historical orders would be near-meaningless, so a fallback result that is not
+        # definite, or that rests on sku_only, is discarded rather than guessed at.
+        if m["shopify_match"] == "none" and fallback_index and fallback_index.get("orders"):
+            fb = shopify_match.match_special_order(
+                o.get("customer_email"),
+                o.get("system_sku"),
+                fallback_index,
+                customer_phone=o.get("customer_phone"),
+                customer_name=o.get("customer_name"),
+                blocked=frozenset(blocked_by_so.get(so_id, set())),
+            )
+            if fb["shopify_match"] == "matched" and fb.get("shopify_match_basis") != "sku_only":
+                fb["_matched_via_closed_order"] = True
+                return fb
         return m
 
     for o in orders:
@@ -680,15 +762,20 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
 
     # Open SOs (always shown), recently-completed SOs (candidates to adopt a still-open Shopify
     # order), and the Shopify rows are all independent — fan them out concurrently.
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         open_future = executor.submit(client.get_special_orders)
         completed_future = executor.submit(client.get_completed_special_orders)
         shopify_future = executor.submit(_shopify_rows)
+        # Fallback population for the late-match second pass. Degrades to empty rather than
+        # failing the dashboard, since it only ever adds matches.
+        fallback_future = executor.submit(_safe, _shopify_fallback_rows, [])
         special_orders = open_future.result()
         completed_all = completed_future.result()
         shop_rows = shopify_future.result()
+        fallback_rows = fallback_future.result()
 
     index = shopify_match.build_shopify_index(shop_rows)
+    fallback_index = shopify_match.build_shopify_index(fallback_rows) if fallback_rows else None
     candidate_skus = set(index["by_sku"].keys())
     # Narrow the completed pool to SOs whose SKU could match an open Shopify order — turns a wide
     # recency window into a handful before we pay for customer/PO resolution.
@@ -741,7 +828,8 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
 
     # Enrich with the Shopify ETA; matched-completed SOs are appended to `orders`, and the
     # genuinely-orphaned Shopify orders come back as the "Unmatched" population.
-    shopify_only = _enrich_with_shopify(index, orders, completed_orders, today, overrides)
+    shopify_only = _enrich_with_shopify(index, orders, completed_orders, today, overrides,
+                                        fallback_index=fallback_index)
 
     _sort_orders(orders)
     return {"orders": orders, "summary": _summarize(orders), "shopify_only": shopify_only}
@@ -765,6 +853,11 @@ def re_enrich_dashboard() -> Optional[Dict[str, Any]]:
     completed_orders = copy.deepcopy(_pre_enrichment.get("completed") or [])
     index = shopify_match.build_shopify_index(_shopify_rows())
     overrides = _safe(bigquery_sync.fetch_so_match_overrides, _EMPTY_OVERRIDES)
-    shopify_only = _enrich_with_shopify(index, orders, completed_orders, today, overrides)
+    # The fallback population is cached for an hour, so re-enriching after a write reuses it
+    # rather than paying a second paginated Shopify pull.
+    fb_rows = _safe(_shopify_fallback_rows, [])
+    fallback_index = shopify_match.build_shopify_index(fb_rows) if fb_rows else None
+    shopify_only = _enrich_with_shopify(index, orders, completed_orders, today, overrides,
+                                        fallback_index=fallback_index)
     _sort_orders(orders)
     return {"orders": orders, "summary": _summarize(orders), "shopify_only": shopify_only}

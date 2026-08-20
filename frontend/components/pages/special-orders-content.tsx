@@ -4,7 +4,10 @@ import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { useSpecialOrders, matchSpecialOrder, unmatchSpecialOrder } from '@/lib/hooks'
 import type { SpecialOrder, ShopifyOnlyOrder, TriageStage, SpecialOrderFlag } from '@/lib/types'
-import { STAGE_SUBTRIAGES, subKeyForOrder, type TriageTone } from '@/lib/special-order-triage'
+import {
+  buildStageSubtriages, DEFAULT_THRESHOLDS, subKeyForOrder,
+  type TriageThresholds, type TriageTone,
+} from '@/lib/special-order-triage'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -48,7 +51,9 @@ const isLs = (o: SpecialOrder) => o.kind !== 'shopify'
 const LATE_FLAGS: SpecialOrderFlag[] = ['overdue', 'overdue_mid', 'critical']
 
 // Build the tile config (predicate-based so the overlay tiles can overlap the LS flow stages).
-const TILES: Tile[] = [
+// A function of the backend's thresholds, so a tier boundary change flows into the tile labels
+// instead of leaving them quietly wrong.
+const buildTiles = (thresholds: TriageThresholds = DEFAULT_THRESHOLDS): Tile[] => [
   {
     stage: 'shopify', label: 'Shopify', icon: Store, color: 'text-violet-600', bgColor: 'bg-violet-50', overlay: true,
     subs: [
@@ -78,7 +83,7 @@ const TILES: Tile[] = [
     return {
       stage,
       ...meta,
-      subs: STAGE_SUBTRIAGES[stage].map((s) => ({
+      subs: buildStageSubtriages(thresholds)[stage].map((s) => ({
         key: s.key,
         label: s.label,
         tone: s.tone,
@@ -141,6 +146,9 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
     sale_line_id: null,
     order_line_id: null,
     vendor_lead_time_days: null,
+    link_provenance: null,
+    link_broken: null,
+    matched_via_closed_order: false,
     // Shopify-only rows have no Lightspeed special order, so the backend computes no SLA
     // verdict for them. They are the intake gap (tagged in Shopify, never created in LS) and
     // are surfaced by the Shopify tile — neutral values here keep them out of the procurement
@@ -192,8 +200,11 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
 }
 
 export function SpecialOrdersContent() {
-  const { orders, shopifyOnly, sla, isLoading, isRefreshing, refetch, revalidate, fetchedAt, error } =
+  const { orders, shopifyOnly, sla, thresholds, isLoading, isRefreshing, refetch, revalidate, fetchedAt, error } =
     useSpecialOrders()
+  // Tile labels are derived from the backend's tier boundaries, falling back to the shipped
+  // defaults until the first payload lands.
+  const TILES = useMemo(() => buildTiles(thresholds ?? DEFAULT_THRESHOLDS), [thresholds])
 
   const handleSync = async () => {
     try {
@@ -234,6 +245,10 @@ export function SpecialOrdersContent() {
   const [orderTypeFilter, setOrderTypeFilter] = useState<string>('all')
   const [sourceFilter, setSourceFilter] = useState<string>('all')
   const [needsActionOnly, setNeedsActionOnly] = useState(false)
+  // Close-out is a MODE, not a filter: these orders have arrived, so the SLA clock has already
+  // stopped on them. They are receiving/CS hygiene, and mixing them into the procurement queue
+  // is exactly what let 100+ of them accumulate unnoticed.
+  const [closeoutMode, setCloseoutMode] = useState(false)
   const [liveOnly, setLiveOnly] = useState(true)
   const [flaggedOnly, setFlaggedOnly] = useState(false)
 
@@ -266,6 +281,10 @@ export function SpecialOrdersContent() {
   const base = useMemo(() => {
     const term = search.trim().toLowerCase()
     return allRows.filter((o) => {
+      // Close-out mode replaces the normal population rather than narrowing it, and
+      // deliberately ignores the live-SO window — the whole point is the old ones.
+      if (closeoutMode) return o.procurement_stage === 'received'
+      if (o.procurement_stage === 'received' && (o.days_since_creation ?? 0) > LIVE_SO_MAX_DAYS) return false
       if (flaggedOnly && o.flag === 'none') return false
       // 'Needs action' = a real SLA breach nobody has parked. Parked rows stay visible
       // under the other filters so the reason and check-back date remain findable.
@@ -281,7 +300,7 @@ export function SpecialOrdersContent() {
         ...o.available_vendors.map((v) => v.vendor_name)]
         .some((v) => v && String(v).toLowerCase().includes(term))
     })
-  }, [allRows, flaggedOnly, needsActionOnly, storeFilter, orderTypeFilter, sourceFilter, liveOnly, search])
+  }, [allRows, flaggedOnly, needsActionOnly, closeoutMode, storeFilter, orderTypeFilter, sourceFilter, liveOnly, search])
 
   // The tiles that currently have ≥1 selected sub-triage. A tile is "active" once you pick any of
   // its buckets; selection combines as AND across tiles, OR within a tile.
@@ -332,7 +351,7 @@ export function SpecialOrdersContent() {
   }
 
   const filtersActive =
-    selected.size > 0 || storeFilter !== 'all' || orderTypeFilter !== 'all' || sourceFilter !== 'all' || search || flaggedOnly || needsActionOnly || !liveOnly
+    selected.size > 0 || storeFilter !== 'all' || orderTypeFilter !== 'all' || sourceFilter !== 'all' || search || flaggedOnly || needsActionOnly || closeoutMode || !liveOnly
 
   return (
     <div className="space-y-4">
@@ -492,8 +511,13 @@ export function SpecialOrdersContent() {
           </Select>
         )}
         <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
-          <Checkbox checked={needsActionOnly} onCheckedChange={(v) => setNeedsActionOnly(v === true)} />
+          <Checkbox checked={needsActionOnly} onCheckedChange={(v) => setNeedsActionOnly(v === true)}
+                    disabled={closeoutMode} />
           Needs action
+        </label>
+        <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
+          <Checkbox checked={closeoutMode} onCheckedChange={(v) => setCloseoutMode(v === true)} />
+          Close-out backlog
         </label>
         <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
           <Checkbox checked={flaggedOnly} onCheckedChange={(v) => setFlaggedOnly(v === true)} />
@@ -508,12 +532,21 @@ export function SpecialOrdersContent() {
             variant="ghost"
             size="sm"
             className="text-muted-foreground"
-            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setOrderTypeFilter('all'); setSourceFilter('all'); setSearch(''); setFlaggedOnly(false); setNeedsActionOnly(false); setLiveOnly(true) }}
+            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setOrderTypeFilter('all'); setSourceFilter('all'); setSearch(''); setFlaggedOnly(false); setNeedsActionOnly(false); setCloseoutMode(false); setLiveOnly(true) }}
           >
             Clear filters
           </Button>
         )}
       </div>
+
+      {closeoutMode && (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          <span className="font-medium">Close-out backlog.</span> These special orders have already
+          arrived, so the SLA clock stopped when the item was received — none of them are late
+          deliveries. What is outstanding is the paperwork: a retail order closes when its Shopify
+          order is fulfilled, a service order when the workorder is closed. Oldest first.
+        </div>
+      )}
 
       <SoScoreboard />
 

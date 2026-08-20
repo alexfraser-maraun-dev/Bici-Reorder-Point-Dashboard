@@ -215,6 +215,48 @@ def test_broken_manual_link_is_flagged_not_silently_dropped():
     print("test_broken_manual_link_is_flagged_not_silently_dropped OK")
 
 
+def test_late_match_fallback():
+    """A special order created before/after its Shopify order still matches once that order
+    has been fulfilled or archived — without polluting the unmatched list.
+
+    Verified live: SO 43605 was created 2026-04-30 and its SO-tagged Shopify order #233420 on
+    2026-05-27, which is now FULFILLED and therefore absent from the open population. A Shopify
+    order can also be fulfilled for its other lines while the special-order line is outstanding.
+    """
+    today = date(2026, 7, 13)
+    # Primary population: one unrelated open order. Fallback: the fulfilled order we want.
+    index = shopify_match.build_shopify_index([_row("500", "OTHER", email="someone@x.com")])
+    fallback = shopify_match.build_shopify_index([_row("900", "SKU1", email="a@b.c")])
+
+    orders = [_ls_order("1", "SKU1", email="a@b.c")]
+    unmatched = _enrich_with_shopify(index, orders, [], today, None, fallback_index=fallback)
+    assert orders[0]["shopify_match"] == "matched", orders[0]["shopify_match"]
+    assert orders[0]["shopify_order_id"] == "900", orders[0]["shopify_order_id"]
+    assert orders[0]["matched_via_closed_order"] is True
+    # The fallback order is fulfilled/archived — it must never appear as "unmatched".
+    assert "900" not in {u["order_id"] for u in unmatched}, unmatched
+
+    # The primary pass still wins when it can match: no fallback consultation, no flag.
+    index2 = shopify_match.build_shopify_index([_row("100", "SKU1", email="a@b.c")])
+    orders2 = [_ls_order("1", "SKU1", email="a@b.c")]
+    _enrich_with_shopify(index2, orders2, [], today, None, fallback_index=fallback)
+    assert orders2[0]["shopify_order_id"] == "100", orders2[0]["shopify_order_id"]
+    assert orders2[0]["matched_via_closed_order"] is False
+
+    # sku_only across ~850 historical orders is near-meaningless, so it is refused.
+    weak = shopify_match.build_shopify_index([_row("901", "SKU1", email=None)])
+    orders3 = [_ls_order("1", "SKU1", email=None)]
+    _enrich_with_shopify(index, orders3, [], today, None, fallback_index=weak)
+    assert orders3[0]["shopify_match"] == "none", orders3[0]["shopify_match"]
+    assert orders3[0]["matched_via_closed_order"] is False
+
+    # No fallback supplied -> behaviour is exactly as before.
+    orders4 = [_ls_order("1", "SKU1", email="a@b.c")]
+    _enrich_with_shopify(index, orders4, [], today)
+    assert orders4[0]["shopify_match"] == "none"
+    print("test_late_match_fallback OK")
+
+
 def test_override_fold():
     """The append-only override log folds to latest-wins state (mirrors
     bigquery_sync.fetch_so_match_overrides without BigQuery)."""
@@ -245,5 +287,6 @@ if __name__ == "__main__":
     test_enrich_ambiguity_surfacing_and_overrides()
     test_completed_adoption_requires_definite_match()
     test_broken_manual_link_is_flagged_not_silently_dropped()
+    test_late_match_fallback()
     test_override_fold()
     print("\nAll shopify-match unit tests passed.")

@@ -1522,7 +1522,7 @@ def _current_user_email(request: Request) -> Optional[str]:
 
 def _sla_view(force: bool = False) -> Dict[str, Any]:
     """SLA-annotated special orders. Reads the cached dashboard; never re-walks Lightspeed."""
-    from app.services import so_sla_service
+    from app.services import so_sla_service, special_order_service
     from app.services.planning_store import PlanningStore
 
     payload = _rebuild_special_orders_cache(force=force) if force else (
@@ -1540,6 +1540,9 @@ def _sla_view(force: bool = False) -> Dict[str, Any]:
     # needs only one fetch. Shopify-only rows have no LS special order, so they carry no SLA
     # verdict -- they are the intake bucket, handled separately in the UI.
     view["shopify_only"] = payload.get("shopify_only") or []
+    # Tier boundaries travel with the data so the frontend derives its tile labels instead of
+    # restating the arithmetic. Changing a threshold used to silently make every label wrong.
+    view["meta"] = {"thresholds": special_order_service.triage_thresholds()}
     return view
 
 
@@ -1563,6 +1566,7 @@ def get_special_order_escalations(refresh: bool = False, live_only_days: Optiona
         rebuilt = so_sla_service.build_escalations(kept, acks)
         rebuilt["fetched_at"] = view.get("fetched_at")
         rebuilt["shopify_only"] = view.get("shopify_only") or []
+        rebuilt["meta"] = view.get("meta")
         view = rebuilt
     return view
 
