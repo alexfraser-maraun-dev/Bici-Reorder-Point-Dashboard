@@ -233,7 +233,7 @@ class ShopifyClient:
     }
     """ % (_ORDERS_PER_PAGE, _ETA_NAMESPACE, _ETA_KEY)
 
-    def get_recent_special_orders(self, months: int = 12) -> List[Dict[str, Any]]:
+    def get_recent_special_orders(self, months: int = 12, *, strict: bool = False) -> List[Dict[str, Any]]:
         """Every `SO`-tagged order in the window, INCLUDING fulfilled and archived ones.
 
         Exists because a Lightspeed special order is routinely created before, or long after,
@@ -248,17 +248,22 @@ class ShopifyClient:
         finished. Callers must consult it only for special orders the normal pass could not
         match, and must not surface its orders as unmatched.
 
-        Same row shape as `get_open_special_orders`. Returns [] on any failure.
+        Same row shape as `get_open_special_orders`. Fail-soft by default; strict mode raises
+        so source-health orchestration can distinguish failure from a healthy empty window.
         """
         from datetime import date, timedelta
         since = (date.today() - timedelta(days=int(months) * 31)).isoformat()
         try:
-            return self._collect_special_orders(self._RECENT_SO_QUERY % since, apply_status_filter=False)
+            return self._collect_special_orders(
+                self._RECENT_SO_QUERY % since, apply_status_filter=False, strict=strict
+            )
         except Exception as e:
+            if strict:
+                raise
             print(f"Shopify recent-special-order fetch failed (fallback disabled): {e}")
             return []
 
-    def get_open_special_orders(self) -> List[Dict[str, Any]]:
+    def get_open_special_orders(self, *, strict: bool = False) -> List[Dict[str, Any]]:
         """
         Live equivalent of `bigquery_sync.get_shopify_special_orders()`: open Shopify orders
         tagged `SO` (not fulfilled, not refunded/voided/cancelled/closed/test), one row per
@@ -269,13 +274,16 @@ class ShopifyClient:
             {order_id, order_name, email, phone, customer_name, fulfillment_status,
              financial_status, created_at, eta, sku}
 
-        Returns [] on any failure (missing config, transport, GraphQL errors) so the
-        Lightspeed-based special-order triage never breaks when Shopify is unavailable —
-        preserving the resilience guarantee the BigQuery pull had.
+        Fail-soft remains available for background callers. ``strict=True`` raises when the
+        source is unavailable so the dashboard orchestrator can keep Lightspeed rows while
+        reporting Shopify as unavailable instead of presenting a false zero.
         """
-        return self._collect_special_orders(self._OPEN_SO_QUERY, apply_status_filter=True)
+        return self._collect_special_orders(
+            self._OPEN_SO_QUERY, apply_status_filter=True, strict=strict
+        )
 
-    def _collect_special_orders(self, query: str, *, apply_status_filter: bool) -> List[Dict[str, Any]]:
+    def _collect_special_orders(self, query: str, *, apply_status_filter: bool,
+                                strict: bool = False) -> List[Dict[str, Any]]:
         """Page a `tag:SO` order query into the flat (order x line SKU) row shape.
 
         `apply_status_filter` is what separates the live population from the fallback one: the
@@ -283,6 +291,8 @@ class ShopifyClient:
         deliberately wants the fulfilled and archived ones too.
         """
         if not self._configured():
+            if strict:
+                raise RuntimeError("Shopify is not configured")
             print("Shopify not configured; skipping live special-order pull.")
             return []
         try:
@@ -337,6 +347,8 @@ class ShopifyClient:
                 cursor = page.get("endCursor")
             return rows
         except Exception as e:
+            if strict:
+                raise RuntimeError("Shopify special-order fetch failed") from e
             print(f"Failed to fetch Shopify special orders: {e}")
             return []
 
@@ -406,18 +418,23 @@ class ShopifyClient:
             ],
         }
 
-    def search_orders(self, term: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def search_orders(self, term: str, limit: int = 10, *, strict: bool = False) -> List[Dict[str, Any]]:
         """
         Finds orders by number (`244786`, `#244786`) or by any other Shopify order-search
         term (email, customer name), newest first — regardless of tag, fulfillment state or
         age. This backs the "link this SO to *any* Shopify order" flow, so it must reach
         orders the `tag:SO` dashboard population deliberately excludes.
 
-        Returns [] (never raises) when Shopify is unconfigured or the search fails; the
-        caller's local candidate list is then all the user sees.
+        ``strict=True`` makes unconfigured/failed searches explicit so an interactive lookup
+        cannot misreport an outage as "no matches". The fail-soft default remains for callers
+        that are enriching a broader Lightspeed response.
         """
         term = (term or "").strip()
-        if not term or not self._configured():
+        if not term:
+            return []
+        if not self._configured():
+            if strict:
+                raise RuntimeError("Shopify is not configured")
             return []
         # A bare/`#`-prefixed number is nearly always an order number — search that field
         # explicitly so `#244786` doesn't also drag in every order mentioning the digits.
@@ -426,6 +443,8 @@ class ShopifyClient:
         try:
             data = self._graphql(self._SEARCH_ORDERS_QUERY, {"q": query, "first": max(1, min(limit, 25))})
         except Exception as e:
+            if strict:
+                raise RuntimeError("Shopify order search failed") from e
             print(f"Shopify order search failed for {term!r}: {e}")
             return []
         return [self._order_detail(n) for n in ((data.get("orders") or {}).get("nodes") or [])]

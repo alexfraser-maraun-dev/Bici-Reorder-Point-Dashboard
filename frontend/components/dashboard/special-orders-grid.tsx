@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Button } from '@/components/ui/button'
 import {
@@ -11,12 +11,22 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import type { SpecialOrder, ShopifyOnlyOrder } from '@/lib/types'
-import { SpecialOrderRow } from './special-order-row'
+import {
+  SPECIAL_ORDER_QUEUE_COLUMNS,
+  SpecialOrderRow,
+} from './special-order-row'
+import { SpecialOrderDetailDrawer } from './special-order-detail-drawer'
 import type { MatchActions } from './special-order-match'
-import { ArrowDownNarrowWide, ArrowUpNarrowWide } from 'lucide-react'
+import {
+  ArrowDownNarrowWide,
+  ArrowUpNarrowWide,
+  ChevronLeft,
+  ChevronRight,
+} from 'lucide-react'
 
-// Re-exported so existing importers of the grid keep working after the file split.
 export type { MatchActions }
+
+const PAGE_SIZE = 25
 
 type SortKey =
   | 'days_lost'
@@ -25,62 +35,56 @@ type SortKey =
   | 'special_order_id'
   | 'customer_name'
   | 'description'
-  | 'vendor_name'
   | 'store'
-  | 'order_id'
-  | 'ordered_date'
   | 'expected_date'
-  | 'shopify_expected_date'
   | 'created_date'
   | 'procurement_stage_index'
 
 type SortDir = 'asc' | 'desc'
 
 const SORT_OPTIONS: { key: SortKey; label: string }[] = [
-  // Days lost is the sharpest priority signal — it needs no customer promise, so it works for
-  // the majority of special orders that have none.
   { key: 'days_lost', label: 'Days lost' },
-  { key: 'fastest_landing_date', label: 'Soonest it can land' },
   { key: 'sla_severity_rank', label: 'SLA severity' },
+  { key: 'fastest_landing_date', label: 'Soonest landing' },
   { key: 'created_date', label: 'Created date' },
-  { key: 'expected_date', label: 'LS PO ETA' },
-  { key: 'shopify_expected_date', label: 'Shopify ETA' },
-  { key: 'ordered_date', label: 'Ordered date' },
-  { key: 'procurement_stage_index', label: 'Stage' },
+  { key: 'expected_date', label: 'PO expected date' },
+  { key: 'procurement_stage_index', label: 'Pipeline stage' },
   { key: 'customer_name', label: 'Customer' },
   { key: 'description', label: 'Product' },
-  { key: 'vendor_name', label: 'Vendor' },
   { key: 'store', label: 'Store' },
-  { key: 'order_id', label: 'PO #' },
-  { key: 'special_order_id', label: 'SO #' },
+  { key: 'special_order_id', label: 'SO number' },
 ]
+
+const DEFAULT_DIR: Partial<Record<SortKey, SortDir>> = {
+  days_lost: 'desc',
+  sla_severity_rank: 'asc',
+  fastest_landing_date: 'asc',
+  created_date: 'asc',
+  expected_date: 'asc',
+}
 
 function compare(a: SpecialOrder, b: SpecialOrder, key: SortKey, dir: SortDir): number {
   const av: unknown = a[key]
   const bv: unknown = b[key]
-
-  // Rows with no value always sink to the bottom, whichever direction is picked.
   const aNull = av === null || av === undefined || av === ''
   const bNull = bv === null || bv === undefined || bv === ''
   if (aNull && bNull) return 0
   if (aNull) return 1
   if (bNull) return -1
-
-  const result =
-    typeof av === 'number' && typeof bv === 'number' ? av - bv : String(av).localeCompare(String(bv))
+  const result = typeof av === 'number' && typeof bv === 'number'
+    ? av - bv
+    : String(av).localeCompare(String(bv), undefined, { numeric: true })
   return dir === 'asc' ? result : -result
 }
 
-// Compact label-over-value cell used across the horizontal field grid.
-// The item UPC, rendered as a one-click-copy chip. Users paste it into a vendor B2B site to
-// research the product, so the copy affordance is the whole point of surfacing it here.
+function orderKey(order: SpecialOrder): string {
+  return `${order.kind ?? 'ls'}-${order.special_order_id}`
+}
+
 interface Props {
   orders: SpecialOrder[]
   isLoading?: boolean
-  // Called after an ETA is written to Shopify, so the parent can refetch the live value.
   onEtaSaved?: () => void | Promise<void>
-  // Link targets for the manual match dialogs — the FULL (unfiltered) populations, so a
-  // filtered-out row can still be picked as a link target.
   lsUnmatched?: SpecialOrder[]
   unmatchedShopify?: ShopifyOnlyOrder[]
   matchActions?: MatchActions
@@ -94,34 +98,29 @@ export function SpecialOrdersGrid({
   unmatchedShopify = [],
   matchActions,
 }: Props) {
-  // Default to the parent's server-side ordering (flag severity); only re-sort once the user picks.
   const [sortKey, setSortKey] = useState<SortKey | 'default'>('default')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
-
-  // Sensible default direction per key: worst-first for severity and delay, soonest-first for
-  // dates you are waiting on. Picking a sort should not also require picking a direction.
-  const DEFAULT_DIR: Partial<Record<SortKey, SortDir>> = {
-    days_lost: 'desc',
-    sla_severity_rank: 'asc',
-    fastest_landing_date: 'asc',
-    created_date: 'asc',
-    expected_date: 'asc',
-    shopify_expected_date: 'asc',
-  }
+  const [page, setPage] = useState(1)
+  const [selectedKey, setSelectedKey] = useState<string | null>(null)
 
   const sorted = useMemo(() => {
     if (sortKey === 'default') return orders
     return [...orders].sort((a, b) => compare(a, b, sortKey, sortDir))
   }, [orders, sortKey, sortDir])
 
-  // `default` preserves the backend's ordering, which is SLA severity worst-first — the order a
-  // buyer should work the queue in. Any explicit sort overrides it.
+  const pageCount = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE))
+  const safePage = Math.min(page, pageCount)
+  const start = (safePage - 1) * PAGE_SIZE
+  const visible = sorted.slice(start, start + PAGE_SIZE)
+  const selectedOrder = selectedKey
+    ? orders.find((order) => orderKey(order) === selectedKey) ?? null
+    : null
 
   if (isLoading) {
     return (
-      <div className="flex flex-col gap-3">
-        {Array.from({ length: 6 }).map((_, i) => (
-          <Skeleton key={i} className="h-28 w-full rounded-xl" />
+      <div className="space-y-2" aria-label="Loading special orders">
+        {Array.from({ length: 8 }).map((_, index) => (
+          <Skeleton key={index} className="h-[92px] w-full rounded-lg" />
         ))}
       </div>
     )
@@ -129,31 +128,39 @@ export function SpecialOrdersGrid({
 
   if (orders.length === 0) {
     return (
-      <div className="text-muted-foreground rounded-md border py-16 text-center text-sm">
-        No special orders match the current filters.
+      <div className="rounded-lg border border-dashed py-16 text-center">
+        <p className="text-sm font-medium">No special orders in this queue</p>
+        <p className="mt-1 text-sm text-muted-foreground">Try another queue or clear a filter.</p>
       </div>
     )
   }
 
   return (
     <div className="space-y-3">
-      {/* Sort control (replaces the table's column-header sorting) */}
-      <div className="flex items-center gap-2">
-        <span className="text-muted-foreground text-sm">{sorted.length} orders</span>
+      <div className="flex items-center gap-3">
+        <p className="text-sm text-muted-foreground" aria-live="polite">
+          Showing {start + 1}–{Math.min(start + PAGE_SIZE, sorted.length)} of {sorted.length} orders
+        </p>
         <div className="ml-auto flex items-center gap-2">
-          <span className="text-muted-foreground text-xs">Sort by</span>
-          <Select value={sortKey} onValueChange={(v) => {
-              const key = v as SortKey | 'default'
+          <label className="text-xs font-medium text-muted-foreground" htmlFor="special-order-sort">
+            Sort by
+          </label>
+          <Select
+            value={sortKey}
+            onValueChange={(value) => {
+              const key = value as SortKey | 'default'
               setSortKey(key)
+              setPage(1)
               if (key !== 'default' && DEFAULT_DIR[key]) setSortDir(DEFAULT_DIR[key]!)
-            }}>
-            <SelectTrigger className="w-[170px]" size="sm">
+            }}
+          >
+            <SelectTrigger id="special-order-sort" className="w-[180px]" size="sm">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="default">Default (priority)</SelectItem>
-              {SORT_OPTIONS.map((o) => (
-                <SelectItem key={o.key} value={o.key}>{o.label}</SelectItem>
+              <SelectItem value="default">Priority</SelectItem>
+              {SORT_OPTIONS.map((option) => (
+                <SelectItem key={option.key} value={option.key}>{option.label}</SelectItem>
               ))}
             </SelectContent>
           </Select>
@@ -162,27 +169,82 @@ export function SpecialOrdersGrid({
             size="sm"
             className="gap-1.5"
             disabled={sortKey === 'default'}
-            onClick={() => setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
-            title={sortDir === 'asc' ? 'Ascending' : 'Descending'}
+            onClick={() => {
+              setSortDir((current) => current === 'asc' ? 'desc' : 'asc')
+              setPage(1)
+            }}
+            aria-label={sortDir === 'asc' ? 'Sort descending' : 'Sort ascending'}
           >
-            {sortDir === 'asc' ? <ArrowUpNarrowWide className="h-4 w-4" /> : <ArrowDownNarrowWide className="h-4 w-4" />}
-            {sortDir === 'asc' ? 'Asc' : 'Desc'}
+            {sortDir === 'asc'
+              ? <ArrowUpNarrowWide className="h-4 w-4" />
+              : <ArrowDownNarrowWide className="h-4 w-4" />}
+            {sortDir === 'asc' ? 'Ascending' : 'Descending'}
           </Button>
         </div>
       </div>
 
-      <div className="flex flex-col gap-3">
-        {sorted.map((o) => (
+      <div
+        className={`grid items-center gap-4 px-5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground ${SPECIAL_ORDER_QUEUE_COLUMNS}`}
+        aria-hidden="true"
+      >
+        <span>Order</span>
+        <span>Next action</span>
+        <span>Status</span>
+        <span>Dates</span>
+        <span className="text-right">Age</span>
+        <span className="sr-only">Review</span>
+      </div>
+
+      <div className="space-y-2">
+        {visible.map((order) => (
           <SpecialOrderRow
-            key={`${o.kind ?? 'ls'}-${o.special_order_id}`}
-            order={o}
-            onEtaSaved={onEtaSaved}
-            lsUnmatched={lsUnmatched}
-            unmatchedShopify={unmatchedShopify}
-            actions={matchActions}
+            key={orderKey(order)}
+            order={order}
+            onReview={(selected) => setSelectedKey(orderKey(selected))}
           />
         ))}
       </div>
+
+      {pageCount > 1 && (
+        <nav className="flex items-center justify-between border-t pt-3" aria-label="Special orders pagination">
+          <p className="text-xs text-muted-foreground">25 orders per page</p>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setPage((current) => Math.max(1, current - 1))}
+              disabled={safePage === 1}
+              className="gap-1"
+            >
+              <ChevronLeft className="h-4 w-4" /> Previous
+            </Button>
+            <span className="min-w-20 text-center text-sm tabular-nums">
+              Page {safePage} of {pageCount}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setPage((current) => Math.min(pageCount, current + 1))}
+              disabled={safePage === pageCount}
+              className="gap-1"
+            >
+              Next <ChevronRight className="h-4 w-4" />
+            </Button>
+          </div>
+        </nav>
+      )}
+
+      {selectedOrder && (
+        <SpecialOrderDetailDrawer
+          order={selectedOrder}
+          open
+          onOpenChange={(open) => { if (!open) setSelectedKey(null) }}
+          onEtaSaved={onEtaSaved}
+          lsUnmatched={lsUnmatched}
+          unmatchedShopify={unmatchedShopify}
+          actions={matchActions}
+        />
+      )}
     </div>
   )
 }

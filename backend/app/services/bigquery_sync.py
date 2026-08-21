@@ -138,21 +138,44 @@ def ensure_so_match_overrides_table():
 def save_so_match_override(special_order_id: str, shopify_order_id: str, action: str, created_by: str = None):
     """Appends one link/unlink decision. Raises on failure so the API can surface it —
     a silently-dropped override would be worse than an error."""
-    if action not in ("link", "unlink"):
-        raise ValueError(f"invalid override action: {action}")
+    save_so_match_overrides([{
+        "special_order_id": special_order_id,
+        "shopify_order_id": shopify_order_id,
+        "action": action,
+    }], created_by=created_by)
+
+
+def save_so_match_overrides(decisions: list, created_by: str = None):
+    """Append validated manual match decisions in one atomic BigQuery load job.
+
+    The previous "none of these" flow issued one request per candidate. A mid-loop failure
+    left only some pairs blocked. One load job either commits the complete decision set or
+    raises before the dashboard cache is refreshed.
+    """
+    clean = []
+    for decision in decisions or []:
+        action = decision.get("action")
+        if action not in ("link", "unlink"):
+            raise ValueError(f"invalid override action: {action}")
+        special_order_id = str(decision.get("special_order_id") or "").strip()
+        shopify_order_id = str(decision.get("shopify_order_id") or "").strip()
+        if not special_order_id or not shopify_order_id:
+            raise ValueError("special_order_id and shopify_order_id are required")
+        clean.append({
+            "special_order_id": special_order_id,
+            "shopify_order_id": shopify_order_id,
+            "action": action,
+            "created_at": datetime.utcnow().isoformat(),
+            "created_by": created_by,
+        })
+    if not clean:
+        raise ValueError("at least one match decision is required")
     ensure_so_match_overrides_table()
     client = get_bq_client()
     append = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
-    row = {
-        "special_order_id": str(special_order_id),
-        "shopify_order_id": str(shopify_order_id),
-        "action": action,
-        "created_at": datetime.utcnow().isoformat(),
-        "created_by": created_by,
-    }
-    client.load_table_from_json([row], _SO_OVERRIDES_TABLE, job_config=append).result()
+    client.load_table_from_json(clean, _SO_OVERRIDES_TABLE, job_config=append).result()
 
-def fetch_so_match_overrides() -> dict:
+def fetch_so_match_overrides(*, strict: bool = False) -> dict:
     """
     Folds the override log into its effective state:
       { "links":   { special_order_id: shopify_order_id },   # forced matches
@@ -162,6 +185,9 @@ def fetch_so_match_overrides() -> dict:
     """
     empty = {"links": {}, "blocked": set(), "provenance": {}}
     try:
+        if strict:
+            # A missing table on a fresh deployment is a healthy empty state, not an outage.
+            ensure_so_match_overrides_table()
         client = get_bq_client()
         rows = client.query(f"""
             SELECT special_order_id, shopify_order_id, action, created_at, created_by
@@ -169,6 +195,8 @@ def fetch_so_match_overrides() -> dict:
             ORDER BY created_at ASC
         """).result()
     except Exception as e:
+        if strict:
+            raise RuntimeError("Special-order match override source is unavailable") from e
         print(f"so_match_overrides fetch failed (treating as empty): {e}")
         return empty
     links: dict = {}

@@ -1528,13 +1528,26 @@ def _sla_view(force: bool = False) -> Dict[str, Any]:
     payload = _rebuild_special_orders_cache(force=force) if force else (
         _special_orders_cache.get("data") or _rebuild_special_orders_cache()
     )
+    workflow_store_ok = True
     try:
-        acks = PlanningStore().list_so_acks()
+        store = PlanningStore()
+        acks = store.list_so_acks()
+        service_promises = store.active_service_promises()
     except Exception as e:
-        # A settings-store hiccup must not hide the queue; it just means nothing reads as acked.
-        print(f"[so_sla] could not load acks: {e}")
-        acks = {}
-    rows = payload.get("orders") or []
+        # A settings-store hiccup must not hide the queue; acknowledgements and app-owned
+        # service promises simply read as unavailable, and source health tells the UI why.
+        print(f"[so_sla] could not load workflow state: {e}")
+        workflow_store_ok = False
+        acks, service_promises = {}, {}
+    rows = []
+    for raw in payload.get("orders") or []:
+        row = dict(raw)
+        promise = service_promises.get(str(row.get("special_order_id") or ""))
+        row["service_promise_date"] = promise.get("promise_date") if promise else None
+        row["service_promise_source"] = promise.get("promise_source") if promise else None
+        row["service_promise_recorded_at"] = promise.get("recorded_at") if promise else None
+        row["service_promise_recorded_by"] = promise.get("recorded_by") if promise else None
+        rows.append(row)
     # Annotate every row with its fastest route and the delay already incurred, so `days_lost`
     # is sortable on the dashboard rather than living only inside the per-row recommendation.
     # Best-effort: a BigQuery hiccup costs the column, not the page.
@@ -1555,32 +1568,74 @@ def _sla_view(force: bool = False) -> Dict[str, Any]:
     view["shopify_only"] = payload.get("shopify_only") or []
     # Tier boundaries travel with the data so the frontend derives its tile labels instead of
     # restating the arithmetic. Changing a threshold used to silently make every label wrong.
-    view["meta"] = {"thresholds": special_order_service.triage_thresholds()}
+    meta = dict(payload.get("meta") or {})
+    meta["thresholds"] = special_order_service.triage_thresholds()
+    cache_age_seconds = max(0, int(time.time() - _special_orders_cache.get("fetched_at", 0.0)))
+    meta["data_freshness"] = {
+        "fetched_at": payload.get("fetched_at"),
+        "cache_age_seconds": cache_age_seconds,
+        "cache_ttl_seconds": _SPECIAL_ORDERS_TTL_SECONDS,
+    }
+    sources = {key: dict(value) for key, value in (meta.get("sources") or {}).items()}
+    if cache_age_seconds > _SPECIAL_ORDERS_TTL_SECONDS:
+        for source in sources.values():
+            if source.get("status") == "ok":
+                source["status"] = "stale"
+                source["message"] = "Cached data is older than the refresh interval."
+    if not workflow_store_ok:
+        sources["workflow"] = {
+            "status": "unavailable",
+            "checked_at": datetime.utcnow().isoformat() + "Z",
+            "record_count": 0,
+            "message": "Parking and service-promise state could not be loaded.",
+        }
+    meta["sources"] = sources
+    meta.setdefault("source_health", {})
+    meta["source_health"]["planning_workflow_store"] = {
+        "status": "ok" if workflow_store_ok else "unavailable",
+        "checked_at": datetime.utcnow().isoformat() + "Z",
+        "record_count": len(service_promises),
+    }
+    view["meta"] = meta
     return view
 
 
 @app.get("/api/special-orders/escalations")
-def get_special_order_escalations(refresh: bool = False, live_only_days: Optional[int] = 365):
+def get_special_order_escalations(background_tasks: BackgroundTasks, refresh: bool = False,
+                                  live_only_days: Optional[int] = 365):
     """The procurement worklist: every open SO with its SLA verdict, plus tile counts."""
     try:
         view = _sla_view(force=refresh)
     except Exception as e:
         print(f"Error building special-order escalations: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
-    if live_only_days:
-        from app.services import so_sla_service
-        from app.services.planning_store import PlanningStore
-        kept = [o for o in view["orders"]
-                if (o.get("days_since_creation") or 0) <= live_only_days]
-        try:
-            acks = PlanningStore().list_so_acks()
-        except Exception:
-            acks = {}
+    cache_age = time.time() - _special_orders_cache.get("fetched_at", 0.0)
+    if not refresh and cache_age > _SPECIAL_ORDERS_TTL_SECONDS:
+        background_tasks.add_task(_refresh_special_orders_in_background)
+    from app.services import so_sla_service
+    before = len(view["orders"])
+    kept = so_sla_service.filter_live_window(view["orders"], live_only_days)
+    normalized_days = int(live_only_days) if live_only_days is not None and int(live_only_days) > 0 else None
+    if len(kept) != before:
+        # The rows already carry the latest ack, so the filtered view can be rebuilt without a
+        # second database read. This keeps all counts in the same population universe.
+        acks = {
+            str(row.get("special_order_id")): row.get("ack")
+            for row in kept if row.get("ack")
+        }
         rebuilt = so_sla_service.build_escalations(kept, acks)
         rebuilt["fetched_at"] = view.get("fetched_at")
         rebuilt["shopify_only"] = view.get("shopify_only") or []
-        rebuilt["meta"] = view.get("meta")
+        rebuilt["meta"] = dict(view.get("meta") or {})
         view = rebuilt
+    meta = dict(view.get("meta") or {})
+    meta.update({
+        "live_only_days": normalized_days,
+        "total_before_window": before,
+        "total_after_window": len(kept),
+        "historical_scope": normalized_days is None,
+    })
+    view["meta"] = meta
     return view
 
 
@@ -1621,28 +1676,203 @@ def ack_special_order(special_order_id: str, payload: Dict[str, Any], request: R
                 if str(o.get("special_order_id")) == str(special_order_id)), None)
     if row is None:
         raise HTTPException(status_code=404, detail="Special order not found")
+    store = PlanningStore()
+    active_service = store.active_service_promises().get(str(special_order_id))
+    if active_service:
+        row = {**row, "service_promise_date": active_service.get("promise_date")}
     promise, _src = so_sla_service.resolve_promise(row)
-
-    record = PlanningStore().upsert_so_ack(
+    existing = store.list_so_acks().get(str(special_order_id))
+    # Progression is derived from the server's existing record. The client cannot reset or
+    # manufacture an escalation level by posting a value in the body.
+    level = so_sla_service.escalation_level(existing, date.today())
+    actor = _current_user_email(request)
+    record = store.upsert_so_ack(
         special_order_id,
-        acked_by=_current_user_email(request),
+        acked_by=actor,
         reason_code=reason,
         note=(payload.get("note") or None),
         checkback_date=checkback,
         pinned_stage=row.get("procurement_stage"),
         pinned_promise=promise.isoformat() if promise else None,
         pinned_po_eta=row.get("expected_date"),
-        escalation_level=int(payload.get("escalation_level") or 0),
+        escalation_level=level,
     )
+    try:
+        store.record_so_activity(
+            special_order_id,
+            "parked",
+            actor=actor,
+            details={
+                "reason_code": reason,
+                "note": payload.get("note") or None,
+                "checkback_date": checkback,
+                "escalation_level": level,
+            },
+        )
+    except Exception as e:
+        # The ack is already durable. Never turn that committed success into a misleading 500.
+        print(f"[so_activity] park event unavailable: {e}")
     return {"ok": True, "ack": record}
 
 
 @app.delete("/api/special-orders/{special_order_id}/ack")
-def unack_special_order(special_order_id: str):
+def unack_special_order(special_order_id: str, request: Request):
     """Un-park a special order, returning it to the active queue immediately."""
     from app.services.planning_store import PlanningStore
-    PlanningStore().delete_so_ack(special_order_id)
+    store = PlanningStore()
+    store.delete_so_ack(special_order_id)
+    try:
+        store.record_so_activity(
+            special_order_id, "unparked", actor=_current_user_email(request), details={}
+        )
+    except Exception as e:
+        print(f"[so_activity] unpark event unavailable: {e}")
     return {"ok": True}
+
+
+@app.post("/api/special-orders/{special_order_id}/service-promise")
+def update_service_parts_promise(special_order_id: str, payload: Dict[str, Any], request: Request):
+    """Set or clear the app-owned parts promise for a workorder-origin special order.
+
+    This never writes Workorder ``etaOut``: that field is the bike's service/booking date and
+    was proven unsuitable as a parts commitment. A null promise_date clears the active value
+    while preserving prior revisions in the audit ledger.
+    """
+    from app.services.planning_store import PlanningStore
+
+    dashboard = _special_orders_cache.get("data") or _rebuild_special_orders_cache()
+    row = next((o for o in dashboard.get("orders", [])
+                if str(o.get("special_order_id")) == str(special_order_id)), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Special order not found")
+    if row.get("source") != "workorder" and not row.get("workorder_id"):
+        raise HTTPException(status_code=409, detail="Service promises are only valid for workorder special orders")
+
+    raw_date = payload.get("promise_date")
+    promise_date = str(raw_date).strip() if raw_date else None
+    if promise_date:
+        try:
+            datetime.strptime(promise_date, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="promise_date must be ISO (YYYY-MM-DD) or null")
+
+    actor = _current_user_email(request)
+    store = PlanningStore()
+    prior = store.active_service_promises().get(str(special_order_id))
+    if promise_date:
+        record = store.set_service_promise(special_order_id, promise_date, recorded_by=actor)
+        changed = not prior or str(prior.get("promise_date"))[:10] != promise_date
+    else:
+        changed = store.clear_service_promise(special_order_id)
+        record = None
+        if changed:
+            try:
+                store.record_so_activity(
+                    special_order_id,
+                    "service_promise_cleared",
+                    actor=actor,
+                    details={"previous_promise_date": (prior or {}).get("promise_date")},
+                )
+            except Exception as e:
+                print(f"[so_activity] service-promise clear event unavailable: {e}")
+    return {
+        "status": "success",
+        "special_order_id": str(special_order_id),
+        "service_promise_date": record.get("promise_date") if record else None,
+        "service_promise_source": record.get("promise_source") if record else None,
+        "changed": bool(changed),
+    }
+
+
+@app.get("/api/special-orders/{special_order_id}/activity")
+def get_special_order_activity(special_order_id: str):
+    """Lazy row-detail timeline; no per-row history is added to the main worklist payload."""
+    from app.services.planning_store import PlanningStore
+
+    dashboard = _special_orders_cache.get("data") or _rebuild_special_orders_cache()
+    row = next((o for o in dashboard.get("orders", [])
+                if str(o.get("special_order_id")) == str(special_order_id)), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Special order not found")
+
+    store = PlanningStore()
+    events: List[Dict[str, Any]] = []
+
+    def add(timestamp, event_type, label, actor=None, details=None):
+        if timestamp:
+            events.append({
+                "timestamp": str(timestamp),
+                "type": event_type,
+                "label": label,
+                "actor": actor,
+                "details": details or {},
+            })
+
+    milestones = (
+        (row.get("created_date"), "created", "Special order created"),
+        (row.get("po_created_date"), "po_drafted", "Draft purchase order created"),
+        (row.get("ordered_date"), "po_placed", "Purchase order placed with vendor"),
+        (row.get("po_received_date"), "received", "Item received"),
+    )
+    for timestamp, event_type, label in milestones:
+        add(timestamp, event_type, label)
+
+    provenance = row.get("link_provenance") or {}
+    add(
+        provenance.get("linked_at"), "shopify_linked", "Shopify order linked",
+        provenance.get("linked_by"),
+        {"shopify_order_id": provenance.get("shopify_order_id")},
+    )
+
+    for promise in store.list_so_promises(str(special_order_id)):
+        source = promise.get("promise_source")
+        source_label = "Service parts promise" if source == "service_manual" else "Customer promise"
+        add(
+            promise.get("recorded_at"), "promise_recorded", f"{source_label} recorded",
+            promise.get("recorded_by"),
+            {
+                "promise_date": promise.get("promise_date"),
+                "promise_source": source,
+                "revision_index": promise.get("revision_index"),
+            },
+        )
+
+    activities = store.list_so_activity(str(special_order_id))
+    labels = {
+        "parked": "Order parked until check-back",
+        "unparked": "Order returned to active queue",
+        "service_promise_cleared": "Service parts promise cleared",
+        "eta_updated": "Shopify customer promise updated",
+        "matched": "Shopify order linked manually",
+        "unmatched": "Shopify match suppressed",
+    }
+    for activity in activities:
+        add(
+            activity.get("occurred_at"), activity.get("event_type"),
+            labels.get(activity.get("event_type"), str(activity.get("event_type") or "Activity")),
+            activity.get("actor"), activity.get("details"),
+        )
+
+    current_ack = store.list_so_acks().get(str(special_order_id))
+    if current_ack and not any(
+        e["type"] == "parked"
+        and isinstance(e.get("details"), dict)
+        and e["details"].get("checkback_date") == current_ack.get("checkback_date")
+        and e.get("actor") == current_ack.get("acked_by")
+        for e in events
+    ):
+        add(
+            current_ack.get("acked_at"), "parked", "Order parked until check-back",
+            current_ack.get("acked_by"),
+            {
+                "reason_code": current_ack.get("reason_code"),
+                "checkback_date": current_ack.get("checkback_date"),
+                "escalation_level": current_ack.get("escalation_level"),
+            },
+        )
+
+    events.sort(key=lambda event: event["timestamp"], reverse=True)
+    return {"special_order_id": str(special_order_id), "activity": events}
 
 
 _reco_context_cache: Dict[str, Any] = {"data": None, "built_at": 0.0}
@@ -1764,11 +1994,18 @@ def get_special_order_scoreboard(include_history: bool = True):
     try:
         store = PlanningStore()
         acks, promises = store.list_so_acks(), store.list_so_promises()
+        service_promises = store.active_service_promises()
     except Exception as e:
         print(f"[so_scoreboard] store unavailable: {e}")
-        acks, promises = {}, []
+        acks, promises, service_promises = {}, [], {}
 
-    board = so_scoreboard_service.build_scoreboard(payload.get("orders") or [], acks, promises)
+    rows = []
+    for raw in payload.get("orders") or []:
+        row = dict(raw)
+        service = service_promises.get(str(row.get("special_order_id") or ""))
+        row["service_promise_date"] = service.get("promise_date") if service else None
+        rows.append(row)
+    board = so_scoreboard_service.build_scoreboard(rows, acks, promises)
     if include_history:
         try:
             board["history"] = so_scoreboard_service.fetch_historical_cycle_times()
@@ -1777,67 +2014,6 @@ def get_special_order_scoreboard(include_history: bool = True):
             print(f"[so_scoreboard] history unavailable: {e}")
             board["history"] = None
     return board
-
-
-@app.get("/api/special-orders/candidate-pos")
-def get_candidate_pos(shop_id: str):
-    """Open POs at one store, for overriding a recommendation."""
-    from app.services import po_recommendation_service
-    from app.services.po_snapshot_service import get_po_snapshot_cache
-    try:
-        orders = get_po_snapshot_cache().get_orders().get("orders", [])
-    except Exception as e:
-        print(f"Error loading candidate POs: {e}")
-        raise HTTPException(status_code=502, detail="Could not load purchase orders")
-    return {"shop_id": shop_id,
-            "orders": po_recommendation_service.list_candidate_pos(orders, shop_id)}
-
-
-@app.get("/api/special-orders/quotable-date")
-def get_quotable_date(shop_id: str, vendor_id: Optional[str] = None, brand: Optional[str] = None):
-    """A defensible ETA for customer service to quote at the point of sale.
-
-    next order window + vendor lead time + receiving buffer, with the arithmetic returned so the
-    number can be explained rather than just asserted. This attacks the root cause of the
-    missing-promise backlog: CS currently has nothing to quote from.
-    """
-    from app.services import bigquery_sync, so_sla_service
-
-    try:
-        cadence = bigquery_sync.fetch_order_cadence()
-        lt_loc, lt_vendor = bigquery_sync.build_lead_time_lookup()
-    except Exception as e:
-        print(f"Error building quotable date: {e}")
-        raise HTTPException(status_code=502, detail="Could not load cadence or lead times")
-
-    candidates = []
-    vendor_ids = [vendor_id] if vendor_id else sorted(
-        {v for (s, v) in cadence.keys() if s == str(shop_id)})
-    for vid in vendor_ids:
-        if not vid:
-            continue
-        cad = cadence.get((str(shop_id), str(vid))) or {}
-        lead = lt_loc.get((str(vid), str(shop_id)))
-        lead_source = "store"
-        if lead is None:
-            lead = lt_vendor.get(str(vid))
-            lead_source = "vendor_median"
-        if lead is None:
-            continue
-        next_order = cad.get("next_expected_order_date") or date.today().isoformat()
-        quote = (date.fromisoformat(next_order)
-                 + timedelta(days=int(round(lead)) + so_sla_service.RECEIVING_BUFFER_DAYS))
-        candidates.append({
-            "vendor_id": str(vid),
-            "next_order_date": next_order,
-            "lead_time_days": int(round(lead)),
-            "lead_time_source": lead_source,
-            "receiving_buffer_days": so_sla_service.RECEIVING_BUFFER_DAYS,
-            "cadence_days": cad.get("cadence_days"),
-            "quotable_date": quote.isoformat(),
-        })
-    candidates.sort(key=lambda c: c["quotable_date"])
-    return {"shop_id": str(shop_id), "brand": brand, "candidates": candidates[:10]}
 
 
 def _refresh_special_orders_after_write() -> None:
@@ -1862,12 +2038,13 @@ def _refresh_special_orders_after_write() -> None:
 
 
 @app.post("/api/special-orders/eta")
-def update_special_order_eta(payload: Dict[str, Any]):
+def update_special_order_eta(payload: Dict[str, Any], request: Request):
     """
     Writes the customer-promised ETA back to Shopify (the `custom.special_order_eta` order
     metafield) via the Admin API, then rebuilds the special-order cache so the change is live
     on the next read. A null/empty `eta` CLEARS the metafield (removes the promise date).
-    Body: { shopify_order_id, eta (YYYY-MM-DD or null), updated_by? }.
+    Body: { shopify_order_id, eta (YYYY-MM-DD or null) }. The audit actor comes only from the
+    proxy-injected authenticated session header.
     """
     from app.services import special_order_service
     from app.services.shopify_client import ShopifyClient
@@ -1883,7 +2060,7 @@ def update_special_order_eta(payload: Dict[str, Any]):
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="eta must be an ISO date (YYYY-MM-DD)")
 
-    triggered_by = payload.get("updated_by") or ("UI_Manual_Clear" if eta is None else "UI_Manual_Edit")
+    triggered_by = _current_user_email(request) or "Dashboard"
     try:
         if eta is None:
             ShopifyClient().delete_order_eta(order_id)
@@ -1913,6 +2090,19 @@ def update_special_order_eta(payload: Dict[str, Any]):
         "error_message": None,
         "created_at": datetime.utcnow().isoformat(),
     })
+    # Best-effort local timeline. The Shopify/BigQuery write already succeeded, so a timeline
+    # storage hiccup must not turn that success into an API failure.
+    try:
+        from app.services.planning_store import PlanningStore
+        row = next((o for o in (_special_orders_cache.get("data") or {}).get("orders", [])
+                    if str(o.get("shopify_order_id") or "") == order_id), None)
+        if row and row.get("special_order_id"):
+            PlanningStore().record_so_activity(
+                str(row["special_order_id"]), "eta_updated", actor=triggered_by,
+                details={"eta": eta, "cleared": eta is None},
+            )
+    except Exception as e:
+        print(f"[so_activity] ETA event unavailable: {e}")
     return {"status": "success", "shopify_order_id": order_id, "eta": eta}
 
 
@@ -1926,8 +2116,9 @@ def lookup_shopify_order(q: str, limit: int = 10):
     Returns { "orders": [ { order_id, order_name, customer_*, created_at,
     shopify_expected_date, fulfillment_status, financial_status, cancelled, closed, test,
     tags, line_items: [{sku, title, variant_title, quantity}], shopify_order_url } ] },
-    with the line items the UI shows for confirmation before the link is committed.
-    Never 500s on a Shopify hiccup — an empty list just means "nothing found".
+    with the line items the UI shows for confirmation before the link is committed. A healthy
+    search with no matches returns []; an unavailable Shopify source returns 502 so the UI does
+    not misstate an outage as "nothing found".
     """
     from app.services.special_order_service import shopify_order_url
     from app.services.shopify_client import ShopifyClient
@@ -1936,17 +2127,46 @@ def lookup_shopify_order(q: str, limit: int = 10):
     if not term:
         raise HTTPException(status_code=400, detail="q is required")
 
-    orders = ShopifyClient().search_orders(term, limit=limit)
+    try:
+        orders = ShopifyClient().search_orders(term, limit=limit, strict=True)
+    except Exception as e:
+        print(f"Shopify order lookup unavailable: {e}")
+        raise HTTPException(status_code=502, detail="Shopify order search is unavailable")
     for o in orders:
         o["shopify_order_url"] = shopify_order_url(o["order_id"])
     return {"orders": orders}
 
 
-def _so_override_request(payload: Dict[str, Any], action: str) -> Dict[str, Any]:
+def _save_so_match_decisions(decisions: List[Dict[str, str]], actor: Optional[str]) -> None:
+    """Persist a fully-validated decision batch, record its activity, and refresh once."""
+    from app.services.bigquery_sync import save_so_match_overrides
+    from app.services.planning_store import PlanningStore
+
+    try:
+        save_so_match_overrides(decisions, created_by=actor or "Dashboard")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"Failed to save match overrides: {e}")
+        raise HTTPException(status_code=502, detail="Failed to save match override")
+
+    try:
+        store = PlanningStore()
+        for decision in decisions:
+            event_type = "matched" if decision["action"] == "link" else "unmatched"
+            store.record_so_activity(
+                decision["special_order_id"], event_type, actor=actor,
+                details={"shopify_order_id": decision["shopify_order_id"]},
+            )
+    except Exception as e:
+        print(f"[so_activity] match event unavailable: {e}")
+    _refresh_special_orders_after_write()
+
+
+def _so_override_request(payload: Dict[str, Any], action: str,
+                         request: Request) -> Dict[str, Any]:
     """Shared body for the manual match/unmatch endpoints: persist the override, then
     rebuild the cached dashboard so the pairing is live on the next read."""
-    from app.services.bigquery_sync import save_so_match_override
-
     special_order_id = str(payload.get("special_order_id") or "").strip()
     shopify_order_id = str(payload.get("shopify_order_id") or "").strip()
     if not special_order_id:
@@ -1954,17 +2174,11 @@ def _so_override_request(payload: Dict[str, Any], action: str) -> Dict[str, Any]
     if not shopify_order_id:
         raise HTTPException(status_code=400, detail="shopify_order_id is required")
 
-    try:
-        save_so_match_override(
-            special_order_id,
-            shopify_order_id,
-            action,
-            created_by=payload.get("updated_by") or "UI_Manual_Match",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail="Failed to save match override")
-
-    _refresh_special_orders_after_write()
+    _save_so_match_decisions([{
+        "special_order_id": special_order_id,
+        "shopify_order_id": shopify_order_id,
+        "action": action,
+    }], _current_user_email(request))
     return {
         "status": "success",
         "action": action,
@@ -1974,20 +2188,69 @@ def _so_override_request(payload: Dict[str, Any], action: str) -> Dict[str, Any]
 
 
 @app.post("/api/special-orders/match")
-def match_special_order_manual(payload: Dict[str, Any]):
+def match_special_order_manual(payload: Dict[str, Any], request: Request):
     """
     Manually links an LS special order to a Shopify order (overrides auto-matching; the
     newest link for an SO supersedes older ones). Body: { special_order_id,
-    shopify_order_id, updated_by? }.
+    shopify_order_id }. Actor identity is derived from the authenticated proxy session.
     """
-    return _so_override_request(payload, "link")
+    return _so_override_request(payload, "link", request)
 
 
 @app.post("/api/special-orders/unmatch")
-def unmatch_special_order_manual(payload: Dict[str, Any]):
+def unmatch_special_order_manual(payload: Dict[str, Any], request: Request):
     """
     Manually forbids an LS SO <-> Shopify order pairing (undoes a manual or automatic
     match; auto-matching will never propose that pair again). Body: { special_order_id,
-    shopify_order_id, updated_by? }.
+    shopify_order_id }. Actor identity is derived from the authenticated proxy session.
     """
-    return _so_override_request(payload, "unlink")
+    return _so_override_request(payload, "unlink", request)
+
+
+@app.post("/api/special-orders/match-decisions")
+def save_special_order_match_decisions(payload: Dict[str, Any], request: Request):
+    """Atomically persist 1-100 link/unlink decisions and refresh matching once.
+
+    Used by "none of these" candidate suppression so a failed third request can no longer
+    leave the first two candidates blocked and the rest active.
+    """
+    raw = payload.get("decisions")
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(status_code=400, detail="decisions must be a non-empty list")
+    if len(raw) > 100:
+        raise HTTPException(status_code=400, detail="at most 100 decisions may be saved at once")
+    clean: List[Dict[str, str]] = []
+    seen = set()
+    pair_actions: Dict[tuple, str] = {}
+    link_by_so: Dict[str, str] = {}
+    for decision in raw:
+        if not isinstance(decision, dict):
+            raise HTTPException(status_code=400, detail="each decision must be an object")
+        special_order_id = str(decision.get("special_order_id") or "").strip()
+        shopify_order_id = str(decision.get("shopify_order_id") or "").strip()
+        action = str(decision.get("action") or "").strip()
+        if not special_order_id or not shopify_order_id:
+            raise HTTPException(status_code=400, detail="every decision requires both ids")
+        if action not in ("link", "unlink"):
+            raise HTTPException(status_code=400, detail="decision action must be link or unlink")
+        pair = (special_order_id, shopify_order_id)
+        prior_action = pair_actions.get(pair)
+        if prior_action and prior_action != action:
+            raise HTTPException(status_code=400, detail="a pair cannot be linked and unlinked in one batch")
+        pair_actions[pair] = action
+        if action == "link":
+            prior_link = link_by_so.get(special_order_id)
+            if prior_link and prior_link != shopify_order_id:
+                raise HTTPException(status_code=400, detail="one special order cannot link to two orders in one batch")
+            link_by_so[special_order_id] = shopify_order_id
+        key = (special_order_id, shopify_order_id, action)
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append({
+            "special_order_id": special_order_id,
+            "shopify_order_id": shopify_order_id,
+            "action": action,
+        })
+    _save_so_match_decisions(clean, _current_user_email(request))
+    return {"status": "success", "saved": len(clean), "decisions": clean}

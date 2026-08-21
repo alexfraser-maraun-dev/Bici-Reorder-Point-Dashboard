@@ -289,6 +289,20 @@ class PlanningStore:
                     escalation_level INTEGER NOT NULL DEFAULT 0
                 )
             """)
+            # Append-only operational activity that has no authoritative timestamp in
+            # Lightspeed. Stage milestones and promise revisions remain in their purpose-built
+            # tables; this ledger records human actions such as park/unpark, clearing a service
+            # promise, and manual match decisions so the row-detail timeline is auditable.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS so_activity_events (
+                    event_id {id_type} PRIMARY KEY,
+                    special_order_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    actor TEXT,
+                    details_json TEXT
+                )
+            """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_so_acks_checkback ON so_acks(checkback_date)")
             conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_so_stage_events_natural
@@ -296,6 +310,7 @@ class PlanningStore:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_so_stage_events_open ON so_stage_events(left_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_so_promises_so ON so_promises(special_order_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_so_activity_so ON so_activity_events(special_order_id, occurred_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_so_links_so ON so_shopify_links(special_order_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_so_links_shopify ON so_shopify_links(shopify_order_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_po_draft_lines_draft ON po_draft_lines(draft_id)")
@@ -720,8 +735,8 @@ class PlanningStore:
             if revision:
                 conn.execute(self._sql(
                     f"UPDATE so_promises SET superseded_at = ? "
-                    f"WHERE {scope_col} = ? AND superseded_at IS NULL"
-                ), (self._now(), str(scope_val)))
+                    f"WHERE {scope_col} = ? AND promise_source = ? AND superseded_at IS NULL"
+                ), (self._now(), str(scope_val), promise_source))
             conn.execute(self._sql("""
                 INSERT INTO so_promises (promise_id,promise_key,special_order_id,shopify_order_id,
                     promise_date,promise_source,recorded_at,recorded_by,superseded_at,revision_index)
@@ -731,6 +746,81 @@ class PlanningStore:
                 promise_date, promise_source, self._now(), recorded_by, None, revision,
             ))
         return True
+
+    def set_service_promise(self, special_order_id: str, promise_date: str,
+                            recorded_by: Optional[str] = None) -> Dict[str, Any]:
+        """Set an app-owned parts promise for a service special order.
+
+        Service's Workorder ``etaOut`` is a booking/service date, not a parts commitment, so a
+        real parts promise needs its own durable source. Revisions are appended and the prior
+        active value is superseded; setting the already-active value is idempotent.
+        """
+        so_id = str(special_order_id)
+        now = self._now()
+        with self.transaction(immediate=True) as conn:
+            active_row = conn.execute(self._sql(
+                "SELECT * FROM so_promises WHERE special_order_id = ? "
+                "AND promise_source = ? AND superseded_at IS NULL "
+                "ORDER BY revision_index DESC LIMIT 1"
+            ), (so_id, "service_manual")).fetchone()
+            active = self._dict(active_row) if active_row else None
+            if active and str(active.get("promise_date"))[:10] == str(promise_date)[:10]:
+                return active
+
+            conn.execute(self._sql(
+                "UPDATE so_promises SET superseded_at = ? WHERE special_order_id = ? "
+                "AND promise_source = ? AND superseded_at IS NULL"
+            ), (now, so_id, "service_manual"))
+            count_row = conn.execute(self._sql(
+                "SELECT COUNT(*) AS n FROM so_promises WHERE special_order_id = ?"
+            ), (so_id,)).fetchone()
+            revision = int(self._dict(count_row)["n"]) if count_row else 0
+            promise_id = uuid.uuid4().hex
+            # A manual promise may legitimately return to a previously-used date after being
+            # cleared, so its key includes the immutable event id rather than blocking reuse.
+            key = f"{so_id}::service_manual:{str(promise_date)[:10]}:{promise_id}"
+            record = {
+                "promise_id": promise_id,
+                "promise_key": key,
+                "special_order_id": so_id,
+                "shopify_order_id": None,
+                "promise_date": str(promise_date)[:10],
+                "promise_source": "service_manual",
+                "recorded_at": now,
+                "recorded_by": recorded_by,
+                "superseded_at": None,
+                "revision_index": revision,
+            }
+            conn.execute(self._sql("""
+                INSERT INTO so_promises (promise_id,promise_key,special_order_id,shopify_order_id,
+                    promise_date,promise_source,recorded_at,recorded_by,superseded_at,revision_index)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """), tuple(record.values()))
+        return record
+
+    def clear_service_promise(self, special_order_id: str) -> bool:
+        """Supersede the active service promise, preserving every prior revision."""
+        with self.transaction(immediate=True) as conn:
+            cursor = conn.execute(self._sql(
+                "UPDATE so_promises SET superseded_at = ? WHERE special_order_id = ? "
+                "AND promise_source = ? AND superseded_at IS NULL"
+            ), (self._now(), str(special_order_id), "service_manual"))
+            return bool(cursor.rowcount)
+
+    def active_service_promises(self) -> Dict[str, Dict[str, Any]]:
+        """Current app-owned service promises keyed by Lightspeed special-order id."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM so_promises WHERE promise_source = 'service_manual' "
+                "AND superseded_at IS NULL ORDER BY revision_index"
+            ).fetchall()
+            return {
+                str(self._dict(row)["special_order_id"]): self._dict(row)
+                for row in rows if self._dict(row).get("special_order_id")
+            }
+        finally:
+            conn.close()
 
     def list_so_promises(self, special_order_id: Optional[str] = None) -> List[Dict[str, Any]]:
         conn = self._connect()
@@ -742,6 +832,46 @@ class PlanningStore:
             else:
                 rows = conn.execute("SELECT * FROM so_promises ORDER BY recorded_at").fetchall()
             return [self._dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def record_so_activity(self, special_order_id: str, event_type: str, *,
+                           actor: Optional[str] = None,
+                           details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Append one human/system action to the special-order activity ledger."""
+        record = {
+            "event_id": uuid.uuid4().hex,
+            "special_order_id": str(special_order_id),
+            "event_type": str(event_type),
+            "occurred_at": self._now(),
+            "actor": actor,
+            "details_json": json.dumps(details or {}, sort_keys=True),
+        }
+        with self.transaction(immediate=True) as conn:
+            conn.execute(self._sql("""
+                INSERT INTO so_activity_events
+                    (event_id,special_order_id,event_type,occurred_at,actor,details_json)
+                VALUES (?,?,?,?,?,?)
+            """), tuple(record.values()))
+        return {**record, "details": details or {}}
+
+    def list_so_activity(self, special_order_id: str) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(self._sql(
+                "SELECT * FROM so_activity_events WHERE special_order_id = ? "
+                "ORDER BY occurred_at DESC"
+            ), (str(special_order_id),)).fetchall()
+            out = []
+            for row in rows:
+                item = self._dict(row)
+                try:
+                    item["details"] = json.loads(item.pop("details_json") or "{}")
+                except (TypeError, ValueError):
+                    item["details"] = {}
+                    item.pop("details_json", None)
+                out.append(item)
+            return out
         finally:
             conn.close()
 

@@ -1,34 +1,61 @@
 'use client'
 
-/** The special-order row: one Card per order, plus the Shopify-only pseudo-row.
- *
- *  Split out of special-orders-grid.tsx so the grid shell stays about sorting and layout while
- *  the row stays about one order. The row composes the presentational fields, the match
- *  controls, the SLA line and the PO recommendation panel.
- */
-
-import { useState } from 'react'
-import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
-import type { SpecialOrder, ShopifyOnlyOrder } from '@/lib/types'
+import type {
+  SpecialOrder,
+  SpecialOrderActionOwner,
+  SpecialOrderWorkState,
+  TriageStage,
+} from '@/lib/types'
+import { SeverityBadge, SourceBadge } from './special-order-badges'
 import {
-  StageBadge,
-  SourceBadge,
-  SeverityBadge,
-  ShopifyMatchBadge,
-} from './special-order-badges'
-import { SoAckMenu, EscalationBadge } from './so-ack-menu'
-import { PoRecommendationPanel } from './so-po-recommendation'
-import {
-  CopyableUpc, AvailableVendors, Field, FieldGroup, LightspeedLink, EditableEta,
-} from './special-order-fields'
-import {
-  LsMatchControls, MatchPickerDialog, WorkorderFields, type MatchActions,
-} from './special-order-match'
-import { ExternalLink, Package, User, FileText, Store, Link2, Wrench } from 'lucide-react'
+  AlertCircle,
+  ChevronRight,
+  Clock3,
+  PackageCheck,
+  ShoppingCart,
+  Store,
+  Truck,
+} from 'lucide-react'
 
-// Left-edge accent by flag severity — the fastest way to scan a long list for trouble.
+export const SPECIAL_ORDER_QUEUE_COLUMNS =
+  'grid-cols-[minmax(240px,1.8fr)_minmax(220px,1.55fr)_150px_190px_105px_auto]'
+
+export const STAGE_LABELS: Record<TriageStage, string> = {
+  shopify: 'Shopify intake',
+  open_pool: 'Awaiting PO',
+  unordered_po: 'Draft PO',
+  ordered: 'In transit',
+  received: 'Arrived',
+}
+
+const STAGE_STYLE: Record<TriageStage, string> = {
+  shopify: 'border-violet-200 bg-violet-50 text-violet-700',
+  open_pool: 'border-slate-200 bg-slate-50 text-slate-700',
+  unordered_po: 'border-orange-200 bg-orange-50 text-orange-700',
+  ordered: 'border-blue-200 bg-blue-50 text-blue-700',
+  received: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+}
+
+const OWNER_LABELS: Record<SpecialOrderActionOwner, string> = {
+  procurement: 'Procurement',
+  service: 'Service',
+  cs: 'Customer service',
+  receiving: 'Receiving',
+  retail: 'Retail',
+}
+
+const WORK_STATE_LABELS: Record<SpecialOrderWorkState, string> = {
+  intake: 'Intake',
+  needs_ordering: 'Needs ordering',
+  vendor_followup: 'Vendor follow-up',
+  promise_needed: 'Promise needed',
+  closeout: 'Close-out',
+  on_track: 'On track',
+}
+
 const ACCENT: Partial<Record<SpecialOrder['sla_severity'], string>> = {
   promise_missed: 'bg-red-600',
   impossible: 'bg-red-500',
@@ -36,307 +63,147 @@ const ACCENT: Partial<Record<SpecialOrder['sla_severity'], string>> = {
   stage_stalled: 'bg-amber-500',
   at_risk: 'bg-yellow-400',
 }
-export function ShopifyOnlyRow({
-  order,
-  onEtaSaved,
-  lsUnmatched,
-  actions,
-}: {
-  order: SpecialOrder
-  onEtaSaved?: () => void | Promise<void>
-  lsUnmatched: SpecialOrder[]
-  actions?: MatchActions
-}) {
-  const [linkOpen, setLinkOpen] = useState(false)
-  const possible = order.ambiguous_candidate === true
+
+const WORK_ACCENT: Partial<Record<SpecialOrderWorkState, string>> = {
+  intake: 'bg-violet-500',
+  needs_ordering: 'bg-orange-500',
+  vendor_followup: 'bg-blue-500',
+  promise_needed: 'bg-amber-500',
+  closeout: 'bg-emerald-500',
+}
+
+export function triageStage(order: SpecialOrder): TriageStage {
+  return order.kind === 'shopify' ? 'shopify' : order.procurement_stage
+}
+
+export function ownerLabel(owner: SpecialOrderActionOwner | null): string {
+  return owner ? OWNER_LABELS[owner] : 'Monitoring'
+}
+
+export function workStateLabel(state: SpecialOrderWorkState): string {
+  return WORK_STATE_LABELS[state]
+}
+
+export function StagePill({ order }: { order: SpecialOrder }) {
+  const stage = triageStage(order)
   return (
-    <Card className="flex-row gap-0 overflow-hidden p-0">
-      <div className={cn('w-1 shrink-0 self-stretch', possible ? 'bg-amber-400' : 'bg-violet-400')} />
-      <div className="flex min-w-0 flex-1 flex-col gap-3 px-4 py-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="font-mono text-sm font-medium">{order.shopify_order_name ?? order.special_order_id}</span>
-          <StageBadge stage="shopify" />
-          <ShopifyMatchBadge match="none" possible={possible} />
-          {actions && lsUnmatched.length > 0 && (
-            <>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-6 gap-1 px-1.5 text-[11px] text-muted-foreground"
-                onClick={() => setLinkOpen(true)}
-              >
-                <Link2 className="h-3 w-3" />
-                Link to SO…
-              </Button>
-              <MatchPickerDialog
-                open={linkOpen}
-                onOpenChange={setLinkOpen}
-                title={`Link ${order.shopify_order_name ?? 'this Shopify order'} to an LS special order`}
-                description="Pick the Lightspeed special order that fulfils this Shopify order. The link is remembered."
-                items={lsUnmatched.map((o) => ({
-                  key: String(o.special_order_id),
-                  title: `SO #${o.special_order_id}${o.description ? ` — ${o.description}` : ''}`,
-                  subtitle: [o.customer_name, o.customer_email].filter(Boolean).join(' · ') || null,
-                  meta: [o.system_sku, o.store].filter(Boolean).join(' · ') || null,
-                }))}
-                onPick={(soId) => actions.onMatch(soId, order.shopify_order_id!)}
-              />
-            </>
-          )}
-        </div>
-        <div className="grid grid-cols-2 gap-x-5 gap-y-2 sm:grid-cols-4">
-          <Field label="Customer" value={order.customer_email} />
-          <Field
-            label="Shopify ETA"
-            value={
-              <EditableEta
-                orderId={order.shopify_order_id}
-                value={order.shopify_expected_date}
-                onSaved={onEtaSaved}
-              />
-            }
-          />
-          <Field
-            label="SKU(s)"
-            value={order.description ? <span className="font-mono text-xs">{order.description}</span> : null}
-          />
-          <Field label="Created" value={order.created_date} />
-        </div>
-      </div>
-      <div className="flex shrink-0 flex-col justify-center gap-2 border-l px-3 py-3 sm:w-44">
-        <span className="text-muted-foreground text-[10px] font-medium uppercase tracking-wide">Open in Shopify</span>
-        {order.shopify_order_url ? (
-          <LightspeedLink url={order.shopify_order_url} label={order.shopify_order_name ?? 'Shopify order'} icon={Store} />
-        ) : (
-          <span className="text-muted-foreground text-sm">{order.shopify_order_name ?? '—'}</span>
-        )}
-      </div>
-    </Card>
+    <Badge variant="outline" className={cn('text-[11px] font-medium', STAGE_STYLE[stage])}>
+      {STAGE_LABELS[stage]}
+    </Badge>
   )
 }
+
+function formatDate(value: string | null): string {
+  if (!value) return '—'
+  const parsed = new Date(`${value.slice(0, 10)}T12:00:00`)
+  if (Number.isNaN(parsed.getTime())) return value
+  return parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+function primaryDate(order: SpecialOrder): { label: string; value: string | null } {
+  if (order.procurement_stage === 'ordered') {
+    return { label: 'Expected', value: order.expected_date ?? order.fastest_landing_date }
+  }
+  if (order.procurement_stage === 'received') {
+    return { label: 'Arrived', value: order.po_received_date ?? order.expected_date }
+  }
+  return { label: 'Promise', value: order.promise_date }
+}
+
+function WorkIcon({ state }: { state: SpecialOrderWorkState }) {
+  const className = 'h-4 w-4 shrink-0'
+  if (state === 'intake') return <Store className={className} />
+  if (state === 'needs_ordering') return <ShoppingCart className={className} />
+  if (state === 'vendor_followup') return <Truck className={className} />
+  if (state === 'closeout') return <PackageCheck className={className} />
+  if (state === 'promise_needed') return <AlertCircle className={className} />
+  return <Clock3 className={className} />
+}
+
 export function SpecialOrderRow({
   order,
-  onEtaSaved,
-  lsUnmatched,
-  unmatchedShopify,
-  actions,
+  onReview,
 }: {
   order: SpecialOrder
-  onEtaSaved?: () => void | Promise<void>
-  lsUnmatched: SpecialOrder[]
-  unmatchedShopify: ShopifyOnlyOrder[]
-  actions?: MatchActions
+  onReview: (order: SpecialOrder) => void
 }) {
-  if (order.kind === 'shopify')
-    return <ShopifyOnlyRow order={order} onEtaSaved={onEtaSaved} lsUnmatched={lsUnmatched} actions={actions} />
-
-  const hasShopify = order.shopify_match === 'matched' || order.shopify_match === 'ambiguous'
+  const date = primaryDate(order)
+  const identity = order.kind === 'shopify'
+    ? order.shopify_order_name ?? order.special_order_id
+    : `SO #${order.special_order_id}`
+  const accent = ACCENT[order.sla_severity] ?? WORK_ACCENT[order.work_state] ?? 'bg-border'
 
   return (
-    <Card className="flex-row gap-0 overflow-hidden p-0">
-      {/* Flag accent (left edge) */}
-      <div className={cn('w-1 shrink-0 self-stretch', ACCENT[order.sla_severity] ?? 'bg-border')} />
+    <article className="overflow-hidden rounded-lg border bg-card shadow-xs transition-colors hover:border-foreground/20">
+      <div className="flex min-w-0">
+        <div className={cn('w-1 shrink-0', accent)} aria-hidden="true" />
+        <div className={cn('grid min-w-0 flex-1 items-center gap-4 px-4 py-3', SPECIAL_ORDER_QUEUE_COLUMNS)}>
+          <div className="min-w-0">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="shrink-0 font-mono text-sm font-semibold">{identity}</span>
+              <SourceBadge source={order.source} />
+            </div>
+            <p className="mt-1 truncate text-sm font-medium" title={order.description ?? 'Special order'}>
+              {order.description ?? 'Special order'}
+            </p>
+            <p className="mt-0.5 truncate text-xs text-muted-foreground">
+              {[order.customer_name ?? order.customer_email, order.system_sku, order.store]
+                .filter(Boolean)
+                .join(' · ') || 'No customer or item details'}
+            </p>
+          </div>
 
-      {/* Main content */}
-      <div className="flex min-w-0 flex-1 flex-col gap-3 px-4 py-3">
-        {/* Header line: identity + product + badges + Shopify indicator. (The workorder now
-            has its own always-present column below, so no chip here.) */}
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0 font-mono text-sm font-medium">SO #{order.special_order_id}</span>
-          <StageBadge stage={order.procurement_stage} />
-          {/* Where this SO derives from: workorder, Shopify, or neither. Always shown --
-              "Unattributed" is a bucket to chase, not a blank to hide. */}
-          <SourceBadge source={order.source} />
-          {/* The SLA verdict. Muted while parked, so an acknowledged breach stays visible as
-              context without competing with the rows that still need action. */}
-          <SeverityBadge severity={order.sla_severity} muted={order.ack_active} />
-          <EscalationBadge level={order.escalation_level} />
-          <span className="min-w-0 flex-1 truncate text-sm font-medium" title={order.description ?? ''}>
-            {order.description ?? 'Special order'}
-          </span>
-          {hasShopify &&
-            (order.shopify_order_url ? (
-              <a
-                href={order.shopify_order_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex shrink-0 items-center gap-1.5"
-                title={`Shopify order ${order.shopify_order_name ?? ''}`}
-              >
-                <ShopifyMatchBadge match={order.shopify_match} basis={order.shopify_match_basis} />
-                {order.shopify_order_name && (
-                  <span className="font-mono text-xs text-blue-600 underline">{order.shopify_order_name}</span>
-                )}
-              </a>
-            ) : (
-              <span className="shrink-0">
-                <ShopifyMatchBadge match={order.shopify_match} basis={order.shopify_match_basis} />
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <WorkIcon state={order.work_state} />
+              <span className="truncate" title={order.next_action ?? undefined}>
+                {order.next_action ?? 'No action required'}
               </span>
-            ))}
-          {actions && <LsMatchControls order={order} unmatchedShopify={unmatchedShopify} actions={actions} />}
+            </div>
+            <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+              <span>{ownerLabel(order.action_owner)}</span>
+              {order.action_due_date && <span>· due {formatDate(order.action_due_date)}</span>}
+              {order.ack_active && <span>· parked</span>}
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <StagePill order={order} />
+            <div><SeverityBadge severity={order.sla_severity} muted={order.ack_active} /></div>
+          </div>
+
+          <div className="min-w-0 text-xs">
+            <div className="flex justify-between gap-3">
+              <span className="text-muted-foreground">{date.label}</span>
+              <span className="font-medium tabular-nums">{formatDate(date.value)}</span>
+            </div>
+            <div className="mt-1 flex justify-between gap-3">
+              <span className="text-muted-foreground">Customer promise</span>
+              <span className="font-medium tabular-nums">{formatDate(order.promise_date)}</span>
+            </div>
+          </div>
+
+          <div className="text-right">
+            <p className="text-lg font-semibold tabular-nums">{order.days_since_creation ?? '—'}</p>
+            <p className="text-xs text-muted-foreground">days open</p>
+            {order.days_lost != null && order.days_lost > 0 && (
+              <p className="mt-1 text-xs font-medium text-red-600">{order.days_lost}d lost</p>
+            )}
+          </div>
+
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="gap-1.5"
+            onClick={() => onReview(order)}
+            aria-label={`Review ${identity}`}
+          >
+            Review
+            <ChevronRight className="h-4 w-4" />
+          </Button>
         </div>
-
-        {/* Fields grouped into logical clusters that read left-to-right:
-            who/what → sourcing PO → when (all dates together) → how late.
-            A full-width grid spreads the groups evenly across the available room. */}
-        <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3 lg:grid-cols-7">
-          <FieldGroup title="Customer">
-            <Field label="Customer" value={order.customer_name} />
-            <Field label="Phone" value={order.customer_phone} />
-            <Field label="Store" value={order.store} />
-          </FieldGroup>
-
-          <FieldGroup title="Item">
-            <Field
-              label="SKU"
-              value={order.system_sku ? <span className="font-mono text-xs">{order.system_sku}</span> : null}
-            />
-            <Field label="UPC" value={order.upc ? <CopyableUpc upc={order.upc} /> : null} />
-            <Field label="Vendor" value={order.vendor_name} />
-            <Field label="Quantity" value={order.unit_quantity} />
-          </FieldGroup>
-
-          <FieldGroup title="Purchase order">
-            <Field label="PO #" value={order.order_id} />
-            <Field
-              label="Receiving"
-              value={order.po_complete ? 'Complete' : order.received_started ? 'Started' : 'Not started'}
-            />
-            <Field label="Order type" value={order.order_type} />
-          </FieldGroup>
-
-          <WorkorderFields order={order} />
-
-          <FieldGroup title="Dates" cols={2} className="col-span-2">
-            <Field label="SO created" value={order.created_date} />
-            <Field label="Ordered" value={order.ordered_date} />
-            <Field label="Expected (PO)" value={order.expected_date} />
-            <Field
-              label="Shopify ETA"
-              value={
-                <EditableEta
-                  orderId={order.shopify_order_id}
-                  value={order.shopify_expected_date}
-                  ambiguous={order.shopify_match === 'ambiguous'}
-                  onSaved={onEtaSaved}
-                />
-              }
-            />
-          </FieldGroup>
-
-          <FieldGroup title="Aging">
-            <Field
-              label="Days open"
-              value={
-                order.days_since_creation !== null ? (
-                  <span className={cn(order.is_overdue && 'font-semibold text-red-600')}>
-                    {order.days_since_creation}
-                  </span>
-                ) : null
-              }
-            />
-            {/* Days lost replaces the old "days overdue", which was measured against the
-                retired age-flag system. This is delay we caused: the gap between when the item
-                could have landed had it been ordered on day one and the soonest it can land
-                now. It needs no customer promise, so it works for every special order. */}
-            <Field
-              label="Days lost"
-              value={
-                order.days_lost !== null && order.days_lost > 0 ? (
-                  <span className="font-semibold text-red-600" title={
-                    order.could_have_landed
-                      ? `Could have landed ${order.could_have_landed}; soonest now ${order.fastest_landing_date ?? 'unknown'}`
-                      : undefined}>
-                    {order.days_lost}
-                  </span>
-                ) : (
-                  order.days_lost ?? '—'
-                )
-              }
-            />
-            <Field
-              label="Soonest it can land"
-              value={order.fastest_landing_date
-                ? <span className="font-mono text-xs">{order.fastest_landing_date}</span>
-                : null}
-            />
-          </FieldGroup>
-        </div>
-
-        {/* The SLA line: the backward-schedule arithmetic in plain English, plus the Park
-            control. Only rendered when there is something to say — a reason line on every
-            healthy row would bury the ~37 that need action among ~230. */}
-        {(order.actionable || order.ack_active) && (
-          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2.5">
-            <span className="text-muted-foreground/70 shrink-0 text-[10px] font-semibold uppercase tracking-wider">
-              SLA
-            </span>
-            <span className="min-w-0 flex-1 text-xs text-muted-foreground">{order.sla_reason}</span>
-            {order.order_by_date && (
-              <span className="shrink-0 font-mono text-xs" title="Latest date this could be ordered and still meet the promise">
-                order by {order.order_by_date}
-                {order.slack_days !== null && (
-                  <span className={cn('ml-1 font-medium',
-                    order.slack_days < 0 ? 'text-red-600' : order.slack_days <= 3 ? 'text-amber-600' : 'text-emerald-600')}>
-                    ({order.slack_days >= 0 ? `${order.slack_days}d slack` : `${Math.abs(order.slack_days)}d late`})
-                  </span>
-                )}
-              </span>
-            )}
-            <SoAckMenu order={order} onDone={() => { void onEtaSaved?.() }} />
-          </div>
-        )}
-
-        {/* Matching diagnostics. Both are silent when there is nothing wrong, so their presence
-            always means something needs a human. */}
-        {(order.link_broken || order.matched_via_closed_order) && (
-          <div className="flex flex-wrap items-center gap-x-3 border-t pt-2.5 text-xs">
-            {order.link_broken && (
-              <span className="text-red-600">
-                Manual link to Shopify order {order.link_broken} no longer resolves — that order
-                has been deleted or re-created. Re-link it.
-                {order.link_provenance?.linked_by && (
-                  <span className="text-muted-foreground">
-                    {' '}(linked by {order.link_provenance.linked_by})
-                  </span>
-                )}
-              </span>
-            )}
-            {order.matched_via_closed_order && (
-              <span className="text-muted-foreground">
-                Matched to a fulfilled/archived Shopify order — found by the late-match pass, so
-                it is not in the unmatched list.
-              </span>
-            )}
-          </div>
-        )}
-
-        {/* Where to order: only for special orders not yet on a placed PO. Once a PO exists the
-            question is answered, and the panel would just be an extra BigQuery round-trip. */}
-        {(order.procurement_stage === 'open_pool' || order.procurement_stage === 'unordered_po') && (
-          <PoRecommendationPanel order={order} />
-        )}
-
-        {/* Brand-level sourcing options: which vendors carry this SKU's brand and how fast each
-            is to this store. Full-width so the (variable-length) vendor chips have room to wrap. */}
-        {order.available_vendors.length > 0 && (
-          <div className="flex min-w-0 flex-wrap items-center gap-2 border-t pt-2.5">
-            <span className="text-muted-foreground/70 shrink-0 text-[10px] font-semibold uppercase tracking-wider">
-              Available from
-            </span>
-            <AvailableVendors vendors={order.available_vendors} />
-          </div>
-        )}
       </div>
-
-      {/* Lightspeed deep links (right edge) */}
-      <div className="flex shrink-0 flex-col justify-center gap-1.5 border-l px-3 py-3 sm:w-44">
-        <span className="text-muted-foreground text-[10px] font-medium uppercase tracking-wide">Open in Lightspeed</span>
-        <LightspeedLink url={order.ls_item_url} label="Product" icon={Package} />
-        <LightspeedLink url={order.ls_customer_url} label="Customer" icon={User} />
-        <LightspeedLink url={order.ls_order_url} label="Purchase order" icon={FileText} />
-        <LightspeedLink url={order.workorder_url} label={`Workorder #${order.workorder_id ?? ''}`} icon={Wrench} />
-      </div>
-    </Card>
+    </article>
   )
 }

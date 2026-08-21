@@ -120,6 +120,8 @@ def _none() -> Dict[str, Any]:
         "shopify_order_id": None,
         "shopify_order_name": None,
         "shopify_expected_date": None,
+        "shopify_fulfillment_status": None,
+        "shopify_financial_status": None,
         "shopify_candidates": [],
         "_candidates": set(),
     }
@@ -133,6 +135,8 @@ def _matched(index: Dict[str, Any], oid: str, basis: str) -> Dict[str, Any]:
         "shopify_order_id": oid,
         "shopify_order_name": o.get("order_name"),
         "shopify_expected_date": o.get("eta"),
+        "shopify_fulfillment_status": o.get("fulfillment_status"),
+        "shopify_financial_status": o.get("financial_status"),
         "shopify_candidates": [],
         "_candidates": {oid},
     }
@@ -145,6 +149,8 @@ def _ambiguous(index: Dict[str, Any], candidates: Set[str], basis: str) -> Dict[
         "shopify_order_id": None,
         "shopify_order_name": None,
         "shopify_expected_date": None,
+        "shopify_fulfillment_status": None,
+        "shopify_financial_status": None,
         "shopify_candidates": candidate_summary(index, candidates),
         "_candidates": set(candidates),
     }

@@ -407,6 +407,26 @@ export type SlaSeverity =
   | 'on_track'
   | 'closed_out'
 
+// Operational work is deliberately separate from delivery SLA. A received item can have a
+// finished delivery clock and still need customer/service close-out, while an order without a
+// recorded promise can still have very concrete procurement work to do.
+export type SpecialOrderWorkState =
+  | 'intake'
+  | 'needs_ordering'
+  | 'vendor_followup'
+  | 'promise_needed'
+  | 'closeout'
+  | 'on_track'
+
+export type SpecialOrderQueueState = SpecialOrderWorkState | 'in_transit'
+
+export type SpecialOrderActionOwner =
+  | 'procurement'
+  | 'service'
+  | 'cs'
+  | 'receiving'
+  | 'retail'
+
 // Why a buyer parked a special order. A code is required on every ack — an un-categorised
 // snooze cannot be reported on, and reporting is the point.
 export type SoReasonCode =
@@ -431,10 +451,21 @@ export interface SoAck {
   escalation_level: number
 }
 
+export interface SpecialOrderActivityEvent {
+  timestamp: string
+  type: string
+  label: string
+  actor: string | null
+  details: Record<string, unknown> | string | null
+}
+
 export interface SpecialOrderSummarySla {
   by_severity: Record<SlaSeverity, number>
   by_owner: Record<'procurement' | 'receiving' | 'cs', number>
   missing_promise_by_owner: Record<'service' | 'cs', number>
+  by_work_state?: Partial<Record<SpecialOrderWorkState, number>>
+  by_queue_state?: Partial<Record<SpecialOrderQueueState, number>>
+  by_action_owner?: Partial<Record<SpecialOrderActionOwner, number>>
   actionable: number
   acked: number
   checkback_due: number
@@ -494,17 +525,6 @@ export interface PoRecommendation {
   // The gap between those two: delay we caused. Needs no customer promise, which is why it
   // works for the ~160 special orders that have none.
   days_lost: number | null
-}
-
-export interface CandidatePo {
-  order_id: string
-  reference_number: string | null
-  vendor_id: string
-  vendor_name: string | null
-  po_state: string
-  appendable: boolean
-  ordered_date: string | null
-  expected_date: string | null
 }
 
 export interface DwellStat { n: number; median: number; p75: number; max: number }
@@ -709,7 +729,7 @@ export interface SpecialOrder {
   sla_owner: 'procurement' | 'receiving' | 'cs'
   sla_reason: string
   promise_date: string | null
-  promise_source: 'shopify_metafield' | 'workorder_eta_out' | null
+  promise_source: 'shopify_metafield' | 'service_manual' | null
   lead_time_days: number
   lead_time_source: 'po_vendor' | 'fastest_qualifying_vendor' | 'default'
   receiving_buffer_days: number
@@ -733,6 +753,16 @@ export interface SpecialOrder {
   escalation_level: number
   actionable: boolean
   checkback_due: boolean
+  work_state: SpecialOrderWorkState
+  queue_states: SpecialOrderQueueState[]
+  next_action: string | null
+  action_owner: SpecialOrderActionOwner | null
+  action_due_date: string | null
+  closeout_state: string | null
+  service_promise_date: string | null
+  service_promise_source: 'service_manual' | null
+  service_promise_recorded_at: string | null
+  service_promise_recorded_by: string | null
   flag: SpecialOrderFlag
   days_overdue: number | null       // signed; only set for the 'ordered' stage
   is_overdue: boolean               // flag is overdue or critical
@@ -744,6 +774,8 @@ export interface SpecialOrder {
   shopify_order_name: string | null
   shopify_order_url: string | null
   shopify_expected_date: string | null   // the customer-promised ETA from Shopify
+  shopify_fulfillment_status: string | null
+  shopify_financial_status: string | null
   shopify_candidates: ShopifyCandidate[] // ambiguous only: the orders it could be
   // Attached service workorder (when the SO was raised from the bench), with the bench's
   // own notes: `note` is customer-facing, `internal_note` staff-only, `hook_in` the tag
@@ -778,13 +810,39 @@ export interface SpecialOrderSummary {
   ready_not_called: number
 }
 
-export interface SpecialOrderDashboard {
+export interface SpecialOrderSourceStatus {
+  status: 'ok' | 'stale' | 'unavailable'
+  fetched_at?: string | null
+  checked_at?: string | null
+  record_count?: number
+  message?: string | null
+}
+
+export interface SpecialOrderMeta {
+  live_only_days?: number | null
+  total_before_window?: number
+  total_after_window?: number
+  historical_scope?: boolean
+  thresholds?: Record<string, unknown>
+  sources?: Record<string, SpecialOrderSourceStatus>
+  data_freshness?: {
+    fetched_at?: string | null
+    cache_age_seconds: number
+    cache_ttl_seconds: number
+  }
+}
+
+export interface SpecialOrderWorklistResponse {
   orders: SpecialOrder[]
-  summary: SpecialOrderSummary
+  summary: SpecialOrderSummarySla
   shopify_only: ShopifyOnlyOrder[]
   fetched_at?: string
   reason_codes?: string[]
+  meta?: SpecialOrderMeta
 }
+
+// Compatibility name for older imports while the base, non-SLA endpoint is retired.
+export type SpecialOrderDashboard = SpecialOrderWorklistResponse
 
 // ---------------------------------------------------------------------------
 // PO Tracker (placed-but-unreceived POs triaged against expected arrival)

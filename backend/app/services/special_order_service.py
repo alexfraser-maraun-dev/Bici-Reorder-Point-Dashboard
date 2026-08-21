@@ -107,14 +107,79 @@ def _customer_name(customer: Dict[str, Any]) -> Optional[str]:
 _MAX_AVAILABLE_VENDORS = 3
 
 
-def _safe(fn, default):
+def _value_count(value: Any) -> Optional[int]:
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value)
+    return None
+
+
+def _safe(fn, default, health: Optional[Dict[str, Any]] = None,
+          source: Optional[str] = None):
     """Runs a sourcing-data fetch, returning `default` on any failure so a BigQuery hiccup
-    degrades the 'Available from' field to empty rather than failing the whole SO dashboard."""
+    degrades the related field rather than failing the whole SO dashboard. When a health
+    collector is supplied, the degradation is returned to the UI instead of masquerading as a
+    genuine empty result."""
     try:
-        return fn()
+        value = fn()
+        if health is not None and source:
+            health[source] = {
+                "status": "ok",
+                "checked_at": datetime.utcnow().isoformat() + "Z",
+                "record_count": _value_count(value),
+            }
+        return value
     except Exception as e:
         print(f"[special_orders] sourcing fetch failed: {e}")
+        if health is not None and source:
+            health[source] = {
+                "status": "unavailable",
+                "checked_at": datetime.utcnow().isoformat() + "Z",
+                "record_count": _value_count(default),
+                "message": "Source unavailable; related fields may be incomplete.",
+            }
         return default
+
+
+def _source_statuses(health: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Collapse detailed fetches into the four source indicators used by the worklist."""
+    groups = {
+        "lightspeed": (
+            "lightspeed_open_special_orders", "lightspeed_completed",
+            "lightspeed_purchase_orders", "lightspeed_customers",
+        ),
+        "shopify": ("shopify_open_special_orders", "shopify_recent_fallback"),
+        "bigquery": (
+            "bigquery_item_brands", "bigquery_brand_vendor_sourcing",
+            "bigquery_vendor_lead_times", "bigquery_match_overrides",
+        ),
+        "workorders": ("lightspeed_workorders",),
+    }
+    out: Dict[str, Dict[str, Any]] = {}
+    for group, names in groups.items():
+        entries = [health[name] for name in names if name in health]
+        if not entries:
+            continue
+        unavailable = [entry for entry in entries if entry.get("status") != "ok"]
+        if not unavailable:
+            group_status = "ok"
+        elif len(unavailable) == len(entries):
+            group_status = "unavailable"
+        else:
+            group_status = "stale"  # partially available; some enrichment may be incomplete
+        counts = [entry.get("record_count") for entry in entries
+                  if isinstance(entry.get("record_count"), int)]
+        out[group] = {
+            "status": group_status,
+            "checked_at": max(
+                (str(entry.get("checked_at") or "") for entry in entries), default=""
+            ) or None,
+            "record_count": sum(counts) if counts else None,
+            "message": (
+                "One or more source reads failed; related fields may be incomplete."
+                if unavailable else None
+            ),
+        }
+    return out
 
 
 def _compute_available_vendors(
@@ -362,6 +427,8 @@ def _normalize(
         "shopify_order_name": None,
         "shopify_order_url": None,
         "shopify_expected_date": None,
+        "shopify_fulfillment_status": None,
+        "shopify_financial_status": None,
         "shopify_candidates": [],
         # Manual-link audit: who linked it, when, and whether a hand-made link has since broken.
         "link_provenance": None,
@@ -511,7 +578,10 @@ def _shopify_rows() -> List[Dict[str, Any]]:
         return _shopify_cache["rows"]
     # Sourced live from the Shopify Admin API (was Fivetran -> BigQuery). The row shape is
     # identical to bigquery_sync.get_shopify_special_orders(), which remains as a fallback.
-    rows = ShopifyClient().get_open_special_orders()
+    # Strict at this layer: the orchestration wrapper catches the failure, keeps Lightspeed
+    # rows visible, and marks Shopify unavailable in meta.sources. Returning [] here would look
+    # exactly like a healthy source with zero special orders.
+    rows = ShopifyClient().get_open_special_orders(strict=True)
     _shopify_cache["rows"] = rows
     _shopify_cache["fetched_at"] = now
     return rows
@@ -534,7 +604,7 @@ def _shopify_fallback_rows() -> List[Dict[str, Any]]:
     cached = _shopify_fallback_cache["rows"]
     if cached is not None and (now - _shopify_fallback_cache["fetched_at"]) < _SHOPIFY_FALLBACK_TTL_SECONDS:
         return cached
-    rows = ShopifyClient().get_recent_special_orders()
+    rows = ShopifyClient().get_recent_special_orders(strict=True)
     _shopify_fallback_cache["rows"] = rows
     _shopify_fallback_cache["fetched_at"] = now
     return rows
@@ -558,6 +628,8 @@ def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> N
     o["shopify_order_id"] = m["shopify_order_id"]
     o["shopify_order_name"] = m["shopify_order_name"]
     o["shopify_expected_date"] = m["shopify_expected_date"]
+    o["shopify_fulfillment_status"] = m.get("shopify_fulfillment_status")
+    o["shopify_financial_status"] = m.get("shopify_financial_status")
     o["shopify_order_url"] = shopify_order_url(m["shopify_order_id"])
     o["shopify_candidates"] = m.get("shopify_candidates") or []
     # Who linked this and when (manual links only), and whether a hand-made link has broken.
@@ -748,7 +820,7 @@ def _sort_orders(orders: List[Dict[str, Any]]) -> None:
 # Snapshot of the last full build's normalized-but-unenriched rows, so a Shopify-side write
 # (ETA edit, manual match/unmatch) can rebuild the dashboard by re-running just the Shopify
 # pull + matching over these rows instead of paying the whole Lightspeed walk again.
-_pre_enrichment: Dict[str, Any] = {"orders": None, "completed": None}
+_pre_enrichment: Dict[str, Any] = {"orders": None, "completed": None, "meta": None}
 
 
 def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Dict[str, Any]:
@@ -759,17 +831,30 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
     client = client or LightspeedClient()
     today = date.today()
     shop_names = {v: k for k, v in client.shop_id_map.items()}
+    source_health: Dict[str, Any] = {}
 
     # Open SOs (always shown), recently-completed SOs (candidates to adopt a still-open Shopify
     # order), and the Shopify rows are all independent — fan them out concurrently.
     with ThreadPoolExecutor(max_workers=4) as executor:
         open_future = executor.submit(client.get_special_orders)
-        completed_future = executor.submit(client.get_completed_special_orders)
-        shopify_future = executor.submit(_shopify_rows)
+        completed_future = executor.submit(
+            _safe, lambda: client.get_completed_special_orders(strict=True), [],
+            source_health, "lightspeed_completed"
+        )
+        shopify_future = executor.submit(
+            _safe, _shopify_rows, [], source_health, "shopify_open_special_orders"
+        )
         # Fallback population for the late-match second pass. Degrades to empty rather than
         # failing the dashboard, since it only ever adds matches.
-        fallback_future = executor.submit(_safe, _shopify_fallback_rows, [])
+        fallback_future = executor.submit(
+            _safe, _shopify_fallback_rows, [], source_health, "shopify_recent_fallback"
+        )
         special_orders = open_future.result()
+        source_health["lightspeed_open_special_orders"] = {
+            "status": "ok",
+            "checked_at": datetime.utcnow().isoformat() + "Z",
+            "record_count": len(special_orders),
+        }
         completed_all = completed_future.result()
         shop_rows = shopify_future.result()
         fallback_rows = fallback_future.result()
@@ -797,13 +882,34 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
         for so in sos_to_resolve
     ]
     with ThreadPoolExecutor(max_workers=7) as executor:
-        order_future = executor.submit(client.get_orders_by_ids, order_ids)
-        customer_future = executor.submit(client.get_customers_by_ids, customer_ids)
-        workorder_future = executor.submit(_safe, lambda: client.get_workorders_by_sale_line_ids(sale_line_ids), {})
-        brand_future = executor.submit(_safe, lambda: bigquery_sync.fetch_item_brands(item_ids), {})
-        sourcing_future = executor.submit(_safe, bigquery_sync.fetch_brand_vendor_sourcing, {})
-        leadtime_future = executor.submit(_safe, bigquery_sync.build_lead_time_lookup, ({}, {}))
-        overrides_future = executor.submit(_safe, bigquery_sync.fetch_so_match_overrides, _EMPTY_OVERRIDES)
+        order_future = executor.submit(
+            _safe, lambda: client.get_orders_by_ids(order_ids, strict=True), {},
+            source_health, "lightspeed_purchase_orders"
+        )
+        customer_future = executor.submit(
+            _safe, lambda: client.get_customers_by_ids(customer_ids, strict=True), {},
+            source_health, "lightspeed_customers"
+        )
+        workorder_future = executor.submit(
+            _safe, lambda: client.get_workorders_by_sale_line_ids(sale_line_ids, strict=True), {},
+            source_health, "lightspeed_workorders"
+        )
+        brand_future = executor.submit(
+            _safe, lambda: bigquery_sync.fetch_item_brands(item_ids), {},
+            source_health, "bigquery_item_brands"
+        )
+        sourcing_future = executor.submit(
+            _safe, bigquery_sync.fetch_brand_vendor_sourcing, {},
+            source_health, "bigquery_brand_vendor_sourcing"
+        )
+        leadtime_future = executor.submit(
+            _safe, bigquery_sync.build_lead_time_lookup, ({}, {}),
+            source_health, "bigquery_vendor_lead_times"
+        )
+        overrides_future = executor.submit(
+            _safe, lambda: bigquery_sync.fetch_so_match_overrides(strict=True), _EMPTY_OVERRIDES,
+            source_health, "bigquery_match_overrides"
+        )
         order_map = order_future.result()
         customer_map = customer_future.result()
         workorder_map = workorder_future.result()
@@ -832,7 +938,24 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
                                         fallback_index=fallback_index)
 
     _sort_orders(orders)
-    return {"orders": orders, "summary": _summarize(orders), "shopify_only": shopify_only}
+    data_status = (
+        "degraded"
+        if any(entry.get("status") != "ok" for entry in source_health.values())
+        else "ok"
+    )
+    dashboard_meta = {
+        "data_status": data_status,
+        "source_health": source_health,
+        "sources": _source_statuses(source_health),
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    _pre_enrichment["meta"] = copy.deepcopy(dashboard_meta)
+    return {
+        "orders": orders,
+        "summary": _summarize(orders),
+        "shopify_only": shopify_only,
+        "meta": dashboard_meta,
+    }
 
 
 def re_enrich_dashboard() -> Optional[Dict[str, Any]]:
@@ -852,7 +975,10 @@ def re_enrich_dashboard() -> Optional[Dict[str, Any]]:
     orders = copy.deepcopy(pre_orders)
     completed_orders = copy.deepcopy(_pre_enrichment.get("completed") or [])
     index = shopify_match.build_shopify_index(_shopify_rows())
-    overrides = _safe(bigquery_sync.fetch_so_match_overrides, _EMPTY_OVERRIDES)
+    # Manual decisions are authoritative. If the ledger cannot be read after a write, abort
+    # this cheap rebuild rather than briefly presenting every saved link as if it disappeared.
+    # The caller preserves/invalidates the cache and the next full build reports source health.
+    overrides = bigquery_sync.fetch_so_match_overrides(strict=True)
     # The fallback population is cached for an hour, so re-enriching after a write reuses it
     # rather than paying a second paginated Shopify pull.
     fb_rows = _safe(_shopify_fallback_rows, [])
@@ -860,4 +986,24 @@ def re_enrich_dashboard() -> Optional[Dict[str, Any]]:
     shopify_only = _enrich_with_shopify(index, orders, completed_orders, today, overrides,
                                         fallback_index=fallback_index)
     _sort_orders(orders)
-    return {"orders": orders, "summary": _summarize(orders), "shopify_only": shopify_only}
+    # Re-enrichment only refreshes Shopify/matching data. Preserve the last full walk's health
+    # and label this as partial so a user does not mistake it for a fresh Lightspeed pull.
+    prior_meta = copy.deepcopy(_pre_enrichment.get("meta") or {})
+    source_health = prior_meta.get("source_health") or {}
+    source_health["shopify_open_special_orders"] = {
+        "status": "ok",
+        "checked_at": datetime.utcnow().isoformat() + "Z",
+        "record_count": len(index.get("orders") or {}),
+    }
+    prior_meta.update({
+        "source_health": source_health,
+        "sources": _source_statuses(source_health),
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "partial_refresh": True,
+    })
+    return {
+        "orders": orders,
+        "summary": _summarize(orders),
+        "shopify_only": shopify_only,
+        "meta": prior_meta,
+    }

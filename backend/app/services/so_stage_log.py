@@ -89,9 +89,10 @@ def build_observations(orders: List[Dict[str, Any]], observed_at: str) -> List[D
 def collect_promises(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Every currently-quoted promise date, tagged with where it came from.
 
-    Priority mirrors the SLA: the Shopify metafield is the real customer quote; the workorder's
-    eta-out is the service-flow equivalent. Implied dates are computed for prioritisation but
-    deliberately never enter the ledger -- only a human-recorded promise counts as a promise.
+    Priority mirrors the SLA: the Shopify metafield is the real customer quote. A workorder's
+    eta-out is the bike's booking/service date and is deliberately excluded; service parts
+    promises enter this same ledger through the app-owned service-promise endpoint. Implied
+    dates are for prioritisation only and never enter the ledger.
     """
     out: List[Dict[str, Any]] = []
     for row in orders:
@@ -102,13 +103,6 @@ def collect_promises(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "shopify_order_id": row.get("shopify_order_id"),
                 "promise_date": str(row["shopify_expected_date"])[:10],
                 "promise_source": "shopify_metafield",
-            })
-        elif row.get("workorder_eta_out"):
-            out.append({
-                "special_order_id": str(so_id) if so_id else None,
-                "shopify_order_id": None,
-                "promise_date": str(row["workorder_eta_out"])[:10],
-                "promise_source": "workorder_eta_out",
             })
     return out
 

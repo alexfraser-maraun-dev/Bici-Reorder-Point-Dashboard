@@ -327,31 +327,3 @@ def _reason(best, row, needed, promise) -> str:
                 f"({best.get('vendor_name')}) and send it — lands ~{best.get('landing_date')}"
                 f"{routine}.")
     return "No recommendation."
-
-
-def list_candidate_pos(open_orders: List[Dict[str, Any]], shop_id: str) -> List[Dict[str, Any]]:
-    """POs a buyer may pick when overriding the recommendation, for one store.
-
-    Unsent drafts are appendable. Ordered-but-incomplete POs are offered too, because a special
-    order can legitimately be satisfied by units already on one — but they are labelled, so
-    nobody adds a line to an order the vendor has already received.
-    """
-    out = []
-    for order in open_orders or []:
-        if str(order.get("shopID")) != str(shop_id):
-            continue
-        state = order.get("po_state")
-        if state not in ("unsent", "ordered", "partially_received"):
-            continue
-        out.append({
-            "order_id": str(order.get("orderID")),
-            "reference_number": order.get("refNum"),
-            "vendor_id": str(order.get("vendorID") or ""),
-            "vendor_name": (order.get("Vendor") or {}).get("name"),
-            "po_state": state,
-            "appendable": state == "unsent",
-            "ordered_date": order.get("orderedDate"),
-            "expected_date": order.get("arrivalDate"),
-        })
-    out.sort(key=lambda o: (not o["appendable"], o.get("vendor_name") or ""))
-    return out

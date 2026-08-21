@@ -10,25 +10,34 @@
  *  closed, so a per-row dialog costs a state hook and a context provider — not a dialog tree.
  */
 
-import { useState, useEffect, useMemo, useRef } from 'react'
-import { toast } from 'sonner'
+import { useState, useEffect, useMemo, useId } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { cn } from '@/lib/utils'
 import { lookupShopifyOrders } from '@/lib/hooks'
 import type { SpecialOrder, ShopifyOnlyOrder, ShopifyOrderLookup } from '@/lib/types'
-import { ShopifyMatchBadge } from './special-order-badges'
 import { Field, FieldGroup } from './special-order-fields'
 import {
-  Link2, Unlink, X, ArrowLeft, Loader2, Search, AlertTriangle, Check, ExternalLink,
-  Wrench, Package,
+  Link2, Unlink, ArrowLeft, Loader2, Search, AlertTriangle, ExternalLink,
+  Wrench, RefreshCw,
 } from 'lucide-react'
 
 // Manual match/unmatch plumbing threaded down from the page: both resolve once the backend
@@ -36,6 +45,7 @@ import {
 export interface MatchActions {
   onMatch: (specialOrderId: string, shopifyOrderId: string) => Promise<void>
   onUnmatch: (specialOrderId: string, shopifyOrderId: string) => Promise<void>
+  onBatchUnmatch: (specialOrderId: string, shopifyOrderIds: string[]) => Promise<void>
 }
 
 // One pickable row inside the match dialog.
@@ -70,7 +80,7 @@ export function OrderStateChips({ order }: { order: ShopifyOrderLookup }) {
         <span
           key={c.label}
           className={cn(
-            'rounded border px-1.5 py-0.5 text-[10px] font-medium capitalize',
+            'rounded border px-1.5 py-0.5 text-xs font-medium capitalize',
             c.tone === 'warn'
               ? 'border-amber-300 bg-amber-50 text-amber-800'
               : 'border-border bg-muted/50 text-muted-foreground'
@@ -88,11 +98,13 @@ export function OrderStateChips({ order }: { order: ShopifyOrderLookup }) {
 export function LookupConfirmation({
   order,
   busy,
+  error,
   onBack,
   onConfirm,
 }: {
   order: ShopifyOrderLookup
   busy: boolean
+  error?: string | null
   onBack: () => void
   onConfirm: () => void
 }) {
@@ -103,7 +115,7 @@ export function LookupConfirmation({
         type="button"
         onClick={onBack}
         disabled={busy}
-        className="text-muted-foreground hover:text-foreground flex items-center gap-1 self-start text-xs disabled:opacity-50"
+        className="flex min-h-10 items-center gap-1 self-start rounded px-2 text-sm text-muted-foreground hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
       >
         <ArrowLeft className="h-3 w-3" />
         Back to results
@@ -139,7 +151,7 @@ export function LookupConfirmation({
       </div>
 
       <div className="flex flex-col gap-1">
-        <span className="text-muted-foreground text-[10px] font-semibold uppercase tracking-wider">
+        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
           Line items ({order.line_items.length})
         </span>
         <div className="flex max-h-56 flex-col gap-1 overflow-y-auto pr-1">
@@ -174,9 +186,67 @@ export function LookupConfirmation({
         </div>
       )}
 
-      <Button size="sm" disabled={busy} onClick={onConfirm} className="gap-2">
+      {error && (
+        <p role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {error}
+        </p>
+      )}
+
+      <Button size="sm" disabled={busy} onClick={onConfirm} className="min-h-10 gap-2">
         {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Link2 className="h-3.5 w-3.5" />}
         Link {order.order_name ?? `order ${order.order_id}`}
+      </Button>
+    </div>
+  )
+}
+
+// Local candidates do not carry Shopify line items, but they still require a review step.
+// This makes every manual link an explicit two-step decision rather than making the most likely
+// (and therefore easiest to mis-click) candidates one-click mutations.
+function PickerConfirmation({
+  item,
+  busy,
+  error,
+  onBack,
+  onConfirm,
+}: {
+  item: PickerItem
+  busy: boolean
+  error: string | null
+  onBack: () => void
+  onConfirm: () => void
+}) {
+  return (
+    <div className="flex flex-col gap-3">
+      <button
+        type="button"
+        onClick={onBack}
+        disabled={busy}
+        className="flex min-h-10 items-center gap-1 self-start rounded px-2 text-sm text-muted-foreground hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
+      >
+        <ArrowLeft className="h-3.5 w-3.5" />
+        Back to results
+      </button>
+      <div className="rounded-md border p-3">
+        <p className="text-sm font-medium">{item.title}</p>
+        {item.subtitle && <p className="mt-1 text-sm text-muted-foreground">{item.subtitle}</p>}
+        {item.meta && <p className="mt-1 text-sm text-muted-foreground">{item.meta}</p>}
+        {item.candidate && (
+          <p className="mt-2 text-xs font-medium text-amber-700">Suggested by automatic matching</p>
+        )}
+      </div>
+      <p className="text-sm text-muted-foreground">
+        Confirm that this is the same customer and item before saving the link. The manual link
+        will replace automatic matching for this special order.
+      </p>
+      {error && (
+        <p role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {error}
+        </p>
+      )}
+      <Button size="sm" className="min-h-10 gap-2" disabled={busy} onClick={onConfirm}>
+        {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Link2 className="h-3.5 w-3.5" />}
+        Confirm link
       </Button>
     </div>
   )
@@ -199,6 +269,7 @@ export function MatchPickerDialog({
   onPick,
   footerAction,
   lookupShopify = false,
+  contentId,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -206,14 +277,26 @@ export function MatchPickerDialog({
   description: string
   items: PickerItem[]
   onPick: (key: string) => Promise<void>
-  footerAction?: { label: string; onClick: () => Promise<void> }
+  footerAction?: {
+    label: string
+    onClick: () => Promise<void>
+    confirmationTitle?: string
+    confirmationDescription?: string
+    confirmLabel?: string
+  }
   lookupShopify?: boolean
+  contentId?: string
 }) {
   const [term, setTerm] = useState('')
   const [busyKey, setBusyKey] = useState<string | null>(null)
   const [results, setResults] = useState<ShopifyOrderLookup[]>([])
   const [searching, setSearching] = useState(false)
   const [confirming, setConfirming] = useState<ShopifyOrderLookup | null>(null)
+  const [confirmingItem, setConfirmingItem] = useState<PickerItem | null>(null)
+  const [confirmingFooter, setConfirmingFooter] = useState(false)
+  const [searchError, setSearchError] = useState<string | null>(null)
+  const [mutationError, setMutationError] = useState<string | null>(null)
+  const [searchAttempt, setSearchAttempt] = useState(0)
 
   const filtered = useMemo(() => {
     const t = term.trim().toLowerCase()
@@ -229,19 +312,17 @@ export function MatchPickerDialog({
   useEffect(() => {
     if (!lookupShopify) return
     const t = term.trim()
-    if (t.length < LOOKUP_MIN_CHARS) {
-      setResults([])
-      setSearching(false)
-      return
-    }
+    if (t.length < LOOKUP_MIN_CHARS) return
     let cancelled = false
-    setSearching(true)
     const timer = setTimeout(async () => {
       try {
         const found = await lookupShopifyOrders(t)
         if (!cancelled) setResults(found)
-      } catch {
-        if (!cancelled) setResults([])
+      } catch (error) {
+        if (!cancelled) {
+          setResults([])
+          setSearchError(error instanceof Error ? error.message : 'Shopify search failed.')
+        }
       } finally {
         if (!cancelled) setSearching(false)
       }
@@ -250,17 +331,18 @@ export function MatchPickerDialog({
       cancelled = true
       clearTimeout(timer)
     }
-  }, [term, lookupShopify])
+  }, [term, lookupShopify, searchAttempt])
 
-  // Reset per-opening state so a reopened dialog never shows the last search or confirmation.
-  useEffect(() => {
-    if (!open) {
-      setTerm('')
-      setResults([])
-      setConfirming(null)
-      setSearching(false)
-    }
-  }, [open])
+  const resetDialog = () => {
+    setTerm('')
+    setResults([])
+    setConfirming(null)
+    setConfirmingItem(null)
+    setConfirmingFooter(false)
+    setSearching(false)
+    setSearchError(null)
+    setMutationError(null)
+  }
 
   // Orders already offered in the local list don't need a duplicate "from Shopify" row.
   const localKeys = useMemo(() => new Set(items.map((i) => i.key)), [items])
@@ -271,17 +353,43 @@ export function MatchPickerDialog({
 
   const pick = async (key: string) => {
     setBusyKey(key)
+    setMutationError(null)
     try {
       await onPick(key)
+      resetDialog()
       onOpenChange(false)
+    } catch (error) {
+      setMutationError(error instanceof Error ? error.message : 'The link could not be saved. Try again.')
+    } finally {
+      setBusyKey(null)
+    }
+  }
+
+  const runFooterAction = async () => {
+    if (!footerAction) return
+    setBusyKey('__footer__')
+    setMutationError(null)
+    try {
+      await footerAction.onClick()
+      resetDialog()
+      onOpenChange(false)
+    } catch (error) {
+      setMutationError(error instanceof Error ? error.message : 'The change could not be saved. Try again.')
     } finally {
       setBusyKey(null)
     }
   }
 
   return (
-    <Dialog open={open} onOpenChange={(o) => { if (!busyKey) onOpenChange(o) }}>
-      <DialogContent className="max-w-lg">
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (busyKey) return
+        if (!nextOpen) resetDialog()
+        onOpenChange(nextOpen)
+      }}
+    >
+      <DialogContent id={contentId} className="max-w-lg">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{description}</DialogDescription>
@@ -291,9 +399,76 @@ export function MatchPickerDialog({
           <LookupConfirmation
             order={confirming}
             busy={busyKey !== null}
-            onBack={() => setConfirming(null)}
+            error={mutationError}
+            onBack={() => {
+              setConfirming(null)
+              setMutationError(null)
+            }}
             onConfirm={() => void pick(confirming.order_id)}
           />
+        ) : confirmingItem ? (
+          <PickerConfirmation
+            item={confirmingItem}
+            busy={busyKey !== null}
+            error={mutationError}
+            onBack={() => {
+              setConfirmingItem(null)
+              setMutationError(null)
+            }}
+            onConfirm={() => void pick(confirmingItem.key)}
+          />
+        ) : confirmingFooter && footerAction ? (
+          <div className="flex flex-col gap-3">
+            <button
+              type="button"
+              onClick={() => {
+                setConfirmingFooter(false)
+                setMutationError(null)
+              }}
+              disabled={busyKey !== null}
+              className="flex min-h-10 items-center gap-1 self-start rounded px-2 text-sm text-muted-foreground hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
+            >
+              <ArrowLeft className="h-3.5 w-3.5" />
+              Back to results
+            </button>
+            <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <div>
+                <p className="font-medium">
+                  {footerAction.confirmationTitle ?? 'Review this matching change'}
+                </p>
+                <p className="mt-1">
+                  {footerAction.confirmationDescription ?? 'This changes future automatic matching. Confirm only if these orders should not be linked.'}
+                </p>
+              </div>
+            </div>
+            {mutationError && (
+              <p role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {mutationError}
+              </p>
+            )}
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                className="min-h-10"
+                disabled={busyKey !== null}
+                onClick={() => setConfirmingFooter(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                className="min-h-10 gap-2"
+                disabled={busyKey !== null}
+                onClick={() => void runFooterAction()}
+              >
+                {busyKey === '__footer__' && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                {footerAction.confirmLabel ?? footerAction.label}
+              </Button>
+            </DialogFooter>
+          </div>
         ) : (
           <>
             <Input
@@ -303,15 +478,46 @@ export function MatchPickerDialog({
                   : 'Filter by order #, customer, SKU…'
               }
               value={term}
-              onChange={(e) => setTerm(e.target.value)}
-              className="h-8"
+              onChange={(e) => {
+                const nextTerm = e.target.value
+                setTerm(nextTerm)
+                setMutationError(null)
+                setSearchError(null)
+                if (nextTerm.trim().length < LOOKUP_MIN_CHARS) {
+                  setResults([])
+                  setSearching(false)
+                } else if (lookupShopify) {
+                  setSearching(true)
+                }
+              }}
+              aria-label={lookupShopify ? 'Search Shopify orders' : 'Filter matching orders'}
+              className="h-10"
             />
             <div className="flex max-h-72 flex-col gap-1 overflow-y-auto pr-1">
-              {filtered.length === 0 && extraResults.length === 0 && !searching && (
+              {searchError && !searching && (
+                <div role="alert" className="flex flex-wrap items-center gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                  <span className="min-w-0 flex-1">{searchError}</span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="min-h-9 gap-1.5 bg-background"
+                    onClick={() => {
+                      setSearching(true)
+                      setSearchError(null)
+                      setSearchAttempt((attempt) => attempt + 1)
+                    }}
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    Retry
+                  </Button>
+                </div>
+              )}
+              {filtered.length === 0 && extraResults.length === 0 && !searching && !searchError && (
                 <div className="text-muted-foreground py-6 text-center text-sm">
                   {lookupShopify && term.trim().length < LOOKUP_MIN_CHARS
-                    ? 'No matches. Type an order number to search all of Shopify.'
-                    : 'No matches.'}
+                    ? 'No local matches. Type at least 3 characters to search all of Shopify.'
+                    : 'No matching orders found.'}
                 </div>
               )}
               {filtered.map((i) => (
@@ -319,9 +525,12 @@ export function MatchPickerDialog({
                   key={i.key}
                   type="button"
                   disabled={busyKey !== null}
-                  onClick={() => void pick(i.key)}
+                  onClick={() => {
+                    setMutationError(null)
+                    setConfirmingItem(i)
+                  }}
                   className={cn(
-                    'flex items-center gap-3 rounded-md border px-3 py-2 text-left transition-colors hover:bg-muted/60 disabled:opacity-50',
+                    'flex min-h-11 items-center gap-3 rounded-md border px-3 py-2 text-left transition-colors hover:bg-muted/60 disabled:opacity-50',
                     i.candidate && 'border-amber-300 bg-amber-50/60'
                   )}
                 >
@@ -329,7 +538,7 @@ export function MatchPickerDialog({
                     <div className="flex items-center gap-2">
                       <span className="truncate text-sm font-medium">{i.title}</span>
                       {i.candidate && (
-                        <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
+                        <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700">
                           Likely candidate
                         </span>
                       )}
@@ -343,7 +552,7 @@ export function MatchPickerDialog({
 
               {lookupShopify && (searching || extraResults.length > 0) && (
                 <div className="mt-2 flex items-center gap-2 border-t pt-2">
-                  <span className="text-muted-foreground text-[10px] font-semibold uppercase tracking-wider">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                     Anywhere in Shopify
                   </span>
                   {searching && <Loader2 className="text-muted-foreground h-3 w-3 animate-spin" />}
@@ -356,7 +565,7 @@ export function MatchPickerDialog({
                     type="button"
                     disabled={busyKey !== null}
                     onClick={() => setConfirming(r)}
-                    className="flex items-center gap-3 rounded-md border border-dashed px-3 py-2 text-left transition-colors hover:bg-muted/60 disabled:opacity-50"
+                    className="flex min-h-11 items-center gap-3 rounded-md border border-dashed px-3 py-2 text-left transition-colors hover:bg-muted/60 disabled:opacity-50"
                   >
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-medium">{r.order_name ?? `Order ${r.order_id}`}</div>
@@ -381,15 +590,11 @@ export function MatchPickerDialog({
               <Button
                 variant="outline"
                 size="sm"
+                className="min-h-10"
                 disabled={busyKey !== null}
-                onClick={async () => {
-                  setBusyKey('__footer__')
-                  try {
-                    await footerAction.onClick()
-                    onOpenChange(false)
-                  } finally {
-                    setBusyKey(null)
-                  }
+                onClick={() => {
+                  setMutationError(null)
+                  setConfirmingFooter(true)
                 }}
               >
                 {footerAction.label}
@@ -415,28 +620,74 @@ export function LsMatchControls({
 }) {
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [unlinkOpen, setUnlinkOpen] = useState(false)
+  const [unlinkError, setUnlinkError] = useState<string | null>(null)
   const soId = String(order.special_order_id)
+  const pickerId = useId()
+  const unlinkId = useId()
 
   if (order.shopify_match === 'matched' && order.shopify_order_id) {
     return (
-      <Button
-        variant="ghost"
-        size="sm"
-        disabled={busy}
-        title={`Unlink Shopify order ${order.shopify_order_name ?? ''} from this SO`}
-        className="h-6 shrink-0 gap-1 px-1.5 text-[11px] text-muted-foreground"
-        onClick={async () => {
-          setBusy(true)
-          try {
-            await actions.onUnmatch(soId, order.shopify_order_id!)
-          } finally {
-            setBusy(false)
-          }
-        }}
-      >
-        <Unlink className="h-3 w-3" />
-        Unlink
-      </Button>
+      <>
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={busy}
+          title={`Review unlinking Shopify order ${order.shopify_order_name ?? ''} from this SO`}
+          aria-haspopup="dialog"
+          aria-expanded={unlinkOpen}
+          aria-controls={unlinkId}
+          className="min-h-9 shrink-0 gap-1 px-2 text-xs text-muted-foreground"
+          onClick={() => {
+            setUnlinkError(null)
+            setUnlinkOpen(true)
+          }}
+        >
+          <Unlink className="h-3.5 w-3.5" />
+          Unlink…
+        </Button>
+        <AlertDialog
+          open={unlinkOpen}
+          onOpenChange={(next) => { if (!busy) setUnlinkOpen(next) }}
+        >
+          <AlertDialogContent id={unlinkId}>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Unlink this Shopify order?</AlertDialogTitle>
+              <AlertDialogDescription>
+                SO #{soId} will be unlinked from{' '}
+                {order.shopify_order_name ?? `Shopify order ${order.shopify_order_id}`}. This pair
+                will also be excluded from future automatic matching, so use this only when the
+                current link is wrong. You can still restore it later with a manual link.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            {unlinkError && (
+              <p role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {unlinkError}
+              </p>
+            )}
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={busy}>Keep link</AlertDialogCancel>
+              <AlertDialogAction
+                disabled={busy}
+                className="bg-red-600 text-white hover:bg-red-700"
+                onClick={(event) => {
+                  event.preventDefault()
+                  setBusy(true)
+                  setUnlinkError(null)
+                  void actions.onUnmatch(soId, order.shopify_order_id!)
+                    .then(() => setUnlinkOpen(false))
+                    .catch((error) => {
+                      setUnlinkError(error instanceof Error ? error.message : 'The link could not be removed. Try again.')
+                    })
+                    .finally(() => setBusy(false))
+                }}
+              >
+                {busy ? 'Unlinking…' : 'Unlink and exclude pair'}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </>
     )
   }
 
@@ -471,7 +722,10 @@ export function LsMatchControls({
       <Button
         variant={ambiguous ? 'outline' : 'ghost'}
         size="sm"
-        className={cn('h-6 shrink-0 gap-1 px-1.5 text-[11px]', !ambiguous && 'text-muted-foreground')}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls={pickerId}
+        className={cn('min-h-9 shrink-0 gap-1 px-2 text-xs', !ambiguous && 'text-muted-foreground')}
         onClick={() => setOpen(true)}
       >
         <Link2 className="h-3 w-3" />
@@ -480,6 +734,7 @@ export function LsMatchControls({
       <MatchPickerDialog
         open={open}
         onOpenChange={setOpen}
+        contentId={pickerId}
         title={`Link SO #${soId} to a Shopify order`}
         description={
           ambiguous
@@ -493,11 +748,13 @@ export function LsMatchControls({
           ambiguous
             ? {
                 label: 'None of these — stop suggesting them',
-                onClick: async () => {
-                  for (const c of shopifyCandidates) {
-                    await actions.onUnmatch(soId, c.order_id)
-                  }
-                },
+                confirmationTitle: 'Stop suggesting these Shopify orders?',
+                confirmationDescription: `This will exclude ${shopifyCandidates.length} candidate${shopifyCandidates.length === 1 ? '' : 's'} from future automatic matching for SO #${soId}. Only continue if none of them belongs to this special order.`,
+                confirmLabel: 'Exclude these candidates',
+                onClick: () => actions.onBatchUnmatch(
+                  soId,
+                  shopifyCandidates.map((candidate) => candidate.order_id),
+                ),
               }
             : undefined
         }
@@ -513,10 +770,12 @@ export function WorkorderNotesDialog({
   order,
   open,
   onOpenChange,
+  contentId,
 }: {
   order: SpecialOrder
   open: boolean
   onOpenChange: (open: boolean) => void
+  contentId?: string
 }) {
   const notes: { label: string; value: string | null }[] = [
     { label: 'Workorder note', value: order.workorder_note },
@@ -527,7 +786,7 @@ export function WorkorderNotesDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-lg">
+      <DialogContent id={contentId} className="max-w-lg">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Wrench className="h-4 w-4 text-cyan-600" />
@@ -554,7 +813,7 @@ export function WorkorderNotesDialog({
             .filter((n) => n.value)
             .map((n) => (
               <div key={n.label} className="flex flex-col gap-1">
-                <span className="text-muted-foreground text-[10px] font-semibold uppercase tracking-wider">
+                <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                   {n.label}
                 </span>
                 <p className="whitespace-pre-wrap rounded-md border bg-muted/30 px-3 py-2 text-sm">{n.value}</p>
@@ -584,6 +843,7 @@ export function WorkorderNotesDialog({
 export function WorkorderFields({ order }: { order: SpecialOrder }) {
   const [notesOpen, setNotesOpen] = useState(false)
   const hasNotes = Boolean(order.workorder_note || order.workorder_internal_note || order.workorder_hook_in)
+  const notesId = useId()
 
   if (!order.workorder_id) {
     return (
@@ -603,7 +863,10 @@ export function WorkorderFields({ order }: { order: SpecialOrder }) {
             type="button"
             onClick={() => setNotesOpen(true)}
             title={hasNotes ? 'View workorder notes' : 'No notes on this workorder'}
-            className="inline-flex max-w-full items-center gap-1 text-left font-medium text-cyan-700 hover:underline"
+            aria-haspopup="dialog"
+            aria-expanded={notesOpen}
+            aria-controls={notesId}
+            className="inline-flex min-h-9 max-w-full items-center gap-1 rounded px-1 text-left font-medium text-cyan-700 hover:bg-cyan-50 hover:underline"
           >
             <Wrench className="h-3 w-3 shrink-0" />
             <span className="truncate">#{order.workorder_id}</span>
@@ -612,7 +875,12 @@ export function WorkorderFields({ order }: { order: SpecialOrder }) {
         }
       />
       <Field label="Status" value={order.workorder_status} />
-      <WorkorderNotesDialog order={order} open={notesOpen} onOpenChange={setNotesOpen} />
+      <WorkorderNotesDialog
+        order={order}
+        open={notesOpen}
+        onOpenChange={setNotesOpen}
+        contentId={notesId}
+      />
     </FieldGroup>
   )
 }

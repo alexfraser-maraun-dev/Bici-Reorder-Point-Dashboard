@@ -81,9 +81,10 @@ def test_promise_precedence_and_implied_exclusion():
     assert len(got) == 1 and got[0]["promise_source"] == "shopify_metafield", got
     assert got[0]["promise_date"] == "2026-09-01", got
 
-    # Service flow: no metafield, so the workorder eta-out is the promise.
+    # Workorder eta-out is the bike booking/service date, not a parts promise. Service parts
+    # promises are written explicitly through the app-owned promise endpoint instead.
     svc = so_stage_log.collect_promises([_row(workorder_eta_out="2026-09-20")])
-    assert svc[0]["promise_source"] == "workorder_eta_out", svc
+    assert svc == [], svc
 
     # No human-recorded promise anywhere -> nothing enters the ledger. Implied dates are for
     # prioritisation only; letting them in would make the on-time number self-referential.

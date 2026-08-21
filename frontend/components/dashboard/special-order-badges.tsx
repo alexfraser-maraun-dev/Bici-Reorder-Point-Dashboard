@@ -2,11 +2,10 @@
 
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
-import type { ProcurementStage, SpecialOrderFlag, ShopifyMatch, ShopifyMatchBasis, SpecialOrderSource, SlaSeverity, TriageStage } from '@/lib/types'
+import type { ShopifyMatch, ShopifyMatchBasis, SpecialOrderSource, SlaSeverity, TriageStage } from '@/lib/types'
 import {
   AlertTriangle,
   CircleHelp,
-  CircleCheck,
   PackageCheck,
   Inbox,
   FileClock,
@@ -31,11 +30,11 @@ interface BadgeConfig {
 
 // The triage stage (the "where is it" axis). `shopify` is the leftmost inbound stage.
 const stageConfig: Record<TriageStage, BadgeConfig> = {
-  shopify: { label: 'Shopify', className: 'bg-violet-100 text-violet-700 border-violet-200', icon: Store },
-  open_pool: { label: 'Open Pool', className: 'bg-secondary text-muted-foreground border-border', icon: Inbox },
-  unordered_po: { label: 'Unordered PO', className: 'bg-orange-100 text-orange-700 border-orange-200', icon: FileClock },
-  ordered: { label: 'Ordered', className: 'bg-blue-100 text-blue-700 border-blue-200', icon: ShoppingCart },
-  received: { label: 'Received', className: 'bg-emerald-100 text-emerald-700 border-emerald-200', icon: PackageCheck },
+  shopify: { label: 'Shopify intake', className: 'bg-violet-100 text-violet-700 border-violet-200', icon: Store },
+  open_pool: { label: 'Awaiting PO', className: 'bg-secondary text-muted-foreground border-border', icon: Inbox },
+  unordered_po: { label: 'Draft PO', className: 'bg-orange-100 text-orange-700 border-orange-200', icon: FileClock },
+  ordered: { label: 'In transit', className: 'bg-blue-100 text-blue-700 border-blue-200', icon: ShoppingCart },
+  received: { label: 'Arrived', className: 'bg-emerald-100 text-emerald-700 border-emerald-200', icon: PackageCheck },
 }
 
 // Where the special order came from. Deliberately always rendered (including 'neither') --
@@ -43,14 +42,14 @@ const stageConfig: Record<TriageStage, BadgeConfig> = {
 const sourceConfig: Record<SpecialOrderSource, BadgeConfig> = {
   workorder: { label: 'Workorder', className: 'bg-cyan-100 text-cyan-700 border-cyan-200', icon: Wrench },
   shopify: { label: 'Shopify', className: 'bg-violet-100 text-violet-700 border-violet-200', icon: Store },
-  neither: { label: 'Unattributed', className: 'bg-amber-100 text-amber-700 border-amber-200', icon: HelpCircle },
+  neither: { label: 'Lightspeed direct', className: 'bg-amber-100 text-amber-700 border-amber-200', icon: HelpCircle },
 }
 
 export function SourceBadge({ source }: { source: SpecialOrderSource | null | undefined }) {
   const config = sourceConfig[source ?? 'neither'] ?? sourceConfig.neither
   const Icon = config.icon
   return (
-    <Badge variant="outline" className={cn('gap-1 text-[10px] font-medium', config.className)}>
+    <Badge variant="outline" className={cn('gap-1 text-xs font-medium', config.className)}>
       <Icon className="h-3 w-3" />
       {config.label}
     </Badge>
@@ -76,7 +75,7 @@ export function SeverityBadge({ severity, muted }: { severity: SlaSeverity; mute
   return (
     <Badge
       variant="outline"
-      className={cn('gap-1 text-[10px] font-medium', config.className, muted && 'opacity-50')}
+      className={cn('gap-1 text-xs font-medium', config.className, muted && 'opacity-50')}
     >
       <Icon className="h-3 w-3" />
       {config.label}
@@ -88,7 +87,7 @@ export function StageBadge({ stage }: { stage: TriageStage }) {
   const config = stageConfig[stage] ?? stageConfig.open_pool
   const Icon = config.icon
   return (
-    <Badge variant="outline" className={cn('gap-1 text-[10px] font-medium', config.className)}>
+    <Badge variant="outline" className={cn('gap-1 text-xs font-medium', config.className)}>
       <Icon className="h-3 w-3" />
       {config.label}
     </Badge>
@@ -120,28 +119,28 @@ export function ShopifyMatchBadge({
   const title = basis ? BASIS_LABEL[basis] : undefined
   if (match === 'matched') {
     return (
-      <Badge variant="outline" title={title} className="gap-1 border-violet-200 bg-violet-100 text-[10px] font-medium text-violet-700">
+      <Badge variant="outline" title={title} className="gap-1 border-violet-200 bg-violet-100 text-xs font-medium text-violet-700">
         <Link2 className="h-3 w-3" />{basis === 'manual' ? 'Linked' : 'Matched'}
       </Badge>
     )
   }
   if (match === 'ambiguous') {
     return (
-      <Badge variant="outline" title={title} className="gap-1 border-amber-200 bg-amber-100 text-[10px] font-medium text-amber-700">
+      <Badge variant="outline" title={title} className="gap-1 border-amber-200 bg-amber-100 text-xs font-medium text-amber-700">
         <CircleHelp className="h-3 w-3" />Ambiguous
       </Badge>
     )
   }
   if (possible) {
     return (
-      <Badge variant="outline" title="One or more LS special orders could plausibly claim this order" className="gap-1 border-amber-200 bg-amber-50 text-[10px] font-medium text-amber-700">
+      <Badge variant="outline" title="One or more LS special orders could plausibly claim this order" className="gap-1 border-amber-200 bg-amber-50 text-xs font-medium text-amber-700">
         <CircleHelp className="h-3 w-3" />Possible match
       </Badge>
     )
   }
   // 'none' on an LS row means "no Shopify order"; on a Shopify-only row it reads as Unmatched.
   return (
-    <Badge variant="outline" className="gap-1 border-border bg-secondary text-[10px] font-medium text-muted-foreground">
+    <Badge variant="outline" className="gap-1 border-border bg-secondary text-xs font-medium text-muted-foreground">
       <Unlink className="h-3 w-3" />Unmatched
     </Badge>
   )
@@ -155,7 +154,7 @@ export function SpecialOrderStatusBadge({ status }: { status: string }) {
   else if (s.includes('received')) className = 'bg-blue-100 text-blue-700 border-blue-200'
   else if (s.includes('ordered')) className = 'bg-yellow-100 text-yellow-700 border-yellow-200'
   return (
-    <Badge variant="outline" className={cn('text-[10px] font-medium', className)}>
+    <Badge variant="outline" className={cn('text-xs font-medium', className)}>
       {status}
     </Badge>
   )

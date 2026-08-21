@@ -3,18 +3,10 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import type {
   SkuLocationRow,
-  RecommendationRun,
-  WritebackAuditEntry,
-  ManagedSku,
   FilterState,
   KpiSummary,
 } from './types'
-import {
-  generateMockSkuData,
-  generateMockRecommendationRuns,
-  generateMockWritebackAudit,
-  generateMockManagedSkus,
-} from './mock-data'
+import { generateMockSkuData } from './mock-data'
 
 // Simulated API delay
 const simulateDelay = (ms: number = 500) => new Promise(resolve => setTimeout(resolve, ms))
@@ -40,7 +32,8 @@ export function useSkuData(filters: FilterState) {
   }, [])
 
   useEffect(() => {
-    refetch()
+    const timer = window.setTimeout(() => { void refetch() }, 0)
+    return () => window.clearTimeout(timer)
   }, [refetch])
 
   // Apply filters
@@ -279,7 +272,6 @@ export async function saveBrandSourcingRule(rule: {
 export async function updateShopifyEta(input: {
   shopify_order_id: string
   eta: string | null
-  updated_by?: string
 }) {
   const baseUrl = '/backend'
   const res = await fetch(`${baseUrl}/api/special-orders/eta`, {
@@ -294,12 +286,37 @@ export async function updateShopifyEta(input: {
   return res.json()
 }
 
+// Service workorders do not have a Shopify order metafield and `workorder.etaOut` is the bike's
+// completion estimate, not a parts promise. This app-owned promise is audited separately and
+// feeds the same SLA/work-queue model without writing a misleading date back to Lightspeed.
+export async function updateServicePromise(
+  specialOrderId: string,
+  promiseDate: string | null,
+) {
+  const res = await fetch(`/backend/api/special-orders/${specialOrderId}/service-promise`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ promise_date: promiseDate }),
+  })
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || 'Failed to update the service parts promise')
+  }
+  return res.json() as Promise<{
+    status: 'success'
+    special_order_id: string
+    service_promise_date: string | null
+    service_promise_source: 'service_manual' | null
+    changed: boolean
+  }>
+}
+
 // Manually links / unlinks an LS special order and a Shopify order (persisted override;
 // unlink also forbids auto-matching from re-proposing the pair). The backend rebuilds its
 // dashboard cache on success — follow with a plain revalidate.
 async function postSoMatchOverride(
   path: 'match' | 'unmatch',
-  input: { special_order_id: string; shopify_order_id: string; updated_by?: string }
+  input: { special_order_id: string; shopify_order_id: string }
 ) {
   const baseUrl = '/backend'
   const res = await fetch(`${baseUrl}/api/special-orders/${path}`, {
@@ -328,11 +345,26 @@ export async function lookupShopifyOrders(term: string): Promise<import('./types
   return data?.orders ?? []
 }
 
-export const matchSpecialOrder = (input: { special_order_id: string; shopify_order_id: string; updated_by?: string }) =>
+export const matchSpecialOrder = (input: { special_order_id: string; shopify_order_id: string }) =>
   postSoMatchOverride('match', input)
 
-export const unmatchSpecialOrder = (input: { special_order_id: string; shopify_order_id: string; updated_by?: string }) =>
+export const unmatchSpecialOrder = (input: { special_order_id: string; shopify_order_id: string }) =>
   postSoMatchOverride('unmatch', input)
+
+export async function saveSpecialOrderMatchDecisions(
+  decisions: { special_order_id: string; shopify_order_id: string; action: 'link' | 'unlink' }[],
+) {
+  const res = await fetch('/backend/api/special-orders/match-decisions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ decisions }),
+  })
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null)
+    throw new Error(errorData?.detail || 'Failed to save the matching decisions')
+  }
+  return res.json() as Promise<{ status: 'success'; saved: number }>
+}
 
 // ---------------------------------------------------------------------------
 // Purchase Orders
@@ -673,14 +705,22 @@ export function useSoRecommendation(specialOrderId: string | null) {
   return { recommendation: data, isLoading, error }
 }
 
-/** Open POs at one store, for overriding a recommendation. Lazy on shop id. */
-export function useCandidatePos(shopId: string | null) {
-  const { data, error, isLoading } = useSWR<{ orders: import('./types').CandidatePo[] }>(
-    shopId ? `/backend/api/special-orders/candidate-pos?shop_id=${shopId}` : null,
+/** Lazy operational timeline for the selected drawer row. */
+export function useSoActivity(specialOrderId: string | null) {
+  const { data, error, isLoading, mutate } = useSWR<{
+    special_order_id: string
+    activity: import('./types').SpecialOrderActivityEvent[]
+  }>(
+    specialOrderId ? `/backend/api/special-orders/${specialOrderId}/activity` : null,
     fetcher,
-    { revalidateOnFocus: false, dedupingInterval: 300000 },
+    { revalidateOnFocus: true, dedupingInterval: 30000 },
   )
-  return { candidates: data?.orders ?? [], isLoading, error }
+  return {
+    activity: data?.activity ?? [],
+    isLoading,
+    error,
+    revalidate: mutate,
+  }
 }
 
 /** Scoreboard metrics. Lazy — pass false until the panel is opened, since the history half
@@ -694,16 +734,27 @@ export function useSoScoreboard(enabled: boolean) {
   return { scoreboard: data, isLoading, error }
 }
 
-export function useSpecialOrders() {
+export function useSpecialOrders({ liveOnly = true }: { liveOnly?: boolean } = {}) {
   const baseUrl = '/backend'
   // The escalations endpoint is a strict superset of /api/special-orders: the same rows plus
   // each one's SLA verdict, with acknowledgements merged fresh per request (they must not be
   // served from the 5-minute dashboard cache, or an ack would appear to do nothing).
-  const url = `${baseUrl}/api/special-orders/escalations`
-  const { data, error, mutate, isLoading } = useSWR<import('./types').SpecialOrderDashboard>(
+  // `live_only_days=0` is meaningful: it asks the server for the historical close-out backlog.
+  // Keeping it in the SWR key prevents the old bug where the client unchecked "Live SOs" but
+  // could only filter the already-truncated 365-day response it had received.
+  const liveOnlyDays = liveOnly ? 365 : 0
+  const url = `${baseUrl}/api/special-orders/escalations?live_only_days=${liveOnlyDays}`
+  const { data, error, mutate, isLoading } = useSWR<import('./types').SpecialOrderWorklistResponse>(
     url,
     fetcher,
-    adminDashboardSWRConfig
+    {
+      ...adminDashboardSWRConfig,
+      revalidateOnFocus: true,
+      revalidateOnReconnect: true,
+      revalidateIfStale: true,
+      refreshInterval: 180000,
+      dedupingInterval: 30000,
+    },
   )
 
   const [isRefreshing, setIsRefreshing] = useState(false)
@@ -715,7 +766,7 @@ export function useSpecialOrders() {
   const refetch = async () => {
     setIsRefreshing(true)
     try {
-      const fresh = await fetcher(`${url}?refresh=true`)
+      const fresh = await fetcher(`${url}&refresh=true`)
       await mutate(fresh, { revalidate: false })
     } finally {
       setIsRefreshing(false)
@@ -732,10 +783,12 @@ export function useSpecialOrders() {
   return {
     orders: data?.orders ?? [],
     summary: data?.summary,
-    sla: data?.summary as unknown as import('./types').SpecialOrderSummarySla | undefined,
+    sla: data?.summary,
     reasonCodes: data?.reason_codes ?? [],
     shopifyOnly: data?.shopify_only ?? [],
     fetchedAt: data?.fetched_at,
+    meta: data?.meta,
+    sourceHealth: data?.meta?.sources,
     isLoading,
     isRefreshing,
     error,

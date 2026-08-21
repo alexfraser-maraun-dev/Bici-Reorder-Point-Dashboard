@@ -1,10 +1,20 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { Suspense, useMemo, useState } from 'react'
+import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import { toast } from 'sonner'
-import { useSpecialOrders, matchSpecialOrder, unmatchSpecialOrder } from '@/lib/hooks'
-import type { SpecialOrder, ShopifyOnlyOrder, TriageStage, SpecialOrderFlag } from '@/lib/types'
-import type { TriageTone } from '@/lib/special-order-triage'
+import {
+  useSpecialOrders,
+  matchSpecialOrder,
+  saveSpecialOrderMatchDecisions,
+  unmatchSpecialOrder,
+} from '@/lib/hooks'
+import type {
+  ShopifyOnlyOrder,
+  SpecialOrder,
+  SpecialOrderSourceStatus,
+  TriageStage,
+} from '@/lib/types'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -17,142 +27,174 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet'
 import { cn } from '@/lib/utils'
-import { SoLegend } from '@/components/dashboard/so-legend'
+import { SoLegend, type SoLegendCounts } from '@/components/dashboard/so-legend'
 import { SoScoreboard } from '@/components/dashboard/so-scoreboard'
 import { SpecialOrdersGrid } from '@/components/dashboard/special-orders-grid'
 import {
-  Store,
-  ListChecks,
-  Inbox,
+  AlertTriangle,
+  BarChart3,
   FileClock,
-  ShoppingCart,
+  Inbox,
   PackageCheck,
   RefreshCw,
   Search,
-  AlertTriangle,
+  Store,
+  Truck,
+  X,
 } from 'lucide-react'
 
-// "Live SOs": hide special orders created more than this many days ago (likely abandoned).
-const LIVE_SO_MAX_DAYS = 365
+type ViewKey = 'action' | 'needs_ordering' | 'in_transit' | 'ready_to_close' | 'data_issues' | 'all'
 
-const seg = (group: string, subKey: string) => `${group}::${subKey}`
+const ACTION_QUEUE_STATES = new Set(['intake', 'needs_ordering', 'vendor_followup', 'promise_needed', 'closeout'])
 
-type Sub = { key: string; label: string; tone: TriageTone; pred: (o: SpecialOrder) => boolean }
-type Tile = { group: string; label: string; icon: typeof Store; color: string; bgColor: string; subs: Sub[] }
-
-const isLs = (o: SpecialOrder) => o.kind !== 'shopify'
-// One definition of "needs a human". The old age-based flag system was removed 2026-08-20: it
-// disagreed with the SLA verdict on 48 of 219 live rows, and drove a second filter, a second
-// sort and its own tiles — two controls answering the same question differently, with no way to
-// tell which was right.
-const needsAction = (o: SpecialOrder) => isLs(o) && o.actionable
-
-// POSITIONAL tiles: where every special order sits in the pipeline. Deliberately not "action"
-// tiles — position is a fact about the order, while what to do about it belongs to the tabs.
-// Each splits only into needs-action vs on-track, so the tile never restates the SLA taxonomy.
-const STAGE_TILES: { stage: SpecialOrder['procurement_stage']; label: string; icon: typeof Store; color: string; bgColor: string }[] = [
-  { stage: 'open_pool', label: 'Awaiting a PO', icon: Inbox, color: 'text-foreground', bgColor: 'bg-secondary' },
-  { stage: 'unordered_po', label: 'On an unsent PO', icon: FileClock, color: 'text-orange-600', bgColor: 'bg-orange-50' },
-  { stage: 'ordered', label: 'Placed, in transit', icon: ShoppingCart, color: 'text-blue-600', bgColor: 'bg-blue-50' },
-  { stage: 'received', label: 'Arrived', icon: PackageCheck, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
-]
-
-// SOURCE tile: where the special order came from. 'Unattributed' is a real order type — raised
-// straight into Lightspeed at the counter or by phone — not a data defect: of 57 such live
-// orders, 56 verifiably have no Shopify order behind them.
-const SOURCE_SUBS: { key: SpecialOrder['source']; label: string; tone: TriageTone }[] = [
-  { key: 'shopify', label: 'Shopify', tone: 'ok' },
-  { key: 'workorder', label: 'Workorder', tone: 'ok' },
-  { key: 'neither', label: 'Unattributed', tone: 'warn' },
-]
-
-const buildTiles = (): Tile[] => [
+const VIEWS: {
+  key: ViewKey
+  label: string
+  description: string
+  pred: (order: SpecialOrder) => boolean
+}[] = [
   {
-    group: 'source', label: 'Source', icon: Store, color: 'text-violet-600', bgColor: 'bg-violet-50',
-    subs: SOURCE_SUBS.map((s) => ({
-      key: String(s.key), label: s.label, tone: s.tone,
-      pred: (o: SpecialOrder) => (o.source ?? 'neither') === s.key,
-    })),
+    key: 'action',
+    label: 'Action required',
+    description: 'Work that needs an owner now. Parked orders return here when their check-back is due.',
+    pred: (order) => order.queue_states.some((state) => ACTION_QUEUE_STATES.has(state)) &&
+      (!order.ack_active || order.checkback_due),
   },
-  ...STAGE_TILES.map((t) => ({
-    group: t.stage, label: t.label, icon: t.icon, color: t.color, bgColor: t.bgColor,
-    subs: [
-      { key: 'needs_action', label: 'Needs action', tone: 'danger' as TriageTone,
-        pred: (o: SpecialOrder) => isLs(o) && o.procurement_stage === t.stage && needsAction(o) },
-      { key: 'on_track', label: 'On track', tone: 'ok' as TriageTone,
-        pred: (o: SpecialOrder) => isLs(o) && o.procurement_stage === t.stage && !needsAction(o) },
-    ],
-  })),
-]
-
-// The tabs. Each is a slice of the pipeline plus a plain statement of what removes a row from
-// it — the question people actually have when looking at a list of problems.
-type ViewKey = 'overview' | 'needs_ordering' | 'in_transit' | 'arrived' | 'problems'
-
-// A row has a "problem" when something about its DATA blocks procurement, as opposed to the
-// work simply not being done yet.
-const hasProblem = (o: SpecialOrder) =>
-  !isLs(o) || Boolean(o.link_broken) || o.shopify_match === 'ambiguous' ||
-  (o.missing_promise && o.procurement_stage !== 'received')
-
-const VIEWS: { key: ViewKey; label: string; blurb: string; pred: (o: SpecialOrder) => boolean }[] = [
   {
-    key: 'overview', label: 'Overview',
-    blurb: 'Every live special order and where it sits. Use the tiles to slice the list; the tabs above narrow it to one kind of work.',
+    key: 'needs_ordering',
+    label: 'Needs ordering',
+    description: 'Shopify intake and Lightspeed orders that still need a supply route confirmed in Lightspeed.',
+    pred: (order) => order.queue_states.includes('intake') || order.queue_states.includes('needs_ordering'),
+  },
+  {
+    key: 'in_transit',
+    label: 'In transit',
+    description: 'Orders already placed with a vendor. Prioritize missed dates and vendor follow-up.',
+    pred: (order) => order.queue_states.includes('in_transit'),
+  },
+  {
+    key: 'ready_to_close',
+    label: 'Ready to close',
+    description: 'Items received but still waiting for customer, Shopify, retail, or service close-out.',
+    pred: (order) => order.queue_states.includes('closeout'),
+  },
+  {
+    key: 'data_issues',
+    label: 'Data issues',
+    description: 'Missing promises and Shopify links that need a human decision before the record can be trusted.',
+    pred: (order) => order.queue_states.includes('promise_needed') || Boolean(order.link_broken) || order.shopify_match === 'ambiguous',
+  },
+  {
+    key: 'all',
+    label: 'All',
+    description: 'Every order in the current live or historical scope.',
     pred: () => true,
   },
+]
+
+const PIPELINE: {
+  key: TriageStage
+  label: string
+  icon: typeof Store
+  tone: string
+  pred: (order: SpecialOrder) => boolean
+}[] = [
   {
-    key: 'needs_ordering', label: 'Needs ordering',
-    blurb: 'No purchase order yet, or sitting on a draft that was never sent. A row leaves this list once its PO is placed with the vendor — or sooner, if the item turns out to be in stock or already inbound.',
-    pred: (o) => isLs(o) && (o.procurement_stage === 'open_pool' || o.procurement_stage === 'unordered_po'),
+    key: 'shopify',
+    label: 'Shopify intake',
+    icon: Store,
+    tone: 'border-violet-200 bg-violet-50 text-violet-700',
+    pred: (order) => order.kind === 'shopify',
   },
   {
-    key: 'in_transit', label: 'In transit',
-    blurb: 'Placed with the vendor and on its way. A row leaves this list when the item is received against the purchase order. Chase the ones past their expected date.',
-    pred: (o) => isLs(o) && o.procurement_stage === 'ordered',
+    key: 'open_pool',
+    label: 'Awaiting PO',
+    icon: Inbox,
+    tone: 'border-slate-200 bg-slate-50 text-slate-700',
+    pred: (order) => order.kind !== 'shopify' && order.procurement_stage === 'open_pool',
   },
   {
-    key: 'arrived', label: 'Arrived',
-    blurb: 'The item is here and the SLA clock has stopped — nothing on this list is a late delivery. A retail order leaves it when its Shopify order is fulfilled; a service order when the workorder is closed. Untick \u201cLive SOs\u201d to include the long close-out backlog.',
-    pred: (o) => isLs(o) && o.procurement_stage === 'received',
+    key: 'unordered_po',
+    label: 'Draft PO',
+    icon: FileClock,
+    tone: 'border-orange-200 bg-orange-50 text-orange-700',
+    pred: (order) => order.kind !== 'shopify' && order.procurement_stage === 'unordered_po',
   },
   {
-    key: 'problems', label: 'Problems',
-    blurb: 'Data standing in the way of procurement rather than work left undone: Shopify orders with no Lightspeed special order, manual links that no longer resolve, ambiguous matches, and orders nobody ever quoted a date for.',
-    pred: hasProblem,
+    key: 'ordered',
+    label: 'In transit',
+    icon: Truck,
+    tone: 'border-blue-200 bg-blue-50 text-blue-700',
+    pred: (order) => order.kind !== 'shopify' && order.procurement_stage === 'ordered',
+  },
+  {
+    key: 'received',
+    label: 'Arrived',
+    icon: PackageCheck,
+    tone: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+    pred: (order) => order.kind !== 'shopify' && order.procurement_stage === 'received',
   },
 ]
 
-const toneDot: Record<TriageTone, string> = {
-  danger: 'bg-red-500',
-  warn: 'bg-amber-500',
-  ok: 'bg-emerald-500',
+const SOURCE_LABEL: Record<string, string> = {
+  lightspeed: 'Lightspeed',
+  shopify: 'Shopify',
+  bigquery: 'BigQuery',
+  workorders: 'Workorders',
+  workorder: 'Workorder',
+  workflow: 'Workflow state',
+  neither: 'Lightspeed direct',
 }
 
-function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
-  const days = o.created_at ? Math.floor((Date.now() - Date.parse(o.created_at)) / 86_400_000) : null
+function formatFreshness(value: string): string {
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(value)) / 1000))
+  if (!Number.isFinite(ageSeconds) || ageSeconds < 60) return 'just now'
+  const minutes = Math.floor(ageSeconds / 60)
+  if (minutes < 60) return `${minutes} min ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} hr ago`
+  const days = Math.floor(hours / 24)
+  return `${days} day${days === 1 ? '' : 's'} ago`
+}
+
+function validView(value: string | null): ViewKey {
+  return VIEWS.some((view) => view.key === value) ? value as ViewKey : 'action'
+}
+
+function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
+  const days = order.created_at
+    ? Math.floor((Date.now() - Date.parse(order.created_at)) / 86_400_000)
+    : null
   return {
-    special_order_id: o.order_name ?? o.order_id,
+    special_order_id: order.order_name ?? order.order_id,
     status: 'Shopify',
     unit_quantity: null,
     shop_id: null,
     store: null,
-    timestamp: o.created_at,
-    created_date: o.created_at ? o.created_at.slice(0, 10) : null,
+    timestamp: order.created_at,
+    created_date: order.created_at?.slice(0, 10) ?? null,
     days_since_creation: days,
     contacted: false,
     completed: false,
     customer_id: null,
-    customer_name: o.customer_email,
+    customer_name: order.customer_email,
     customer_phone: null,
-    customer_email: o.customer_email,
+    customer_email: order.customer_email,
     item_id: null,
-    system_sku: o.skus[0] ?? null,
+    system_sku: order.skus[0] ?? null,
     upc: null,
     brand: null,
     available_vendors: [],
-    description: o.skus.join(', ') || null,
+    description: order.skus.join(', ') || null,
     order_id: null,
     vendor_id: null,
     vendor_name: null,
@@ -162,11 +204,8 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
     po_ordered: false,
     po_complete: false,
     received_started: false,
-    procurement_stage: 'open_pool', // unused for shopify rows — the table branches on `kind`
+    procurement_stage: 'open_pool',
     procurement_stage_index: -1,
-    // A tagged Shopify order with no Lightspeed SO behind it yet: the intake case. Source is
-    // 'shopify' because that is genuinely where it came from — the missing piece is the LS SO,
-    // not the derivation.
     source: 'shopify',
     days_in_stage: days,
     po_created_date: null,
@@ -179,21 +218,16 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
     link_provenance: null,
     link_broken: null,
     matched_via_closed_order: false,
-    // No Lightspeed special order exists yet, so there is no route to cost out.
     fastest_landing_date: null,
     fastest_path_tier: null,
     could_have_landed: null,
     days_lost: null,
-    // Shopify-only rows have no Lightspeed special order, so the backend computes no SLA
-    // verdict for them. They are the intake gap (tagged in Shopify, never created in LS) and
-    // are surfaced by the Shopify tile — neutral values here keep them out of the procurement
-    // severity counts rather than showing up as fake breaches.
     sla_severity: 'no_promise',
     sla_severity_rank: 5,
     sla_owner: 'cs',
-    sla_reason: 'Tagged in Shopify but no Lightspeed special order exists yet.',
-    promise_date: o.shopify_expected_date ?? null,
-    promise_source: o.shopify_expected_date ? 'shopify_metafield' : null,
+    sla_reason: 'This Shopify order still needs a Lightspeed special order.',
+    promise_date: order.shopify_expected_date,
+    promise_source: order.shopify_expected_date ? 'shopify_metafield' : null,
     lead_time_days: 0,
     lead_time_source: 'default',
     receiving_buffer_days: 0,
@@ -201,22 +235,34 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
     slack_days: null,
     stage_sla_days: null,
     days_over_stage_sla: null,
-    missing_promise: !o.shopify_expected_date,
-    promise_owner: o.shopify_expected_date ? null : 'cs',
+    missing_promise: !order.shopify_expected_date,
+    promise_owner: order.shopify_expected_date ? null : 'cs',
     ack: null,
     ack_active: false,
     escalation_level: 0,
-    actionable: false,
+    actionable: true,
     checkback_due: false,
+    work_state: 'intake',
+    queue_states: order.shopify_expected_date ? ['intake'] : ['intake', 'promise_needed'],
+    next_action: 'Create the Lightspeed special order',
+    action_owner: 'retail',
+    action_due_date: order.created_at?.slice(0, 10) ?? null,
+    closeout_state: null,
+    service_promise_date: null,
+    service_promise_source: null,
+    service_promise_recorded_at: null,
+    service_promise_recorded_by: null,
     flag: 'none',
     days_overdue: null,
     is_overdue: false,
     shopify_match: 'none',
     shopify_match_basis: null,
-    shopify_order_id: o.order_id,
-    shopify_order_name: o.order_name,
-    shopify_order_url: o.shopify_order_url,
-    shopify_expected_date: o.shopify_expected_date,
+    shopify_order_id: order.order_id,
+    shopify_order_name: order.order_name,
+    shopify_order_url: order.shopify_order_url,
+    shopify_expected_date: order.shopify_expected_date,
+    shopify_fulfillment_status: order.fulfillment_status,
+    shopify_financial_status: order.financial_status,
     shopify_candidates: [],
     workorder_id: null,
     workorder_status: null,
@@ -230,432 +276,508 @@ function shopifyRow(o: ShopifyOnlyOrder): SpecialOrder {
     ls_customer_url: null,
     ls_order_url: null,
     kind: 'shopify',
-    ambiguous_candidate: o.ambiguous_candidate === true,
+    ambiguous_candidate: order.ambiguous_candidate === true,
   }
 }
 
+function compareOperationalPriority(a: SpecialOrder, b: SpecialOrder): number {
+  const aActive = a.actionable || a.checkback_due
+  const bActive = b.actionable || b.checkback_due
+  if (aActive !== bActive) return aActive ? -1 : 1
+  if (a.sla_severity_rank !== b.sla_severity_rank) {
+    return a.sla_severity_rank - b.sla_severity_rank
+  }
+  const dueCompare = (a.action_due_date ?? '9999-12-31').localeCompare(
+    b.action_due_date ?? '9999-12-31',
+  )
+  if (dueCompare !== 0) return dueCompare
+  return (b.days_since_creation ?? 0) - (a.days_since_creation ?? 0)
+}
+
+function SourceHealth({ sources }: { sources?: Record<string, SpecialOrderSourceStatus> }) {
+  const entries = Object.entries(sources ?? {})
+  if (entries.length === 0) return null
+  const degraded = entries.filter(([, health]) => health.status !== 'ok')
+  if (degraded.length === 0) {
+    return (
+      <span
+        className="ml-2 inline-flex items-center gap-1"
+        aria-label="All Special Orders data sources are healthy"
+        title={entries.map(([source]) => SOURCE_LABEL[source] ?? source).join(', ')}
+      >
+        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" aria-hidden="true" />
+        All systems healthy
+      </span>
+    )
+  }
+  return (
+    <span className="ml-2 inline-flex flex-wrap items-center gap-2" aria-label="Data source health">
+      {degraded.map(([source, health]) => (
+        <span
+          key={source}
+          className="inline-flex items-center gap-1"
+          title={health.message ?? `${SOURCE_LABEL[source] ?? source}: ${health.status}`}
+        >
+          <span
+            className={cn(
+              'h-1.5 w-1.5 rounded-full',
+              health.status === 'ok' && 'bg-emerald-500',
+              health.status === 'stale' && 'bg-amber-500',
+              health.status === 'unavailable' && 'bg-red-500',
+            )}
+            aria-hidden="true"
+          />
+          {SOURCE_LABEL[source] ?? source}
+          <span> {health.status}</span>
+        </span>
+      ))}
+    </span>
+  )
+}
+
+function FilterChip({ label, onRemove }: { label: string; onRemove: () => void }) {
+  return (
+    <Button
+      type="button"
+      variant="secondary"
+      size="sm"
+      className="h-7 gap-1.5 rounded-full px-2.5 text-xs"
+      onClick={onRemove}
+      aria-label={`Remove filter: ${label}`}
+    >
+      {label}
+      <X className="h-3.5 w-3.5" />
+    </Button>
+  )
+}
+
+function SpecialOrdersFallback() {
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div className="space-y-2">
+          <Skeleton className="h-8 w-52" />
+          <Skeleton className="h-4 w-96" />
+        </div>
+        <Skeleton className="h-8 w-24" />
+      </div>
+      <Skeleton className="h-24 w-full rounded-lg" />
+      <Skeleton className="h-10 w-full" />
+      {Array.from({ length: 6 }).map((_, index) => (
+        <Skeleton key={index} className="h-[92px] w-full rounded-lg" />
+      ))}
+    </div>
+  )
+}
+
 export function SpecialOrdersContent() {
-  const { orders, shopifyOnly, sla, isLoading, isRefreshing, refetch, revalidate, fetchedAt, error } =
-    useSpecialOrders()
-  // Tile labels are derived from the backend's tier boundaries, falling back to the shipped
-  // defaults until the first payload lands.
-  const TILES = useMemo(() => buildTiles(), [])
+  return (
+    <Suspense fallback={<SpecialOrdersFallback />}>
+      <SpecialOrdersContentInner />
+    </Suspense>
+  )
+}
+
+function SpecialOrdersContentInner() {
+  const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const view = validView(searchParams.get('queue'))
+  const search = searchParams.get('q') ?? ''
+  const storeFilter = searchParams.get('store') ?? 'all'
+  const sourceFilter = searchParams.get('source') ?? 'all'
+  const orderTypeFilter = searchParams.get('type') ?? 'all'
+  const liveOnly = searchParams.get('archive') !== '1'
+  const [insightsOpen, setInsightsOpen] = useState(false)
+
+  const {
+    orders,
+    shopifyOnly,
+    isLoading,
+    isRefreshing,
+    refetch,
+    revalidate,
+    fetchedAt,
+    sourceHealth,
+    error,
+  } = useSpecialOrders({ liveOnly })
+
+  const replaceParams = (updates: Record<string, string | null>) => {
+    const params = new URLSearchParams(searchParams.toString())
+    Object.entries(updates).forEach(([key, value]) => {
+      if (value === null || value === '') params.delete(key)
+      else params.set(key, value)
+    })
+    const query = params.toString()
+    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false })
+  }
 
   const handleSync = async () => {
     try {
       await refetch()
-      toast.success('Special orders synced from Lightspeed.')
+      toast.success('Special Orders data refreshed.')
     } catch {
-      toast.error('Sync failed. Lightspeed may be unavailable — try again.')
+      toast.error('Refresh failed. The current cached worklist remains visible.')
     }
   }
 
-  // Manual match/unmatch: persist the override, then pull the rebuilt payload (the backend
-  // re-matches over its cached Lightspeed rows — cheap, no full re-walk).
+  const refreshAfterSavedMutation = async () => {
+    try {
+      await revalidate()
+    } catch {
+      toast.warning('The change was saved, but the worklist could not refresh. Use Refresh data to try again.')
+    }
+  }
+
   const matchActions = {
     onMatch: async (specialOrderId: string, shopifyOrderId: string) => {
       try {
         await matchSpecialOrder({ special_order_id: specialOrderId, shopify_order_id: shopifyOrderId })
         toast.success(`Linked SO #${specialOrderId} to the Shopify order.`)
-        await revalidate()
-      } catch (err) {
-        toast.error(err instanceof Error ? err.message : 'Failed to link the orders.')
-        throw err
+      } catch (matchError) {
+        toast.error(matchError instanceof Error ? matchError.message : 'Failed to link the orders.')
+        throw matchError
       }
+      await refreshAfterSavedMutation()
     },
     onUnmatch: async (specialOrderId: string, shopifyOrderId: string) => {
       try {
         await unmatchSpecialOrder({ special_order_id: specialOrderId, shopify_order_id: shopifyOrderId })
         toast.success(`Unlinked SO #${specialOrderId} from the Shopify order.`)
-        await revalidate()
-      } catch (err) {
-        toast.error(err instanceof Error ? err.message : 'Failed to unlink the orders.')
-        throw err
+      } catch (unmatchError) {
+        toast.error(unmatchError instanceof Error ? unmatchError.message : 'Failed to unlink the orders.')
+        throw unmatchError
       }
+      await refreshAfterSavedMutation()
+    },
+    onBatchUnmatch: async (specialOrderId: string, shopifyOrderIds: string[]) => {
+      try {
+        await saveSpecialOrderMatchDecisions(shopifyOrderIds.map((shopifyOrderId) => ({
+          special_order_id: specialOrderId,
+          shopify_order_id: shopifyOrderId,
+          action: 'unlink',
+        })))
+        toast.success(`Excluded ${shopifyOrderIds.length} Shopify candidate${shopifyOrderIds.length === 1 ? '' : 's'} from SO #${specialOrderId}.`)
+      } catch (batchError) {
+        toast.error(batchError instanceof Error ? batchError.message : 'Failed to exclude the candidates.')
+        throw batchError
+      }
+      await refreshAfterSavedMutation()
     },
   }
-  const [selected, setSelected] = useState<Set<string>>(new Set())
-  const [search, setSearch] = useState('')
-  const [storeFilter, setStoreFilter] = useState<string>('all')
-  const [orderTypeFilter, setOrderTypeFilter] = useState<string>('all')
-  const [sourceFilter, setSourceFilter] = useState<string>('all')
 
-  // The active tab. Overview is the landing view; the rest narrow to one kind of work.
-  const [view, setView] = useState<ViewKey>('overview')
-  const activeView = useMemo(() => VIEWS.find((v) => v.key === view) ?? VIEWS[0], [view])
-  // Within a tab, show only rows that still need a human. Replaces both the old 'Flagged only'
-  // and 'Needs action' checkboxes, which disagreed with each other.
-  const [openWorkOnly, setOpenWorkOnly] = useState(false)
-  const [liveOnly, setLiveOnly] = useState(true)
-
-
-  // Unified rows: live LS SOs + Shopify-only ("Unmatched") pseudo-rows.
   const allRows = useMemo(
-    () => [...orders, ...shopifyOnly.map(shopifyRow)],
-    [orders, shopifyOnly]
+    () => [...orders, ...shopifyOnly.map(shopifyRow)].sort(compareOperationalPriority),
+    [orders, shopifyOnly],
   )
+  const lsUnmatched = useMemo(
+    () => orders.filter((order) => order.shopify_match !== 'matched'),
+    [orders],
+  )
+  const stores = useMemo(() => (
+    Array.from(new Set(orders.map((order) => order.store).filter((store): store is string => Boolean(store)))).sort()
+  ), [orders])
+  const orderTypes = useMemo(() => (
+    Array.from(new Set(orders.map((order) => order.order_type).filter((type): type is string => Boolean(type)))).sort()
+  ), [orders])
 
-  // Link targets for the manual match dialogs — full populations, ignoring the page filters.
-  // Ambiguous SOs are included: linking a "possible match" Shopify order to its ambiguous LS
-  // counterpart is the main way an ambiguity gets resolved from the Shopify side.
-  const lsUnmatched = useMemo(() => orders.filter((o) => o.shopify_match !== 'matched'), [orders])
-
-  const stores = useMemo(() => {
-    const names = new Set<string>()
-    orders.forEach((o) => { if (o.store) names.add(o.store) })
-    return Array.from(names).sort()
-  }, [orders])
-
-  // Order types come from the data rather than a hardcoded Replenishment/Booking pair, so
-  // renaming or adding a choice in Lightspeed shows up here without a code change.
-  const orderTypes = useMemo(() => {
-    const names = new Set<string>()
-    orders.forEach((o) => { if (o.order_type) names.add(o.order_type) })
-    return Array.from(names).sort()
-  }, [orders])
-
-  // Base set: everything EXCEPT the tile selection — so the tile counts react to the toggles.
-  const base = useMemo(() => {
+  const filteredPopulation = useMemo(() => {
     const term = search.trim().toLowerCase()
-    return allRows.filter((o) => {
-      // The tab is the primary slice. Age is handled solely by the 'Live SOs' toggle below —
-      // a second, received-specific age rule here made the Arrived tile and its tab disagree.
-      if (!activeView.pred(o)) return false
-      if (openWorkOnly && !needsAction(o)) return false
-      // 'Needs action' = a real SLA breach nobody has parked. Parked rows stay visible
-      // under the other filters so the reason and check-back date remain findable.
-      if (storeFilter !== 'all' && o.store !== storeFilter) return false
-      // 'none' = the SO has no PO yet, so it has no order type to speak of.
-      if (orderTypeFilter === 'none' && o.order_type) return false
-      if (orderTypeFilter !== 'all' && orderTypeFilter !== 'none' && o.order_type !== orderTypeFilter) return false
-      if (sourceFilter !== 'all' && (o.source ?? 'neither') !== sourceFilter) return false
-      if (liveOnly && o.days_since_creation !== null && o.days_since_creation > LIVE_SO_MAX_DAYS) return false
+    return allRows.filter((order) => {
+      if (storeFilter !== 'all' && order.store !== storeFilter) return false
+      if (sourceFilter !== 'all' && (order.source ?? 'neither') !== sourceFilter) return false
+      if (orderTypeFilter === 'none' && order.order_type) return false
+      if (orderTypeFilter !== 'all' && orderTypeFilter !== 'none' && order.order_type !== orderTypeFilter) return false
       if (!term) return true
-      return [o.customer_name, o.customer_email, o.description, o.system_sku, o.upc, o.brand, o.vendor_name, o.order_id, o.special_order_id, o.shopify_order_name, o.workorder_id,
-        ...o.available_vendors.map((v) => v.vendor_name)]
-        .some((v) => v && String(v).toLowerCase().includes(term))
+      return [
+        order.customer_name,
+        order.customer_email,
+        order.description,
+        order.system_sku,
+        order.upc,
+        order.brand,
+        order.vendor_name,
+        order.order_id,
+        order.special_order_id,
+        order.shopify_order_name,
+        order.workorder_id,
+        order.next_action,
+        ...order.available_vendors.map((vendor) => vendor.vendor_name),
+      ].some((value) => value && String(value).toLowerCase().includes(term))
     })
-  }, [allRows, activeView, view, openWorkOnly, storeFilter, orderTypeFilter, sourceFilter, liveOnly, search])
+  }, [allRows, orderTypeFilter, search, sourceFilter, storeFilter])
 
-  // The tiles that currently have ≥1 selected sub-triage. A tile is "active" once you pick any of
-  // its buckets; selection combines as AND across tiles, OR within a tile.
-  const activeTiles = useMemo(
-    () => TILES.filter((t) => t.subs.some((s) => selected.has(seg(t.group, s.key)))),
-    [selected]
+  const activeView = VIEWS.find((item) => item.key === view) ?? VIEWS[0]
+  const filtered = useMemo(
+    () => filteredPopulation.filter(activeView.pred),
+    [activeView, filteredPopulation],
   )
-
-  // Does row `o` satisfy a tile's selection? (true when the tile has no selection — it's not a
-  // constraint yet.) Within the tile it's an OR over the selected buckets' predicates.
-  const matchesTile = (o: SpecialOrder, t: Tile) =>
-    t.subs.some((s) => selected.has(seg(t.group, s.key)) && s.pred(o))
-
-  // Table = base narrowed to rows passing EVERY active tile (AND across tiles).
-  const filtered = useMemo(() => {
-    if (activeTiles.length === 0) return base
-    return base.filter((o) => activeTiles.every((t) => matchesTile(o, t)))
-  }, [base, activeTiles])
-
-  // Faceted counts: each tile's buckets are counted over the rows passing all the OTHER active
-  // tiles' selections (a tile ignores its own selection, so you can still see/toggle its buckets).
-  const segCounts = useMemo(() => {
-    const counts: Record<string, number> = {}
-    for (const t of TILES) {
-      const others = activeTiles.filter((a) => a.group !== t.group)
-      const rows = others.length === 0 ? base : base.filter((o) => others.every((a) => matchesTile(o, a)))
-      for (const s of t.subs) counts[seg(t.group, s.key)] = rows.filter(s.pred).length
-    }
-    return counts
-  }, [base, activeTiles])
-
-  const toggleSeg = (id: string) => {
-    setSelected((prev) => {
-      const next = new Set(prev)
-      next.has(id) ? next.delete(id) : next.add(id)
-      return next
-    })
-  }
-
-  const toggleStage = (t: Tile) => {
-    const ids = t.subs.map((s) => seg(t.group, s.key))
-    const allOn = ids.every((id) => selected.has(id))
-    setSelected((prev) => {
-      const next = new Set(prev)
-      ids.forEach((id) => (allOn ? next.delete(id) : next.add(id)))
-      return next
-    })
-  }
-
-  // Counts per tab over the live population (ignoring the tab itself, so each is stable).
   const viewCounts = useMemo(() => {
-    // Same age rule as the list, so a tab badge never disagrees with its tile.
-    const inWindow = (o: SpecialOrder) =>
-      !liveOnly || o.days_since_creation === null || o.days_since_creation <= LIVE_SO_MAX_DAYS
-    const live = allRows
-    const out: Record<string, number> = {}
-    for (const v of VIEWS) {
-      out[v.key] = live.filter((o) => v.pred(o) && inWindow(o)).length
+    const counts: Record<ViewKey, number> = {
+      action: 0,
+      needs_ordering: 0,
+      in_transit: 0,
+      ready_to_close: 0,
+      data_issues: 0,
+      all: 0,
     }
-    return out
-  }, [allRows, liveOnly])
+    VIEWS.forEach((item) => { counts[item.key] = filteredPopulation.filter(item.pred).length })
+    return counts
+  }, [filteredPopulation])
+  const pipelineCounts = useMemo(() => {
+    const counts: Record<TriageStage, number> = {
+      shopify: 0,
+      open_pool: 0,
+      unordered_po: 0,
+      ordered: 0,
+      received: 0,
+    }
+    PIPELINE.forEach((stage) => { counts[stage.key] = filteredPopulation.filter(stage.pred).length })
+    return counts
+  }, [filteredPopulation])
+  const legendCounts = useMemo<SoLegendCounts>(() => {
+    const stages: NonNullable<SoLegendCounts['stages']> = {}
+    const sources: NonNullable<SoLegendCounts['sources']> = {}
+    const severities: NonNullable<SoLegendCounts['severities']> = {}
+    filteredPopulation.forEach((order) => {
+      if (order.kind === 'shopify') {
+        stages.shopify = (stages.shopify ?? 0) + 1
+      } else {
+        stages[order.procurement_stage] = (stages[order.procurement_stage] ?? 0) + 1
+      }
+      sources[order.source] = (sources[order.source] ?? 0) + 1
+      severities[order.sla_severity] = (severities[order.sla_severity] ?? 0) + 1
+    })
+    return { stages, sources, severities }
+  }, [filteredPopulation])
 
-  const filtersActive =
-    selected.size > 0 || storeFilter !== 'all' || orderTypeFilter !== 'all' || sourceFilter !== 'all' || search || openWorkOnly || !liveOnly
+  const filtersActive = search !== '' || storeFilter !== 'all' || sourceFilter !== 'all' ||
+    orderTypeFilter !== 'all' || !liveOnly
+  const degradedSources = Object.entries(sourceHealth ?? {}).filter(([, health]) => health.status !== 'ok')
 
   return (
     <div className="space-y-4">
-      <div className="flex items-start justify-between gap-4">
+      <header className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Special Orders</h1>
-          <p className="text-muted-foreground text-sm">
-            Live triage — Shopify inbound and Lightspeed procurement stages, flagging what needs action.
+          <p className="mt-1 text-sm text-muted-foreground">
+            Work the next action across Shopify, Lightspeed purchasing, receiving, and service.
             {fetchedAt && (
-              <span className="ml-1 text-xs">Updated {new Date(fetchedAt).toLocaleTimeString()}.</span>
+              <time
+                className="ml-1 text-xs"
+                dateTime={fetchedAt}
+                title={new Date(fetchedAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}
+              >
+                Updated {formatFreshness(fetchedAt)}.
+              </time>
             )}
+            <SourceHealth sources={sourceHealth} />
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleSync}
-          disabled={isRefreshing}
-          className="gap-2"
-        >
-          <RefreshCw className={cn('h-4 w-4', isRefreshing && 'animate-spin')} />
-          {isRefreshing ? 'Syncing…' : 'Sync'}
-        </Button>
-      </div>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-2"
+            aria-haspopup="dialog"
+            aria-expanded={insightsOpen}
+            aria-controls="special-orders-insights"
+            onClick={() => setInsightsOpen(true)}
+          >
+            <BarChart3 className="h-4 w-4" />
+            Insights
+          </Button>
+          <Button variant="outline" size="sm" onClick={handleSync} disabled={isRefreshing} className="gap-2">
+            <RefreshCw className={cn('h-4 w-4', isRefreshing && 'animate-spin')} />
+            {isRefreshing ? 'Refreshing…' : 'Refresh data'}
+          </Button>
+        </div>
+      </header>
 
-      {/* Load failures must never masquerade as "no special orders" — surface them. */}
-      {error && (
-        <Card className="border-red-300 bg-red-50 py-3 dark:border-red-900 dark:bg-red-950/30">
-          <CardContent className="flex flex-wrap items-center gap-3 px-4 py-0">
-            <AlertTriangle className="h-4 w-4 shrink-0 text-red-600" />
-            <div className="min-w-0 flex-1 text-sm text-red-800 dark:text-red-300">
-              Couldn&apos;t load special orders from the server.
-              {orders.length > 0 || shopifyOnly.length > 0
-                ? ' Showing the last successfully loaded data.'
-                : ' Lightspeed or the backend may be unavailable.'}
-            </div>
-            <Button variant="outline" size="sm" onClick={handleSync} disabled={isRefreshing} className="gap-2">
-              <RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} />
-              Retry
-            </Button>
+      {(error || degradedSources.length > 0) && (
+        <Card className="border-amber-300 bg-amber-50 py-3 dark:border-amber-900 dark:bg-amber-950/30">
+          <CardContent className="flex items-center gap-3 px-4 py-0">
+            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700" />
+            <p className="min-w-0 flex-1 text-sm text-amber-900 dark:text-amber-200">
+              {error
+                ? 'The live refresh failed. The last successfully loaded worklist remains visible.'
+                : degradedSources.map(([source, health]) => `${SOURCE_LABEL[source] ?? source}: ${health.message ?? health.status}`).join(' · ')}
+            </p>
+            <Button variant="outline" size="sm" onClick={handleSync} disabled={isRefreshing}>Retry</Button>
           </CardContent>
         </Card>
       )}
 
-      {/* Triage tiles: Shopify inbound (leftmost) + the four LS procurement stages. */}
       {isLoading ? (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-6">
-          {TILES.map((t) => (
-            <Card key={t.group} className="py-3">
-              <CardContent className="px-4 py-0">
-                <Skeleton className="mb-2 h-4 w-24" />
-                <Skeleton className="h-7 w-12" />
-                <Skeleton className="mt-3 h-3 w-full" />
-                <Skeleton className="mt-1.5 h-3 w-full" />
-              </CardContent>
-            </Card>
-          ))}
-        </div>
+        <Skeleton className="h-[92px] w-full rounded-lg" />
       ) : (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-6">
-          {TILES.map((t) => {
-            const Icon = t.icon
-            const ids = t.subs.map((s) => seg(t.group, s.key))
-            const stageActive = ids.every((id) => selected.has(id))
-            const total = ids.reduce((sum, id) => sum + (segCounts[id] ?? 0), 0)
-            return (
-              <Card key={t.group} className={cn('py-3 transition-colors', stageActive && 'ring-primary ring-2')}>
-                <CardContent className="px-4 py-0">
-                  <button
-                    type="button"
-                    onClick={() => toggleStage(t)}
-                    className="flex w-full items-center gap-2 text-left"
-                  >
-                    <div className={cn('rounded-md p-1.5', t.bgColor)}>
-                      <Icon className={cn('h-3.5 w-3.5', t.color)} />
-                    </div>
-                    <span className="text-muted-foreground text-xs font-medium">{t.label}</span>
-                    <span className="ml-auto text-2xl font-semibold tabular-nums">{total.toLocaleString()}</span>
-                  </button>
-                  <div className="mt-2.5 flex flex-col gap-1 border-t pt-2">
-                    {t.subs.map((s) => {
-                      const id = seg(t.group, s.key)
-                      const count = segCounts[id] ?? 0
-                      const subActive = selected.has(id)
-                      return (
-                        <button
-                          type="button"
-                          key={s.key}
-                          onClick={() => toggleSeg(id)}
-                          className={cn(
-                            'flex items-center gap-2 rounded px-1.5 py-1 text-left transition-colors hover:bg-muted/60',
-                            subActive && 'bg-muted ring-1 ring-primary/40',
-                            count === 0 && !subActive && 'opacity-50'
-                          )}
-                        >
-                          <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', toneDot[s.tone])} />
-                          <span className="text-[11px] text-muted-foreground">{s.label}</span>
-                          <span className="ml-auto text-xs font-medium tabular-nums">{count.toLocaleString()}</span>
-                        </button>
-                      )
-                    })}
-                  </div>
-                </CardContent>
-              </Card>
-            )
-          })}
-        </div>
+        <section className="rounded-lg border bg-card px-4 py-3" aria-labelledby="pipeline-heading">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 id="pipeline-heading" className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              {liveOnly ? 'Live pipeline' : 'Live and historical pipeline'}
+            </h2>
+            <span className="text-sm font-semibold tabular-nums">{filteredPopulation.length} total</span>
+          </div>
+          <ol className="grid grid-cols-5 divide-x" aria-label="Special order pipeline">
+            {PIPELINE.map((stage) => {
+              const Icon = stage.icon
+              return (
+                <li key={stage.key} className="flex items-center gap-3 px-4 first:pl-0 last:pr-0">
+                  <span className={cn('rounded-md border p-2', stage.tone)} aria-hidden="true">
+                    <Icon className="h-4 w-4" />
+                  </span>
+                  <span>
+                    <span className="block text-xl font-semibold tabular-nums">{pipelineCounts[stage.key]}</span>
+                    <span className="block text-xs text-muted-foreground">{stage.label}</span>
+                  </span>
+                </li>
+              )
+            })}
+          </ol>
+        </section>
       )}
 
-      {/* Search + filters */}
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="relative max-w-sm flex-1">
-          <Search className="text-muted-foreground absolute left-2.5 top-2.5 h-4 w-4" />
-          <Input
-            placeholder="Search customer, product, SKU, vendor, PO, Shopify #…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="pl-8"
-          />
-        </div>
-        <Select value={storeFilter} onValueChange={setStoreFilter}>
-          <SelectTrigger className="w-[160px]">
-            <SelectValue placeholder="All locations" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All locations</SelectItem>
-            {stores.map((s) => (
-              <SelectItem key={s} value={s}>{s}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Select value={sourceFilter} onValueChange={setSourceFilter}>
-          <SelectTrigger className="w-[150px]">
-            <SelectValue placeholder="All sources" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All sources</SelectItem>
-            <SelectItem value="workorder">Workorder</SelectItem>
-            <SelectItem value="shopify">Shopify</SelectItem>
-            {/* Neither a workorder nor a matched Shopify order — raised straight in
-                Lightspeed, or a match that was never resolved. Its own bucket by design. */}
-            <SelectItem value="neither">Unattributed</SelectItem>
-          </SelectContent>
-        </Select>
-        {orderTypes.length > 0 && (
-          <Select value={orderTypeFilter} onValueChange={setOrderTypeFilter}>
-            <SelectTrigger className="w-[170px]">
-              <SelectValue placeholder="All order types" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All order types</SelectItem>
-              {orderTypes.map((t) => (
-                <SelectItem key={t} value={t}>{t}</SelectItem>
-              ))}
-              <SelectItem value="none">No PO yet</SelectItem>
-            </SelectContent>
-          </Select>
-        )}
-        <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
-          <Checkbox checked={openWorkOnly} onCheckedChange={(v) => setOpenWorkOnly(v === true)} />
-          Needs action
-        </label>
-        <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
-          <Checkbox checked={liveOnly} onCheckedChange={(v) => setLiveOnly(v === true)} />
-          Live SOs
-        </label>
-        {filtersActive && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="text-muted-foreground"
-            onClick={() => { setSelected(new Set()); setStoreFilter('all'); setOrderTypeFilter('all'); setSourceFilter('all'); setSearch(''); setOpenWorkOnly(false); setLiveOnly(true) }}
-          >
-            Clear filters
-          </Button>
-        )}
-      </div>
-
-      {/* Tabs are the primary navigation: each is one kind of work, with a plain statement of
-          what removes a row from it. Counts are over the live population and do not react to the
-          active tab, so switching tabs never makes a backlog look smaller than it is. */}
-      <div className="flex flex-wrap items-center gap-1 border-b">
-        {VIEWS.map((v) => {
-          const count = viewCounts[v.key] ?? 0
-          const active = v.key === view
-          return (
-            <button
-              key={v.key}
-              type="button"
-              onClick={() => { setView(v.key); setSelected(new Set()) }}
-              className={cn(
-                'flex items-center gap-2 border-b-2 px-3 py-2 text-sm transition-colors',
-                active
-                  ? 'border-primary font-medium text-foreground'
-                  : 'border-transparent text-muted-foreground hover:text-foreground',
-              )}
+      <Tabs
+        value={view}
+        onValueChange={(value) => replaceParams({ queue: value === 'action' ? null : value })}
+        className="gap-3"
+      >
+        <TabsList className="h-11 w-full justify-start rounded-none border-b bg-transparent p-0" aria-label="Special order queues">
+          {VIEWS.map((item) => (
+            <TabsTrigger
+              key={item.key}
+              value={item.key}
+              className="h-11 flex-none rounded-none border-x-0 border-t-0 px-3 shadow-none data-[state=active]:border-b-2 data-[state=active]:border-b-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none"
             >
-              {v.label}
-              {v.key !== 'overview' && (
-                <span className={cn('rounded-full px-1.5 py-0.5 text-[10px] tabular-nums',
-                  v.key === 'problems' && count > 0 ? 'bg-red-100 text-red-700'
-                    : active ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground')}>
-                  {count}
-                </span>
-              )}
-            </button>
-          )
-        })}
-      </div>
+              {item.label}
+              <span className={cn(
+                'rounded-full bg-muted px-1.5 py-0.5 text-xs tabular-nums',
+                item.key === 'action' && viewCounts[item.key] > 0 && 'bg-red-100 text-red-700',
+              )}>
+                {viewCounts[item.key]}
+              </span>
+            </TabsTrigger>
+          ))}
+        </TabsList>
 
-      <p className="text-xs text-muted-foreground">{activeView.blurb}</p>
+        <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-muted/20 px-3 py-2">
+          <div className="relative min-w-[280px] flex-1 max-w-[430px]">
+            <label htmlFor="special-order-search" className="sr-only">Search special orders</label>
+            <Search className="absolute left-2.5 top-2 h-4 w-4 text-muted-foreground" />
+            <Input
+              id="special-order-search"
+              type="search"
+              placeholder="Search order, customer, product, SKU, PO…"
+              value={search}
+              onChange={(event) => replaceParams({ q: event.target.value || null })}
+              className="h-8 bg-background pl-8"
+            />
+          </div>
 
-      <SoLegend />
+          <div className="flex items-center gap-2">
+            <label htmlFor="special-order-store" className="text-xs font-medium text-muted-foreground">Store</label>
+            <Select value={storeFilter} onValueChange={(value) => replaceParams({ store: value === 'all' ? null : value })}>
+              <SelectTrigger id="special-order-store" className="w-[145px] bg-background" size="sm">
+                <SelectValue placeholder="All stores" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All stores</SelectItem>
+                {stores.map((store) => <SelectItem key={store} value={store}>{store}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
 
-      <SoScoreboard />
+          <div className="flex items-center gap-2">
+            <label htmlFor="special-order-source" className="text-xs font-medium text-muted-foreground">Source</label>
+            <Select value={sourceFilter} onValueChange={(value) => replaceParams({ source: value === 'all' ? null : value })}>
+              <SelectTrigger id="special-order-source" className="w-[135px] bg-background" size="sm">
+                <SelectValue placeholder="All sources" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All sources</SelectItem>
+                <SelectItem value="shopify">Shopify</SelectItem>
+                <SelectItem value="workorder">Workorder</SelectItem>
+                <SelectItem value="neither">Lightspeed direct</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
 
-      {/* Queue state at a glance. Counts come from the backend over the FULL live population,
-          not the current filter, so narrowing the view never makes the backlog look smaller. */}
-      {sla && (
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-1 rounded-md border bg-muted/40 px-3 py-2 text-xs">
-          <button
-            type="button"
-            onClick={() => setOpenWorkOnly((v: boolean) => !v)}
-            className={cn('font-medium underline-offset-2 hover:underline',
-              sla.actionable > 0 ? 'text-red-600' : 'text-emerald-600')}
-          >
-            {sla.actionable} need action
-          </button>
-          {sla.checkback_due > 0 && (
-            <span className="text-amber-700">{sla.checkback_due} due for check-back</span>
-          )}
-          {sla.escalated > 0 && (
-            <span className="font-medium text-red-600">{sla.escalated} escalated</span>
-          )}
-          {sla.acked > 0 && <span className="text-muted-foreground">{sla.acked} parked</span>}
-          {sla.missing_promise > 0 && (
-            <span className="text-muted-foreground" title="No customer promise recorded, so there is nothing to schedule against">
-              {sla.missing_promise} without a promised date
-              {sla.missing_promise_by_owner && (
-                <span className="opacity-70">
-                  {' '}({sla.missing_promise_by_owner.service} service · {sla.missing_promise_by_owner.cs} CS)
-                </span>
-              )}
-            </span>
-          )}
+          <div className="flex items-center gap-2">
+            <label htmlFor="special-order-type" className="text-xs font-medium text-muted-foreground">Type</label>
+            <Select value={orderTypeFilter} onValueChange={(value) => replaceParams({ type: value === 'all' ? null : value })}>
+              <SelectTrigger id="special-order-type" className="w-[150px] bg-background" size="sm">
+                <SelectValue placeholder="All PO types" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All PO types</SelectItem>
+                {orderTypes.map((type) => <SelectItem key={type} value={type}>{type}</SelectItem>)}
+                <SelectItem value="none">No PO yet</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <label className="ml-auto flex items-center gap-2 whitespace-nowrap text-xs text-muted-foreground">
+            <Checkbox
+              checked={!liveOnly}
+              onCheckedChange={(checked) => replaceParams({ archive: checked === true ? '1' : null })}
+            />
+            Include archive
+          </label>
         </div>
-      )}
 
-      <SpecialOrdersGrid
-        orders={filtered}
-        isLoading={isLoading}
-        onEtaSaved={revalidate}
-        lsUnmatched={lsUnmatched}
-        unmatchedShopify={shopifyOnly}
-        matchActions={matchActions}
-      />
+        {filtersActive && (
+          <div className="flex flex-wrap items-center gap-2" aria-label="Active filters">
+            <span className="text-xs font-medium text-muted-foreground">Active filters</span>
+            {search && <FilterChip label={`Search: ${search}`} onRemove={() => replaceParams({ q: null })} />}
+            {storeFilter !== 'all' && <FilterChip label={`Store: ${storeFilter}`} onRemove={() => replaceParams({ store: null })} />}
+            {sourceFilter !== 'all' && <FilterChip label={`Source: ${SOURCE_LABEL[sourceFilter] ?? sourceFilter}`} onRemove={() => replaceParams({ source: null })} />}
+            {orderTypeFilter !== 'all' && <FilterChip label={`Type: ${orderTypeFilter === 'none' ? 'No PO yet' : orderTypeFilter}`} onRemove={() => replaceParams({ type: null })} />}
+            {!liveOnly && <FilterChip label="Archive included" onRemove={() => replaceParams({ archive: null })} />}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs text-muted-foreground"
+              onClick={() => replaceParams({ q: null, store: null, source: null, type: null, archive: null })}
+            >
+              Clear all
+            </Button>
+          </div>
+        )}
+
+        {VIEWS.map((item) => (
+          <TabsContent key={item.key} value={item.key} className="mt-0 space-y-3">
+            {item.key === view && (
+              <>
+                <p className="text-sm text-muted-foreground">{activeView.description}</p>
+                <SpecialOrdersGrid
+                  key={`${item.key}:${search}:${storeFilter}:${sourceFilter}:${orderTypeFilter}:${liveOnly}`}
+                  orders={filtered}
+                  isLoading={isLoading}
+                  onEtaSaved={revalidate}
+                  lsUnmatched={lsUnmatched}
+                  unmatchedShopify={shopifyOnly}
+                  matchActions={matchActions}
+                />
+              </>
+            )}
+          </TabsContent>
+        ))}
+      </Tabs>
+
+      <Sheet open={insightsOpen} onOpenChange={setInsightsOpen}>
+        <SheetContent id="special-orders-insights" className="w-[760px] gap-0 p-0 sm:max-w-[760px]">
+          <SheetHeader className="border-b px-6 py-5 pr-12">
+            <SheetTitle>Special Orders insights</SheetTitle>
+            <SheetDescription>Queue logic, delivery performance, dwell time, and ownership.</SheetDescription>
+          </SheetHeader>
+          {insightsOpen && (
+            <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-5">
+              <SoScoreboard />
+              <SoLegend counts={legendCounts} />
+            </div>
+          )}
+        </SheetContent>
+      </Sheet>
     </div>
   )
 }

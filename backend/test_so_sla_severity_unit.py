@@ -30,6 +30,9 @@ def test_promise_precedence_and_lead_time_source():
     assert sla.TREAT_WORKORDER_ETA_AS_PROMISE is False
     assert sla.resolve_promise(svc) == (None, None)
     assert sla.resolve_promise(_row()) == (None, None)
+    manual = _row(source="workorder", service_promise_date="2026-09-10",
+                  shopify_expected_date="2026-09-01")
+    assert sla.resolve_promise(manual) == (date(2026, 9, 10), "service_manual")
 
     # Once a PO exists we know the real vendor; before that, the fastest that can supply.
     assert sla.effective_lead_time(_row(vendor_lead_time_days=5)) == (5, "po_vendor")
@@ -67,7 +70,9 @@ def test_severity_boundaries():
     assert sla.compute_sla(_row(), TODAY)["missing_promise"] is True
     # Who must set the missing promise depends on origin: the bench owns workorder parts ETAs,
     # CS owns the Shopify metafield. Blaming CS for both hands them the bench's backlog.
-    assert sla.compute_sla(_row(source="workorder"), TODAY)["promise_owner"] == "service"
+    service = sla.compute_sla(_row(source="workorder"), TODAY)
+    assert service["promise_owner"] == "service"
+    assert "Service needs to record" in service["sla_reason"]
     assert sla.compute_sla(_row(source="shopify"), TODAY)["promise_owner"] == "cs"
     print("test_severity_boundaries OK")
 
@@ -145,11 +150,79 @@ def test_escalation_ladder_and_queue():
                   "reason_code": "vendor_backorder", "escalation_level": 0}}
     out = sla.build_escalations(orders, acks, TODAY)
     ids = [r["special_order_id"] for r in out["orders"]]
-    assert ids[0] == "a", ids                          # worst first
+    assert ids[-1] == "a", ids  # parked breach sorts behind active operational work
     assert out["summary"]["acked"] == 1, out["summary"]
-    assert out["summary"]["actionable"] == 0, out["summary"]  # 'a' is parked, others are fine
+    # Operational work is wider than a delivery breach: b still needs PO allocation and c
+    # still needs post-receipt close-out. The parked breach remains suppressed.
+    assert out["summary"]["actionable"] == 2, out["summary"]
     assert out["summary"]["by_severity"]["closed_out"] == 1
     print("test_escalation_ladder_and_queue OK")
+
+
+def test_operational_work_states_and_closeout_are_separate_from_delivery_sla():
+    needs = sla.build_escalations([_row(source="workorder", created_date="2026-08-01")], {}, TODAY)["orders"][0]
+    assert needs["sla_severity"] == "no_promise"
+    assert needs["work_state"] == "needs_ordering"
+    assert needs["queue_states"] == ["needs_ordering", "promise_needed"]
+    assert needs["action_owner"] == "procurement"
+    assert needs["actionable"] is True
+
+    followup = sla.build_escalations([
+        _row(procurement_stage="ordered", flag="no_eta", source="shopify")
+    ], {}, TODAY)["orders"][0]
+    assert followup["work_state"] == "vendor_followup"
+    assert followup["queue_states"] == ["in_transit", "vendor_followup", "promise_needed"]
+    assert followup["action_owner"] == "procurement"
+
+    service_close = sla.build_escalations([
+        _row(procurement_stage="received", source="workorder", workorder_id="10",
+             workorder_status="Waiting Parts", contacted=False, completed=False,
+             po_received_date="2026-08-18")
+    ], {}, TODAY)["orders"][0]
+    assert service_close["sla_severity"] == "closed_out"
+    assert service_close["work_state"] == "closeout"
+    assert service_close["closeout_state"] == "workorder_action_required"
+    assert service_close["action_owner"] == "service"
+    assert service_close["action_due_date"] == "2026-08-19"
+    assert service_close["actionable"] is True
+
+    retail_close = sla.build_escalations([
+        _row(procurement_stage="received", contacted=False, completed=False)
+    ], {}, TODAY)["orders"][0]
+    assert retail_close["closeout_state"] == "ready_not_called"
+    assert retail_close["action_owner"] == "retail"
+
+    complete = sla.build_escalations([
+        _row(procurement_stage="received", contacted=True, completed=True)
+    ], {}, TODAY)["orders"][0]
+    assert complete["closeout_state"] == "complete"
+    assert complete["work_state"] == "on_track"
+    assert complete["actionable"] is False
+    print("test_operational_work_states_and_closeout_are_separate_from_delivery_sla OK")
+
+
+def test_service_promise_clears_promise_needed_queue():
+    row = sla.build_escalations([
+        _row(procurement_stage="ordered", source="workorder", flag="none",
+             service_promise_date="2026-09-15")
+    ], {}, TODAY)["orders"][0]
+    assert row["promise_source"] == "service_manual"
+    assert row["missing_promise"] is False
+    assert "promise_needed" not in row["queue_states"]
+    assert row["work_state"] == "on_track"
+    print("test_service_promise_clears_promise_needed_queue OK")
+
+
+def test_live_window_zero_and_none_return_historical_rows():
+    rows = [
+        {"special_order_id": "live", "days_since_creation": 10},
+        {"special_order_id": "old", "days_since_creation": 900},
+        {"special_order_id": "unknown", "days_since_creation": None},
+    ]
+    assert len(sla.filter_live_window(rows, 365)) == 2
+    assert sla.filter_live_window(rows, 0) == rows
+    assert sla.filter_live_window(rows, None) == rows
+    print("test_live_window_zero_and_none_return_historical_rows OK")
 
 
 if __name__ == "__main__":
@@ -161,4 +234,7 @@ if __name__ == "__main__":
     test_per_store_stage_limits()
     test_ack_rearms_on_each_pinned_value()
     test_escalation_ladder_and_queue()
+    test_operational_work_states_and_closeout_are_separate_from_delivery_sla()
+    test_service_promise_clears_promise_needed_queue()
+    test_live_window_zero_and_none_return_historical_rows()
     print("\nAll SLA severity/ack unit tests passed.")

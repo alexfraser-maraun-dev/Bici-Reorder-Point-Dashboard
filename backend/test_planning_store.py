@@ -115,6 +115,33 @@ class PlanningStoreTest(unittest.TestCase):
         restored = self.store.get_draft(draft["draft_id"])
         self.assertEqual(restored["lines"][0]["description"], "Rotor")
 
+    def test_service_promise_revisions_clear_and_can_reuse_a_date(self):
+        first = self.store.set_service_promise("SO-1", "2026-09-01", "svc@example.com")
+        same = self.store.set_service_promise("SO-1", "2026-09-01", "other@example.com")
+        self.assertEqual(first["promise_id"], same["promise_id"])
+        self.assertEqual(self.store.active_service_promises()["SO-1"]["promise_date"], "2026-09-01")
+
+        second = self.store.set_service_promise("SO-1", "2026-09-05", "svc@example.com")
+        self.assertEqual(second["revision_index"], 1)
+        self.assertEqual(self.store.active_service_promises()["SO-1"]["promise_date"], "2026-09-05")
+        self.assertTrue(self.store.clear_service_promise("SO-1"))
+        self.assertNotIn("SO-1", self.store.active_service_promises())
+
+        reused = self.store.set_service_promise("SO-1", "2026-09-01", "svc@example.com")
+        self.assertEqual(reused["revision_index"], 2)
+        self.assertNotEqual(reused["promise_id"], first["promise_id"])
+
+    def test_special_order_activity_is_append_only_and_json_round_trips(self):
+        self.store.record_so_activity(
+            "SO-1", "parked", actor="buyer@example.com",
+            details={"reason_code": "vendor_backorder", "level": 1},
+        )
+        events = self.store.list_so_activity("SO-1")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "parked")
+        self.assertEqual(events[0]["actor"], "buyer@example.com")
+        self.assertEqual(events[0]["details"]["level"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

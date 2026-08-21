@@ -198,21 +198,6 @@ def test_fastest_path_covers_every_stage():
     print("test_fastest_path_covers_every_stage OK")
 
 
-def test_candidate_pos_labels_appendability():
-    orders = [
-        {"orderID": "1", "shopID": "3", "po_state": "unsent", "vendorID": "5", "refNum": "D1", "Vendor": {"name": "HLC"}},
-        {"orderID": "2", "shopID": "3", "po_state": "ordered", "vendorID": "5", "refNum": "P2", "Vendor": {"name": "HLC"}},
-        {"orderID": "3", "shopID": "2", "po_state": "unsent", "vendorID": "5", "refNum": "D3", "Vendor": {"name": "HLC"}},
-        {"orderID": "4", "shopID": "3", "po_state": "complete", "vendorID": "5", "refNum": "C4", "Vendor": {"name": "HLC"}},
-    ]
-    got = reco.list_candidate_pos(orders, "3")
-    ids = [o["order_id"] for o in got]
-    assert ids == ["1", "2"], ids           # other store and completed excluded; drafts first
-    assert got[0]["appendable"] is True      # unsent can take a new line
-    assert got[1]["appendable"] is False     # already sent to the vendor — never append
-    print("test_candidate_pos_labels_appendability OK")
-
-
 if __name__ == "__main__":
     test_in_stock_beats_everything()
     test_insufficient_stock_does_not_count()
@@ -223,5 +208,4 @@ if __name__ == "__main__":
     test_cadence_never_defers_the_landing_date()
     test_delay_cost_needs_no_promise()
     test_fastest_path_covers_every_stage()
-    test_candidate_pos_labels_appendability()
     print("\nAll PO recommendation unit tests passed.")

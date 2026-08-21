@@ -3,8 +3,7 @@
 import { useState } from 'react'
 import { ChevronDown, ChevronRight, BookOpen } from 'lucide-react'
 import { SeverityBadge, SourceBadge, StageBadge } from './special-order-badges'
-import type { SlaSeverity, SpecialOrderSource } from '@/lib/types'
-import type { ProcurementStage } from '@/lib/types'
+import type { SlaSeverity, SpecialOrderSource, TriageStage } from '@/lib/types'
 
 /** Explains the derived elements on this page.
  *
@@ -20,7 +19,7 @@ function Row({ visual, children }: { visual: React.ReactNode; children: React.Re
   return (
     <div className="flex items-start gap-3 py-1">
       <div className="w-[150px] shrink-0 pt-0.5">{visual}</div>
-      <p className="min-w-0 flex-1 text-xs text-muted-foreground">{children}</p>
+      <p className="min-w-0 flex-1 text-sm leading-5 text-muted-foreground">{children}</p>
     </div>
   )
 }
@@ -28,7 +27,7 @@ function Row({ visual, children }: { visual: React.ReactNode; children: React.Re
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div>
-      <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
+      <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
         {title}
       </p>
       {children}
@@ -45,28 +44,51 @@ const SEVERITIES: { key: SlaSeverity; text: string }[] = [
   { key: 'no_promise', text: 'Nobody recorded a date for this customer, so there is nothing to schedule against. Owned by whoever raised it — the service bench for workorders, CS for Shopify orders.' },
 ]
 
-const STAGES: { key: ProcurementStage; text: string }[] = [
-  { key: 'open_pool', text: 'Exists in Lightspeed but is not on any purchase order yet.' },
-  { key: 'unordered_po', text: 'Attached to a purchase order that has never been sent to the vendor.' },
-  { key: 'ordered', text: 'The purchase order has been placed and the item is on its way.' },
-  { key: 'received', text: 'The item has arrived. The SLA clock stops here — anything still open is paperwork, not a late delivery.' },
+const STAGES: { key: TriageStage; text: string }[] = [
+  { key: 'shopify', text: 'Shopify intake: the tagged order has not yet been matched to a Lightspeed special order.' },
+  { key: 'open_pool', text: 'Awaiting PO: the special order exists in Lightspeed but is not attached to a purchase order.' },
+  { key: 'unordered_po', text: 'Draft PO: attached to a purchase order that has not been sent to the vendor.' },
+  { key: 'ordered', text: 'In transit: the purchase order has been placed and the item is awaiting arrival.' },
+  { key: 'received', text: 'Arrived: the item has been received. Delivery SLA stops here; remaining work belongs in close-out.' },
 ]
 
 const SOURCES: { key: SpecialOrderSource; text: string }[] = [
-  { key: 'shopify', text: 'Raised from a Shopify order tagged SO. These are the only ones that carry a customer-quoted date.' },
-  { key: 'workorder', text: 'Raised from a service workorder. The workorder’s eta-out is the bike’s booking date, not a promise about the part, so it is not treated as one.' },
-  { key: 'neither', text: 'Raised straight into Lightspeed at the counter or by phone. A real order type, not a data fault — of 57 such orders, 56 verifiably have no Shopify order behind them.' },
+  { key: 'shopify', text: 'Raised from a Shopify order tagged SO. A customer promise can be recorded here; an explicit save writes that date to the Shopify order.' },
+  { key: 'workorder', text: 'Raised from a service workorder. The workorder’s ETA-out describes the bike, not the part; service records a separate parts promise in this tool.' },
+  { key: 'neither', text: 'Raised straight into Lightspeed at the counter or by phone. This is a valid intake route, not automatically a data fault.' },
 ]
 
-export function SoLegend() {
+export interface SoLegendCounts {
+  stages?: Partial<Record<TriageStage, number>>
+  sources?: Partial<Record<SpecialOrderSource, number>>
+  severities?: Partial<Record<SlaSeverity, number>>
+}
+
+function VisualWithCount({ visual, count }: { visual: React.ReactNode; count?: number }) {
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      {visual}
+      {count !== undefined && (
+        <span className="text-xs tabular-nums text-muted-foreground" aria-label={`${count} orders`}>
+          {count}
+        </span>
+      )}
+    </span>
+  )
+}
+
+export function SoLegend({ counts }: { counts?: SoLegendCounts }) {
   const [open, setOpen] = useState(false)
+  const contentId = 'special-orders-legend-content'
 
   return (
     <div className="rounded-md border">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-sm font-medium hover:bg-muted/50"
+        aria-expanded={open}
+        aria-controls={contentId}
+        className="flex min-h-11 w-full items-center gap-2 rounded-md px-3 py-2 text-sm font-medium hover:bg-muted/50"
       >
         {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
         <BookOpen className="h-4 w-4 text-muted-foreground" />
@@ -77,12 +99,17 @@ export function SoLegend() {
       </button>
 
       {open && (
-        <div className="space-y-4 border-t px-3 py-3">
-          <Section title="Where it is (tiles)">
+        <div id={contentId} className="space-y-4 border-t px-3 py-3">
+          <Section title="Pipeline stages">
             {STAGES.map((s) => (
-              <Row key={s.key} visual={<StageBadge stage={s.key} />}>{s.text}</Row>
+              <Row
+                key={s.key}
+                visual={<VisualWithCount visual={<StageBadge stage={s.key} />} count={counts?.stages?.[s.key]} />}
+              >
+                {s.text}
+              </Row>
             ))}
-            <p className="mt-1 text-xs text-muted-foreground">
+            <p className="mt-1 text-sm leading-5 text-muted-foreground">
               Each tile splits only into <span className="font-medium">Needs action</span> and{' '}
               <span className="font-medium">On track</span>. Position is a fact about the order;
               what to do about it is what the tabs are for.
@@ -91,15 +118,25 @@ export function SoLegend() {
 
           <Section title="Where it came from">
             {SOURCES.map((s) => (
-              <Row key={String(s.key)} visual={<SourceBadge source={s.key} />}>{s.text}</Row>
+              <Row
+                key={String(s.key)}
+                visual={<VisualWithCount visual={<SourceBadge source={s.key} />} count={counts?.sources?.[s.key]} />}
+              >
+                {s.text}
+              </Row>
             ))}
           </Section>
 
           <Section title="What needs attention">
             {SEVERITIES.map((s) => (
-              <Row key={s.key} visual={<SeverityBadge severity={s.key} />}>{s.text}</Row>
+              <Row
+                key={s.key}
+                visual={<VisualWithCount visual={<SeverityBadge severity={s.key} />} count={counts?.severities?.[s.key]} />}
+              >
+                {s.text}
+              </Row>
             ))}
-            <p className="mt-1 text-xs text-muted-foreground">
+            <p className="mt-1 text-sm leading-5 text-muted-foreground">
               Healthy and already-received orders carry no badge. A muted badge means the order is
               parked — the problem is known and someone has a date to come back to it.
             </p>
@@ -132,7 +169,7 @@ export function SoLegend() {
           </Section>
 
           <Section title="Parking an order">
-            <p className="text-xs text-muted-foreground">
+            <p className="text-sm leading-5 text-muted-foreground">
               Parking requires a reason and a check-back date — an open-ended dismissal cannot be
               reported on, and is how orders get parked rather than worked. A parked order
               re-opens by itself if its <span className="font-medium">stage</span>,{' '}
@@ -142,12 +179,14 @@ export function SoLegend() {
             </p>
           </Section>
 
-          <Section title="Two things the tool cannot do">
-            <p className="text-xs text-muted-foreground">
-              It cannot attach a special order to a purchase order: Lightspeed’s API rejects every
-              write to that record, so allocation happens in Lightspeed and the next sync confirms
-              it landed. And it never writes a customer date to Shopify — a promise has to be made
-              by a person.
+          <Section title="Write boundaries">
+            <p className="text-sm leading-5 text-muted-foreground">
+              The tool recommends a sourcing route but cannot attach a special order to a purchase
+              order: Lightspeed’s API does not support that relationship, so allocation is completed
+              in Lightspeed and confirmed after a refresh. A customer promise is always chosen by a
+              person; when that person explicitly saves the Shopify ETA here, the tool writes the
+              date to the Shopify order. Service parts promises are stored and audited in this tool
+              without changing the workorder ETA-out.
             </p>
           </Section>
         </div>

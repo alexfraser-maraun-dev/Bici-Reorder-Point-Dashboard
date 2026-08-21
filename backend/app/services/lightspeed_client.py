@@ -566,7 +566,8 @@ class LightspeedClient:
         return results
 
     def get_completed_special_orders(
-        self, lookback_days: int = 60, page_limit: int = 100, max_pages: int = 40
+        self, lookback_days: int = 60, page_limit: int = 100, max_pages: int = 40,
+        *, strict: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Pages through *recently-completed* special orders (completed=true, last `lookback_days`
@@ -578,7 +579,8 @@ class LightspeedClient:
 
         Bounded by recency (and max_pages) to stay cheap; older completions are unlikely to still
         have an open Shopify order. Same relations as get_special_orders so rows normalize identically.
-        Returns raw SpecialOrder dicts; [] on any failure (matching simply falls back to open SOs).
+        Returns raw SpecialOrder dicts. Fail-soft is the compatibility default; strict mode
+        raises so the dashboard can label this optional historical source as unavailable.
         """
         # The legacy API has no sort param; it filters by field operator instead — `timeStamp=>,<iso>`.
         since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
@@ -595,6 +597,14 @@ class LightspeedClient:
             }
             response = self._legacy_request("GET", "/SpecialOrder.json", params=params)
             if response is None or response.status_code != 200:
+                if strict:
+                    detail = (
+                        f"{response.status_code} {response.text[:300]}"
+                        if response is not None else "no response"
+                    )
+                    raise LightspeedReadError(
+                        f"Completed special-order read failed at offset {offset}: {detail}"
+                    )
                 if response is not None:
                     print(f"Error fetching completed special orders: {response.status_code} {response.text[:300]}")
                 break
@@ -612,8 +622,9 @@ class LightspeedClient:
 
     def _fetch_in_chunks(self, unique_ids: List[str], chunk_size: int, worker) -> Dict[str, Dict[str, Any]]:
         """Splits ``unique_ids`` into chunks and runs ``worker(chunk)`` over them in
-        parallel, merging the returned partial maps. ``worker`` must never raise
-        (network/HTTP errors are swallowed and returned as an empty partial)."""
+        parallel, merging the returned partial maps. Most workers fail soft and return an
+        empty partial; strict workers may raise so callers can report an unavailable source
+        instead of treating an outage as a genuine empty result."""
         if not unique_ids:
             return {}
         chunks = [unique_ids[i:i + chunk_size] for i in range(0, len(unique_ids), chunk_size)]
@@ -724,7 +735,9 @@ class LightspeedClient:
             }
         return out
 
-    def get_orders_by_ids(self, order_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
+    def get_orders_by_ids(
+        self, order_ids: List[str], chunk_size: int = 40, *, strict: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
         """
         Fetches the purchase orders (Order entity) behind a set of special orders and
         returns, keyed by orderID, just the fields the triage logic needs:
@@ -737,7 +750,11 @@ class LightspeedClient:
         field, falling back to the field's account-level default (see `order_type_default`).
         """
         unique_ids = sorted({str(o) for o in order_ids if o and str(o) != "0"})
-        orders = self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_order_chunk)
+        orders = self._fetch_in_chunks(
+            unique_ids,
+            chunk_size,
+            lambda chunk: self._fetch_order_chunk(chunk, strict=strict),
+        )
 
         # Lightspeed stores a CustomFieldValue row only when someone picks the NON-default
         # choice, so an untouched PO carries no value at all while Lightspeed's own UI still
@@ -819,7 +836,9 @@ class LightspeedClient:
             return str(name).strip() or None if name else None
         return None
 
-    def _fetch_order_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
+    def _fetch_order_chunk(
+        self, chunk: List[str], *, strict: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
         params = {
             "orderID": f"IN,[{','.join(chunk)}]",
             "load_relations": '["Vendor","OrderLines","CustomFieldValues"]',
@@ -828,6 +847,12 @@ class LightspeedClient:
         out: Dict[str, Dict[str, Any]] = {}
         response = self._legacy_request("GET", "/Order.json", params=params)
         if response is None or response.status_code != 200:
+            if strict:
+                detail = (
+                    f"{response.status_code} {response.text[:300]}"
+                    if response is not None else "no response"
+                )
+                raise LightspeedReadError(f"Purchase-order read failed: {detail}")
             if response is not None:
                 print(f"Error fetching orders: {response.status_code} {response.text[:300]}")
             return out
@@ -860,16 +885,24 @@ class LightspeedClient:
             }
         return out
 
-    def get_customers_by_ids(self, customer_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
+    def get_customers_by_ids(
+        self, customer_ids: List[str], chunk_size: int = 40, *, strict: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
         """
         Resolves customer names/contact for a set of special orders, keyed by customerID:
           { customerID: { "first_name", "last_name", "company", "phone" } }
         Customer is not loadable as a relation on SpecialOrder, so it's fetched here.
         """
         unique_ids = sorted({str(c) for c in customer_ids if c and str(c) != "0"})
-        return self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_customer_chunk)
+        return self._fetch_in_chunks(
+            unique_ids,
+            chunk_size,
+            lambda chunk: self._fetch_customer_chunk(chunk, strict=strict),
+        )
 
-    def _fetch_customer_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
+    def _fetch_customer_chunk(
+        self, chunk: List[str], *, strict: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
         params = {
             "customerID": f"IN,[{','.join(chunk)}]",
             "load_relations": '["Contact"]',
@@ -878,6 +911,12 @@ class LightspeedClient:
         out: Dict[str, Dict[str, Any]] = {}
         response = self._legacy_request("GET", "/Customer.json", params=params)
         if response is None or response.status_code != 200:
+            if strict:
+                detail = (
+                    f"{response.status_code} {response.text[:300]}"
+                    if response is not None else "no response"
+                )
+                raise LightspeedReadError(f"Customer read failed: {detail}")
             if response is not None:
                 print(f"Error fetching customers: {response.status_code} {response.text[:300]}")
             return out
@@ -903,7 +942,9 @@ class LightspeedClient:
             }
         return out
 
-    def get_workorders_by_sale_line_ids(self, sale_line_ids: List[str], chunk_size: int = 40) -> Dict[str, Dict[str, Any]]:
+    def get_workorders_by_sale_line_ids(
+        self, sale_line_ids: List[str], chunk_size: int = 40, *, strict: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
         """
         Resolves which special orders are attached to service workorders, keyed by the SO's
         saleLineID:
@@ -917,7 +958,8 @@ class LightspeedClient:
 
         `status` is the human name resolved via /WorkorderStatus.json (the Workorder row
         itself only carries workorderStatusID). Failures (including a token without the
-        workorder scope) degrade to {} so the dashboard just shows no workorder badge.
+        workorder scope) degrade to {} by default for compatibility. Strict mode raises so
+        source-health callers can distinguish an outage from "no linked workorders".
 
         The three note fields are the bench's own record of why the part is on order and
         what has been chased so far — `note` (customer-facing), `internalNote` (staff), and
@@ -927,12 +969,20 @@ class LightspeedClient:
         unique_ids = sorted({str(s) for s in sale_line_ids if s and str(s) != "0"})
         if not unique_ids:
             return {}
-        line_map = self._fetch_in_chunks(unique_ids, chunk_size, self._fetch_workorder_item_chunk)
+        line_map = self._fetch_in_chunks(
+            unique_ids,
+            chunk_size,
+            lambda chunk: self._fetch_workorder_item_chunk(chunk, strict=strict),
+        )
         if not line_map:
             return {}
         wo_ids = sorted({v["workorder_id"] for v in line_map.values()})
-        detail_map = self._fetch_in_chunks(wo_ids, chunk_size, self._fetch_workorder_chunk)
-        status_names = self._fetch_workorder_status_names()
+        detail_map = self._fetch_in_chunks(
+            wo_ids,
+            chunk_size,
+            lambda chunk: self._fetch_workorder_chunk(chunk, strict=strict),
+        )
+        status_names = self._fetch_workorder_status_names(strict=strict)
         out: Dict[str, Dict[str, Any]] = {}
         for sale_line_id, link in line_map.items():
             detail = detail_map.get(link["workorder_id"], {})
@@ -947,7 +997,9 @@ class LightspeedClient:
             }
         return out
 
-    def _fetch_workorder_item_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
+    def _fetch_workorder_item_chunk(
+        self, chunk: List[str], *, strict: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
         """saleLineID -> {workorder_id} via the WorkorderItem part lines."""
         params = {
             "saleLineID": f"IN,[{','.join(chunk)}]",
@@ -956,6 +1008,12 @@ class LightspeedClient:
         out: Dict[str, Dict[str, Any]] = {}
         response = self._legacy_request("GET", "/WorkorderItem.json", params=params)
         if response is None or response.status_code != 200:
+            if strict:
+                detail = (
+                    f"{response.status_code} {response.text[:300]}"
+                    if response is not None else "no response"
+                )
+                raise LightspeedReadError(f"Workorder-item read failed: {detail}")
             if response is not None:
                 print(f"Error fetching workorder items: {response.status_code} {response.text[:300]}")
             return out
@@ -968,7 +1026,9 @@ class LightspeedClient:
             out[sale_line_id] = {"workorder_id": str(wo_id)}
         return out
 
-    def _fetch_workorder_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
+    def _fetch_workorder_chunk(
+        self, chunk: List[str], *, strict: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
         """workorderID -> {status_id, eta_out, time_in, note, internal_note, hook_in}."""
         params = {
             "workorderID": f"IN,[{','.join(chunk)}]",
@@ -977,6 +1037,12 @@ class LightspeedClient:
         out: Dict[str, Dict[str, Any]] = {}
         response = self._legacy_request("GET", "/Workorder.json", params=params)
         if response is None or response.status_code != 200:
+            if strict:
+                detail = (
+                    f"{response.status_code} {response.text[:300]}"
+                    if response is not None else "no response"
+                )
+                raise LightspeedReadError(f"Workorder read failed: {detail}")
             if response is not None:
                 print(f"Error fetching workorders: {response.status_code} {response.text[:300]}")
             return out
@@ -993,10 +1059,16 @@ class LightspeedClient:
             }
         return out
 
-    def _fetch_workorder_status_names(self) -> Dict[str, str]:
-        """{workorderStatusID: name} from the (small) WorkorderStatus table; {} on failure."""
+    def _fetch_workorder_status_names(self, *, strict: bool = False) -> Dict[str, str]:
+        """{workorderStatusID: name}; strict mode distinguishes failure from no statuses."""
         response = self._legacy_request("GET", "/WorkorderStatus.json", params={"limit": "100"})
         if response is None or response.status_code != 200:
+            if strict:
+                detail = (
+                    f"{response.status_code} {response.text[:300]}"
+                    if response is not None else "no response"
+                )
+                raise LightspeedReadError(f"Workorder-status read failed: {detail}")
             return {}
         return {
             str(s.get("workorderStatusID")): s.get("name")
