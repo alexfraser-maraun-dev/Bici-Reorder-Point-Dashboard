@@ -14,14 +14,13 @@ import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
-import type { ShopifyOnlyOrder, SpecialOrder } from '@/lib/types'
+import type { ShopifyOnlyOrder, SpecialOrder, SpecialOrderActivityEvent } from '@/lib/types'
 import { useSoActivity } from '@/lib/hooks'
 import {
   AvailableVendors,
   CopyableUpc,
   EditableServicePromise,
   EditableEta,
-  LightspeedLink,
 } from './special-order-fields'
 import {
   LsMatchControls,
@@ -32,15 +31,7 @@ import { SeverityBadge, ShopifyMatchBadge, SourceBadge } from './special-order-b
 import { EscalationBadge, SoAckMenu } from './so-ack-menu'
 import { PoRecommendationPanel } from './so-po-recommendation'
 import { ownerLabel, StagePill, workStateLabel } from './special-order-row'
-import {
-  CalendarClock,
-  FileText,
-  Link2,
-  Package,
-  ShoppingBag,
-  User,
-  Wrench,
-} from 'lucide-react'
+import { CalendarClock, Link2 } from 'lucide-react'
 
 interface Props {
   order: SpecialOrder
@@ -97,6 +88,100 @@ function eventDetails(details: Record<string, unknown> | string | null): string 
     .filter(([, value]) => value !== null && value !== undefined && value !== '')
     .map(([key, value]) => `${key.replace(/_/g, ' ')}: ${String(value)}`)
   return parts.length > 0 ? parts.join(' · ') : null
+}
+
+function ActivityPanel({
+  order,
+  activity,
+  isLoading,
+  error,
+  onRetry,
+}: {
+  order: SpecialOrder
+  activity: SpecialOrderActivityEvent[]
+  isLoading: boolean
+  error: unknown
+  onRetry: () => void
+}) {
+  return (
+    <Section title="Activity">
+      {isLoading && <Skeleton className="h-24 w-full" />}
+      {activity.length > 0 ? (
+        <ol className="space-y-3 border-l pl-4 text-sm">
+          {activity.map((event, index) => {
+            const details = eventDetails(event.details)
+            return (
+              <li key={`${event.timestamp}-${event.type}-${index}`}>
+                <p className="font-medium">{event.label}</p>
+                <p className="text-xs text-muted-foreground">
+                  {new Date(event.timestamp).toLocaleString()}
+                  {event.actor ? ` · ${event.actor}` : ''}
+                </p>
+                {details && <p className="mt-1 text-xs text-muted-foreground">{details}</p>}
+              </li>
+            )
+          })}
+        </ol>
+      ) : !isLoading && (
+        <ol className="space-y-3 border-l pl-4 text-sm">
+          <li>
+            <p className="font-medium">Special order created</p>
+            <p className="text-xs text-muted-foreground">{formatDate(order.created_date)}</p>
+          </li>
+          {order.ordered_date && (
+            <li>
+              <p className="font-medium">Purchase order placed</p>
+              <p className="text-xs text-muted-foreground">{formatDate(order.ordered_date)}</p>
+            </li>
+          )}
+          {order.po_received_date && (
+            <li>
+              <p className="font-medium">Item received</p>
+              <p className="text-xs text-muted-foreground">{formatDate(order.po_received_date)}</p>
+            </li>
+          )}
+          {order.link_provenance && (
+            <li>
+              <p className="font-medium">Shopify order linked manually</p>
+              <p className="text-xs text-muted-foreground">
+                {order.link_provenance.linked_at
+                  ? new Date(order.link_provenance.linked_at).toLocaleString()
+                  : 'Date unavailable'}
+                {order.link_provenance.linked_by ? ` · ${order.link_provenance.linked_by}` : ''}
+              </p>
+            </li>
+          )}
+          {order.service_promise_recorded_at && (
+            <li>
+              <p className="font-medium">Service parts promise recorded</p>
+              <p className="text-xs text-muted-foreground">
+                {new Date(order.service_promise_recorded_at).toLocaleString()}
+                {order.service_promise_recorded_by ? ` · ${order.service_promise_recorded_by}` : ''}
+              </p>
+            </li>
+          )}
+          {order.ack && (
+            <li>
+              <p className="font-medium">Parked: {order.ack.reason_code.replace(/_/g, ' ')}</p>
+              <p className="text-xs text-muted-foreground">
+                {new Date(order.ack.acked_at).toLocaleString()} · check back {formatDate(order.ack.checkback_date)}
+                {order.ack.acked_by ? ` · ${order.ack.acked_by}` : ''}
+              </p>
+              {order.ack.note && <p className="mt-1 text-xs text-muted-foreground">{order.ack.note}</p>}
+            </li>
+          )}
+        </ol>
+      )}
+      {Boolean(error) && (
+        <div className="flex items-center justify-between gap-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <p>The live activity feed is unavailable; showing milestones from the current record.</p>
+          <Button variant="outline" size="sm" onClick={onRetry}>
+            Retry
+          </Button>
+        </div>
+      )}
+    </Section>
+  )
 }
 
 export function SpecialOrderDetailDrawer({
@@ -193,6 +278,16 @@ export function SpecialOrderDetailDrawer({
                   )}
                 </div>
               </section>
+
+              <ActivityPanel
+                order={order}
+                activity={activity}
+                isLoading={activityLoading}
+                error={activityError}
+                onRetry={() => void revalidateActivity()}
+              />
+
+              <Separator />
 
               <Section title="Customer and item">
                 <dl className="grid grid-cols-3 gap-x-5 gap-y-4">
@@ -353,98 +448,6 @@ export function SpecialOrderDetailDrawer({
                     This was matched through the fulfilled or archived Shopify-order lookup.
                   </p>
                 )}
-              </Section>
-
-              <Separator />
-
-              <Section title="Activity">
-                {activityLoading && <Skeleton className="h-24 w-full" />}
-                {activity.length > 0 ? (
-                  <ol className="space-y-3 border-l pl-4 text-sm">
-                    {activity.map((event, index) => {
-                      const details = eventDetails(event.details)
-                      return (
-                        <li key={`${event.timestamp}-${event.type}-${index}`}>
-                          <p className="font-medium">{event.label}</p>
-                          <p className="text-xs text-muted-foreground">
-                            {new Date(event.timestamp).toLocaleString()}
-                            {event.actor ? ` · ${event.actor}` : ''}
-                          </p>
-                          {details && <p className="mt-1 text-xs text-muted-foreground">{details}</p>}
-                        </li>
-                      )
-                    })}
-                  </ol>
-                ) : !activityLoading && (
-                  <ol className="space-y-3 border-l pl-4 text-sm">
-                  <li>
-                    <p className="font-medium">Special order created</p>
-                    <p className="text-xs text-muted-foreground">{formatDate(order.created_date)}</p>
-                  </li>
-                  {order.ordered_date && (
-                    <li>
-                      <p className="font-medium">Purchase order placed</p>
-                      <p className="text-xs text-muted-foreground">{formatDate(order.ordered_date)}</p>
-                    </li>
-                  )}
-                  {order.po_received_date && (
-                    <li>
-                      <p className="font-medium">Item received</p>
-                      <p className="text-xs text-muted-foreground">{formatDate(order.po_received_date)}</p>
-                    </li>
-                  )}
-                  {order.link_provenance && (
-                    <li>
-                      <p className="font-medium">Shopify order linked manually</p>
-                      <p className="text-xs text-muted-foreground">
-                        {order.link_provenance.linked_at
-                          ? new Date(order.link_provenance.linked_at).toLocaleString()
-                          : 'Date unavailable'}
-                        {order.link_provenance.linked_by ? ` · ${order.link_provenance.linked_by}` : ''}
-                      </p>
-                    </li>
-                  )}
-                  {order.service_promise_recorded_at && (
-                    <li>
-                      <p className="font-medium">Service parts promise recorded</p>
-                      <p className="text-xs text-muted-foreground">
-                        {new Date(order.service_promise_recorded_at).toLocaleString()}
-                        {order.service_promise_recorded_by ? ` · ${order.service_promise_recorded_by}` : ''}
-                      </p>
-                    </li>
-                  )}
-                  {order.ack && (
-                    <li>
-                      <p className="font-medium">Parked: {order.ack.reason_code.replace(/_/g, ' ')}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {new Date(order.ack.acked_at).toLocaleString()} · check back {formatDate(order.ack.checkback_date)}
-                        {order.ack.acked_by ? ` · ${order.ack.acked_by}` : ''}
-                      </p>
-                      {order.ack.note && <p className="mt-1 text-xs text-muted-foreground">{order.ack.note}</p>}
-                    </li>
-                  )}
-                  </ol>
-                )}
-                {activityError && (
-                  <div className="flex items-center justify-between gap-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                    <p>The live activity feed is unavailable; showing milestones from the current record.</p>
-                    <Button variant="outline" size="sm" onClick={() => void revalidateActivity()}>
-                      Retry
-                    </Button>
-                  </div>
-                )}
-              </Section>
-
-              <Separator />
-
-              <Section title="Open in source systems">
-                <div className="grid grid-cols-2 gap-2">
-                  <LightspeedLink url={order.ls_item_url} label="Lightspeed product" icon={Package} />
-                  <LightspeedLink url={order.ls_customer_url} label="Lightspeed customer" icon={User} />
-                  <LightspeedLink url={order.ls_order_url} label="Lightspeed purchase order" icon={FileText} />
-                  <LightspeedLink url={order.workorder_url} label="Lightspeed workorder" icon={Wrench} />
-                  <LightspeedLink url={order.shopify_order_url} label="Shopify order" icon={ShoppingBag} />
-                </div>
               </Section>
             </div>
           </ScrollArea>

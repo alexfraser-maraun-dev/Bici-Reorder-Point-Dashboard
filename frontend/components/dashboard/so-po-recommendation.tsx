@@ -11,7 +11,7 @@ import type { PoRecommendationCandidate, PoRecommendationTier, SpecialOrder } fr
 import { cn } from '@/lib/utils'
 import {
   PackageCheck, ArrowLeftRight, Truck, FileClock, FilePlus, ChevronDown, ChevronRight,
-  Copy, ExternalLink, RefreshCw,
+  Copy, RefreshCw,
 } from 'lucide-react'
 
 const TIER_META: Record<PoRecommendationTier, { label: string; className: string; icon: typeof Truck }> = {
@@ -198,26 +198,11 @@ export function PoRecommendationPanel({ order }: { order: SpecialOrder }) {
                   <Copy className="h-3.5 w-3.5" />
                   {copying ? 'Copying…' : 'Copy handoff details'}
                 </Button>
-                {order.ls_item_url && (
-                  <Button variant="outline" size="sm" className="min-h-9 gap-1.5 text-xs" asChild>
-                    <a href={order.ls_item_url} target="_blank" rel="noopener noreferrer">
-                      Open product in Lightspeed
-                      <ExternalLink className="h-3.5 w-3.5" />
-                    </a>
-                  </Button>
-                )}
-                {order.ls_order_url && (
-                  <Button variant="outline" size="sm" className="min-h-9 gap-1.5 text-xs" asChild>
-                    <a href={order.ls_order_url} target="_blank" rel="noopener noreferrer">
-                      Open assigned PO
-                      <ExternalLink className="h-3.5 w-3.5" />
-                    </a>
-                  </Button>
-                )}
               </div>
               <p className="text-xs text-muted-foreground">
                 Complete the allocation in Lightspeed. Its API cannot attach a special order to a
-                purchase order; refresh this dashboard afterward to confirm the assignment.
+                purchase order; use the product and PO links on the order tile, then refresh this
+                dashboard to confirm the assignment.
               </p>
             </>
           )}

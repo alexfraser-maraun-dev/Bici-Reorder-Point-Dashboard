@@ -25,7 +25,7 @@ import {
 import { cn } from '@/lib/utils'
 import { updateServicePromise, updateShopifyEta } from '@/lib/hooks'
 import type { AvailableVendor } from '@/lib/types'
-import { ExternalLink, Copy, Check, X, Package } from 'lucide-react'
+import { Copy, Check, X } from 'lucide-react'
 import { ShopifyMatchBadge } from './special-order-badges'
 
 export function CopyableUpc({ upc }: { upc: string }) {
@@ -403,18 +403,5 @@ export function FieldGroup({
         {children}
       </div>
     </div>
-  )
-}
-
-export function LightspeedLink({ url, label, icon: Icon }: { url: string | null; label: string; icon: typeof Package }) {
-  if (!url) return null
-  return (
-    <Button variant="outline" size="sm" className="min-h-9 w-full justify-start gap-2 px-2" asChild>
-      <a href={url} target="_blank" rel="noopener noreferrer">
-        <Icon className="h-3.5 w-3.5" />
-        <span className="text-xs">{label}</span>
-        <ExternalLink className="ml-auto h-3 w-3 opacity-60" />
-      </a>
-    </Button>
   )
 }

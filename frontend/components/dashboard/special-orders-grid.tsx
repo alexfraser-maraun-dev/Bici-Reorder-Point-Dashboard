@@ -120,7 +120,7 @@ export function SpecialOrdersGrid({
     return (
       <div className="space-y-2" aria-label="Loading special orders">
         {Array.from({ length: 8 }).map((_, index) => (
-          <Skeleton key={index} className="h-[92px] w-full rounded-lg" />
+          <Skeleton key={index} className="h-[140px] w-full rounded-lg" />
         ))}
       </div>
     )

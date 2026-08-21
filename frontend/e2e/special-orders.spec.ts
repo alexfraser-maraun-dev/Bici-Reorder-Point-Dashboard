@@ -43,6 +43,8 @@ function workForStage(stage: Stage) {
 function makeOrder(sequence: number, stage: Stage) {
   const work = workForStage(stage)
   const id = String(1000 + sequence)
+  const poId = String(5000 + sequence)
+  const hasShopifyOrder = sequence % 5 === 0
   return {
     special_order_id: id,
     status: stage === 'received' ? 'Received' : 'Open',
@@ -64,7 +66,7 @@ function makeOrder(sequence: number, stage: Stage) {
     brand: 'Test Brand',
     available_vendors: [],
     description: `Fixture product ${id}`,
-    order_id: stage === 'open_pool' ? null : `PO-${id}`,
+    order_id: stage === 'open_pool' ? null : poId,
     vendor_id: stage === 'open_pool' ? null : 'vendor-1',
     vendor_name: stage === 'open_pool' ? null : 'Fixture Vendor',
     order_type: stage === 'open_pool' ? null : 'Replenishment',
@@ -75,11 +77,11 @@ function makeOrder(sequence: number, stage: Stage) {
     received_started: stage === 'received',
     procurement_stage: stage,
     procurement_stage_index: stageIndex[stage],
-    source: 'neither',
+    source: hasShopifyOrder ? 'shopify' : 'neither',
     days_in_stage: 4 + sequence,
     po_created_date: stage === 'open_pool' ? null : '2026-08-04',
     po_received_date: stage === 'received' ? '2026-08-19' : null,
-    po_ref_num: null,
+    po_ref_num: stage === 'open_pool' ? null : `REF-${id}`,
     days_po_open: stage === 'open_pool' ? null : 15,
     sale_line_id: `sale-line-${id}`,
     order_line_id: stage === 'open_pool' ? null : `order-line-${id}`,
@@ -121,11 +123,11 @@ function makeOrder(sequence: number, stage: Stage) {
     flag: 'none',
     days_overdue: null,
     is_overdue: false,
-    shopify_match: 'none',
-    shopify_match_basis: null,
-    shopify_order_id: null,
-    shopify_order_name: null,
-    shopify_order_url: null,
+    shopify_match: hasShopifyOrder ? 'matched' : 'none',
+    shopify_match_basis: hasShopifyOrder ? 'email_sku' : null,
+    shopify_order_id: hasShopifyOrder ? `gid://shopify/Order/${id}` : null,
+    shopify_order_name: hasShopifyOrder ? `#SHOP-${id}` : null,
+    shopify_order_url: hasShopifyOrder ? `https://admin.shopify.com/store/test/orders/${id}` : null,
     shopify_expected_date: null,
     shopify_fulfillment_status: null,
     shopify_financial_status: null,
@@ -138,9 +140,9 @@ function makeOrder(sequence: number, stage: Stage) {
     workorder_eta_out: null,
     workorder_time_in: null,
     workorder_url: null,
-    ls_item_url: null,
-    ls_customer_url: null,
-    ls_order_url: null,
+    ls_item_url: `https://ls.example.test/items/${id}`,
+    ls_customer_url: `https://ls.example.test/customers/${id}`,
+    ls_order_url: stage === 'open_pool' ? null : `https://ls.example.test/orders/${poId}`,
     kind: 'ls',
     ambiguous_candidate: false,
   }
@@ -228,6 +230,7 @@ test('desktop Special Orders worklist is actionable, reconciled, paginated, and 
   }])
 
   let recommendationCalls = 0
+  let activityCalls = 0
 
   await page.route('**/api/auth/session', (route) => route.fulfill({
     status: 200,
@@ -262,6 +265,7 @@ test('desktop Special Orders worklist is actionable, reconciled, paginated, and 
     body: JSON.stringify(worklist),
   }))
   await page.route('**/backend/api/special-orders/*/activity', (route) => {
+    activityCalls += 1
     const specialOrderId = new URL(route.request().url()).pathname.split('/').at(-2) ?? 'unknown'
     return route.fulfill({
       status: 200,
@@ -324,12 +328,20 @@ test('desktop Special Orders worklist is actionable, reconciled, paginated, and 
 
   await expect(page.getByText('Showing 1–25 of 32 orders')).toBeVisible()
   await expect(page.getByRole('button', { name: /^Review / })).toHaveCount(25)
+  await expect(page.getByRole('list', { name: /^Order milestones for / })).toHaveCount(25)
+  await expect(page.getByRole('link', { name: /^Open Lightspeed product for System ID/ }).first()).toBeVisible()
+  await expect(page.getByRole('link', { name: /^Open Lightspeed customer/ }).first()).toBeVisible()
+  await expect(page.getByRole('link', { name: /^Open Lightspeed purchase order/ }).first()).toBeVisible()
+  await expect(page.getByRole('link', { name: /^Open Shopify order/ }).first()).toBeVisible()
+  expect(activityCalls).toBe(0)
 
   await page.getByRole('button', { name: /^Review SO/ }).first().click()
   const drawer = page.getByRole('dialog')
   await expect(drawer).toBeVisible()
   await expect(drawer.getByRole('heading', { name: /^SO #/ })).toBeVisible()
   await expect(drawer.getByText('Activity fixture loaded')).toBeVisible()
+  expect(activityCalls).toBe(1)
+  await expect(drawer.getByRole('heading', { name: 'Open in source systems' })).toHaveCount(0)
 
   await drawer.getByRole('button', { name: 'Where to order' }).click()
   await expect(drawer.getByText('Fixture recommendation')).toBeVisible()

@@ -45,13 +45,47 @@ const sourceConfig: Record<SpecialOrderSource, BadgeConfig> = {
   neither: { label: 'Lightspeed direct', className: 'bg-amber-100 text-amber-700 border-amber-200', icon: HelpCircle },
 }
 
-export function SourceBadge({ source }: { source: SpecialOrderSource | null | undefined }) {
+export function SourceBadge({
+  source,
+  href,
+  linkLabel,
+}: {
+  source: SpecialOrderSource | null | undefined
+  href?: string | null
+  linkLabel?: string
+}) {
   const config = sourceConfig[source ?? 'neither'] ?? sourceConfig.neither
   const Icon = config.icon
-  return (
-    <Badge variant="outline" className={cn('gap-1 text-xs font-medium', config.className)}>
+  const content = (
+    <>
       <Icon className="h-3 w-3" />
       {config.label}
+    </>
+  )
+
+  if (href) {
+    return (
+      <Badge
+        asChild
+        variant="outline"
+        className={cn('gap-1 text-xs font-medium', config.className)}
+      >
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label={linkLabel ?? `Open ${config.label} in a new tab`}
+          title={linkLabel ?? `Open ${config.label} in a new tab`}
+        >
+          {content}
+        </a>
+      </Badge>
+    )
+  }
+
+  return (
+    <Badge variant="outline" className={cn('gap-1 text-xs font-medium', config.className)}>
+      {content}
     </Badge>
   )
 }

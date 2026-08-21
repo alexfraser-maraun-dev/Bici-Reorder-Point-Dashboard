@@ -364,7 +364,7 @@ function SpecialOrdersFallback() {
       <Skeleton className="h-24 w-full rounded-lg" />
       <Skeleton className="h-10 w-full" />
       {Array.from({ length: 6 }).map((_, index) => (
-        <Skeleton key={index} className="h-[92px] w-full rounded-lg" />
+        <Skeleton key={index} className="h-[140px] w-full rounded-lg" />
       ))}
     </div>
   )
@@ -609,7 +609,7 @@ function SpecialOrdersContentInner() {
       )}
 
       {isLoading ? (
-        <Skeleton className="h-[92px] w-full rounded-lg" />
+        <Skeleton className="h-[140px] w-full rounded-lg" />
       ) : (
         <section className="rounded-lg border bg-card px-4 py-3" aria-labelledby="pipeline-heading">
           <div className="mb-2 flex items-center justify-between">
