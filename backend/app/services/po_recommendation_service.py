@@ -50,7 +50,8 @@ def build_context(rows: List[Dict[str, Any]], *, stock, unallocated, open_orders
             "cadence": cadence}
 
 
-def _in_stock_candidates(row, ctx, needed):
+def _in_stock_candidates(row, ctx, needed, today=None):
+    today = today or date.today()
     item = str(row.get("item_id") or "")
     shop = str(row.get("shop_id") or "")
     out = []
@@ -59,7 +60,7 @@ def _in_stock_candidates(row, ctx, needed):
         out.append({
             "tier": "in_stock", "shop_id": shop, "store": row.get("store"),
             "sellable": own["sellable"], "qoh": own.get("qoh"),
-            "eta": date.today().isoformat(),
+            "eta": today.isoformat(),
         })
     sister = SISTER_STORE.get(shop)
     if sister:
@@ -69,12 +70,13 @@ def _in_stock_candidates(row, ctx, needed):
                 "tier": "transfer", "shop_id": sister,
                 "sellable": far["sellable"], "qoh": far.get("qoh"),
                 # A transfer between the two Island stores is same-week, not same-day.
-                "eta": (date.today() + timedelta(days=2)).isoformat(),
+                "eta": (today + timedelta(days=2)).isoformat(),
             })
     return out
 
 
-def _inbound_candidates(row, ctx, needed):
+def _inbound_candidates(row, ctx, needed, today=None):
+    today = today or date.today()
     item = str(row.get("item_id") or "")
     shop = str(row.get("shop_id") or "")
     out = []
@@ -91,7 +93,7 @@ def _inbound_candidates(row, ctx, needed):
             "eta": eta,
             # A PO whose ETA has already passed is late, not fast. Surfaced so the buyer does
             # not treat a stale date as a delivery promise.
-            "eta_overdue": bool(eta and _parse(eta) and _parse(eta) < date.today()),
+            "eta_overdue": bool(eta and _parse(eta) and _parse(eta) < today),
         })
     return out
 
@@ -172,14 +174,19 @@ def compute_fastest_path(row: Dict[str, Any], ctx: Dict[str, Any],
 
     tier = None
     if stage == "received":
-        fastest = _parse(row.get("po_received_date")) or today
+        # Freeze only at the individual SpecialOrder receipt timestamp. A PO header receipt
+        # may belong to another line in a split shipment.
+        fastest = _parse(row.get("so_received_date")) or today
         tier = "received"
     elif stage == "ordered":
         fastest = _parse(row.get("expected_date")) or _order_landing(row, today)
         tier = "inbound_po"
     else:
         needed = int(row.get("unit_quantity") or 1)
-        options = _in_stock_candidates(row, ctx, needed) + _inbound_candidates(row, ctx, needed)
+        options = (
+            _in_stock_candidates(row, ctx, needed, today)
+            + _inbound_candidates(row, ctx, needed, today)
+        )
         order_landing = _order_landing(row, today)
         best, tier = order_landing, "new_po"
         for c in options:
@@ -204,8 +211,8 @@ def recommend(row: Dict[str, Any], ctx: Dict[str, Any], today: Optional[date] = 
     needed = int(row.get("unit_quantity") or 1)
     promise = _parse(row.get("promise_date"))
 
-    candidates = (_in_stock_candidates(row, ctx, needed)
-                  + _inbound_candidates(row, ctx, needed)
+    candidates = (_in_stock_candidates(row, ctx, needed, today)
+                  + _inbound_candidates(row, ctx, needed, today)
                   + _draft_candidates(row, ctx))
 
     # Give every option a landing date, so they can be compared on the only thing that matters

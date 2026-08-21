@@ -124,6 +124,50 @@ class SpecialOrderApiBoundaryTest(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 502)
         self.assertIn("unavailable", raised.exception.detail.lower())
 
+    def test_activity_separates_po_receiving_from_individual_so_receipt(self):
+        class Store:
+            def list_so_promises(self, _special_order_id):
+                return []
+
+            def list_so_activity(self, _special_order_id):
+                return []
+
+            def list_so_acks(self):
+                return {}
+
+        row = {
+            "special_order_id": "SO-1",
+            "created_date": "2026-08-01",
+            "po_received_date": "2026-08-20",
+            "so_received": False,
+            "so_received_date": None,
+            "receiving_state": "po_receiving",
+        }
+        main._special_orders_cache["data"]["orders"] = [row]
+        with patch("app.services.planning_store.PlanningStore", return_value=Store()):
+            activity = main.get_special_order_activity("SO-1")["activity"]
+
+        self.assertFalse(any(event["type"] == "received" for event in activity))
+        po_event = next(event for event in activity if event["type"] == "po_receiving")
+        self.assertEqual(po_event["timestamp"], "2026-08-20")
+        self.assertEqual(po_event["details"]["receiving_state"], "po_receiving")
+        self.assertFalse(po_event["details"]["so_received"])
+        self.assertEqual(
+            po_event["details"]["exception"], "backorder_or_split_shipment"
+        )
+        self.assertIn("remains unreceived", po_event["label"])
+
+        row.update({
+            "so_received": True,
+            "so_received_date": "2026-08-21",
+            "receiving_state": "so_received",
+        })
+        with patch("app.services.planning_store.PlanningStore", return_value=Store()):
+            activity = main.get_special_order_activity("SO-1")["activity"]
+        receipt = next(event for event in activity if event["type"] == "received")
+        self.assertEqual(receipt["timestamp"], "2026-08-21")
+        self.assertEqual(receipt["label"], "Special order checked in")
+
 
 class BigQueryMatchBatchTest(unittest.TestCase):
     def test_one_load_job_contains_the_complete_decision_batch(self):

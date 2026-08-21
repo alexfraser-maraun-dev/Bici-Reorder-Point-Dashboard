@@ -30,7 +30,7 @@ import {
 import { SeverityBadge, ShopifyMatchBadge, SourceBadge } from './special-order-badges'
 import { EscalationBadge, SoAckMenu } from './so-ack-menu'
 import { PoRecommendationPanel } from './so-po-recommendation'
-import { ownerLabel, StagePill, workStateLabel } from './special-order-row'
+import { ownerLabel, specialOrderReceivingState, StagePill, workStateLabel } from './special-order-row'
 import { CalendarClock, Link2 } from 'lucide-react'
 
 interface Props {
@@ -79,6 +79,18 @@ function routeLabel(tier: SpecialOrder['fastest_path_tier']): string {
   if (tier === 'new_po') return 'New vendor order'
   if (tier === 'received') return 'Received'
   return 'Not calculated'
+}
+
+function receivingLabel(order: SpecialOrder): string {
+  const state = specialOrderReceivingState(order)
+  if (state === 'so_received') return 'Special order received'
+  if (state === 'po_complete_so_unreceived') {
+    return 'PO complete · SO pending (split shipment/backorder likely)'
+  }
+  if (state === 'po_receiving') {
+    return 'PO receiving · SO pending (split shipment/backorder likely)'
+  }
+  return 'Not started'
 }
 
 function eventDetails(details: Record<string, unknown> | string | null): string | null {
@@ -136,8 +148,19 @@ function ActivityPanel({
           )}
           {order.po_received_date && (
             <li>
-              <p className="font-medium">Item received</p>
-              <p className="text-xs text-muted-foreground">{formatDate(order.po_received_date)}</p>
+              <p className="font-medium">Purchase order receiving activity recorded</p>
+              <p className="text-xs text-muted-foreground">
+                {formatDate(order.po_received_date)}
+                {(order.receiving_state === 'po_receiving' || order.receiving_state === 'po_complete_so_unreceived') && (
+                  <span> · SO pending — likely split shipment or backorder</span>
+                )}
+              </p>
+            </li>
+          )}
+          {order.so_received_date && (
+            <li>
+              <p className="font-medium">Special order checked in</p>
+              <p className="text-xs text-muted-foreground">{formatDate(order.so_received_date)}</p>
             </li>
           )}
           {order.link_provenance && (
@@ -358,7 +381,7 @@ export function SpecialOrderDetailDrawer({
                   <Info label="PO type" value={order.order_type} />
                   <Info
                     label="Receiving"
-                    value={order.po_complete ? 'Complete' : order.received_started ? 'Started' : 'Not started'}
+                    value={receivingLabel(order)}
                   />
                   <Info label="Fastest route" value={routeLabel(order.fastest_path_tier)} />
                   <Info label="Could have landed" value={formatDate(order.could_have_landed)} />

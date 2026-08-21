@@ -32,6 +32,9 @@ function fixture(overrides: Partial<SpecialOrder> = {}): SpecialOrder {
     po_ordered: true,
     po_complete: false,
     received_started: false,
+    so_received: false,
+    so_received_date: null,
+    receiving_state: 'not_started',
     work_state: 'vendor_followup',
     next_action: 'Confirm the vendor arrival date',
     action_owner: 'procurement',
@@ -92,8 +95,8 @@ describe('SpecialOrderRow progress rail', () => {
     const rail = screen.getByRole('list', { name: 'Order milestones for SO #42' })
     expect(within(rail).getByText('SO created').closest('li')).not.toHaveAttribute('aria-current')
     expect(within(rail).getByText('Ordered').closest('li')).not.toHaveAttribute('aria-current')
-    expect(within(rail).getByText('Arrived').closest('li')).toHaveAttribute('aria-current', 'step')
-    expect(within(rail).getByText('Arrived').closest('li')).toHaveTextContent('Pending')
+    expect(within(rail).getByText('SO check-in').closest('li')).toHaveAttribute('aria-current', 'step')
+    expect(within(rail).getByText('SO check-in').closest('li')).toHaveTextContent('Pending')
   })
 
   it('uses authoritative stage completion without inventing a missing date', () => {
@@ -117,6 +120,7 @@ describe('SpecialOrderRow progress rail', () => {
           po_created_date: null,
           ordered_date: null,
           po_ordered: false,
+          receiving_state: 'not_started',
           shopify_order_name: '#1234',
         })}
         onReview={vi.fn()}
@@ -126,5 +130,99 @@ describe('SpecialOrderRow progress rail', () => {
     const rail = screen.getByRole('list', { name: 'Order milestones for #1234' })
     expect(within(rail).getByText('Shopify order')).toBeInTheDocument()
     expect(within(rail).getByText('Lightspeed SO').closest('li')).toHaveAttribute('aria-current', 'step')
+  })
+
+  it('does not mark the SO received when PO receiving has started', () => {
+    render(
+      <SpecialOrderRow
+        order={fixture({
+          received_started: true,
+          po_received_date: '2026-08-18',
+          receiving_state: 'po_receiving',
+        })}
+        onReview={vi.fn()}
+      />,
+    )
+
+    const checkIn = screen.getByText('SO check-in').closest('li')
+    expect(checkIn).toHaveAttribute('aria-current', 'step')
+    expect(checkIn).toHaveTextContent('PO receiving Aug 18 · SO pending')
+    expect(checkIn).toHaveTextContent('Likely split shipment / backorder')
+  })
+
+  it('keeps SO check-in pending when the PO is complete', () => {
+    const received = orderMilestones(fixture({
+      po_complete: true,
+      received_started: true,
+      po_received_date: '2026-08-18',
+      receiving_state: 'po_complete_so_unreceived',
+    })).find((milestone) => milestone.key === 'received')
+
+    expect(received).toMatchObject({
+      label: 'SO check-in',
+      date: null,
+      complete: false,
+      detail: 'PO complete Aug 18 · SO pending',
+      hint: 'Likely split shipment / backorder',
+      attention: true,
+    })
+  })
+
+  it('completes check-in only from the individual SO receipt signal and date', () => {
+    const received = orderMilestones(fixture({
+      procurement_stage: 'received',
+      procurement_stage_index: 3,
+      po_complete: true,
+      received_started: true,
+      po_received_date: '2026-08-18',
+      so_received: true,
+      so_received_date: '2026-08-20',
+      receiving_state: 'so_received',
+    })).find((milestone) => milestone.key === 'received')
+
+    expect(received).toMatchObject({
+      date: '2026-08-20',
+      complete: true,
+      attention: false,
+    })
+  })
+
+  it('derives the PO exception safely for cached rows without the new fields', () => {
+    const received = orderMilestones(fixture({
+      receiving_state: undefined,
+      so_received: undefined,
+      po_complete: true,
+      received_started: true,
+    })).find((milestone) => milestone.key === 'received')
+
+    expect(received).toMatchObject({
+      complete: false,
+      detail: 'PO complete · SO pending',
+      attention: true,
+    })
+  })
+
+  it('uses the received stage only as a fallback when explicit receipt fields are absent', () => {
+    const legacyReceived = orderMilestones(fixture({
+      receiving_state: undefined,
+      so_received: undefined,
+      procurement_stage: 'received',
+      procurement_stage_index: 3,
+      po_complete: false,
+      received_started: false,
+      po_received_date: null,
+    })).find((milestone) => milestone.key === 'received')
+    const explicitlyUnreceived = orderMilestones(fixture({
+      receiving_state: undefined,
+      so_received: false,
+      procurement_stage: 'received',
+      procurement_stage_index: 3,
+      po_complete: false,
+      received_started: false,
+      po_received_date: null,
+    })).find((milestone) => milestone.key === 'received')
+
+    expect(legacyReceived?.complete).toBe(true)
+    expect(explicitlyUnreceived?.complete).toBe(false)
   })
 })

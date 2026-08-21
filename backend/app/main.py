@@ -1812,10 +1812,31 @@ def get_special_order_activity(special_order_id: str):
         (row.get("created_date"), "created", "Special order created"),
         (row.get("po_created_date"), "po_drafted", "Draft purchase order created"),
         (row.get("ordered_date"), "po_placed", "Purchase order placed with vendor"),
-        (row.get("po_received_date"), "received", "Item received"),
+        # Individual-SO receipt only. The PO header date can belong to another line in a split
+        # shipment and is represented as PO receiving context below instead.
+        (row.get("so_received_date"), "received", "Special order checked in"),
     )
     for timestamp, event_type, label in milestones:
         add(timestamp, event_type, label)
+
+    if row.get("po_received_date"):
+        receipt_exception = row.get("receiving_state") in (
+            "po_receiving", "po_complete_so_unreceived"
+        )
+        add(
+            row.get("po_received_date"),
+            "po_receiving",
+            (
+                "PO checked in; special order remains unreceived"
+                if receipt_exception
+                else "Purchase order receiving activity recorded"
+            ),
+            details={
+                "receiving_state": row.get("receiving_state"),
+                "so_received": bool(row.get("so_received")),
+                "exception": "backorder_or_split_shipment" if receipt_exception else None,
+            },
+        )
 
     provenance = row.get("link_provenance") or {}
     add(

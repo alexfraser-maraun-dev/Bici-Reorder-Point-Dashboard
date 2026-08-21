@@ -135,6 +135,11 @@ export function SoScoreboard() {
                     <p className="text-red-600">{p.breached_outstanding} past promise, not yet here</p>
                   )}
                   <p className="text-muted-foreground">{p?.undetermined ?? 0} still inside their window</p>
+                  {!!p?.received_date_unknown && (
+                    <p className="text-muted-foreground">
+                      {p.received_date_unknown} received with no individual check-in date; excluded from the rate
+                    </p>
+                  )}
                   {!!p?.revised_at_least_once && (
                     <p className="text-amber-700">{p.revised_at_least_once} had the date revised</p>
                   )}

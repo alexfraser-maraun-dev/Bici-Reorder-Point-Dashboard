@@ -189,7 +189,7 @@ def _workorder_is_open(row: Dict[str, Any]) -> bool:
 def _closeout_action(row: Dict[str, Any]) -> Dict[str, Any]:
     """Post-receipt work, kept explicitly outside the delivery SLA."""
     due = _due_from(
-        row.get("po_received_date") or row.get("ordered_date") or row.get("created_date"),
+        row.get("so_received_date") or row.get("ordered_date") or row.get("created_date"),
         RECEIVING_BUFFER_DAYS,
     )
     if _workorder_is_open(row):
@@ -250,7 +250,10 @@ def compute_work_state(row: Dict[str, Any], sla: Dict[str, Any], today: date) ->
         queue_states.append("needs_ordering")
     elif stage == "ordered":
         queue_states.append("in_transit")
-        if row.get("flag") == "no_eta" or severity in (
+        receipt_exception = row.get("receiving_state") in (
+            "po_receiving", "po_complete_so_unreceived"
+        )
+        if receipt_exception or row.get("flag") == "no_eta" or severity in (
             "promise_missed", "stage_stalled", "impossible", "order_today", "at_risk"
         ):
             queue_states.append("vendor_followup")
@@ -287,7 +290,17 @@ def compute_work_state(row: Dict[str, Any], sla: Dict[str, Any], today: date) ->
         }
     elif "vendor_followup" in queue_states:
         primary = "vendor_followup"
-        if row.get("flag") == "no_eta":
+        if row.get("receiving_state") == "po_complete_so_unreceived":
+            next_action = (
+                "PO is complete but this special order is not received — confirm a backorder "
+                "or split shipment with the vendor."
+            )
+        elif row.get("receiving_state") == "po_receiving":
+            next_action = (
+                "PO receiving has started but this special order is not received — confirm a "
+                "backorder or split shipment with the vendor."
+            )
+        elif row.get("flag") == "no_eta":
             next_action = "Confirm an expected arrival date with the vendor."
         elif severity == "promise_missed":
             next_action = "Chase the vendor now and re-quote the customer if required."

@@ -873,9 +873,9 @@ class LightspeedClient:
                 # is the failure we are hunting, and SO age hides it completely.
                 "createTime": order.get("createTime") or None,
                 "refNum": order.get("refNum") or None,
-                # Header-level receipt date. Lightspeed does not timestamp individual line
-                # receipts, so this is the best available marker for "the item landed" and is
-                # where the special-order SLA clock stops.
+                # PO-header receipt context only. It can be set because a different line was
+                # checked in, so the Special Orders workflow must not treat this as proof that
+                # its individual item landed.
                 "receivedDate": order.get("receivedDate") or None,
                 "complete": str(order.get("complete")).lower() == "true",
                 "vendor_id": order.get("vendorID"),

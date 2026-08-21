@@ -186,7 +186,8 @@ def test_fastest_path_covers_every_stage():
     # Received: frozen at receipt — never keeps accruing after the item arrived.
     received = reco.compute_fastest_path(
         _row(procurement_stage="received", created_date="2026-08-01",
-             po_received_date="2026-08-05", available_vendors=vendors), _ctx(), TODAY)
+             po_received_date="2026-08-03", so_received_date="2026-08-05",
+             available_vendors=vendors), _ctx(), TODAY)
     assert received["fastest_path_tier"] == "received", received
     assert received["fastest_landing_date"] == "2026-08-05", received
     assert received["days_lost"] == 1, received   # landed 1 day after it could have

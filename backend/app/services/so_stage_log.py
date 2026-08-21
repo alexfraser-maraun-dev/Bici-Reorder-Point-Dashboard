@@ -31,7 +31,9 @@ _STAGE_TIMESTAMP_FIELD = {
     "open_pool": "created_date",        # SaleLine.createTime -- the customer asked
     "unordered_po": "po_created_date",  # Order.createTime -- a draft PO was opened
     "ordered": "ordered_date",          # Order.orderedDate -- placed with the vendor
-    "received": "po_received_date",     # Order.receivedDate -- the item landed
+    # SpecialOrder.timeStamp while its own status is received. Order.receivedDate is PO-wide
+    # and can belong to another line in a backorder/split shipment.
+    "received": "so_received_date",
 }
 
 _META_LAST_POPULATION = "so_sweep_last_population"
@@ -52,9 +54,9 @@ def derive_stage_entry(row: Dict[str, Any], observed_at: str) -> Optional[Dict[s
     entered_at = row.get(_STAGE_TIMESTAMP_FIELD.get(stage) or "")
     entered_source = "derived"
     if not entered_at:
-        # Fall back down the chain: a received SO whose PO has no receivedDate is still at
-        # least as old as its ordered date, and so on. Only when nothing at all is known do
-        # we stamp the observation time.
+        # Fall back down the chain when Lightspeed has no individual status timestamp. These
+        # are measurement floors only; a PO header receipt date is intentionally excluded
+        # because it may belong to another line in a split shipment.
         for fallback in ("ordered_date", "po_created_date", "created_date"):
             if row.get(fallback):
                 entered_at = row[fallback]

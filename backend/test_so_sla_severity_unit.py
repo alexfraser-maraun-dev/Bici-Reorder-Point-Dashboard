@@ -177,7 +177,7 @@ def test_operational_work_states_and_closeout_are_separate_from_delivery_sla():
     service_close = sla.build_escalations([
         _row(procurement_stage="received", source="workorder", workorder_id="10",
              workorder_status="Waiting Parts", contacted=False, completed=False,
-             po_received_date="2026-08-18")
+             po_received_date="2026-08-16", so_received_date="2026-08-18")
     ], {}, TODAY)["orders"][0]
     assert service_close["sla_severity"] == "closed_out"
     assert service_close["work_state"] == "closeout"

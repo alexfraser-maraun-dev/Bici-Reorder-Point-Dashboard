@@ -29,6 +29,7 @@ so lateness is judged solely against placed POs. See `_compute_stage_and_flag`.
 
 import copy
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
@@ -61,12 +62,42 @@ _OVERDUE_FLAGS = ("overdue", "overdue_mid", "critical")
 
 # SpecialOrder.status keywords meaning the item has been checked in / received.
 _RECEIVED_STATUS_KEYS = ("received", "ready", "arrived", "pickup", "checked in", "in stock")
+_UNRECEIVED_STATUS_KEYS = (
+    "not received", "not ready", "not arrived", "not checked in", "not in stock",
+    "backorder", "backordered", "back order",
+)
 
 
 def _status_is_received(status: str) -> bool:
     """True if the SpecialOrder.status indicates the item has been checked in/received."""
     sl = (status or "").strip().lower()
-    return any(key in sl for key in _RECEIVED_STATUS_KEYS)
+
+    def has_phrase(key: str) -> bool:
+        # Word boundaries matter: a substring check would find "ready" inside "already" and
+        # could turn "already ordered" into a false receipt.
+        return bool(re.search(rf"(?<!\w){re.escape(key)}(?!\w)", sl))
+
+    if any(has_phrase(key) for key in _UNRECEIVED_STATUS_KEYS):
+        return False
+    return any(has_phrase(key) for key in _RECEIVED_STATUS_KEYS)
+
+
+def derive_receiving_state(*, so_received: bool, po_receiving_started: bool,
+                           po_received_date: Optional[str], po_complete: bool) -> str:
+    """Keep individual-SO receipt separate from purchase-order receiving context.
+
+    Lightspeed's PO header and OrderLines describe the whole purchase order. Another line can
+    be checked in while this special-order item remains outstanding, so neither ``checkedIn`` /
+    ``numReceived`` on another line nor ``Order.receivedDate`` proves this SO arrived. The
+    SpecialOrder's own status is authoritative for ``so_received``.
+    """
+    if so_received:
+        return "so_received"
+    if po_complete:
+        return "po_complete_so_unreceived"
+    if po_receiving_started or bool(po_received_date):
+        return "po_receiving"
+    return "not_started"
 
 
 def _ls_url(view: str, entity_id: Optional[str], extra: str = "") -> Optional[str]:
@@ -329,6 +360,7 @@ def _normalize(
     customer_id = so.get("customerID")
     shop_id = str(so.get("shopID")) if so.get("shopID") is not None else None
     status = so.get("status") or "Unknown"
+    so_received = _status_is_received(status)
     contacted = _coerce_bool(so.get("contacted"))
 
     # Service-bench linkage: an SO raised from a workorder reaches its Workorder via
@@ -349,6 +381,19 @@ def _normalize(
     expected_date = _parse_ls_date(po.get("arrivalDate"))
     ordered_date = _parse_ls_date(po.get("orderedDate"))
     po_created_date = _parse_ls_date(po.get("createTime"))
+    po_received_date = _parse_ls_date(po.get("receivedDate"))
+    # SpecialOrder.timeStamp is the best available timestamp for the individual SO's status
+    # transition. It is deliberately used only when that status says the SO itself is received;
+    # the PO header date may belong to a different line in a split shipment.
+    so_received_date = _parse_ls_date(so.get("timeStamp")) if so_received else None
+    po_complete = bool(po.get("complete"))
+    po_receiving_started = bool(po.get("received_started"))
+    receiving_state = derive_receiving_state(
+        so_received=so_received,
+        po_receiving_started=po_receiving_started,
+        po_received_date=po_received_date.isoformat() if po_received_date else None,
+        po_complete=po_complete,
+    )
     days_po_open = (today - po_created_date).days if po_created_date else None
 
     # Two clocks, deliberately kept separate (verified against live data 2026-08-19):
@@ -372,7 +417,7 @@ def _normalize(
     triage = _compute_stage_and_flag(
         has_po=order_id is not None,
         po_ordered=ordered_date is not None,
-        received=_status_is_received(status),
+        received=so_received,
         expected_date=expected_date,
         days_since_creation=days_since_creation,
         contacted=contacted,
@@ -415,6 +460,10 @@ def _normalize(
         "days_since_creation": days_since_creation,
         "contacted": contacted,
         "completed": _coerce_bool(so.get("completed")),
+        # Individual receipt is authoritative from SpecialOrder.status. `completed` remains a
+        # separate lifecycle flag because a completed/cancelled SO is not necessarily received.
+        "so_received": so_received,
+        "so_received_date": so_received_date.isoformat() if so_received_date else None,
         # Customer
         "customer_id": customer_id,
         "customer_name": _customer_name(customer),
@@ -456,13 +505,15 @@ def _normalize(
         "expected_date": expected_date.isoformat() if expected_date else None,
         "ordered_date": ordered_date.isoformat() if ordered_date else None,
         "po_created_date": po_created_date.isoformat() if po_created_date else None,
-        "po_received_date": (_parse_ls_date(po.get("receivedDate")).isoformat()
-                             if _parse_ls_date(po.get("receivedDate")) else None),
+        # PO-wide context only. This can reflect another line's receipt in a split shipment and
+        # must never be presented as the individual SO's received date.
+        "po_received_date": po_received_date.isoformat() if po_received_date else None,
         "po_ref_num": po.get("refNum"),
         "days_po_open": days_po_open,
         "po_ordered": ordered_date is not None,
-        "po_complete": bool(po.get("complete")),
-        "received_started": bool(po.get("received_started")),
+        "po_complete": po_complete,
+        "received_started": po_receiving_started,
+        "receiving_state": receiving_state,
         # Triage: procurement stage + within-stage attention flag
         "procurement_stage": triage["procurement_stage"],
         "procurement_stage_index": triage["procurement_stage_index"],

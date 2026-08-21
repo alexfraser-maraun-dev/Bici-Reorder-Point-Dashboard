@@ -45,6 +45,7 @@ function makeOrder(sequence: number, stage: Stage) {
   const id = String(1000 + sequence)
   const poId = String(5000 + sequence)
   const hasShopifyOrder = sequence % 5 === 0
+  const hasReceiptException = stage === 'ordered' && sequence === 25
   return {
     special_order_id: id,
     status: stage === 'received' ? 'Received' : 'Open',
@@ -74,13 +75,20 @@ function makeOrder(sequence: number, stage: Stage) {
     ordered_date: stage === 'ordered' || stage === 'received' ? '2026-08-05' : null,
     po_ordered: stage === 'ordered' || stage === 'received',
     po_complete: stage === 'received',
-    received_started: stage === 'received',
+    received_started: stage === 'received' || hasReceiptException,
+    so_received: stage === 'received',
+    so_received_date: stage === 'received' ? '2026-08-19' : null,
+    receiving_state: stage === 'received'
+      ? 'so_received'
+      : hasReceiptException
+        ? 'po_receiving'
+        : 'not_started',
     procurement_stage: stage,
     procurement_stage_index: stageIndex[stage],
     source: hasShopifyOrder ? 'shopify' : 'neither',
     days_in_stage: 4 + sequence,
     po_created_date: stage === 'open_pool' ? null : '2026-08-04',
-    po_received_date: stage === 'received' ? '2026-08-19' : null,
+    po_received_date: stage === 'received' || hasReceiptException ? '2026-08-18' : null,
     po_ref_num: stage === 'open_pool' ? null : `REF-${id}`,
     days_po_open: stage === 'open_pool' ? null : 15,
     sale_line_id: `sale-line-${id}`,
@@ -334,6 +342,21 @@ test('desktop Special Orders worklist is actionable, reconciled, paginated, and 
   await expect(page.getByRole('link', { name: /^Open Lightspeed purchase order/ }).first()).toBeVisible()
   await expect(page.getByRole('link', { name: /^Open Shopify order/ }).first()).toBeVisible()
   expect(activityCalls).toBe(0)
+
+  const actionFilter = page.getByRole('combobox', { name: 'Action' })
+  await actionFilter.click()
+  await page.getByRole('option', { name: 'Split shipment / backorder' }).click()
+  await expect(page).toHaveURL(/action=receipt_exception/)
+  await expect(page.getByText('Showing 1–1 of 1 orders')).toBeVisible()
+  const exceptionRail = page.getByRole('list', { name: 'Order milestones for SO #1025' })
+  await expect(exceptionRail.getByText('SO check-in')).toBeVisible()
+  await expect(exceptionRail.getByText('PO receiving Aug 18 · SO pending')).toBeVisible()
+  await expect(exceptionRail.getByText('Likely split shipment / backorder')).toBeVisible()
+  expect(activityCalls).toBe(0)
+
+  await actionFilter.click()
+  await page.getByRole('option', { name: 'All actions' }).click()
+  await expect(page).not.toHaveURL(/action=/)
 
   await page.getByRole('button', { name: /^Review SO/ }).first().click()
   const drawer = page.getByRole('dialog')

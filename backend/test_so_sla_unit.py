@@ -22,6 +22,7 @@ def _row(**kw) -> Dict[str, Any]:
         "po_created_date": None,
         "ordered_date": None,
         "po_received_date": None,
+        "so_received_date": None,
         "shop_id": "3",
         "source": "workorder",
         "order_id": None,
@@ -37,7 +38,7 @@ def test_each_stage_uses_its_own_lightspeed_timestamp():
         ("open_pool", {"created_date": "2026-05-20"}, "2026-05-20"),
         ("unordered_po", {"po_created_date": "2026-07-02"}, "2026-07-02"),
         ("ordered", {"ordered_date": "2026-07-10"}, "2026-07-10"),
-        ("received", {"po_received_date": "2026-08-01"}, "2026-08-01"),
+        ("received", {"so_received_date": "2026-08-01"}, "2026-08-01"),
     ]
     for stage, fields, expected in cases:
         entry = so_stage_log.derive_stage_entry(_row(procurement_stage=stage, **fields), NOW)
@@ -47,10 +48,11 @@ def test_each_stage_uses_its_own_lightspeed_timestamp():
 
 
 def test_missing_timestamp_falls_back_and_is_marked_observed():
-    # A received SO whose PO carries no receivedDate is still at least as old as its order
-    # date. The approximation must be flagged so the scoreboard can discount it.
+    # A PO-wide receivedDate may belong to another line in a split shipment. If the individual
+    # SO has no status timestamp, ignore the PO date and fall back to the ordered date.
     entry = so_stage_log.derive_stage_entry(
-        _row(procurement_stage="received", ordered_date="2026-07-10", po_received_date=None), NOW
+        _row(procurement_stage="received", ordered_date="2026-07-10",
+             po_received_date="2026-07-25", so_received_date=None), NOW
     )
     assert entry["entered_at"] == "2026-07-10", entry
     assert entry["entered_source"] == "observed", entry

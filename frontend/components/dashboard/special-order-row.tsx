@@ -6,6 +6,7 @@ import { cn } from '@/lib/utils'
 import type {
   SpecialOrder,
   SpecialOrderActionOwner,
+  SpecialOrderReceivingState,
   SpecialOrderWorkState,
   TriageStage,
 } from '@/lib/types'
@@ -105,6 +106,32 @@ export interface OrderMilestone {
   label: string
   date: string | null
   complete: boolean
+  detail?: string
+  hint?: string
+  attention?: boolean
+}
+
+/** Resolve the new explicit receiving contract, with a safe fallback for cached responses made
+ * before it existed. PO-level progress must never be interpreted as receipt of this SO. */
+export function specialOrderReceivingState(order: SpecialOrder): SpecialOrderReceivingState {
+  // `so_received` is the authoritative individual-unit signal when present. The enum adds the
+  // PO context; neither a PO header nor another received line may override an explicit `false`.
+  if (order.so_received === true) return 'so_received'
+  if (order.receiving_state && order.receiving_state !== 'so_received') {
+    return order.receiving_state
+  }
+  if (order.so_received === false) {
+    if (order.po_complete) return 'po_complete_so_unreceived'
+    if (order.received_started || order.po_received_date) return 'po_receiving'
+    return 'not_started'
+  }
+  if (order.receiving_state === 'so_received') return 'so_received'
+  if (order.procurement_stage === 'received' || order.procurement_stage_index >= 3) {
+    return 'so_received'
+  }
+  if (order.po_complete) return 'po_complete_so_unreceived'
+  if (order.received_started || order.po_received_date) return 'po_receiving'
+  return 'not_started'
 }
 
 /** A lightweight progress summary built from the worklist row itself.
@@ -114,15 +141,22 @@ export interface OrderMilestone {
 export function orderMilestones(order: SpecialOrder): OrderMilestone[] {
   const isShopifyIntake = order.kind === 'shopify'
   const stageIndex = isShopifyIntake ? 0 : order.procurement_stage_index
+  const receivingState = isShopifyIntake
+    ? 'not_started'
+    : specialOrderReceivingState(order)
   const drafted = !isShopifyIntake && Boolean(
     order.po_created_date || order.order_id || stageIndex >= 1,
   )
   const ordered = !isShopifyIntake && Boolean(
     order.ordered_date || order.po_ordered || stageIndex >= 2,
   )
-  const received = !isShopifyIntake && Boolean(
-    order.po_received_date || order.po_complete || order.received_started || stageIndex >= 3,
-  )
+  const received = !isShopifyIntake && receivingState === 'so_received'
+  const poContextDate = order.po_received_date ? ` ${formatDate(order.po_received_date)}` : ''
+  const receivingDetail = receivingState === 'po_complete_so_unreceived'
+    ? `PO complete${poContextDate} · SO pending`
+    : receivingState === 'po_receiving'
+      ? `PO receiving${poContextDate} · SO pending`
+      : undefined
 
   return [
     {
@@ -138,7 +172,16 @@ export function orderMilestones(order: SpecialOrder): OrderMilestone[] {
       complete: drafted,
     },
     { key: 'ordered', label: 'Ordered', date: order.ordered_date, complete: ordered },
-    { key: 'received', label: 'Arrived', date: order.po_received_date, complete: received },
+    {
+      key: 'received',
+      label: 'SO check-in',
+      // `po_received_date` is a PO-header timestamp and can predate this unit's arrival.
+      date: received ? order.so_received_date ?? null : null,
+      complete: received,
+      detail: receivingDetail,
+      hint: receivingDetail ? 'Likely split shipment / backorder' : undefined,
+      attention: Boolean(receivingDetail),
+    },
   ]
 }
 
@@ -147,7 +190,7 @@ function primaryDate(order: SpecialOrder): { label: string; value: string | null
     return { label: 'Expected', value: order.expected_date ?? order.fastest_landing_date }
   }
   if (order.procurement_stage === 'received') {
-    return { label: 'Arrived', value: order.po_received_date ?? order.expected_date }
+    return { label: 'Arrived', value: order.so_received_date ?? order.expected_date }
   }
   return { label: 'Promise', value: order.promise_date }
 }
@@ -227,20 +270,33 @@ function MilestoneRail({ order, identity }: { order: SpecialOrder; identity: str
                   className={cn(
                     'relative z-10 mt-0.5 h-3.5 w-3.5 shrink-0 rounded-full border-2 bg-card',
                     milestone.complete && 'border-primary bg-primary',
-                    isCurrent && !milestone.complete && 'border-primary ring-2 ring-primary/15',
+                    isCurrent && !milestone.complete && !milestone.attention && 'border-primary ring-2 ring-primary/15',
+                    milestone.attention && 'border-amber-600 bg-amber-50 ring-2 ring-amber-500/20',
                     !milestone.complete && !isCurrent && 'border-muted-foreground/30',
                   )}
                   aria-hidden="true"
                 />
                 <span className="relative z-10 min-w-0 bg-card/90 pr-1 text-[11px] leading-4">
-                  <span className={cn('block truncate font-medium', !milestone.complete && !isCurrent && 'text-muted-foreground')}>
+                  <span className={cn(
+                    'block truncate font-medium',
+                    milestone.attention && 'text-amber-800',
+                    !milestone.complete && !isCurrent && 'text-muted-foreground',
+                  )}>
                     {milestone.label}
                   </span>
-                  <span className="block truncate text-muted-foreground">
-                    {milestone.date ? (
+                  <span className={cn(
+                    'block truncate text-muted-foreground',
+                    milestone.attention && 'font-medium text-amber-800',
+                  )}>
+                    {milestone.detail ?? (milestone.date ? (
                       <time dateTime={milestone.date}>{formatDate(milestone.date)}</time>
-                    ) : milestone.complete ? 'Complete' : 'Pending'}
+                    ) : milestone.complete ? 'Complete' : 'Pending')}
                   </span>
+                  {milestone.hint && (
+                    <span className="block truncate text-[10px] font-medium text-amber-700">
+                      {milestone.hint}
+                    </span>
+                  )}
                 </span>
               </li>
             )

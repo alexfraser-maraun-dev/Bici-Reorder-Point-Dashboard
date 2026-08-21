@@ -12,7 +12,9 @@ import {
 import type {
   ShopifyOnlyOrder,
   SpecialOrder,
+  SpecialOrderQueueState,
   SpecialOrderSourceStatus,
+  SpecialOrderWorkState,
   TriageStage,
 } from '@/lib/types'
 import { Card, CardContent } from '@/components/ui/card'
@@ -53,8 +55,48 @@ import {
 } from 'lucide-react'
 
 type ViewKey = 'action' | 'needs_ordering' | 'in_transit' | 'ready_to_close' | 'data_issues' | 'all'
+type ActionFilterKey = 'all' | SpecialOrderWorkState | 'receipt_exception'
+type ActionFilterOrder = {
+  queue_states: readonly SpecialOrderQueueState[]
+  work_state: SpecialOrderWorkState
+  receiving_state?: string | null
+}
 
 const ACTION_QUEUE_STATES = new Set(['intake', 'needs_ordering', 'vendor_followup', 'promise_needed', 'closeout'])
+
+export const ACTION_FILTERS: readonly { key: ActionFilterKey; label: string }[] = [
+  { key: 'all', label: 'All actions' },
+  { key: 'intake', label: 'Shopify intake' },
+  { key: 'needs_ordering', label: 'Needs ordering' },
+  { key: 'vendor_followup', label: 'Vendor follow-up' },
+  { key: 'promise_needed', label: 'Promise date needed' },
+  { key: 'receipt_exception', label: 'Split shipment / backorder' },
+  { key: 'closeout', label: 'Ready to close' },
+  { key: 'on_track', label: 'No action needed' },
+]
+
+export function validActionFilter(value: string | null): ActionFilterKey {
+  return ACTION_FILTERS.some((filter) => filter.key === value) ? value as ActionFilterKey : 'all'
+}
+
+export function matchesActionFilter(
+  order: ActionFilterOrder,
+  filter: ActionFilterKey,
+): boolean {
+  if (filter === 'all') return true
+  if (filter === 'receipt_exception') {
+    return order.receiving_state === 'po_receiving' || order.receiving_state === 'po_complete_so_unreceived'
+  }
+  // Ordered healthy rows remain in the in-transit lifecycle queue, so their queue_states do
+  // not also contain on_track. Every actionable filter uses the multi-valued queue membership
+  // so parallel work (for example ordering + promise capture) remains discoverable in both.
+  if (filter === 'on_track') return order.work_state === 'on_track' && !isReceiptException(order)
+  return order.queue_states.includes(filter)
+}
+
+function isReceiptException(order: ActionFilterOrder): boolean {
+  return matchesActionFilter(order, 'receipt_exception')
+}
 
 const VIEWS: {
   key: ViewKey
@@ -66,7 +108,7 @@ const VIEWS: {
     key: 'action',
     label: 'Action required',
     description: 'Work that needs an owner now. Parked orders return here when their check-back is due.',
-    pred: (order) => order.queue_states.some((state) => ACTION_QUEUE_STATES.has(state)) &&
+    pred: (order) => (order.queue_states.some((state) => ACTION_QUEUE_STATES.has(state)) || isReceiptException(order)) &&
       (!order.ack_active || order.checkback_due),
   },
   {
@@ -387,6 +429,7 @@ function SpecialOrdersContentInner() {
   const storeFilter = searchParams.get('store') ?? 'all'
   const sourceFilter = searchParams.get('source') ?? 'all'
   const orderTypeFilter = searchParams.get('type') ?? 'all'
+  const actionFilter = validActionFilter(searchParams.get('action'))
   const liveOnly = searchParams.get('archive') !== '1'
   const [insightsOpen, setInsightsOpen] = useState(false)
 
@@ -488,6 +531,7 @@ function SpecialOrdersContentInner() {
       if (sourceFilter !== 'all' && (order.source ?? 'neither') !== sourceFilter) return false
       if (orderTypeFilter === 'none' && order.order_type) return false
       if (orderTypeFilter !== 'all' && orderTypeFilter !== 'none' && order.order_type !== orderTypeFilter) return false
+      if (!matchesActionFilter(order, actionFilter)) return false
       if (!term) return true
       return [
         order.customer_name,
@@ -505,7 +549,7 @@ function SpecialOrdersContentInner() {
         ...order.available_vendors.map((vendor) => vendor.vendor_name),
       ].some((value) => value && String(value).toLowerCase().includes(term))
     })
-  }, [allRows, orderTypeFilter, search, sourceFilter, storeFilter])
+  }, [actionFilter, allRows, orderTypeFilter, search, sourceFilter, storeFilter])
 
   const activeView = VIEWS.find((item) => item.key === view) ?? VIEWS[0]
   const filtered = useMemo(
@@ -552,7 +596,7 @@ function SpecialOrdersContentInner() {
   }, [filteredPopulation])
 
   const filtersActive = search !== '' || storeFilter !== 'all' || sourceFilter !== 'all' ||
-    orderTypeFilter !== 'all' || !liveOnly
+    orderTypeFilter !== 'all' || actionFilter !== 'all' || !liveOnly
   const degradedSources = Object.entries(sourceHealth ?? {}).filter(([, health]) => health.status !== 'ok')
 
   return (
@@ -716,6 +760,20 @@ function SpecialOrdersContentInner() {
             </Select>
           </div>
 
+          <div className="flex items-center gap-2">
+            <label htmlFor="special-order-action" className="text-xs font-medium text-muted-foreground">Action</label>
+            <Select value={actionFilter} onValueChange={(value) => replaceParams({ action: value === 'all' ? null : value })}>
+              <SelectTrigger id="special-order-action" className="w-[205px] bg-background" size="sm">
+                <SelectValue placeholder="All actions" />
+              </SelectTrigger>
+              <SelectContent>
+                {ACTION_FILTERS.map((filter) => (
+                  <SelectItem key={filter.key} value={filter.key}>{filter.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
           <label className="ml-auto flex items-center gap-2 whitespace-nowrap text-xs text-muted-foreground">
             <Checkbox
               checked={!liveOnly}
@@ -732,12 +790,13 @@ function SpecialOrdersContentInner() {
             {storeFilter !== 'all' && <FilterChip label={`Store: ${storeFilter}`} onRemove={() => replaceParams({ store: null })} />}
             {sourceFilter !== 'all' && <FilterChip label={`Source: ${SOURCE_LABEL[sourceFilter] ?? sourceFilter}`} onRemove={() => replaceParams({ source: null })} />}
             {orderTypeFilter !== 'all' && <FilterChip label={`Type: ${orderTypeFilter === 'none' ? 'No PO yet' : orderTypeFilter}`} onRemove={() => replaceParams({ type: null })} />}
+            {actionFilter !== 'all' && <FilterChip label={`Action: ${ACTION_FILTERS.find((filter) => filter.key === actionFilter)?.label ?? actionFilter}`} onRemove={() => replaceParams({ action: null })} />}
             {!liveOnly && <FilterChip label="Archive included" onRemove={() => replaceParams({ archive: null })} />}
             <Button
               variant="ghost"
               size="sm"
               className="h-7 text-xs text-muted-foreground"
-              onClick={() => replaceParams({ q: null, store: null, source: null, type: null, archive: null })}
+              onClick={() => replaceParams({ q: null, store: null, source: null, type: null, action: null, archive: null })}
             >
               Clear all
             </Button>
@@ -750,7 +809,7 @@ function SpecialOrdersContentInner() {
               <>
                 <p className="text-sm text-muted-foreground">{activeView.description}</p>
                 <SpecialOrdersGrid
-                  key={`${item.key}:${search}:${storeFilter}:${sourceFilter}:${orderTypeFilter}:${liveOnly}`}
+                  key={`${item.key}:${search}:${storeFilter}:${sourceFilter}:${orderTypeFilter}:${actionFilter}:${liveOnly}`}
                   orders={filtered}
                   isLoading={isLoading}
                   onEtaSaved={revalidate}

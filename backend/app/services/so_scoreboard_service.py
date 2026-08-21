@@ -82,12 +82,14 @@ def build_scoreboard(orders: List[Dict[str, Any]], acks: Dict[str, Dict[str, Any
             original_by_so[so_id] = str(p.get("promise_date"))[:10]
 
     promised = [r for r in rows if r.get("promise_date")]
-    met = missed = breached_outstanding = undetermined = 0
+    met = missed = breached_outstanding = undetermined = received_date_unknown = 0
     revised = 0
     for r in promised:
         so_id = str(r.get("special_order_id"))
         original = original_by_so.get(so_id) or r.get("promise_date")
-        received = r.get("po_received_date")
+        # The PO header date can belong to another line. Only the individual SpecialOrder
+        # receipt state/date can settle its delivery SLA.
+        received = r.get("so_received_date") if r.get("so_received") else None
         if revisions.get(so_id, 0) > 0:
             revised += 1
         if received:
@@ -96,6 +98,10 @@ def build_scoreboard(orders: List[Dict[str, Any]], acks: Dict[str, Dict[str, Any
                 met += 1
             else:
                 missed += 1
+        elif r.get("so_received"):
+            # Receipt is confirmed, but Lightspeed supplied no individual status timestamp.
+            # Do not guess from the PO header and accidentally turn a split shipment into a win.
+            received_date_unknown += 1
         elif today.isoformat() > original:
             # Not here and the date has gone: already a failure, counted separately because it
             # is not yet a *completed* outcome.
@@ -116,6 +122,7 @@ def build_scoreboard(orders: List[Dict[str, Any]], acks: Dict[str, Dict[str, Any
         "on_time_pct_vs_original": round(100 * met / settled, 1) if settled else None,
         "breached_outstanding": breached_outstanding,
         "undetermined": undetermined,
+        "received_date_unknown": received_date_unknown,
         "revised_at_least_once": revised,
         # Split out so a missing promise is never mistaken for a met one.
         "missing_promise": sla["summary"]["missing_promise"],

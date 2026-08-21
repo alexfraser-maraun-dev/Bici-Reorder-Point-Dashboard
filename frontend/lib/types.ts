@@ -385,6 +385,15 @@ export type ProcurementStage =
   | 'ordered'       // PO placed with the vendor (Order.orderedDate is set)
   | 'received'      // SO has been checked in / received
 
+// PO-level receiving and individual-SO check-in are deliberately separate. A PO can be partly
+// or fully received while one special-order unit remains outstanding (usually a split shipment
+// or backorder). Only `so_received` means the customer's item was checked in.
+export type SpecialOrderReceivingState =
+  | 'not_started'
+  | 'po_receiving'
+  | 'po_complete_so_unreceived'
+  | 'so_received'
+
 // The one thing (if any) that needs attention within a stage. 'none' = nothing to action.
 export type SpecialOrderFlag =
   | 'none'
@@ -553,6 +562,7 @@ export interface SoScoreboard {
     on_time_pct_vs_original: number | null
     breached_outstanding: number
     undetermined: number
+    received_date_unknown?: number
     revised_at_least_once: number
     missing_promise: number
     missing_promise_by_owner: Record<'service' | 'cs', number>
@@ -700,6 +710,11 @@ export interface SpecialOrder {
   po_ordered: boolean
   po_complete: boolean
   received_started: boolean
+  // Explicit individual-special-order receipt state. Optional while cached/Shopify-only rows
+  // transition to the new backend contract; `procurement_stage` remains the legacy fallback.
+  so_received?: boolean
+  so_received_date?: string | null
+  receiving_state?: SpecialOrderReceivingState
   // Triage: procurement stage + within-stage attention flag
   procurement_stage: ProcurementStage
   procurement_stage_index: number   // 0=open_pool, 1=unordered_po, 2=ordered, 3=received
