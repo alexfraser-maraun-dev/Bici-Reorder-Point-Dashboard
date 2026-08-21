@@ -103,6 +103,16 @@ export function SpecialOrdersGrid({
   const [page, setPage] = useState(1)
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
 
+  // Filtering to a different result set should put you back on page 1. Deriving that from the
+  // count during render keeps it in step with the props that caused it, and costs no extra
+  // render pass — the parent used to force it by remounting the entire grid on every
+  // keystroke, which is exactly what made the filters feel frozen.
+  const [lastCount, setLastCount] = useState(orders.length)
+  if (lastCount !== orders.length) {
+    setLastCount(orders.length)
+    setPage(1)
+  }
+
   const sorted = useMemo(() => {
     if (sortKey === 'default') return orders
     return [...orders].sort((a, b) => compare(a, b, sortKey, sortDir))
@@ -201,6 +211,7 @@ export function SpecialOrdersGrid({
             key={orderKey(order)}
             order={order}
             onReview={(selected) => setSelectedKey(orderKey(selected))}
+            onWorkStateChanged={onEtaSaved}
           />
         ))}
       </div>
@@ -237,7 +248,7 @@ export function SpecialOrdersGrid({
       {selectedOrder && (
         <SpecialOrderDetailDrawer
           order={selectedOrder}
-          open
+          open={Boolean(selectedOrder)}
           onOpenChange={(open) => { if (!open) setSelectedKey(null) }}
           onEtaSaved={onEtaSaved}
           lsUnmatched={lsUnmatched}

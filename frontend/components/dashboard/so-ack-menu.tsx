@@ -48,7 +48,11 @@ const isoInDays = (days: number) => {
 
 /** Park / un-park a special order. Only rendered for rows that actually need action or are
  *  already parked — an Ack button on a healthy row invites dismissing things that were never
- *  a problem. */
+ *  a problem.
+ *
+ *  This is the reason-coded snooze only. Rows cleared by the one-click Start/Done actions are
+ *  owned by SoWorkActions; showing "Parked until…" over one of those would describe the same
+ *  row with two different, competing statuses. */
 export function SoAckMenu({ order, onDone }: { order: SpecialOrder; onDone: () => void }) {
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -58,6 +62,7 @@ export function SoAckMenu({ order, onDone }: { order: SpecialOrder; onDone: () =
   const [unparkOpen, setUnparkOpen] = useState(false)
   const [unparkError, setUnparkError] = useState<string | null>(null)
 
+  if (order.work_status === 'in_progress' || order.work_status === 'done') return null
   if (!order.actionable && !order.ack_active) return null
 
   const submit = async () => {
@@ -98,7 +103,7 @@ export function SoAckMenu({ order, onDone }: { order: SpecialOrder; onDone: () =
     }
   }
 
-  if (order.ack_active && order.ack) {
+  if (order.ack_active && order.ack && order.work_status === 'parked') {
     const label = REASONS.find((r) => r.value === order.ack!.reason_code)?.label ?? order.ack.reason_code
     const unparkContentId = `unpark-so-${order.special_order_id}`
     return (

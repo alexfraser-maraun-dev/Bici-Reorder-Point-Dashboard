@@ -669,7 +669,15 @@ export function useConnectionStatus() {
  *  an order gets parked rather than worked. */
 export async function ackSpecialOrder(
   specialOrderId: string,
-  input: { reason_code: string; note?: string; checkback_days?: number; checkback_date?: string },
+  input: {
+    // Omit for the reason-coded park (the server default). 'in_progress' and 'done' are the
+    // one-click Start/Done actions and need no reason and no check-back date.
+    work_status?: import('./types').SoWorkStatus
+    reason_code?: string
+    note?: string
+    checkback_days?: number
+    checkback_date?: string
+  },
 ) {
   const res = await fetch(`/backend/api/special-orders/${specialOrderId}/ack`, {
     method: 'POST',
@@ -683,7 +691,8 @@ export async function ackSpecialOrder(
   return res.json()
 }
 
-/** Return a parked special order to the active queue immediately. */
+/** Clear the human decision on a special order, returning it to the active queue now.
+ *  One undo for all three statuses: un-park, un-claim (Start), and reopen (Done). */
 export async function unackSpecialOrder(specialOrderId: string) {
   const res = await fetch(`/backend/api/special-orders/${specialOrderId}/ack`, { method: 'DELETE' })
   if (!res.ok) {

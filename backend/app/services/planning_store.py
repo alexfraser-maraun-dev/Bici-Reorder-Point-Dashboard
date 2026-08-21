@@ -275,6 +275,15 @@ class PlanningStore:
             # stage, promise and PO ETA. Pinning one is not enough -- a snoozed SO that
             # regresses to an earlier stage, or whose customer promise moves, must re-arm or
             # the snooze silently hides a new problem.
+            #
+            # `work_status` splits that one row into three shapes of the same record:
+            #   parked      -- the original reason-coded snooze, all three pins armed
+            #   in_progress -- "Start": someone owns it now, pinned to the work_state only
+            #   done        -- "Done": this task is finished, pinned to the work_state only
+            # in_progress/done deliberately do NOT pin the stage/promise/PO ETA: editing an
+            # ETA is part of working a ticket, and re-arming on your own edit would throw the
+            # row back at you mid-task. `pinned_work_state` is the one re-arm trigger they
+            # keep, so a NEW kind of work on the same order always comes back.
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS so_acks (
                     special_order_id {id_type} PRIMARY KEY,
@@ -286,7 +295,9 @@ class PlanningStore:
                     pinned_stage TEXT,
                     pinned_promise TEXT,
                     pinned_po_eta TEXT,
-                    escalation_level INTEGER NOT NULL DEFAULT 0
+                    escalation_level INTEGER NOT NULL DEFAULT 0,
+                    work_status TEXT NOT NULL DEFAULT 'parked',
+                    pinned_work_state TEXT
                 )
             """)
             # Append-only operational activity that has no authoritative timestamp in
@@ -326,6 +337,20 @@ class PlanningStore:
                 for name in ("description", "brand", "category_top_level"):
                     if name not in existing:
                         conn.execute(f"ALTER TABLE po_draft_lines ADD COLUMN {name} TEXT")
+            # Same story for so_acks, which predates the Start/Done work statuses. Existing
+            # rows are all reason-coded parks, which is exactly what the default encodes.
+            if self.is_postgres:
+                conn.execute("ALTER TABLE so_acks ADD COLUMN IF NOT EXISTS "
+                             "work_status TEXT NOT NULL DEFAULT 'parked'")
+                conn.execute("ALTER TABLE so_acks ADD COLUMN IF NOT EXISTS pinned_work_state TEXT")
+            else:
+                so_ack_columns = {row["name"] for row
+                                  in conn.execute("PRAGMA table_info(so_acks)").fetchall()}
+                if "work_status" not in so_ack_columns:
+                    conn.execute("ALTER TABLE so_acks ADD COLUMN work_status TEXT "
+                                 "NOT NULL DEFAULT 'parked'")
+                if "pinned_work_state" not in so_ack_columns:
+                    conn.execute("ALTER TABLE so_acks ADD COLUMN pinned_work_state TEXT")
 
     @staticmethod
     def _now() -> str:
@@ -669,12 +694,20 @@ class PlanningStore:
     def upsert_so_ack(self, special_order_id: str, *, acked_by: Optional[str], reason_code: str,
                       note: Optional[str], checkback_date: str, pinned_stage: Optional[str],
                       pinned_promise: Optional[str], pinned_po_eta: Optional[str],
-                      escalation_level: int = 0) -> Dict[str, Any]:
-        """Acknowledge a special-order breach until ``checkback_date``.
+                      escalation_level: int = 0, work_status: str = "parked",
+                      pinned_work_state: Optional[str] = None) -> Dict[str, Any]:
+        """Record what a human decided about this special order.
 
-        The three pinned values are the re-arm triggers: if the SO's stage, customer promise or
-        PO ETA changes afterwards, the ack stops applying and the row surfaces again. That is
-        what stops a snooze from masking a *new* problem on an SO someone already looked at.
+        ``work_status`` picks which of the three shapes this row takes -- see the table comment
+        in ``initialize``. For a ``parked`` record the three pinned values are the re-arm
+        triggers: if the SO's stage, customer promise or PO ETA changes afterwards, the ack
+        stops applying and the row surfaces again. That is what stops a snooze from masking a
+        *new* problem on an SO someone already looked at. ``in_progress`` and ``done`` re-arm
+        on ``pinned_work_state`` instead.
+
+        ``reason_code`` is NOT NULL in the schema and carries the park reason. For in_progress
+        and done there is no reason to collect (that is the point of the one-click actions), so
+        it holds the work_status itself; read it as a park reason only when parked.
         """
         record = {
             "special_order_id": str(special_order_id),
@@ -687,14 +720,17 @@ class PlanningStore:
             "pinned_promise": pinned_promise,
             "pinned_po_eta": pinned_po_eta,
             "escalation_level": int(escalation_level),
+            "work_status": work_status,
+            "pinned_work_state": pinned_work_state,
         }
         with self.transaction(immediate=True) as conn:
             conn.execute(self._sql("DELETE FROM so_acks WHERE special_order_id = ?"),
                          (record["special_order_id"],))
             conn.execute(self._sql("""
                 INSERT INTO so_acks (special_order_id,acked_by,reason_code,note,acked_at,
-                    checkback_date,pinned_stage,pinned_promise,pinned_po_eta,escalation_level)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                    checkback_date,pinned_stage,pinned_promise,pinned_po_eta,escalation_level,
+                    work_status,pinned_work_state)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """), tuple(record.values()))
         return record
 

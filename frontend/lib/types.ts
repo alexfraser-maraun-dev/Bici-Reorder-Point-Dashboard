@@ -447,17 +447,24 @@ export type SoReasonCode =
   | 'substitute_offered'
   | 'other'
 
+/** What a human last decided about a row. All three clear it out of "Action required"; they
+ *  differ in what brings it back — see so_sla_service.WORK_STATUSES. */
+export type SoWorkStatus = 'parked' | 'in_progress' | 'done'
+
 export interface SoAck {
   special_order_id: string
   acked_by: string | null
-  reason_code: SoReasonCode
+  /** A park reason only when `work_status` is 'parked'; otherwise it repeats the status. */
+  reason_code: SoReasonCode | SoWorkStatus
   note: string | null
   acked_at: string
   checkback_date: string
   pinned_stage: string | null
   pinned_promise: string | null
   pinned_po_eta: string | null
+  pinned_work_state: SpecialOrderWorkState | null
   escalation_level: number
+  work_status: SoWorkStatus
 }
 
 export interface SpecialOrderActivityEvent {
@@ -765,6 +772,9 @@ export interface SpecialOrder {
   days_lost: number | null
   ack: SoAck | null
   ack_active: boolean
+  /** The active status, or null when nothing is currently silencing this row. Distinct from
+   *  `ack.work_status`, which survives on a record whose re-arm trigger has already fired. */
+  work_status: SoWorkStatus | null
   escalation_level: number
   actionable: boolean
   checkback_due: boolean

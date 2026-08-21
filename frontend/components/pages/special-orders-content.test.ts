@@ -30,6 +30,25 @@ describe('Special Orders action filter', () => {
     expect(matchesActionFilter(order, 'all')).toBe(true)
   })
 
+  it('matches the Start/Done statuses on work_status, not on a queue', () => {
+    // These two are how a row LEAVES the active queues, so they can never be answered from
+    // queue_states — an in-progress row still sits in whatever queue it was claimed from.
+    const started = {
+      work_state: 'needs_ordering' as const,
+      queue_states: ['needs_ordering'] as const,
+      work_status: 'in_progress' as const,
+    }
+
+    expect(matchesActionFilter(started, 'in_progress')).toBe(true)
+    expect(matchesActionFilter(started, 'done')).toBe(false)
+    expect(matchesActionFilter({ ...started, work_status: 'done' }, 'done')).toBe(true)
+    expect(matchesActionFilter({ ...started, work_status: null }, 'in_progress')).toBe(false)
+    // A cleared row is still findable by the work it was cleared from.
+    expect(matchesActionFilter(started, 'needs_ordering')).toBe(true)
+    expect(validActionFilter('in_progress')).toBe('in_progress')
+    expect(validActionFilter('done')).toBe('done')
+  })
+
   it.each(['po_receiving', 'po_complete_so_unreceived'])(
     'finds the %s receiving exception without changing the primary work state',
     (receivingState) => {

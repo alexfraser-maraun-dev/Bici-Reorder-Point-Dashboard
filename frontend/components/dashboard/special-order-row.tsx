@@ -11,6 +11,7 @@ import type {
   TriageStage,
 } from '@/lib/types'
 import { SeverityBadge, SourceBadge } from './special-order-badges'
+import { SoWorkActions } from './so-work-actions'
 import {
   AlertCircle,
   ChevronRight,
@@ -233,7 +234,15 @@ function MetadataLink({
   )
 }
 
-function MilestoneRail({ order, identity }: { order: SpecialOrder; identity: string }) {
+function MilestoneRail({
+  order,
+  identity,
+  onWorkStateChanged,
+}: {
+  order: SpecialOrder
+  identity: string
+  onWorkStateChanged?: () => void | Promise<void>
+}) {
   const milestones = orderMilestones(order)
   const firstIncomplete = milestones.findIndex((milestone) => !milestone.complete)
   const currentIndex = firstIncomplete === -1 ? milestones.length - 1 : firstIncomplete
@@ -302,6 +311,14 @@ function MilestoneRail({ order, identity }: { order: SpecialOrder; identity: str
             )
           })}
         </ol>
+        {onWorkStateChanged && (
+          <SoWorkActions
+            order={order}
+            size="compact"
+            className="shrink-0 border-l pl-4"
+            onDone={onWorkStateChanged}
+          />
+        )}
       </div>
     </div>
   )
@@ -310,9 +327,12 @@ function MilestoneRail({ order, identity }: { order: SpecialOrder; identity: str
 export function SpecialOrderRow({
   order,
   onReview,
+  onWorkStateChanged,
 }: {
   order: SpecialOrder
   onReview: (order: SpecialOrder) => void
+  /** Refresh the worklist after Start/Done. Omit to render the row read-only. */
+  onWorkStateChanged?: () => void | Promise<void>
 }) {
   const date = primaryDate(order)
   const identity = order.kind === 'shopify'
@@ -406,7 +426,13 @@ export function SpecialOrderRow({
               <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
                 <span>{ownerLabel(order.action_owner)}</span>
                 {order.action_due_date && <span>· due {formatDate(order.action_due_date)}</span>}
-                {order.ack_active && <span>· parked</span>}
+                {order.work_status === 'in_progress' && (
+                  <span className="font-medium text-blue-700">· in progress</span>
+                )}
+                {order.work_status === 'done' && (
+                  <span className="font-medium text-emerald-700">· done</span>
+                )}
+                {order.work_status === 'parked' && <span>· parked</span>}
               </div>
             </div>
 
@@ -446,7 +472,11 @@ export function SpecialOrderRow({
               <ChevronRight className="h-4 w-4" />
             </Button>
           </div>
-          <MilestoneRail order={order} identity={identity} />
+          <MilestoneRail
+            order={order}
+            identity={identity}
+            onWorkStateChanged={onWorkStateChanged}
+          />
         </div>
       </div>
     </article>

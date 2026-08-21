@@ -1641,24 +1641,47 @@ def get_special_order_escalations(background_tasks: BackgroundTasks, refresh: bo
 
 @app.post("/api/special-orders/{special_order_id}/ack")
 def ack_special_order(special_order_id: str, payload: Dict[str, Any], request: Request):
-    """Park a special order until a check-back date, with a required reason.
+    """Record what a human decided about a special order: started, done, or parked.
 
-    Both the reason code and the check-back date are mandatory. An open-ended dismissal cannot
-    be reported on and produces exactly the "parked, not worked" pattern that generated the
-    22-92 day tail this feature exists to remove.
+    ``work_status`` selects the shape:
+
+    * ``in_progress`` ("Start") -- one click, no data entry. Claims the row for whoever pressed
+      it and quiets it for ``IN_PROGRESS_DAYS`` so it can actually be worked.
+    * ``done`` ("Done") -- one click. Clears the row's current task for good; no check-back
+      date, because there is nothing left to check back on.
+    * ``parked`` (default) -- the reason-coded snooze. Here both the reason code and the
+      check-back date stay mandatory: an open-ended, un-categorised dismissal cannot be
+      reported on and produces exactly the "parked, not worked" pattern that generated the
+      22-92 day tail this feature exists to remove. Start and Done are not that pattern --
+      they are a claim and a completion, and both stay visible as such.
     """
     from app.services import so_sla_service
     from app.services.planning_store import PlanningStore
 
-    reason = str(payload.get("reason_code") or "").strip()
-    if reason not in so_sla_service.REASON_CODES:
+    work_status = str(payload.get("work_status") or "parked").strip()
+    if work_status not in so_sla_service.WORK_STATUSES:
         raise HTTPException(
             status_code=400,
-            detail=f"reason_code must be one of: {', '.join(so_sla_service.REASON_CODES)}")
+            detail=f"work_status must be one of: {', '.join(so_sla_service.WORK_STATUSES)}")
+
+    if work_status == "parked":
+        reason = str(payload.get("reason_code") or "").strip()
+        if reason not in so_sla_service.REASON_CODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"reason_code must be one of: {', '.join(so_sla_service.REASON_CODES)}")
+    else:
+        # No reason to collect -- that is the point of the one-click actions. The column is
+        # NOT NULL, so it carries the status itself; see upsert_so_ack.
+        reason = work_status
 
     checkback = str(payload.get("checkback_date") or "").strip()
     if not checkback:
         days = payload.get("checkback_days")
+        if days is None and work_status != "parked":
+            # Done has no check-back at all; the far date only satisfies the NOT NULL column
+            # and is never read, because ack_is_active short-circuits on status.
+            days = so_sla_service.IN_PROGRESS_DAYS if work_status == "in_progress" else 3650
         if days is None:
             raise HTTPException(status_code=400,
                                 detail="checkback_date or checkback_days is required")
@@ -1671,7 +1694,7 @@ def ack_special_order(special_order_id: str, payload: Dict[str, Any], request: R
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="checkback_date must be ISO (YYYY-MM-DD)")
 
-    # Pin the three re-arm triggers from the CURRENT row, so any later change un-parks it.
+    # Pin the re-arm triggers from the CURRENT row, so any later change un-parks it.
     row = next((o for o in (_special_orders_cache.get("data") or {}).get("orders", [])
                 if str(o.get("special_order_id")) == str(special_order_id)), None)
     if row is None:
@@ -1681,10 +1704,15 @@ def ack_special_order(special_order_id: str, payload: Dict[str, Any], request: R
     if active_service:
         row = {**row, "service_promise_date": active_service.get("promise_date")}
     promise, _src = so_sla_service.resolve_promise(row)
+    # The cached row predates this request's SLA pass, so recompute the work_state that Start
+    # and Done are taken against rather than trusting whatever the cache last stored.
+    today = date.today()
+    sla = so_sla_service.compute_sla(row, today)
+    work_state = so_sla_service.compute_work_state(row, sla, today).get("work_state")
     existing = store.list_so_acks().get(str(special_order_id))
     # Progression is derived from the server's existing record. The client cannot reset or
     # manufacture an escalation level by posting a value in the body.
-    level = so_sla_service.escalation_level(existing, date.today())
+    level = so_sla_service.escalation_level(existing, today)
     actor = _current_user_email(request)
     record = store.upsert_so_ack(
         special_order_id,
@@ -1696,37 +1724,47 @@ def ack_special_order(special_order_id: str, payload: Dict[str, Any], request: R
         pinned_promise=promise.isoformat() if promise else None,
         pinned_po_eta=row.get("expected_date"),
         escalation_level=level,
+        work_status=work_status,
+        pinned_work_state=work_state,
     )
+    event_type = {"in_progress": "started", "done": "completed"}.get(work_status, "parked")
     try:
         store.record_so_activity(
             special_order_id,
-            "parked",
+            event_type,
             actor=actor,
             details={
-                "reason_code": reason,
+                "reason_code": reason if work_status == "parked" else None,
                 "note": payload.get("note") or None,
-                "checkback_date": checkback,
+                "checkback_date": checkback if work_status != "done" else None,
+                "work_state": work_state,
                 "escalation_level": level,
             },
         )
     except Exception as e:
         # The ack is already durable. Never turn that committed success into a misleading 500.
-        print(f"[so_activity] park event unavailable: {e}")
+        print(f"[so_activity] {event_type} event unavailable: {e}")
     return {"ok": True, "ack": record}
 
 
 @app.delete("/api/special-orders/{special_order_id}/ack")
 def unack_special_order(special_order_id: str, request: Request):
-    """Un-park a special order, returning it to the active queue immediately."""
+    """Clear the human decision on a special order, returning it to the active queue now.
+
+    One undo for all three statuses: un-park, un-claim, and reopen a completed task.
+    """
+    from app.services import so_sla_service
     from app.services.planning_store import PlanningStore
     store = PlanningStore()
+    previous = so_sla_service.ack_work_status(store.list_so_acks().get(str(special_order_id)))
     store.delete_so_ack(special_order_id)
+    event_type = {"in_progress": "unstarted", "done": "reopened"}.get(previous, "unparked")
     try:
         store.record_so_activity(
-            special_order_id, "unparked", actor=_current_user_email(request), details={}
+            special_order_id, event_type, actor=_current_user_email(request), details={}
         )
     except Exception as e:
-        print(f"[so_activity] unpark event unavailable: {e}")
+        print(f"[so_activity] {event_type} event unavailable: {e}")
     return {"ok": True}
 
 
@@ -1862,6 +1900,10 @@ def get_special_order_activity(special_order_id: str):
     labels = {
         "parked": "Order parked until check-back",
         "unparked": "Order returned to active queue",
+        "started": "Work started",
+        "unstarted": "Work released back to the queue",
+        "completed": "Task marked done",
+        "reopened": "Task reopened",
         "service_promise_cleared": "Service parts promise cleared",
         "eta_updated": "Shopify customer promise updated",
         "matched": "Shopify order linked manually",
@@ -1874,23 +1916,32 @@ def get_special_order_activity(special_order_id: str):
             activity.get("actor"), activity.get("details"),
         )
 
+    # Backfill the live ack as an event when the ledger has no matching row (records written
+    # before the ledger existed, or a lost activity write). Keyed on the ack's own status so a
+    # started/done record is not retold as a park.
     current_ack = store.list_so_acks().get(str(special_order_id))
-    if current_ack and not any(
-        e["type"] == "parked"
-        and isinstance(e.get("details"), dict)
-        and e["details"].get("checkback_date") == current_ack.get("checkback_date")
-        and e.get("actor") == current_ack.get("acked_by")
-        for e in events
-    ):
-        add(
-            current_ack.get("acked_at"), "parked", "Order parked until check-back",
-            current_ack.get("acked_by"),
-            {
-                "reason_code": current_ack.get("reason_code"),
-                "checkback_date": current_ack.get("checkback_date"),
-                "escalation_level": current_ack.get("escalation_level"),
-            },
-        )
+    if current_ack:
+        from app.services import so_sla_service
+        status = so_sla_service.ack_work_status(current_ack)
+        ack_event_type = {"in_progress": "started", "done": "completed"}.get(status, "parked")
+        if not any(
+            e["type"] == ack_event_type and e.get("actor") == current_ack.get("acked_by")
+            and (ack_event_type == "completed" or (
+                isinstance(e.get("details"), dict)
+                and e["details"].get("checkback_date") == current_ack.get("checkback_date")))
+            for e in events
+        ):
+            add(
+                current_ack.get("acked_at"), ack_event_type,
+                labels.get(ack_event_type, "Order parked until check-back"),
+                current_ack.get("acked_by"),
+                {
+                    "reason_code": current_ack.get("reason_code") if status == "parked" else None,
+                    "checkback_date": (current_ack.get("checkback_date")
+                                       if status != "done" else None),
+                    "escalation_level": current_ack.get("escalation_level"),
+                },
+            )
 
     events.sort(key=lambda event: event["timestamp"], reverse=True)
     return {"special_order_id": str(special_order_id), "activity": events}

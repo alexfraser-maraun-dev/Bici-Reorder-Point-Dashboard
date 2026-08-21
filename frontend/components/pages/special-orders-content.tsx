@@ -1,7 +1,7 @@
 'use client'
 
-import { Suspense, useMemo, useState } from 'react'
-import { usePathname, useRouter, useSearchParams } from 'next/navigation'
+import { Suspense, useEffect, useMemo, useState } from 'react'
+import { usePathname, useSearchParams, type ReadonlyURLSearchParams } from 'next/navigation'
 import { toast } from 'sonner'
 import {
   useSpecialOrders,
@@ -11,6 +11,7 @@ import {
 } from '@/lib/hooks'
 import type {
   ShopifyOnlyOrder,
+  SoWorkStatus,
   SpecialOrder,
   SpecialOrderQueueState,
   SpecialOrderSourceStatus,
@@ -55,12 +56,23 @@ import {
 } from 'lucide-react'
 
 type ViewKey = 'action' | 'needs_ordering' | 'in_transit' | 'ready_to_close' | 'data_issues' | 'all'
-type ActionFilterKey = 'all' | SpecialOrderWorkState | 'receipt_exception'
+type ActionFilterKey =
+  | 'all'
+  | SpecialOrderWorkState
+  | 'receipt_exception'
+  | 'in_progress'
+  | 'done'
 type ActionFilterOrder = {
   queue_states: readonly SpecialOrderQueueState[]
   work_state: SpecialOrderWorkState
   receiving_state?: string | null
+  work_status?: SoWorkStatus | null
 }
+
+// 'in_progress' and 'done' are the two statuses that, by design, sit OUTSIDE the active
+// queues — they are how a row leaves Action required. Selecting one therefore has to escape
+// the queue predicate, or it would always come back empty and read as a broken filter.
+const CLEARED_WORK_FILTERS = new Set<ActionFilterKey>(['in_progress', 'done'])
 
 const ACTION_QUEUE_STATES = new Set(['intake', 'needs_ordering', 'vendor_followup', 'promise_needed', 'closeout'])
 
@@ -73,6 +85,8 @@ export const ACTION_FILTERS: readonly { key: ActionFilterKey; label: string }[] 
   { key: 'receipt_exception', label: 'Split shipment / backorder' },
   { key: 'closeout', label: 'Ready to close' },
   { key: 'on_track', label: 'No action needed' },
+  { key: 'in_progress', label: 'In progress (started)' },
+  { key: 'done', label: 'Done' },
 ]
 
 export function validActionFilter(value: string | null): ActionFilterKey {
@@ -84,6 +98,7 @@ export function matchesActionFilter(
   filter: ActionFilterKey,
 ): boolean {
   if (filter === 'all') return true
+  if (filter === 'in_progress' || filter === 'done') return order.work_status === filter
   if (filter === 'receipt_exception') {
     return order.receiving_state === 'po_receiving' || order.receiving_state === 'po_complete_so_unreceived'
   }
@@ -212,6 +227,42 @@ function validView(value: string | null): ViewKey {
   return VIEWS.some((view) => view.key === value) ? value as ViewKey : 'action'
 }
 
+interface FilterState {
+  view: ViewKey
+  search: string
+  store: string
+  source: string
+  orderType: string
+  action: ActionFilterKey
+  liveOnly: boolean
+}
+
+function readFilters(params: URLSearchParams | ReadonlyURLSearchParams): FilterState {
+  return {
+    view: validView(params.get('queue')),
+    search: params.get('q') ?? '',
+    store: params.get('store') ?? 'all',
+    source: params.get('source') ?? 'all',
+    orderType: params.get('type') ?? 'all',
+    action: validActionFilter(params.get('action')),
+    liveOnly: params.get('archive') !== '1',
+  }
+}
+
+/** The shareable-link half of the filter state. Every default is omitted so a clean worklist
+ *  keeps a clean URL. */
+function filterQuery(filters: FilterState): string {
+  const params = new URLSearchParams()
+  if (filters.view !== 'action') params.set('queue', filters.view)
+  if (filters.search) params.set('q', filters.search)
+  if (filters.store !== 'all') params.set('store', filters.store)
+  if (filters.source !== 'all') params.set('source', filters.source)
+  if (filters.orderType !== 'all') params.set('type', filters.orderType)
+  if (filters.action !== 'all') params.set('action', filters.action)
+  if (!filters.liveOnly) params.set('archive', '1')
+  return params.toString()
+}
+
 function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
   const days = order.created_at
     ? Math.floor((Date.now() - Date.parse(order.created_at)) / 86_400_000)
@@ -281,6 +332,7 @@ function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
     promise_owner: order.shopify_expected_date ? null : 'cs',
     ack: null,
     ack_active: false,
+    work_status: null,
     escalation_level: 0,
     actionable: true,
     checkback_due: false,
@@ -421,17 +473,33 @@ export function SpecialOrdersContent() {
 }
 
 function SpecialOrdersContentInner() {
-  const router = useRouter()
   const pathname = usePathname()
   const searchParams = useSearchParams()
-  const view = validView(searchParams.get('queue'))
-  const search = searchParams.get('q') ?? ''
-  const storeFilter = searchParams.get('store') ?? 'all'
-  const sourceFilter = searchParams.get('source') ?? 'all'
-  const orderTypeFilter = searchParams.get('type') ?? 'all'
-  const actionFilter = validActionFilter(searchParams.get('action'))
-  const liveOnly = searchParams.get('archive') !== '1'
+  // Filters are ordinary React state, seeded once from the URL on mount.
+  //
+  // They used to live IN the URL, written through router.replace(). That made every keystroke
+  // and every dropdown a Next.js navigation: an RSC round-trip to the server before the
+  // control could show its own new value, and — because router.replace defers the update —
+  // a controlled <Input> that reverted characters mid-word. Two filters changed inside one
+  // pending navigation also clobbered each other, since both rebuilt their params from the
+  // same stale searchParams snapshot. The result read exactly as "the filters are frozen".
+  //
+  // Local state updates synchronously; the URL is mirrored below for shareable links.
+  const [filters, setFilters] = useState<FilterState>(() => readFilters(searchParams))
+  const { view, search, store: storeFilter, source: sourceFilter,
+          orderType: orderTypeFilter, action: actionFilter, liveOnly } = filters
   const [insightsOpen, setInsightsOpen] = useState(false)
+
+  // window.history.replaceState is the documented Next.js shallow-routing escape hatch: it
+  // updates the address bar and stays in sync with useSearchParams without re-running the
+  // route. Guarded on the current URL so it is a no-op when nothing actually moved.
+  useEffect(() => {
+    const query = filterQuery(filters)
+    const next = query ? `${pathname}?${query}` : pathname
+    if (`${window.location.pathname}${window.location.search}` !== next) {
+      window.history.replaceState(null, '', next)
+    }
+  }, [filters, pathname])
 
   const {
     orders,
@@ -445,14 +513,16 @@ function SpecialOrdersContentInner() {
     error,
   } = useSpecialOrders({ liveOnly })
 
-  const replaceParams = (updates: Record<string, string | null>) => {
-    const params = new URLSearchParams(searchParams.toString())
-    Object.entries(updates).forEach(([key, value]) => {
-      if (value === null || value === '') params.delete(key)
-      else params.set(key, value)
-    })
-    const query = params.toString()
-    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false })
+  const updateFilters = (updates: Partial<FilterState>) => {
+    setFilters((current) => ({ ...current, ...updates }))
+  }
+  const CLEARED_FILTERS: Omit<FilterState, 'view'> = {
+    search: '',
+    store: 'all',
+    source: 'all',
+    orderType: 'all',
+    action: 'all',
+    liveOnly: true,
   }
 
   const handleSync = async () => {
@@ -552,9 +622,12 @@ function SpecialOrdersContentInner() {
   }, [actionFilter, allRows, orderTypeFilter, search, sourceFilter, storeFilter])
 
   const activeView = VIEWS.find((item) => item.key === view) ?? VIEWS[0]
+  // Started and done rows have already left every active queue, so the queue predicate would
+  // filter them all back out. When one of those statuses is what you asked for, it wins.
+  const showsClearedWork = CLEARED_WORK_FILTERS.has(actionFilter)
   const filtered = useMemo(
-    () => filteredPopulation.filter(activeView.pred),
-    [activeView, filteredPopulation],
+    () => showsClearedWork ? filteredPopulation : filteredPopulation.filter(activeView.pred),
+    [activeView, filteredPopulation, showsClearedWork],
   )
   const viewCounts = useMemo(() => {
     const counts: Record<ViewKey, number> = {
@@ -565,9 +638,13 @@ function SpecialOrdersContentInner() {
       data_issues: 0,
       all: 0,
     }
-    VIEWS.forEach((item) => { counts[item.key] = filteredPopulation.filter(item.pred).length })
+    VIEWS.forEach((item) => {
+      counts[item.key] = showsClearedWork
+        ? filteredPopulation.length
+        : filteredPopulation.filter(item.pred).length
+    })
     return counts
-  }, [filteredPopulation])
+  }, [filteredPopulation, showsClearedWork])
   const pipelineCounts = useMemo(() => {
     const counts: Record<TriageStage, number> = {
       shopify: 0,
@@ -683,7 +760,7 @@ function SpecialOrdersContentInner() {
 
       <Tabs
         value={view}
-        onValueChange={(value) => replaceParams({ queue: value === 'action' ? null : value })}
+        onValueChange={(value) => updateFilters({ view: validView(value) })}
         className="gap-3"
       >
         <TabsList className="h-11 w-full justify-start rounded-none border-b bg-transparent p-0" aria-label="Special order queues">
@@ -713,14 +790,14 @@ function SpecialOrdersContentInner() {
               type="search"
               placeholder="Search order, customer, product, SKU, PO…"
               value={search}
-              onChange={(event) => replaceParams({ q: event.target.value || null })}
+              onChange={(event) => updateFilters({ search: event.target.value })}
               className="h-8 bg-background pl-8"
             />
           </div>
 
           <div className="flex items-center gap-2">
             <label htmlFor="special-order-store" className="text-xs font-medium text-muted-foreground">Store</label>
-            <Select value={storeFilter} onValueChange={(value) => replaceParams({ store: value === 'all' ? null : value })}>
+            <Select value={storeFilter} onValueChange={(value) => updateFilters({ store: value })}>
               <SelectTrigger id="special-order-store" className="w-[145px] bg-background" size="sm">
                 <SelectValue placeholder="All stores" />
               </SelectTrigger>
@@ -733,7 +810,7 @@ function SpecialOrdersContentInner() {
 
           <div className="flex items-center gap-2">
             <label htmlFor="special-order-source" className="text-xs font-medium text-muted-foreground">Source</label>
-            <Select value={sourceFilter} onValueChange={(value) => replaceParams({ source: value === 'all' ? null : value })}>
+            <Select value={sourceFilter} onValueChange={(value) => updateFilters({ source: value })}>
               <SelectTrigger id="special-order-source" className="w-[135px] bg-background" size="sm">
                 <SelectValue placeholder="All sources" />
               </SelectTrigger>
@@ -748,7 +825,7 @@ function SpecialOrdersContentInner() {
 
           <div className="flex items-center gap-2">
             <label htmlFor="special-order-type" className="text-xs font-medium text-muted-foreground">Type</label>
-            <Select value={orderTypeFilter} onValueChange={(value) => replaceParams({ type: value === 'all' ? null : value })}>
+            <Select value={orderTypeFilter} onValueChange={(value) => updateFilters({ orderType: value })}>
               <SelectTrigger id="special-order-type" className="w-[150px] bg-background" size="sm">
                 <SelectValue placeholder="All PO types" />
               </SelectTrigger>
@@ -762,7 +839,7 @@ function SpecialOrdersContentInner() {
 
           <div className="flex items-center gap-2">
             <label htmlFor="special-order-action" className="text-xs font-medium text-muted-foreground">Action</label>
-            <Select value={actionFilter} onValueChange={(value) => replaceParams({ action: value === 'all' ? null : value })}>
+            <Select value={actionFilter} onValueChange={(value) => updateFilters({ action: validActionFilter(value) })}>
               <SelectTrigger id="special-order-action" className="w-[205px] bg-background" size="sm">
                 <SelectValue placeholder="All actions" />
               </SelectTrigger>
@@ -777,7 +854,7 @@ function SpecialOrdersContentInner() {
           <label className="ml-auto flex items-center gap-2 whitespace-nowrap text-xs text-muted-foreground">
             <Checkbox
               checked={!liveOnly}
-              onCheckedChange={(checked) => replaceParams({ archive: checked === true ? '1' : null })}
+              onCheckedChange={(checked) => updateFilters({ liveOnly: checked !== true })}
             />
             Include archive
           </label>
@@ -786,17 +863,17 @@ function SpecialOrdersContentInner() {
         {filtersActive && (
           <div className="flex flex-wrap items-center gap-2" aria-label="Active filters">
             <span className="text-xs font-medium text-muted-foreground">Active filters</span>
-            {search && <FilterChip label={`Search: ${search}`} onRemove={() => replaceParams({ q: null })} />}
-            {storeFilter !== 'all' && <FilterChip label={`Store: ${storeFilter}`} onRemove={() => replaceParams({ store: null })} />}
-            {sourceFilter !== 'all' && <FilterChip label={`Source: ${SOURCE_LABEL[sourceFilter] ?? sourceFilter}`} onRemove={() => replaceParams({ source: null })} />}
-            {orderTypeFilter !== 'all' && <FilterChip label={`Type: ${orderTypeFilter === 'none' ? 'No PO yet' : orderTypeFilter}`} onRemove={() => replaceParams({ type: null })} />}
-            {actionFilter !== 'all' && <FilterChip label={`Action: ${ACTION_FILTERS.find((filter) => filter.key === actionFilter)?.label ?? actionFilter}`} onRemove={() => replaceParams({ action: null })} />}
-            {!liveOnly && <FilterChip label="Archive included" onRemove={() => replaceParams({ archive: null })} />}
+            {search && <FilterChip label={`Search: ${search}`} onRemove={() => updateFilters({ search: '' })} />}
+            {storeFilter !== 'all' && <FilterChip label={`Store: ${storeFilter}`} onRemove={() => updateFilters({ store: 'all' })} />}
+            {sourceFilter !== 'all' && <FilterChip label={`Source: ${SOURCE_LABEL[sourceFilter] ?? sourceFilter}`} onRemove={() => updateFilters({ source: 'all' })} />}
+            {orderTypeFilter !== 'all' && <FilterChip label={`Type: ${orderTypeFilter === 'none' ? 'No PO yet' : orderTypeFilter}`} onRemove={() => updateFilters({ orderType: 'all' })} />}
+            {actionFilter !== 'all' && <FilterChip label={`Action: ${ACTION_FILTERS.find((filter) => filter.key === actionFilter)?.label ?? actionFilter}`} onRemove={() => updateFilters({ action: 'all' })} />}
+            {!liveOnly && <FilterChip label="Archive included" onRemove={() => updateFilters({ liveOnly: true })} />}
             <Button
               variant="ghost"
               size="sm"
               className="h-7 text-xs text-muted-foreground"
-              onClick={() => replaceParams({ q: null, store: null, source: null, type: null, action: null, archive: null })}
+              onClick={() => updateFilters(CLEARED_FILTERS)}
             >
               Clear all
             </Button>
@@ -807,9 +884,14 @@ function SpecialOrdersContentInner() {
           <TabsContent key={item.key} value={item.key} className="mt-0 space-y-3">
             {item.key === view && (
               <>
-                <p className="text-sm text-muted-foreground">{activeView.description}</p>
+                <p className="text-sm text-muted-foreground">
+                  {showsClearedWork
+                    ? actionFilter === 'done'
+                      ? 'Tasks someone marked done. Reopen one to send it back to Action required.'
+                      : 'Tasks someone has started. They return to Action required if they are still open in a few days.'
+                    : activeView.description}
+                </p>
                 <SpecialOrdersGrid
-                  key={`${item.key}:${search}:${storeFilter}:${sourceFilter}:${orderTypeFilter}:${actionFilter}:${liveOnly}`}
                   orders={filtered}
                   isLoading={isLoading}
                   onEtaSaved={revalidate}

@@ -79,6 +79,24 @@ REASON_CODES = [
     "other",
 ]
 
+# What a human last decided about a row. All three clear it out of "Action required"; they
+# differ in what brings it back.
+#   parked      -- reason-coded snooze; re-arms on the check-back date OR any change to the
+#                  stage, customer promise or PO ETA.
+#   in_progress -- "Start": claimed, so nobody else picks it up and it stops nagging while it
+#                  is being worked. Re-arms on the check-back date, or if the work itself
+#                  changes into a different task.
+#   done        -- "Done": this task is finished. No date brings it back -- only a NEW kind of
+#                  work on the same order does, which is why it still pins the work_state. A
+#                  received order that later needs customer close-out is a different task, and
+#                  hiding that forever is how a customer never gets their call.
+WORK_STATUSES = ["parked", "in_progress", "done"]
+
+# How long "Start" buys you before the row returns to the queue. Long enough to actually work
+# a ticket (chase a vendor, wait on a callback), short enough that a claimed-and-abandoned
+# order cannot sit invisible for a week.
+IN_PROGRESS_DAYS = 3
+
 
 def filter_live_window(orders: List[Dict[str, Any]], live_only_days: Optional[int]) -> List[Dict[str, Any]]:
     """Apply the optional live-age window.
@@ -448,14 +466,41 @@ def _reason(row, severity, promise, promise_source, lead_days, lead_source,
     return " · ".join(bits) or "On track."
 
 
-def ack_is_active(ack: Optional[Dict[str, Any]], row: Dict[str, Any], today: date) -> bool:
-    """Whether an acknowledgement still silences this special order.
+def ack_work_status(ack: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The work status of an ack record, defaulting rows written before the column existed."""
+    if not ack:
+        return None
+    status = str(ack.get("work_status") or "parked")
+    return status if status in WORK_STATUSES else "parked"
 
-    Four independent invalidations. The three pinned values re-arm the alert the moment the
-    underlying situation changes, so a snooze can only ever hide the problem it was taken for.
+
+def ack_is_active(ack: Optional[Dict[str, Any]], row: Dict[str, Any], today: date,
+                  work_state: Optional[str] = None) -> bool:
+    """Whether a human decision still keeps this special order out of the active queue.
+
+    ``parked`` has four independent invalidations: the three pinned values re-arm the alert the
+    moment the underlying situation changes, so a snooze can only ever hide the problem it was
+    taken for.
+
+    ``in_progress`` and ``done`` re-arm on the work itself instead. Both are taken against one
+    task, not against the order, so a different task on the same order must come back. Neither
+    pins the PO ETA or the promise, because editing those is part of working the ticket.
     """
     if not ack:
         return False
+    status = ack_work_status(ack)
+
+    if status in ("in_progress", "done"):
+        pinned_work = ack.get("pinned_work_state") or None
+        current_work = work_state if work_state is not None else (row.get("work_state") or None)
+        # Legacy/absent pin: nothing to compare against, so fall back to the date alone rather
+        # than re-arming every row at once.
+        if pinned_work is not None and pinned_work != current_work:
+            return False                                # this became a different job
+        if status == "done":
+            return True                                 # finished work has no check-back
+        return str(ack.get("checkback_date") or "")[:10] >= today.isoformat()
+
     if str(ack.get("checkback_date") or "")[:10] < today.isoformat():
         return False                                    # the check-back date arrived
     if (ack.get("pinned_stage") or None) != (row.get("procurement_stage") or None):
@@ -476,6 +521,11 @@ def escalation_level(ack: Optional[Dict[str, Any]], today: date) -> int:
     """
     if not ack:
         return 0
+    # Finished work is not neglected work. A done record has no check-back to miss, so it can
+    # never accrue an escalation -- but it keeps any level it had carried, so reopening a row
+    # that was escalated before someone closed it does not launder its history away.
+    if ack_work_status(ack) == "done":
+        return int(ack.get("escalation_level") or 0)
     checkback = str(ack.get("checkback_date") or "")[:10]
     if not checkback or checkback >= today.isoformat():
         return int(ack.get("escalation_level") or 0)
@@ -492,17 +542,24 @@ def build_escalations(orders: List[Dict[str, Any]], acks: Dict[str, Dict[str, An
         work = compute_work_state(row, sla, today)
         so_id = str(row.get("special_order_id") or "")
         ack = acks.get(so_id)
-        active = ack_is_active(ack, row, today)
+        # The ack is evaluated against the work_state just computed, not the one on the stored
+        # row: a done/in_progress record is pinned to the task it was taken against.
+        active = ack_is_active(ack, row, today, work_state=work.get("work_state"))
         level = escalation_level(ack, today)
+        status = ack_work_status(ack) if active else None
         enriched = {**row, **sla, **work}
         enriched.update({
             "ack": ack,
             "ack_active": active,
+            "work_status": status,
             "escalation_level": level,
             # Operational actionability is wider than delivery-SLA breach: missing promises
             # and post-receipt close-out are real work, but remain outside the on-time metric.
             "actionable": work["work_state"] != "on_track" and not active,
+            # A done record is never "due" for anything -- only new work reopens it, and that
+            # shows up as ack_active going false on its own.
             "checkback_due": bool(ack and not active and ack.get("checkback_date")
+                                  and ack_work_status(ack) != "done"
                                   and str(ack["checkback_date"])[:10] <= today.isoformat()),
         })
         rows.append(enriched)
@@ -532,8 +589,11 @@ def build_escalations(orders: List[Dict[str, Any]], acks: Dict[str, Dict[str, An
             for o in ("service", "cs")},
         "actionable": sum(1 for r in rows if r["actionable"]),
         "acked": sum(1 for r in rows if r["ack_active"]),
+        "in_progress": sum(1 for r in rows if r.get("work_status") == "in_progress"),
+        "done": sum(1 for r in rows if r.get("work_status") == "done"),
         "checkback_due": sum(1 for r in rows if r["checkback_due"]),
         "escalated": sum(1 for r in rows if r["escalation_level"] >= 1),
         "missing_promise": sum(1 for r in rows if r.get("missing_promise")),
     }
-    return {"orders": rows, "summary": summary, "reason_codes": REASON_CODES}
+    return {"orders": rows, "summary": summary, "reason_codes": REASON_CODES,
+            "work_statuses": WORK_STATUSES}

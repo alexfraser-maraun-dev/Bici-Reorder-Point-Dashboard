@@ -29,6 +29,7 @@ import {
 } from './special-order-match'
 import { SeverityBadge, ShopifyMatchBadge, SourceBadge } from './special-order-badges'
 import { EscalationBadge, SoAckMenu } from './so-ack-menu'
+import { SoWorkActions } from './so-work-actions'
 import { PoRecommendationPanel } from './so-po-recommendation'
 import { ownerLabel, specialOrderReceivingState, StagePill, workStateLabel } from './special-order-row'
 import { CalendarClock, Link2 } from 'lucide-react'
@@ -185,9 +186,14 @@ function ActivityPanel({
           )}
           {order.ack && (
             <li>
-              <p className="font-medium">Parked: {order.ack.reason_code.replace(/_/g, ' ')}</p>
+              <p className="font-medium">
+                {order.ack.work_status === 'in_progress' ? 'Work started'
+                  : order.ack.work_status === 'done' ? 'Task marked done'
+                  : `Parked: ${order.ack.reason_code.replace(/_/g, ' ')}`}
+              </p>
               <p className="text-xs text-muted-foreground">
-                {new Date(order.ack.acked_at).toLocaleString()} · check back {formatDate(order.ack.checkback_date)}
+                {new Date(order.ack.acked_at).toLocaleString()}
+                {order.ack.work_status !== 'done' && ` · check back ${formatDate(order.ack.checkback_date)}`}
                 {order.ack.acked_by ? ` · ${order.ack.acked_by}` : ''}
               </p>
               {order.ack.note && <p className="mt-1 text-xs text-muted-foreground">{order.ack.note}</p>}
@@ -289,6 +295,15 @@ export function SpecialOrderDetailDrawer({
                       Due {formatDate(order.action_due_date)}
                     </span>
                   )}
+                  <SoWorkActions
+                    order={order}
+                    size="compact"
+                    onDone={() => {
+                      void refreshAfterMutation().catch(() => {
+                        toast.warning('The change was saved, but the worklist could not refresh.')
+                      })
+                    }}
+                  />
                   {order.kind !== 'shopify' && (
                     <SoAckMenu
                       order={order}
