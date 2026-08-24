@@ -589,22 +589,6 @@ export interface PoWatchAck {
   active: boolean
 }
 
-export interface PoTrackingBox {
-  box_number: string | null
-  tracking_number: string
-  carrier: string | null
-  tracking_url: string | null   // HLC spells the source field "TrakingUrl"
-}
-
-/** HLC shipment tracking for one PO. A PO can ship as several boxes, and a
- *  split shipment can span more than one HLC order number. */
-export interface PoTracking {
-  carrier: string | null        // the single carrier, or 'Mixed'
-  box_count: number
-  boxes: PoTrackingBox[]
-  hlc_order_numbers: string[]
-}
-
 export interface PoWatchOrder {
   order_id: string
   ref_num: string | null
@@ -636,7 +620,6 @@ export interface PoWatchOrder {
   lightspeed_url: string
   ack: PoWatchAck | null
   alertable: boolean
-  tracking: PoTracking | null   // HLC only; null for other vendors or when unshipped
 }
 
 export interface PoWatchSummary {

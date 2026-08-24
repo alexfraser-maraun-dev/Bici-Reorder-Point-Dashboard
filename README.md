@@ -268,29 +268,6 @@ QUALIFIED_ITEMS_VIEW
 LS_PO_SNAPSHOT_TTL_SECONDS
 ```
 
-### HLC shipment tracking (PO tracker)
-
-Adds carrier, tracking number and tracking link to HLC (Cycles Lambert) purchase
-orders on the PO Tracker. Read-only, and off unless `HLC_ENABLED` is set.
-
-```text
-HLC_ENABLED            default false
-HLC_API_KEY            sent as the header `Authorization: ApiKey <key>`
-HLC_BASE_URL           default https://api.hlc.bike/ca/v3.0
-HLC_LOOKBACK_DAYS      default 60   how far back /Orders is walked
-HLC_CACHE_TTL_SECONDS  default 900  matches HLC's 15-minute tracking refresh
-HLC_TIMEOUT_SECONDS    default 30   a 45-day /Orders call measures ~12s
-```
-
-Canada is on the **v3.0 "legacy"** API. Don't point `HLC_BASE_URL` at v4.x — the
-tracking endpoints differ and `/Orders/Packages` 404s on the Canadian account.
-
-POs are joined to HLC orders through HLC's `PoNumber`, which holds the Lightspeed
-`orderID` (the number shown as "PO #" in the UI) because buyers type it into HLC's
-PO field when ordering. Orders with a blank PO number, and dropship
-(`Fulfillment`) orders, are skipped. The lookup is best-effort throughout: if HLC
-is disabled, slow or down, the PO Tracker renders exactly as it does without it.
-
 ### Google Merchant Center benchmark (price intelligence)
 
 Pulls the market benchmark price and Google's suggested price for products in our
