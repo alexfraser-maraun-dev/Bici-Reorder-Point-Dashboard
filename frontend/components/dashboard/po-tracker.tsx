@@ -3,7 +3,7 @@
 import { Fragment, useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { usePoWatch, fetchPoWatchLines, ackPoWatchAlert, unackPoWatchAlert } from '@/lib/hooks'
-import type { PoTracking, PoWatchLine, PoWatchOrder, PoWatchTriage } from '@/lib/types'
+import type { PoWatchLine, PoWatchOrder, PoWatchTriage } from '@/lib/types'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -32,7 +32,6 @@ import {
   ChevronDown,
   ChevronRight,
   ExternalLink,
-  Package,
   RefreshCw,
   Timer,
 } from 'lucide-react'
@@ -87,7 +86,7 @@ function fmtDate(value: string | null | undefined) {
 // Column sorting. 'severity' is the backend's default order (worst first).
 type SortKey =
   | 'severity' | 'order_id' | 'vendor' | 'shop' | 'created' | 'ordered'
-  | 'expected' | 'tracking' | 'units' | 'cost' | 'received' | 'lead_time'
+  | 'expected' | 'units' | 'cost' | 'received' | 'lead_time'
 
 const SORT_VALUE: Record<Exclude<SortKey, 'severity'>, (o: PoWatchOrder) => number | string | null> = {
   order_id: (o) => Number(o.order_id),
@@ -97,8 +96,6 @@ const SORT_VALUE: Record<Exclude<SortKey, 'severity'>, (o: PoWatchOrder) => numb
   ordered: (o) => o.ordered_date,
   // Sort the Expected column by urgency: most-late first when descending.
   expected: (o) => (o.days_late != null ? o.days_late : o.days_until_expected != null ? -o.days_until_expected : null),
-  // Sort by box count so POs that are actually in transit float to the top.
-  tracking: (o) => o.tracking?.box_count ?? null,
   units: (o) => o.units_ordered,
   cost: (o) => o.cost_ordered,
   received: (o) => o.received_pct,
@@ -143,67 +140,7 @@ function SortableHead({ label, sortKey, sort, onSort, className }: {
   )
 }
 
-/** Carrier + box count at a glance. A single-box PO links straight out, since
- *  there's nothing extra hidden in the expanded row; multi-box POs point at the
- *  row instead, where every box gets its own link. */
-function TrackingCell({ tracking }: { tracking: PoTracking | null }) {
-  if (!tracking || tracking.box_count === 0) return <span className="text-xs text-muted-foreground">—</span>
-
-  const label = `${tracking.carrier || 'Shipped'} · ${tracking.box_count} ${tracking.box_count === 1 ? 'box' : 'boxes'}`
-  const only = tracking.box_count === 1 ? tracking.boxes[0] : null
-
-  if (only?.tracking_url) {
-    return (
-      <a
-        href={only.tracking_url}
-        target="_blank"
-        rel="noopener noreferrer"
-        onClick={(event) => event.stopPropagation()}
-        className="inline-flex items-center gap-1 text-sm text-primary hover:underline"
-      >
-        <Package className="h-3 w-3" />{label}<ExternalLink className="h-3 w-3" />
-      </a>
-    )
-  }
-  return (
-    <span className="inline-flex items-center gap-1 text-sm text-muted-foreground">
-      <Package className="h-3 w-3" />{label}
-    </span>
-  )
-}
-
-function TrackingBoxes({ tracking }: { tracking: PoTracking }) {
-  return (
-    <div className="border-b px-4 py-3">
-      <div className="mb-2 text-xs font-medium text-muted-foreground">
-        Shipment tracking · HLC {tracking.hlc_order_numbers.join(', ')}
-      </div>
-      <div className="flex flex-col gap-1">
-        {tracking.boxes.map((box) => (
-          <div key={box.box_number || box.tracking_number} className="flex flex-wrap items-center gap-x-3 text-sm">
-            <span className="font-mono text-xs text-muted-foreground">{box.box_number || '—'}</span>
-            <span className="text-xs text-muted-foreground">{box.carrier || '—'}</span>
-            {box.tracking_url ? (
-              <a
-                href={box.tracking_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={(event) => event.stopPropagation()}
-                className="inline-flex items-center gap-1 font-mono text-xs text-primary hover:underline"
-              >
-                {box.tracking_number}<ExternalLink className="h-3 w-3" />
-              </a>
-            ) : (
-              <span className="font-mono text-xs">{box.tracking_number}</span>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function LinesPanel({ orderId, tracking }: { orderId: string; tracking: PoTracking | null }) {
+function LinesPanel({ orderId }: { orderId: string }) {
   const [lines, setLines] = useState<PoWatchLine[] | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -215,37 +152,30 @@ function LinesPanel({ orderId, tracking }: { orderId: string; tracking: PoTracki
     return () => { cancelled = true }
   }, [orderId])
 
-  // Tracking already arrived with the watchlist, so it renders immediately —
-  // it must not wait on (or be hidden by) the lazy line-item fetch.
-  const boxes = tracking && tracking.box_count > 0 ? <TrackingBoxes tracking={tracking} /> : null
-
-  if (error) return <>{boxes}<div className="p-4 text-sm text-destructive">{error}</div></>
-  if (!lines) return <>{boxes}<div className="space-y-2 p-4"><Skeleton className="h-5 w-full" /><Skeleton className="h-5 w-2/3" /></div></>
-  if (lines.length === 0) return <>{boxes}<div className="p-4 text-sm text-muted-foreground">No line items on this PO.</div></>
+  if (error) return <div className="p-4 text-sm text-destructive">{error}</div>
+  if (!lines) return <div className="space-y-2 p-4"><Skeleton className="h-5 w-full" /><Skeleton className="h-5 w-2/3" /></div>
+  if (lines.length === 0) return <div className="p-4 text-sm text-muted-foreground">No line items on this PO.</div>
 
   return (
-    <>
-      {boxes}
-      <Table>
-        <TableHeader><TableRow className="text-xs">
-          <TableHead>SKU</TableHead><TableHead>Item</TableHead>
-          <TableHead className="text-right">Ordered</TableHead><TableHead className="text-right">Received</TableHead>
-          <TableHead className="text-right">Unit cost</TableHead><TableHead className="text-right">Total</TableHead>
-        </TableRow></TableHeader>
-        <TableBody>
-          {lines.map((line) => (
-            <TableRow key={line.order_line_id} className={line.received >= line.quantity ? 'text-muted-foreground' : ''}>
-              <TableCell className="font-mono text-xs">{line.sku || line.item_id}</TableCell>
-              <TableCell className="max-w-96 truncate text-sm">{line.description || `Item ${line.item_id}`}</TableCell>
-              <TableCell className="text-right">{line.quantity}</TableCell>
-              <TableCell className="text-right">{line.received}</TableCell>
-              <TableCell className="text-right">{money.format(line.unit_cost)}</TableCell>
-              <TableCell className="text-right">{money.format(line.total)}</TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </>
+    <Table>
+      <TableHeader><TableRow className="text-xs">
+        <TableHead>SKU</TableHead><TableHead>Item</TableHead>
+        <TableHead className="text-right">Ordered</TableHead><TableHead className="text-right">Received</TableHead>
+        <TableHead className="text-right">Unit cost</TableHead><TableHead className="text-right">Total</TableHead>
+      </TableRow></TableHeader>
+      <TableBody>
+        {lines.map((line) => (
+          <TableRow key={line.order_line_id} className={line.received >= line.quantity ? 'text-muted-foreground' : ''}>
+            <TableCell className="font-mono text-xs">{line.sku || line.item_id}</TableCell>
+            <TableCell className="max-w-96 truncate text-sm">{line.description || `Item ${line.item_id}`}</TableCell>
+            <TableCell className="text-right">{line.quantity}</TableCell>
+            <TableCell className="text-right">{line.received}</TableCell>
+            <TableCell className="text-right">{money.format(line.unit_cost)}</TableCell>
+            <TableCell className="text-right">{money.format(line.total)}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
   )
 }
 
@@ -523,7 +453,6 @@ export function PoTracker() {
               <SortableHead label="Created" sortKey="created" sort={sort} onSort={toggleSort} />
               <SortableHead label="Ordered" sortKey="ordered" sort={sort} onSort={toggleSort} />
               <SortableHead label="Expected" sortKey="expected" sort={sort} onSort={toggleSort} />
-              <SortableHead label="Tracking" sortKey="tracking" sort={sort} onSort={toggleSort} />
               <SortableHead label="Units" sortKey="units" sort={sort} onSort={toggleSort} className="text-right" />
               <SortableHead label="Cost" sortKey="cost" sort={sort} onSort={toggleSort} className="text-right" />
               <SortableHead label="Received" sortKey="received" sort={sort} onSort={toggleSort} className="w-32" />
@@ -569,7 +498,6 @@ export function PoTracker() {
                         )}
                         {order.days_until_expected != null && <div className="text-xs text-muted-foreground">in {order.days_until_expected}d</div>}
                       </TableCell>
-                      <TableCell><TrackingCell tracking={order.tracking} /></TableCell>
                       <TableCell className="text-right text-sm">{order.units_ordered}</TableCell>
                       <TableCell className="text-right text-sm">{money.format(order.cost_ordered)}</TableCell>
                       <TableCell>
@@ -607,8 +535,8 @@ export function PoTracker() {
                     </TableRow>
                     {isOpen && (
                       <TableRow>
-                        <TableCell colSpan={14} className="bg-muted/30 p-0">
-                          <LinesPanel orderId={order.order_id} tracking={order.tracking} />
+                        <TableCell colSpan={13} className="bg-muted/30 p-0">
+                          <LinesPanel orderId={order.order_id} />
                         </TableCell>
                       </TableRow>
                     )}
