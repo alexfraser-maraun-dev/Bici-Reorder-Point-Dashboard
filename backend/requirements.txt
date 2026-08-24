@@ -16,4 +16,6 @@ beautifulsoup4==4.12.3
 lxml==5.2.2
 rapidfuzz==3.9.6
 anthropic==0.116.0
-psycopg[binary]>=3.2,<4
+# `pool` extra: PlanningStore keeps a small ConnectionPool so request-path reads
+# reuse connections instead of paying a TCP+TLS+auth handshake each time.
+psycopg[binary,pool]>=3.2,<4

@@ -38,6 +38,11 @@ class PurchaseOrderSnapshotCache:
         self.gateway_factory = gateway_factory or LiveLightspeedReadGateway
         self.clock = clock or time.time
         self._lock = threading.RLock()
+        # Held only across the Lightspeed walk, never across a cache read. Keeping the
+        # walk out of `_lock` is the whole point: a complete walk costs ~40s over ~1,850
+        # POs, and holding the state mutex for that long made `peek_orders()` -- which is
+        # documented never to trigger a load -- block for the entire walk anyway.
+        self._load_lock = threading.Lock()
         self._orders: Optional[List[Dict[str, Any]]] = None
         self._snapshot_at_epoch: Optional[float] = None
         self._generation = 0
@@ -84,6 +89,35 @@ class PurchaseOrderSnapshotCache:
                 return deepcopy(self._orders)
         return None
 
+    def _render(self, now: float, vendor_id: Optional[str], shop_id: Optional[str],
+                cache_hit: bool) -> Dict[str, Any]:
+        """Filter and package the current snapshot. Caller must hold ``_lock``."""
+        if self._orders is None or self._snapshot_at_epoch is None:
+            raise LightspeedReadError("No complete Lightspeed PO snapshot is available.")
+        filtered = [
+            order for order in self._orders
+            if (vendor_id is None or str(order.get("vendorID")) == str(vendor_id))
+            and (shop_id is None or str(order.get("shopID")) == str(shop_id))
+        ]
+        snapshot_at = datetime.fromtimestamp(
+            self._snapshot_at_epoch, tz=timezone.utc
+        ).isoformat()
+        return {
+            # Copied so a caller cannot reach back into the shared snapshot; only the
+            # filtered subset is copied, not the whole walk.
+            "orders": deepcopy(filtered),
+            "meta": {
+                "snapshot_at": snapshot_at,
+                "age_seconds": round(max(0.0, now - self._snapshot_at_epoch), 3),
+                "ttl_seconds": self.ttl_seconds,
+                "cache_hit": cache_hit,
+                "complete": True,
+                "includes_lines": False,
+                "total_order_count": len(self._orders),
+                "filtered_order_count": len(filtered),
+            },
+        }
+
     def get_orders(
         self,
         vendor_id: Optional[str] = None,
@@ -91,49 +125,38 @@ class PurchaseOrderSnapshotCache:
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
         requested_generation = self._generation
-        with self._lock:
-            now = self.clock()
-            refreshed_while_waiting = (
-                force_refresh
-                and self._orders is not None
-                and self._generation != requested_generation
-            )
-            cache_hit = refreshed_while_waiting or (
-                not force_refresh and self._is_fresh(now)
-            )
-            if not cache_hit:
-                # Deliberately omit filters: one complete paginated snapshot is
-                # shared by every vendor/shop workbench card.
-                loaded = self.gateway_factory().list_purchase_orders(include_lines=False)
-                orders = self._validate_complete_snapshot(loaded)
+
+        # Fast path: a fresh snapshot answers without ever queueing behind a walk.
+        if not force_refresh:
+            with self._lock:
+                now = self.clock()
+                if self._is_fresh(now):
+                    return self._render(now, vendor_id, shop_id, cache_hit=True)
+
+        # Slow path. `_load_lock` serializes walkers so a burst of expired requests
+        # triggers one walk, not N -- but readers holding `_lock` are never blocked by it.
+        with self._load_lock:
+            with self._lock:
+                now = self.clock()
+                refreshed_while_waiting = (
+                    force_refresh
+                    and self._orders is not None
+                    and self._generation != requested_generation
+                )
+                if refreshed_while_waiting or (not force_refresh and self._is_fresh(now)):
+                    return self._render(now, vendor_id, shop_id, cache_hit=True)
+
+            # Deliberately omit filters: one complete paginated snapshot is shared by
+            # every vendor/shop workbench card. Runs OUTSIDE `_lock`.
+            loaded = self.gateway_factory().list_purchase_orders(include_lines=False)
+            orders = self._validate_complete_snapshot(loaded)
+
+            with self._lock:
+                now = self.clock()
                 self._orders = deepcopy(orders)
                 self._snapshot_at_epoch = now
                 self._generation += 1
-
-            if self._orders is None or self._snapshot_at_epoch is None:
-                raise LightspeedReadError("No complete Lightspeed PO snapshot is available.")
-
-            filtered = [
-                order for order in self._orders
-                if (vendor_id is None or str(order.get("vendorID")) == str(vendor_id))
-                and (shop_id is None or str(order.get("shopID")) == str(shop_id))
-            ]
-            snapshot_at = datetime.fromtimestamp(
-                self._snapshot_at_epoch, tz=timezone.utc
-            ).isoformat()
-            return {
-                "orders": deepcopy(filtered),
-                "meta": {
-                    "snapshot_at": snapshot_at,
-                    "age_seconds": round(max(0.0, now - self._snapshot_at_epoch), 3),
-                    "ttl_seconds": self.ttl_seconds,
-                    "cache_hit": cache_hit,
-                    "complete": True,
-                    "includes_lines": False,
-                    "total_order_count": len(self._orders),
-                    "filtered_order_count": len(filtered),
-                },
-            }
+                return self._render(now, vendor_id, shop_id, cache_hit=False)
 
 
 _po_snapshot_cache: Optional[PurchaseOrderSnapshotCache] = None

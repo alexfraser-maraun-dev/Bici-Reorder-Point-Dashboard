@@ -1,3 +1,5 @@
+import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -83,6 +85,34 @@ class PurchaseOrderSnapshotCacheTest(unittest.TestCase):
         first["orders"][0]["vendorID"] = "changed"
         second = self.cache.get_orders(vendor_id="807", shop_id="3")
         self.assertEqual(second["orders"][0]["vendorID"], "807")
+
+    def test_peek_never_waits_on_an_in_flight_walk(self):
+        """peek_orders is documented never to trigger a load; it must not block on one
+        either. A complete walk takes ~40s, and holding the state mutex across it made
+        every peek pay that cost second-hand."""
+        walking, release = threading.Event(), threading.Event()
+
+        class SlowGateway:
+            def list_purchase_orders(self, include_lines=True):
+                walking.set()
+                release.wait(5)
+                return [_order("16192", "807", "3")]
+
+        cache = PurchaseOrderSnapshotCache(
+            gateway_factory=lambda: SlowGateway(), ttl_seconds=15
+        )
+        walker = threading.Thread(target=cache.get_orders, daemon=True)
+        walker.start()
+        self.assertTrue(walking.wait(5), "gateway walk never started")
+
+        started = time.monotonic()
+        self.assertIsNone(cache.peek_orders())
+        elapsed = time.monotonic() - started
+        release.set()
+        walker.join(5)
+
+        self.assertLess(elapsed, 0.5, f"peek_orders blocked for {elapsed:.2f}s on the walk")
+        self.assertEqual([o["orderID"] for o in cache.peek_orders()], ["16192"])
 
 
 class PurchaseOrderSnapshotApiTest(unittest.TestCase):

@@ -1860,6 +1860,16 @@ def fetch_unified_metrics(trailing_days: int = 60) -> pd.DataFrame:
 
 _bq_tag_cache = {}
 
+
+def tagged_items_fetched_at(tag_name: str = "auto-replen") -> float:
+    """When the cached tagged-item metrics were last actually queried (0.0 if never).
+
+    Callers use this to tell a genuine refresh from a cache hit, so per-run logging
+    fires once per underlying data change rather than once per request.
+    """
+    entry = _bq_tag_cache.get(tag_name)
+    return entry[1] if entry else 0.0
+
 def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: bool = False) -> pd.DataFrame:
     """
     Fetches product, inventory, sales, and PO metrics from the trusted latest

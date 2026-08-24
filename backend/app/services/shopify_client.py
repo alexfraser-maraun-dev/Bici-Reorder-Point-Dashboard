@@ -28,6 +28,14 @@ import threading
 import requests
 from typing import Any, Dict, List, Optional
 
+# One pooled Session for every Shopify call in this process, so the token exchange and
+# the GraphQL posts reuse a connection instead of repeating the TLS handshake per call.
+_session = requests.Session()
+_session.mount(
+    "https://",
+    requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=8),
+)
+
 # The metafield that holds the customer-promised ETA, mirrored from the BigQuery query in
 # bigquery_sync.get_shopify_special_orders().
 _ETA_NAMESPACE = "custom"
@@ -102,7 +110,7 @@ class ShopifyClient:
             if self._token and time.time() < self._token_expiry - _TOKEN_SKEW_SECONDS:
                 return self._token
             url = f"https://{self.shop_domain}/admin/oauth/access_token"
-            resp = requests.post(
+            resp = _session.post(
                 url,
                 json={
                     "client_id": self.client_id,
@@ -156,7 +164,7 @@ class ShopifyClient:
             )
 
         def _post() -> requests.Response:
-            return requests.post(
+            return _session.post(
                 self.endpoint,
                 headers={
                     "X-Shopify-Access-Token": self._access_token(),

@@ -7,6 +7,8 @@ import hmac
 import threading
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from starlette.concurrency import run_in_threadpool
 from app.services.bigquery_sync import (
     log_recommendation_run, log_velocity_snapshots, log_writeback,
     get_managed_skus, upsert_managed_skus, get_sku_overrides, upsert_sku_override,
@@ -63,6 +65,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Compress responses on the way out. The analytical payloads here are wide, highly
+# repetitive JSON -- a replenishment row alone carries ~90 keys, repeated per item per
+# shop -- so gzip cuts the backend->proxy hop by roughly an order of magnitude. Small
+# responses (health checks, acks) fall under the threshold and are left alone.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
 # Feature access control. A feature switched off in the Admin page must be truly
 # dormant, not merely hidden — so requests to endpoints that feature exclusively
 # owns are refused here, before any BigQuery/Lightspeed work starts. Endpoints
@@ -87,7 +95,11 @@ async def _enforce_feature_access(request: Request, call_next):
         if feature_key is not None:
             email = (request.headers.get(_USER_EMAIL_HEADER) or "").strip().lower() or None
             try:
-                allowed = access_service.can_access(email, feature_key)
+                # can_access is served from a 30s in-process cache, but the refresh
+                # behind it reads Postgres. This is async middleware on a single-worker
+                # deployment, so running it inline would stall the event loop -- and with
+                # it every other in-flight request -- for the length of that read.
+                allowed = await run_in_threadpool(access_service.can_access, email, feature_key)
             except Exception as e:
                 # Never let a settings-store hiccup black-hole the whole API.
                 print(f"access: could not resolve '{feature_key}', allowing request: {e}")
@@ -332,11 +344,14 @@ def get_replenishment_data(
             fetch_tagged_items_metrics,
             fetch_lead_times,
             get_brand_sourcing_rules_map,
+            tagged_items_fetched_at,
         )
-        # We handle caching via BigQuery functions or use simple manual cache dict if needed.
-        # For now, fetch_tagged_items_metrics will hit BQ directly on every call unless we add caching.
-        # In a real production scenario, caching this result is recommended.
+        # fetch_tagged_items_metrics serves from a TTL cache; note whether this call
+        # actually re-queried BigQuery, so the run/velocity logging below can fire on a
+        # real data refresh instead of on every debounced slider change.
+        fetched_at_before = tagged_items_fetched_at("auto-replen")
         raw_data = fetch_tagged_items_metrics("auto-replen", force_refresh=force_refresh).to_dict(orient="records")
+        data_is_fresh = tagged_items_fetched_at("auto-replen") != fetched_at_before
         lead_times = fetch_lead_times().to_dict(orient="records")
         brand_sourcing_rules = get_brand_sourcing_rules_map()
         
@@ -391,31 +406,34 @@ def get_replenishment_data(
                 )
         
         # 4. Save NEW snapshots and run info to BigQuery. These are two streaming
-        # inserts that don't affect the response payload, so defer them to run
-        # AFTER the response is sent — they no longer sit in front of every load
-        # (and every debounced slider change).
+        # inserts that don't affect the response payload, so they run AFTER the response
+        # is sent -- and only when the underlying data actually moved. Velocity is a
+        # property of the sales history, not of the forecast knobs, so re-logging one row
+        # per recommendation for every debounced slider change wrote thousands of
+        # duplicate rows per session and bought nothing.
         run_id = str(uuid.uuid4())
-        run_log = {
-            "run_id": run_id,
-            "run_type": "manual",
-            "triggered_by": "UI_User",
-            "started_at": datetime.utcnow().isoformat(),
-            "completed_at": datetime.utcnow().isoformat(),
-            "status": "completed",
-            "row_count": len(recommendations)
-        }
-        background_tasks.add_task(log_recommendation_run, run_log)
+        if data_is_fresh:
+            run_log = {
+                "run_id": run_id,
+                "run_type": "manual",
+                "triggered_by": "UI_User",
+                "started_at": datetime.utcnow().isoformat(),
+                "completed_at": datetime.utcnow().isoformat(),
+                "status": "completed",
+                "row_count": len(recommendations)
+            }
+            background_tasks.add_task(log_recommendation_run, run_log)
 
-        snapshots = []
-        for rec in recommendations:
-            snapshots.append({
-                "system_id": str(rec['system_id']),
-                "sku": str(rec['sku']),
-                "location": rec['location'],
-                "daily_sales": float(rec['raw_daily_sales'] if 'raw_daily_sales' in rec else rec['daily_sales']),
-                "created_at": datetime.utcnow().isoformat()
-            })
-        background_tasks.add_task(log_velocity_snapshots, snapshots)
+            snapshots = []
+            for rec in recommendations:
+                snapshots.append({
+                    "system_id": str(rec['system_id']),
+                    "sku": str(rec['sku']),
+                    "location": rec['location'],
+                    "daily_sales": float(rec['raw_daily_sales'] if 'raw_daily_sales' in rec else rec['daily_sales']),
+                    "created_at": datetime.utcnow().isoformat()
+                })
+            background_tasks.add_task(log_velocity_snapshots, snapshots)
 
         # Organize by location
         by_location = {
@@ -1291,15 +1309,42 @@ def push_po_draft_endpoint(draft_id: str, payload: Dict[str, Any] = None):
 def push_po_draft_v2_endpoint(draft_id: str, payload: Dict[str, Any] = None):
     return push_po_draft_endpoint(draft_id, payload)
 
+# The app header polls all three connection dots every 30 seconds, in every open tab,
+# on every page. Each check is a live third-party round-trip, so without a cache the
+# cost scales with however many tabs someone happens to have open while telling them
+# nothing new in between. One probe per TTL is plenty for a status light.
+_HEALTH_TTL_SECONDS = 120
+_health_cache: Dict[str, Any] = {}
+_health_lock = threading.Lock()
+
+
+def _cached_health(name: str, probe) -> bool:
+    """Runs `probe()` at most once per TTL per source; serves the last answer between.
+
+    The probe runs outside the lock: it is a network call, and holding a shared mutex
+    across it would make the three independent status lights block one another.
+    """
+    now = time.time()
+    with _health_lock:
+        entry = _health_cache.get(name)
+        if entry and now - entry["checked_at"] < _HEALTH_TTL_SECONDS:
+            return entry["ok"]
+    try:
+        ok = bool(probe())
+    except Exception as e:
+        print(f"Health check '{name}' failed: {e}")
+        ok = False
+    with _health_lock:
+        _health_cache[name] = {"ok": ok, "checked_at": time.time()}
+    return ok
+
+
 @app.get("/api/health/lightspeed")
 def check_lightspeed_health():
     from app.services.lightspeed_client import LightspeedClient
-    client = LightspeedClient()
-    is_connected = client.check_health()
-    if is_connected:
+    if _cached_health("lightspeed", lambda: LightspeedClient().check_health()):
         return {"status": "connected"}
-    else:
-        raise HTTPException(status_code=503, detail="Disconnected from Lightspeed")
+    raise HTTPException(status_code=503, detail="Disconnected from Lightspeed")
 
 @app.get("/api/health/lightspeed-po")
 def check_lightspeed_po_access():
@@ -1320,22 +1365,22 @@ def check_lightspeed_po_access():
 @app.get("/api/health/shopify")
 def check_shopify_health():
     from app.services.shopify_client import ShopifyClient
-    client = ShopifyClient()
-    if client.check_health():
+    if _cached_health("shopify", lambda: ShopifyClient().check_health()):
         return {"status": "connected"}
     raise HTTPException(status_code=503, detail="Disconnected from Shopify")
 
 @app.get("/api/health/bigquery")
 def check_bigquery_health():
     from app.services.bigquery_sync import get_bq_client
-    try:
-        client = get_bq_client()
+
+    def probe() -> bool:
         # Force an actual API call by iterating over the results
-        list(client.list_datasets(max_results=1))
+        list(get_bq_client().list_datasets(max_results=1))
+        return True
+
+    if _cached_health("bigquery", probe):
         return {"status": "connected"}
-    except Exception as e:
-        print(f"BigQuery health check failed: {e}")
-        raise HTTPException(status_code=503, detail="Disconnected from BigQuery")
+    raise HTTPException(status_code=503, detail="Disconnected from BigQuery")
 
 @app.get("/api/replenishment/ls-link/{item_id}")
 def get_lightspeed_link(item_id: str):
@@ -1363,9 +1408,9 @@ def _persist_special_order_sweep(result: Dict[str, Any]) -> None:
     """
     try:
         from app.services import so_stage_log
-        from app.services.planning_store import PlanningStore
+        from app.services.planning_store import get_planning_store
         outcome = so_stage_log.persist_observations(
-            result.get("orders") or [], PlanningStore(), result.get("fetched_at") or ""
+            result.get("orders") or [], get_planning_store(), result.get("fetched_at") or ""
         )
         if outcome.get("skipped"):
             print(f"[so_sla] sweep skipped: {outcome['skipped']}")
@@ -1438,8 +1483,8 @@ def _so_sweep_scheduler_loop() -> None:
             now = datetime.now(ZoneInfo(tz_name))
             if (now.hour, now.minute) >= (hour, minute):
                 today = now.strftime("%Y-%m-%d")
-                from app.services.planning_store import PlanningStore
-                store = PlanningStore()
+                from app.services.planning_store import get_planning_store
+                store = get_planning_store()
                 # Persisted day-guard, so a restart cannot re-run the sweep repeatedly.
                 if store.get_po_watch_meta(_SO_SWEEP_META_KEY) != today:
                     store.set_po_watch_meta(_SO_SWEEP_META_KEY, today)
@@ -1523,14 +1568,14 @@ def _current_user_email(request: Request) -> Optional[str]:
 def _sla_view(force: bool = False) -> Dict[str, Any]:
     """SLA-annotated special orders. Reads the cached dashboard; never re-walks Lightspeed."""
     from app.services import so_sla_service, special_order_service
-    from app.services.planning_store import PlanningStore
+    from app.services.planning_store import get_planning_store
 
     payload = _rebuild_special_orders_cache(force=force) if force else (
         _special_orders_cache.get("data") or _rebuild_special_orders_cache()
     )
     workflow_store_ok = True
     try:
-        store = PlanningStore()
+        store = get_planning_store()
         acks = store.list_so_acks()
         service_promises = store.active_service_promises()
     except Exception as e:
@@ -1656,7 +1701,7 @@ def ack_special_order(special_order_id: str, payload: Dict[str, Any], request: R
       they are a claim and a completion, and both stay visible as such.
     """
     from app.services import so_sla_service
-    from app.services.planning_store import PlanningStore
+    from app.services.planning_store import get_planning_store
 
     work_status = str(payload.get("work_status") or "parked").strip()
     if work_status not in so_sla_service.WORK_STATUSES:
@@ -1699,7 +1744,7 @@ def ack_special_order(special_order_id: str, payload: Dict[str, Any], request: R
                 if str(o.get("special_order_id")) == str(special_order_id)), None)
     if row is None:
         raise HTTPException(status_code=404, detail="Special order not found")
-    store = PlanningStore()
+    store = get_planning_store()
     active_service = store.active_service_promises().get(str(special_order_id))
     if active_service:
         row = {**row, "service_promise_date": active_service.get("promise_date")}
@@ -1754,8 +1799,8 @@ def unack_special_order(special_order_id: str, request: Request):
     One undo for all three statuses: un-park, un-claim, and reopen a completed task.
     """
     from app.services import so_sla_service
-    from app.services.planning_store import PlanningStore
-    store = PlanningStore()
+    from app.services.planning_store import get_planning_store
+    store = get_planning_store()
     previous = so_sla_service.ack_work_status(store.list_so_acks().get(str(special_order_id)))
     store.delete_so_ack(special_order_id)
     event_type = {"in_progress": "unstarted", "done": "reopened"}.get(previous, "unparked")
@@ -1776,7 +1821,7 @@ def update_service_parts_promise(special_order_id: str, payload: Dict[str, Any],
     was proven unsuitable as a parts commitment. A null promise_date clears the active value
     while preserving prior revisions in the audit ledger.
     """
-    from app.services.planning_store import PlanningStore
+    from app.services.planning_store import get_planning_store
 
     dashboard = _special_orders_cache.get("data") or _rebuild_special_orders_cache()
     row = next((o for o in dashboard.get("orders", [])
@@ -1795,7 +1840,7 @@ def update_service_parts_promise(special_order_id: str, payload: Dict[str, Any],
             raise HTTPException(status_code=400, detail="promise_date must be ISO (YYYY-MM-DD) or null")
 
     actor = _current_user_email(request)
-    store = PlanningStore()
+    store = get_planning_store()
     prior = store.active_service_promises().get(str(special_order_id))
     if promise_date:
         record = store.set_service_promise(special_order_id, promise_date, recorded_by=actor)
@@ -1825,7 +1870,7 @@ def update_service_parts_promise(special_order_id: str, payload: Dict[str, Any],
 @app.get("/api/special-orders/{special_order_id}/activity")
 def get_special_order_activity(special_order_id: str):
     """Lazy row-detail timeline; no per-row history is added to the main worklist payload."""
-    from app.services.planning_store import PlanningStore
+    from app.services.planning_store import get_planning_store
 
     dashboard = _special_orders_cache.get("data") or _rebuild_special_orders_cache()
     row = next((o for o in dashboard.get("orders", [])
@@ -1833,7 +1878,7 @@ def get_special_order_activity(special_order_id: str):
     if row is None:
         raise HTTPException(status_code=404, detail="Special order not found")
 
-    store = PlanningStore()
+    store = get_planning_store()
     events: List[Dict[str, Any]] = []
 
     def add(timestamp, event_type, label, actor=None, details=None):
@@ -2060,11 +2105,11 @@ def get_special_order_scoreboard(include_history: bool = True):
     timestamps, so the scoreboard is useful immediately instead of after weeks of accumulation.
     """
     from app.services import so_scoreboard_service
-    from app.services.planning_store import PlanningStore
+    from app.services.planning_store import get_planning_store
 
     payload = _special_orders_cache.get("data") or _rebuild_special_orders_cache()
     try:
-        store = PlanningStore()
+        store = get_planning_store()
         acks, promises = store.list_so_acks(), store.list_so_promises()
         service_promises = store.active_service_promises()
     except Exception as e:
@@ -2165,11 +2210,11 @@ def update_special_order_eta(payload: Dict[str, Any], request: Request):
     # Best-effort local timeline. The Shopify/BigQuery write already succeeded, so a timeline
     # storage hiccup must not turn that success into an API failure.
     try:
-        from app.services.planning_store import PlanningStore
+        from app.services.planning_store import get_planning_store
         row = next((o for o in (_special_orders_cache.get("data") or {}).get("orders", [])
                     if str(o.get("shopify_order_id") or "") == order_id), None)
         if row and row.get("special_order_id"):
-            PlanningStore().record_so_activity(
+            get_planning_store().record_so_activity(
                 str(row["special_order_id"]), "eta_updated", actor=triggered_by,
                 details={"eta": eta, "cleared": eta is None},
             )
@@ -2212,7 +2257,7 @@ def lookup_shopify_order(q: str, limit: int = 10):
 def _save_so_match_decisions(decisions: List[Dict[str, str]], actor: Optional[str]) -> None:
     """Persist a fully-validated decision batch, record its activity, and refresh once."""
     from app.services.bigquery_sync import save_so_match_overrides
-    from app.services.planning_store import PlanningStore
+    from app.services.planning_store import get_planning_store
 
     try:
         save_so_match_overrides(decisions, created_by=actor or "Dashboard")
@@ -2223,7 +2268,7 @@ def _save_so_match_decisions(decisions: List[Dict[str, str]], actor: Optional[st
         raise HTTPException(status_code=502, detail="Failed to save match override")
 
     try:
-        store = PlanningStore()
+        store = get_planning_store()
         for decision in decisions:
             event_type = "matched" if decision["action"] == "link" else "unmatched"
             store.record_so_activity(

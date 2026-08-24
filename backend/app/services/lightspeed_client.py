@@ -16,6 +16,17 @@ LIGHTSPEED_SCOPES = ["employee:inventory", "employee:purchase_orders"]
 LIGHTSPEED_AUTHORIZE_URL = "https://cloud.lightspeedapp.com/auth/oauth/authorize"
 LIGHTSPEED_TOKEN_URL = "https://cloud.lightspeedapp.com/oauth/access_token.php"
 
+# One pooled Session for every Lightspeed call in this process. Bare `requests.get`
+# opens a new TCP connection and repeats the TLS handshake each time, which is pure
+# latency on a client that fans out chunked reads across threads. The pool is sized
+# above `_CHUNK_FETCH_WORKERS` so those parallel chunks actually share connections
+# instead of evicting each other.
+_session = requests.Session()
+_session.mount(
+    "https://",
+    requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=12),
+)
+
 
 class LightspeedWriteBlocked(RuntimeError):
     """Raised before any mutating Lightspeed request when the write gate is shut."""
@@ -90,7 +101,7 @@ class LightspeedClient:
                 "client_secret": self.client_secret,
                 "grant_type": "refresh_token"
             }
-            response = requests.post(url, data=payload, timeout=10)
+            response = _session.post(url, data=payload, timeout=10)
             if response.status_code == 200:
                 new_token = response.json().get("access_token")
                 self.bearer_token = new_token
@@ -112,10 +123,10 @@ class LightspeedClient:
         """
         url = f"{self.base_url}.json"
         try:
-            response = requests.get(url, headers=self._get_headers(), timeout=10)
+            response = _session.get(url, headers=self._get_headers(), timeout=10)
             if response.status_code == 401:
                 self._refresh_access_token()
-                response = requests.get(url, headers=self._get_headers(), timeout=10)
+                response = _session.get(url, headers=self._get_headers(), timeout=10)
             return response.status_code == 200
         except Exception as e:
             print(f"Lightspeed health check failed: {e}")
@@ -141,10 +152,10 @@ class LightspeedClient:
         params = {"load_relations": '["ItemShops"]'}
         
         try:
-            response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
+            response = _session.get(url, headers=self._get_headers(), params=params, timeout=10)
             if response.status_code == 401:
                 self._refresh_access_token()
-                response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
+                response = _session.get(url, headers=self._get_headers(), params=params, timeout=10)
                 
             if response.status_code != 200:
                 print(f"Error fetching item {item_id}: {response.text}")
@@ -169,7 +180,7 @@ class LightspeedClient:
     def get_item_by_sku(self, sku: str) -> List[Dict[str, Any]]:
         url = f"{self.base_url}/Item.json"
         params = {"systemSku": sku}
-        response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
+        response = _session.get(url, headers=self._get_headers(), params=params, timeout=10)
         if response.status_code == 200:
             items = response.json().get("Item", [])
             if isinstance(items, dict): return [items]
@@ -179,7 +190,7 @@ class LightspeedClient:
     def get_item_shops_full(self, item_id: str) -> List[Dict[str, Any]]:
         url = f"{self.base_url}/Item/{item_id}.json"
         params = {"load_relations": '["ItemShops"]'}
-        response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
+        response = _session.get(url, headers=self._get_headers(), params=params, timeout=10)
         if response.status_code == 200:
             data = response.json()
             item_shops = data.get("Item", {}).get("ItemShops", {}).get("ItemShop", [])
@@ -196,10 +207,10 @@ class LightspeedClient:
             "reorderLevel": str(reorder_level)
         }
         try:
-            response = requests.put(url, headers=self._get_headers(), json=payload, timeout=10)
+            response = _session.put(url, headers=self._get_headers(), json=payload, timeout=10)
             if response.status_code == 401:
                 self._refresh_access_token()
-                response = requests.put(url, headers=self._get_headers(), json=payload, timeout=10)
+                response = _session.put(url, headers=self._get_headers(), json=payload, timeout=10)
             
             if response.status_code == 200:
                 return response.json().get("ItemShop")
@@ -292,10 +303,10 @@ class LightspeedClient:
             shop_id = (json or {}).get("shopID") if isinstance(json, dict) else None
             self._assert_writes_enabled(shop_id)
         try:
-            response = requests.request(method, url, headers=self._get_headers(), params=params, json=json, timeout=15)
+            response = _session.request(method, url, headers=self._get_headers(), params=params, json=json, timeout=15)
             if response.status_code == 401:
                 self._refresh_access_token()
-                response = requests.request(method, url, headers=self._get_headers(), params=params, json=json, timeout=15)
+                response = _session.request(method, url, headers=self._get_headers(), params=params, json=json, timeout=15)
             return response
         except Exception as e:
             safe_path = urlparse(url).path
@@ -449,7 +460,7 @@ class LightspeedClient:
         # Try as internal ID first if it's numeric
         if system_id.isdigit():
             url = f"{self.base_url}/Item/{system_id}.json"
-            resp = requests.get(url, headers=self._get_headers(), timeout=10)
+            resp = _session.get(url, headers=self._get_headers(), timeout=10)
             if resp.status_code == 200:
                 items = [resp.json().get("Item")]
         
@@ -514,12 +525,12 @@ class LightspeedClient:
             try:
                 headers = self._get_headers()
                 headers["Accept"] = "application/json"
-                response = requests.request(method, url, headers=headers, params=params, timeout=20)
+                response = _session.request(method, url, headers=headers, params=params, timeout=20)
                 if response.status_code == 401:
                     self._refresh_access_token()
                     headers = self._get_headers()
                     headers["Accept"] = "application/json"
-                    response = requests.request(method, url, headers=headers, params=params, timeout=20)
+                    response = _session.request(method, url, headers=headers, params=params, timeout=20)
                 if response.status_code == 429:
                     retry_after = response.headers.get("retry-after", "")
                     delay = int(retry_after) if retry_after.isdigit() else 2

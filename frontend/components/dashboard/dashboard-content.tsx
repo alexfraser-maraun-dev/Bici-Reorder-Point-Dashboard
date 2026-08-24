@@ -1,16 +1,53 @@
 'use client'
 
+import dynamic from 'next/dynamic'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { SheetsReplenishment } from './sheets-replenishment'
-import { VendorLeadTimes } from './vendor-lead-times'
-import { BrandConfiguration } from './brand-configuration'
-import { PurchaseOrders } from './purchase-orders'
-import { PoTracker } from './po-tracker'
-import { DemandInsights } from './demand-insights'
+import { Skeleton } from '@/components/ui/skeleton'
 import { LayoutDashboard, PackageSearch, SlidersHorizontal, Truck, ShoppingCart, TrendingUp } from 'lucide-react'
 import { useAccess } from '@/lib/access/hooks'
 import type { FeatureKey } from '@/lib/access/types'
 import type { AdjustmentMode, DemandWeights } from './sheets-replenishment'
+
+// Radix already unmounts the inactive tab panels, so only one tab is ever rendered.
+// These dynamic imports make the *code* follow the same rule: each tab's JavaScript is
+// fetched when the buyer first opens it, not on every page load. That matters most for
+// Demand & Seasonality, which pulls in the ~380 KB charting library — the landing tab
+// (PO Tracker) draws no charts at all and used to download it anyway.
+//
+// ssr: false is safe here: this is a Client Component, and every tab is a live
+// dashboard whose content comes from the API after hydration regardless.
+const TabFallback = () => (
+  <div className="space-y-2 p-4" role="status" aria-label="Loading">
+    <Skeleton className="h-8" />
+    <Skeleton className="h-8" />
+    <Skeleton className="h-8" />
+  </div>
+)
+
+const SheetsReplenishment = dynamic(
+  () => import('./sheets-replenishment').then((m) => m.SheetsReplenishment),
+  { ssr: false, loading: TabFallback },
+)
+const VendorLeadTimes = dynamic(
+  () => import('./vendor-lead-times').then((m) => m.VendorLeadTimes),
+  { ssr: false, loading: TabFallback },
+)
+const BrandConfiguration = dynamic(
+  () => import('./brand-configuration').then((m) => m.BrandConfiguration),
+  { ssr: false, loading: TabFallback },
+)
+const PurchaseOrders = dynamic(
+  () => import('./purchase-orders').then((m) => m.PurchaseOrders),
+  { ssr: false, loading: TabFallback },
+)
+const PoTracker = dynamic(
+  () => import('./po-tracker').then((m) => m.PoTracker),
+  { ssr: false, loading: TabFallback },
+)
+const DemandInsights = dynamic(
+  () => import('./demand-insights').then((m) => m.DemandInsights),
+  { ssr: false, loading: TabFallback },
+)
 
 export type DashboardTab = 'inventory' | 'demand' | 'purchase-orders' | 'po-tracker' | 'vendors' | 'brands'
 

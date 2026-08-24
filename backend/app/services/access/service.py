@@ -57,20 +57,31 @@ def _store():
     return get_planning_store()
 
 
+# Serializes cache refreshes. Without it, every request that arrives after the TTL
+# expires issues its own pair of store reads; this gate makes it one refresh while the
+# rest wait for (and then reuse) that answer.
+_refresh_lock = threading.Lock()
+
+
 def _load() -> Dict[str, Any]:
     with _lock:
         if _cache["flags"] is not None and time.monotonic() < _cache["expires_at"]:
             return {"flags": _cache["flags"], "users": _cache["users"]}
-    store = _store()
-    flags = dict(registry.defaults())
-    flags.update(store.list_feature_flags())
-    for key in registry.ALWAYS_ON:
-        flags[key] = True
-    users = {u["email"].lower(): u for u in store.list_user_access()}
-    with _lock:
-        _cache.update({"flags": flags, "users": users,
-                       "expires_at": time.monotonic() + _CACHE_TTL_SECONDS})
-    return {"flags": flags, "users": users}
+    with _refresh_lock:
+        # Another thread may have refreshed while we queued for the lock.
+        with _lock:
+            if _cache["flags"] is not None and time.monotonic() < _cache["expires_at"]:
+                return {"flags": _cache["flags"], "users": _cache["users"]}
+        store = _store()
+        flags = dict(registry.defaults())
+        flags.update(store.list_feature_flags())
+        for key in registry.ALWAYS_ON:
+            flags[key] = True
+        users = {u["email"].lower(): u for u in store.list_user_access()}
+        with _lock:
+            _cache.update({"flags": flags, "users": users,
+                           "expires_at": time.monotonic() + _CACHE_TTL_SECONDS})
+        return {"flags": flags, "users": users}
 
 
 def invalidate() -> None:
@@ -147,12 +158,50 @@ def resolve(email: Optional[str]) -> Dict[str, Any]:
 
 
 def can_access(email: Optional[str], feature_key: str) -> bool:
-    return bool(resolve(email)["features"].get(feature_key, True))
+    """Whether this user may reach one feature.
+
+    Called by the API middleware on every request, so it resolves just the key asked
+    for (and its parent) rather than building the whole feature map the way `resolve`
+    does for the frontend shell. Same rules, same answer.
+    """
+    feature = registry.BY_KEY.get(feature_key)
+    if feature is None:
+        return True
+    data = _load()
+    flags = data["flags"]
+
+    def _enabled(key: str) -> bool:
+        spec = registry.BY_KEY.get(key)
+        if spec is None:
+            return True
+        if key in registry.ALWAYS_ON:
+            on = True
+        else:
+            on = bool(flags.get(key, True))
+        # A switched-off feature stays off for everyone; per-user rules only
+        # subdivide what is already on.
+        if on and key in overrides:
+            on = bool(overrides[key])
+        if spec.admin_only and not admin:
+            on = False
+        # A tab is only reachable when its page is.
+        if on and spec.parent:
+            on = _enabled(spec.parent)
+        return on
+
+    admin = is_admin(email)
+    overrides = _user_record(email).get("overrides") or {}
+    return _enabled(feature_key)
+
+
+# The registry is static, so its (prefix -> feature) table is built once at import
+# rather than rebuilt and re-sorted on every request.
+_PREFIX_OWNERS = registry.prefix_owners()
 
 
 def feature_for_path(path: str) -> Optional[str]:
     """The feature that exclusively owns this API path, if any."""
-    for prefix, key in registry.prefix_owners():
+    for prefix, key in _PREFIX_OWNERS:
         if path == prefix or path.startswith(prefix + "/"):
             return key
     return None

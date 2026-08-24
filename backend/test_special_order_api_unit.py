@@ -105,7 +105,7 @@ class SpecialOrderApiBoundaryTest(unittest.TestCase):
                     "promise_source": "service_manual",
                 }
 
-        with patch("app.services.planning_store.PlanningStore", return_value=Store()):
+        with patch("app.services.planning_store.get_planning_store", return_value=Store()):
             result = main.update_service_parts_promise(
                 "SO-1", {"promise_date": "2026-09-20", "updated_by": "spoof@example.com"},
                 _request(),
@@ -144,7 +144,7 @@ class SpecialOrderApiBoundaryTest(unittest.TestCase):
             "receiving_state": "po_receiving",
         }
         main._special_orders_cache["data"]["orders"] = [row]
-        with patch("app.services.planning_store.PlanningStore", return_value=Store()):
+        with patch("app.services.planning_store.get_planning_store", return_value=Store()):
             activity = main.get_special_order_activity("SO-1")["activity"]
 
         self.assertFalse(any(event["type"] == "received" for event in activity))
@@ -162,7 +162,7 @@ class SpecialOrderApiBoundaryTest(unittest.TestCase):
             "so_received_date": "2026-08-21",
             "receiving_state": "so_received",
         })
-        with patch("app.services.planning_store.PlanningStore", return_value=Store()):
+        with patch("app.services.planning_store.get_planning_store", return_value=Store()):
             activity = main.get_special_order_activity("SO-1")["activity"]
         receipt = next(event for event in activity if event["type"] == "received")
         self.assertEqual(receipt["timestamp"], "2026-08-21")

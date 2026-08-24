@@ -100,6 +100,9 @@ class _FakeStore:
     def __init__(self, previous_population=None):
         self.meta = {"so_sweep_last_population": previous_population}
         self.stage_calls: List[int] = []
+        # One entry per sweep: the sweep must write promises in a single batch, not
+        # one transaction per order.
+        self.promise_batches: List[int] = []
 
     def get_po_watch_meta(self, key):
         return self.meta.get(key)
@@ -111,8 +114,9 @@ class _FakeStore:
         self.stage_calls.append(len(obs))
         return {"inserted": len(obs), "touched": 0}
 
-    def record_so_promise(self, **kw):
-        return True
+    def record_so_promises(self, promises):
+        self.promise_batches.append(len(list(promises)))
+        return sum(self.promise_batches[-1:])
 
 
 def test_population_collapse_is_treated_as_a_bad_read():
@@ -130,6 +134,8 @@ def test_population_collapse_is_treated_as_a_bad_read():
     assert out2["skipped"] is None, out2
     assert store2.stage_calls == [370], store2.stage_calls
     assert store2.meta["so_sweep_last_population"] == "370"
+    # 370 orders, one promise write.
+    assert len(store2.promise_batches) == 1, store2.promise_batches
 
     # An empty payload is never a real population either.
     assert so_stage_log.persist_observations([], _FakeStore(), NOW)["skipped"] == "empty_population"

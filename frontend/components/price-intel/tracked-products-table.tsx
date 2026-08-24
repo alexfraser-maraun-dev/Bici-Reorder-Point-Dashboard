@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import dynamic from 'next/dynamic'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -28,12 +29,18 @@ import { isMapViolation, mapFloor, itemIdentity, lightspeedItemUrl } from '@/lib
 import { PricePushDialog } from './price-push-dialog'
 import { MatrixPushDialog } from './matrix-push-dialog'
 import { ItemSearchPicker } from './item-search-picker'
-import { PriceHistoryChart } from './price-history-chart'
 import {
   ArrowDown, ArrowUp, ArrowUpDown, Ban, ChevronDown, ChevronRight, DollarSign,
   ExternalLink, EyeOff, Layers, Link2, Pin, PinOff, RefreshCw, Search, ShieldAlert,
   ShieldCheck, Undo2, X,
 } from 'lucide-react'
+
+// Only rendered inside an expanded row, so the charting library it pulls in
+// (~380 KB) is fetched on the first expand rather than on every page load.
+const PriceHistoryChart = dynamic(
+  () => import('./price-history-chart').then((m) => m.PriceHistoryChart),
+  { ssr: false, loading: () => <Skeleton className="h-[220px] w-full" /> },
+)
 
 const fmt = (v: number | null | undefined) => (v == null ? '—' : `$${Number(v).toFixed(2)}`)
 

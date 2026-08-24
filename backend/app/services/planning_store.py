@@ -8,10 +8,20 @@ forecast outputs, and append-only reporting facts.
 import json
 import os
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
+
+
+# Schema bootstrap is ~30 DDL statements. It is idempotent, but it is not free: on
+# Postgres the ALTER TABLE ... ADD COLUMN IF NOT EXISTS statements each take a brief
+# ACCESS EXCLUSIVE lock, and every statement is a round-trip. Track which databases
+# this process has already bootstrapped so building a store a second time (tests, or
+# a stray `PlanningStore()` on a request path) costs nothing.
+_initialized_urls: set = set()
+_init_lock = threading.Lock()
 
 
 ALLOWED_DRAFT_TRANSITIONS = {
@@ -38,10 +48,100 @@ class PlanningConflict(RuntimeError):
 
 
 class PlanningStore:
+    # Upper bound on pooled Postgres connections. The API runs a single gunicorn
+    # worker whose sync endpoints execute on the anyio threadpool, so a handful of
+    # connections covers the real concurrency while staying well inside the
+    # connection limit of the 1 GB Render database.
+    _POOL_MAX_SIZE = 8
+    # How long to wait for a free pooled connection before giving up on the pool for
+    # this call. Under normal load one is available immediately; waiting at all means
+    # every connection is busy or the database is unreachable.
+    _POOL_CHECKOUT_TIMEOUT = 5.0
+
     def __init__(self, database_url: Optional[str] = None):
         self.database_url = database_url or os.getenv("DATABASE_URL") or "sqlite:///replen_app.db"
         self.is_postgres = self.database_url.startswith(("postgres://", "postgresql://"))
-        self.initialize()
+        self._pool = None
+        self._pool_lock = threading.Lock()
+        with _init_lock:
+            already_bootstrapped = self.database_url in _initialized_urls
+        if not already_bootstrapped:
+            self.initialize()
+            with _init_lock:
+                _initialized_urls.add(self.database_url)
+
+    def _get_pool(self):
+        """Lazily built Postgres connection pool, or None when pooling is unavailable.
+
+        Unpooled, every query pays a fresh TCP + TLS + auth handshake, which dominates
+        the cost of the small reads on the request path. ``psycopg_pool`` is an optional
+        extra, so a deployment without it degrades to per-call connects rather than
+        failing outright.
+        """
+        if self._pool is not None:
+            return self._pool
+        with self._pool_lock:
+            if self._pool is not None:
+                return self._pool
+            try:
+                from psycopg.rows import dict_row
+                from psycopg_pool import ConnectionPool
+            except ImportError:
+                return None
+            try:
+                self._pool = ConnectionPool(
+                    self.database_url,
+                    min_size=1,
+                    max_size=self._POOL_MAX_SIZE,
+                    kwargs={"row_factory": dict_row},
+                    # Bound the wait for a free connection. The default is 30s, which
+                    # would turn a database outage into a 30-second hang per request --
+                    # far worse than the fast connect error the unpooled path gave.
+                    timeout=self._POOL_CHECKOUT_TIMEOUT,
+                    # Non-blocking: the pool reconnects in the background rather than
+                    # making process startup depend on the database being up.
+                    open=True,
+                )
+            except Exception as exc:
+                print(f"planning_store: pool unavailable, using direct connects: {exc}")
+                self._pool = None
+            return self._pool
+
+    @contextmanager
+    def _connection(self):
+        """Lends a connection for the duration of the block.
+
+        Pooled connections go back to the pool on exit; unpooled ones are closed. Either
+        way the caller must not retain it past the block.
+        """
+        if self.is_postgres:
+            pool = self._get_pool()
+            if pool is not None:
+                # getconn/putconn rather than `pool.connection()`: that helper commits or
+                # rolls back on exit, and this store's callers already own their
+                # transaction boundaries. Borrowing the raw connection keeps the
+                # semantics identical to the unpooled path below.
+                #
+                # A checkout failure (pool exhausted, or the database unreachable while
+                # the pool retries in the background) falls through to a direct connect,
+                # so the worst case is the behaviour this had before pooling -- never a
+                # request that hangs waiting on the pool.
+                pooled = None
+                try:
+                    pooled = pool.getconn()
+                except Exception as exc:
+                    print(f"planning_store: pooled checkout failed, connecting directly: {exc}")
+                if pooled is not None:
+                    try:
+                        yield pooled
+                    finally:
+                        pool.putconn(pooled)
+                    return
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _connect(self):
         if self.is_postgres:
@@ -64,19 +164,17 @@ class PlanningStore:
 
     @contextmanager
     def transaction(self, immediate: bool = False):
-        conn = self._connect()
-        try:
-            if self.is_postgres:
-                conn.execute("BEGIN")
-            else:
-                conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        with self._connection() as conn:
+            try:
+                if self.is_postgres:
+                    conn.execute("BEGIN")
+                else:
+                    conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def initialize(self) -> None:
         id_type = "TEXT" if not self.is_postgres else "TEXT"
@@ -441,24 +539,18 @@ class PlanningStore:
         return run
 
     def get_planning_run(self, run_id: str) -> Optional[Dict[str, Any]]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             row = conn.execute(
                 self._sql("SELECT result_json FROM planning_runs WHERE run_id = ?"), (str(run_id),)
             ).fetchone()
             return json.loads(self._dict(row)["result_json"]) if row else None
-        finally:
-            conn.close()
 
     def get_latest_planning_run(self) -> Optional[Dict[str, Any]]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT result_json FROM planning_runs WHERE status = 'complete' ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
             return json.loads(self._dict(row)["result_json"]) if row else None
-        finally:
-            conn.close()
 
     def set_target_order(
         self, draft_id: str, expected_version: int, order_id: Optional[str]
@@ -510,8 +602,7 @@ class PlanningStore:
         return updated
 
     def get_draft(self, draft_id: str) -> Optional[Dict[str, Any]]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             row = conn.execute(
                 self._sql("SELECT * FROM po_drafts WHERE draft_id = ?"), (draft_id,)
             ).fetchone()
@@ -524,12 +615,9 @@ class PlanningStore:
             ).fetchall()
             draft["lines"] = [self._dict(line) for line in lines]
             return draft
-        finally:
-            conn.close()
 
     def list_drafts(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             if status:
                 rows = conn.execute(
                     self._sql("SELECT * FROM po_drafts WHERE status = ? ORDER BY created_at DESC"),
@@ -538,8 +626,6 @@ class PlanningStore:
             else:
                 rows = conn.execute("SELECT * FROM po_drafts ORDER BY created_at DESC").fetchall()
             return [self._dict(row) for row in rows]
-        finally:
-            conn.close()
 
     def replace_lines(
         self, draft_id: str, expected_version: int, lines: Iterable[Dict[str, Any]]
@@ -671,8 +757,7 @@ class PlanningStore:
         return {"inserted": inserted, "touched": touched}
 
     def list_so_stage_events(self, special_order_ids: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             if special_order_ids is None:
                 rows = conn.execute("SELECT * FROM so_stage_events").fetchall()
                 return [self._dict(r) for r in rows]
@@ -688,8 +773,6 @@ class PlanningStore:
                 ), tuple(chunk)).fetchall()
                 out.extend(self._dict(r) for r in rows)
             return out
-        finally:
-            conn.close()
 
     def upsert_so_ack(self, special_order_id: str, *, acked_by: Optional[str], reason_code: str,
                       note: Optional[str], checkback_date: str, pinned_stage: Optional[str],
@@ -740,12 +823,9 @@ class PlanningStore:
                          (str(special_order_id),))
 
     def list_so_acks(self) -> Dict[str, Dict[str, Any]]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             rows = conn.execute("SELECT * FROM so_acks").fetchall()
             return {str(self._dict(r)["special_order_id"]): self._dict(r) for r in rows}
-        finally:
-            conn.close()
 
     def record_so_promise(self, *, special_order_id: Optional[str], shopify_order_id: Optional[str],
                           promise_date: str, promise_source: str,
@@ -756,31 +836,64 @@ class PlanningStore:
         promise on every sweep is a no-op while a genuine re-quote lands as a new revision.
         The earliest surviving row is the ORIGINAL promise the headline SLA scores against.
         """
-        key = f"{special_order_id or ''}:{shopify_order_id or ''}:{promise_date}:{promise_source}"
         with self.transaction(immediate=True) as conn:
-            if conn.execute(self._sql(
-                "SELECT promise_id FROM so_promises WHERE promise_key = ?"
-            ), (key,)).fetchone():
-                return False
-            scope_col = "special_order_id" if special_order_id else "shopify_order_id"
-            scope_val = special_order_id or shopify_order_id
-            prior = conn.execute(self._sql(
-                f"SELECT COUNT(*) AS n FROM so_promises WHERE {scope_col} = ?"
-            ), (str(scope_val),)).fetchone() if scope_val else None
-            revision = int(self._dict(prior)["n"]) if prior else 0
-            if revision:
-                conn.execute(self._sql(
-                    f"UPDATE so_promises SET superseded_at = ? "
-                    f"WHERE {scope_col} = ? AND promise_source = ? AND superseded_at IS NULL"
-                ), (self._now(), str(scope_val), promise_source))
-            conn.execute(self._sql("""
-                INSERT INTO so_promises (promise_id,promise_key,special_order_id,shopify_order_id,
-                    promise_date,promise_source,recorded_at,recorded_by,superseded_at,revision_index)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
-            """), (
-                uuid.uuid4().hex, key, _opt_str(special_order_id), _opt_str(shopify_order_id),
-                promise_date, promise_source, self._now(), recorded_by, None, revision,
-            ))
+            return self._record_promise_on(
+                conn, special_order_id=special_order_id, shopify_order_id=shopify_order_id,
+                promise_date=promise_date, promise_source=promise_source,
+                recorded_by=recorded_by,
+            )
+
+    def record_so_promises(self, promises: Iterable[Dict[str, Any]]) -> int:
+        """Batch form of `record_so_promise`: one transaction for the whole sweep.
+
+        The sweep observes a promise for every open special order, and writing each one
+        in its own transaction meant a connection round-trip per order every five
+        minutes. Returns the count of genuinely NEW promises. A single bad row is
+        skipped rather than losing the rest of the batch, matching the per-row
+        behaviour callers already relied on.
+        """
+        rows = list(promises)
+        if not rows:
+            return 0
+        new_count = 0
+        with self.transaction(immediate=True) as conn:
+            for promise in rows:
+                try:
+                    if self._record_promise_on(conn, **promise):
+                        new_count += 1
+                except Exception as exc:
+                    print(f"[planning_store] promise write failed for "
+                          f"{promise.get('special_order_id')}: {exc}")
+        return new_count
+
+    def _record_promise_on(self, conn, *, special_order_id: Optional[str],
+                           shopify_order_id: Optional[str], promise_date: str,
+                           promise_source: str, recorded_by: Optional[str] = None) -> bool:
+        """The promise-ledger write itself, on a caller-supplied open transaction."""
+        key = f"{special_order_id or ''}:{shopify_order_id or ''}:{promise_date}:{promise_source}"
+        if conn.execute(self._sql(
+            "SELECT promise_id FROM so_promises WHERE promise_key = ?"
+        ), (key,)).fetchone():
+            return False
+        scope_col = "special_order_id" if special_order_id else "shopify_order_id"
+        scope_val = special_order_id or shopify_order_id
+        prior = conn.execute(self._sql(
+            f"SELECT COUNT(*) AS n FROM so_promises WHERE {scope_col} = ?"
+        ), (str(scope_val),)).fetchone() if scope_val else None
+        revision = int(self._dict(prior)["n"]) if prior else 0
+        if revision:
+            conn.execute(self._sql(
+                f"UPDATE so_promises SET superseded_at = ? "
+                f"WHERE {scope_col} = ? AND promise_source = ? AND superseded_at IS NULL"
+            ), (self._now(), str(scope_val), promise_source))
+        conn.execute(self._sql("""
+            INSERT INTO so_promises (promise_id,promise_key,special_order_id,shopify_order_id,
+                promise_date,promise_source,recorded_at,recorded_by,superseded_at,revision_index)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """), (
+            uuid.uuid4().hex, key, _opt_str(special_order_id), _opt_str(shopify_order_id),
+            promise_date, promise_source, self._now(), recorded_by, None, revision,
+        ))
         return True
 
     def set_service_promise(self, special_order_id: str, promise_date: str,
@@ -845,8 +958,7 @@ class PlanningStore:
 
     def active_service_promises(self) -> Dict[str, Dict[str, Any]]:
         """Current app-owned service promises keyed by Lightspeed special-order id."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM so_promises WHERE promise_source = 'service_manual' "
                 "AND superseded_at IS NULL ORDER BY revision_index"
@@ -855,12 +967,9 @@ class PlanningStore:
                 str(self._dict(row)["special_order_id"]): self._dict(row)
                 for row in rows if self._dict(row).get("special_order_id")
             }
-        finally:
-            conn.close()
 
     def list_so_promises(self, special_order_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             if special_order_id:
                 rows = conn.execute(self._sql(
                     "SELECT * FROM so_promises WHERE special_order_id = ? ORDER BY revision_index"
@@ -868,8 +977,6 @@ class PlanningStore:
             else:
                 rows = conn.execute("SELECT * FROM so_promises ORDER BY recorded_at").fetchall()
             return [self._dict(r) for r in rows]
-        finally:
-            conn.close()
 
     def record_so_activity(self, special_order_id: str, event_type: str, *,
                            actor: Optional[str] = None,
@@ -892,8 +999,7 @@ class PlanningStore:
         return {**record, "details": details or {}}
 
     def list_so_activity(self, special_order_id: str) -> List[Dict[str, Any]]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             rows = conn.execute(self._sql(
                 "SELECT * FROM so_activity_events WHERE special_order_id = ? "
                 "ORDER BY occurred_at DESC"
@@ -908,30 +1014,22 @@ class PlanningStore:
                     item.pop("details_json", None)
                 out.append(item)
             return out
-        finally:
-            conn.close()
 
     def delete_po_ack(self, order_id: str) -> None:
         with self.transaction(immediate=True) as conn:
             conn.execute(self._sql("DELETE FROM po_watch_acks WHERE order_id = ?"), (str(order_id),))
 
     def list_po_acks(self) -> Dict[str, Dict[str, Any]]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             rows = conn.execute("SELECT * FROM po_watch_acks").fetchall()
             return {str(self._dict(row)["order_id"]): self._dict(row) for row in rows}
-        finally:
-            conn.close()
 
     def get_po_watch_meta(self, key: str) -> Optional[str]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             row = conn.execute(
                 self._sql("SELECT value FROM po_watch_meta WHERE key = ?"), (key,)
             ).fetchone()
             return self._dict(row)["value"] if row else None
-        finally:
-            conn.close()
 
     def set_po_watch_meta(self, key: str, value: str) -> None:
         with self.transaction(immediate=True) as conn:

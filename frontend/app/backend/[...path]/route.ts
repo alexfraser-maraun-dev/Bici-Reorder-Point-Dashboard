@@ -47,12 +47,22 @@ async function proxy(req: NextRequest, ctx: { params: Promise<{ path: string[] }
   // The backend runs on Render's free tier and can spin down / briefly reset, so a
   // single fetch occasionally throws before it ever reaches FastAPI (the classic
   // "Backend unreachable" on a DELETE/POST). Retry, but stay safe on mutations: only
-  // retry a non-idempotent method when the connection was NEVER established
+  // retry a NON-idempotent method when the connection was NEVER established
   // (ECONNREFUSED/DNS during cold start) — never on a mid-flight reset, which could
   // double-apply a write like a price push.
-  const idempotent = method === "GET" || method === "HEAD"
+  //
+  // Idempotent means "repeating it lands on the same final state" (RFC 9110), which
+  // covers DELETE and PUT as well as reads — not just the safe methods. Every DELETE
+  // this API exposes removes one identified resource, so a repeat is a no-op. Leaving
+  // them out gave a Release/Unpark exactly one attempt where a page load got three,
+  // so an idle tab hitting a cold backend failed outright on a button but recovered
+  // silently on a refresh. POST and PATCH stay strictly single-attempt.
+  const idempotent = method === "GET" || method === "HEAD" ||
+    method === "DELETE" || method === "PUT"
+  const causeCode = (err: unknown): string | undefined =>
+    (err as { cause?: { code?: string } } | null)?.cause?.code
   const neverConnected = (err: unknown): boolean => {
-    const code = (err as { cause?: { code?: string } } | null)?.cause?.code
+    const code = causeCode(err)
     return code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN"
   }
   const MAX_ATTEMPTS = 3
@@ -70,7 +80,18 @@ async function proxy(req: NextRequest, ctx: { params: Promise<{ path: string[] }
   }
   if (!upstream) {
     console.error(`[backend-proxy] ${method} ${target} unreachable:`, lastErr)
-    return NextResponse.json({ detail: "Backend unreachable" }, { status: 502 })
+    // Name the actual failure. "Backend unreachable" on its own sent someone hunting
+    // through application code for a bug that was really a stopped/cold API process.
+    const code = causeCode(lastErr)
+    const detail = code === "ECONNREFUSED"
+      ? "The API server is not running or is still starting up. Try again in a moment."
+      : code === "ENOTFOUND" || code === "EAI_AGAIN"
+        ? "The API server address could not be resolved."
+        : `The connection to the API server failed${code ? ` (${code})` : ""}.`
+    return NextResponse.json(
+      { detail: `Backend unreachable. ${detail}`, code: code ?? null },
+      { status: 502 },
+    )
   }
 
   const respHeaders = new Headers()

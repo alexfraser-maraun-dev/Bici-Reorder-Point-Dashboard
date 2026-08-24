@@ -135,14 +135,10 @@ def persist_observations(orders: List[Dict[str, Any]], store, observed_at: str) 
         result["stages"] = store.record_so_stage_observations(
             build_observations(orders, observed_at)
         )
-        new_promises = 0
-        for promise in collect_promises(orders):
-            try:
-                if store.record_so_promise(**promise):
-                    new_promises += 1
-            except Exception as exc:  # one bad row must not lose the rest of the sweep
-                print(f"[so_sla] promise write failed for {promise.get('special_order_id')}: {exc}")
-        result["promises_new"] = new_promises
+        # One transaction for the whole sweep. Per-row writes meant a connection
+        # round-trip per open special order, every five minutes. The batch writer keeps
+        # the same per-row fail-soft behaviour: a bad row is skipped, not fatal.
+        result["promises_new"] = store.record_so_promises(collect_promises(orders))
         store.set_po_watch_meta(_META_LAST_POPULATION, str(population))
     except Exception as exc:
         print(f"[so_sla] stage persistence failed: {exc}")
