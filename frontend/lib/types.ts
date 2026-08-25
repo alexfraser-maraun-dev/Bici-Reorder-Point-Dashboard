@@ -867,6 +867,31 @@ export interface SpecialOrder {
   ambiguous_candidate?: boolean
 }
 
+/** One entry from the linked Shopify order's timeline. Read-only: the Admin API has no mutation
+ *  that writes a timeline comment, so this panel reports rather than converses. `message` is
+ *  already plain text — markup is stripped server-side. */
+export interface ShopifyTimelineEvent {
+  id: string
+  created_at: string
+  action: string | null
+  /** A staff comment, as opposed to an automatic event. The most useful entries by far. */
+  is_comment: boolean
+  message: string
+  app_title: string | null
+  critical: boolean
+  /** Payment plumbing, hidden until "Show all". Never true for a critical alert. */
+  noise: boolean
+}
+
+export interface ShopifyTimeline {
+  linked: boolean
+  order_id: string | null
+  order_name: string | null
+  events: ShopifyTimelineEvent[]
+  truncated: boolean
+  error: string | null
+}
+
 export interface SpecialOrderSummary {
   total_open: number
   by_stage: Record<ProcurementStage, number>

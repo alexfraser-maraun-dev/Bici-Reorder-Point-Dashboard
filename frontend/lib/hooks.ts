@@ -637,6 +637,17 @@ export function useSoActivity(specialOrderId: string | null) {
   }
 }
 
+/** The linked Shopify order's timeline. Lazy — pass null until the drawer opens, since every
+ *  call is a live Shopify round-trip (the backend caches it for 2 minutes). */
+export function useShopifyTimeline(specialOrderId: string | null) {
+  const { data, error, isLoading, mutate } = useSWR<import('./types').ShopifyTimeline>(
+    specialOrderId ? `/backend/api/special-orders/${specialOrderId}/shopify-timeline` : null,
+    fetcher,
+    { revalidateOnFocus: false, dedupingInterval: 120000 },
+  )
+  return { timeline: data, isLoading, error, revalidate: mutate }
+}
+
 /** Scoreboard metrics. Lazy — pass false until the panel is opened, since the history half
  *  costs a BigQuery round-trip. */
 export function useSoScoreboard(enabled: boolean) {

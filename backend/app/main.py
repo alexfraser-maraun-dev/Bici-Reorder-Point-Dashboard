@@ -1992,6 +1992,57 @@ def get_special_order_activity(special_order_id: str):
     return {"special_order_id": str(special_order_id), "activity": events}
 
 
+# Shopify order timelines, keyed by Shopify order id. Short TTL because the drawer is opened and
+# reopened while someone works a row, and each open would otherwise be a live GraphQL round-trip.
+# Bounded so a long session cannot grow it without limit.
+_shopify_timeline_cache: Dict[str, Any] = {}
+_SHOPIFY_TIMELINE_TTL_SECONDS = 120
+_SHOPIFY_TIMELINE_CACHE_MAX = 200
+
+
+@app.get("/api/special-orders/{special_order_id}/shopify-timeline")
+def get_special_order_shopify_timeline(special_order_id: str, limit: int = 60):
+    """The linked Shopify order's timeline. Lazy — never part of the worklist payload.
+
+    Read-only: the Admin API exposes no mutation that writes a timeline comment, so this panel
+    reports what Shopify knows rather than pretending to be a two-way conversation.
+    """
+    dashboard = _special_orders_cache.get("data") or _rebuild_special_orders_cache()
+    row = next((o for o in dashboard.get("orders", [])
+                if str(o.get("special_order_id")) == str(special_order_id)), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Special order not found")
+
+    order_id = row.get("shopify_order_id")
+    if not order_id:
+        # Not an error: most special orders have no Shopify order behind them at all.
+        return {"linked": False, "order_id": None, "order_name": None,
+                "events": [], "truncated": False, "error": None}
+
+    key = str(order_id)
+    cached = _shopify_timeline_cache.get(key)
+    if cached and time.time() - cached["fetched_at"] < _SHOPIFY_TIMELINE_TTL_SECONDS:
+        return cached["data"]
+
+    from app.services.shopify_client import ShopifyClient
+    try:
+        payload = ShopifyClient().get_order_timeline(key, limit=limit)
+    except Exception as e:
+        # Fail soft: the drawer's other panels are still useful, and a timeline that cannot be
+        # loaded is not a reason to fail the whole review.
+        print(f"[so_timeline] Shopify timeline unavailable for order {key}: {e}")
+        return {"linked": True, "order_id": key, "order_name": row.get("shopify_order_name"),
+                "events": [], "truncated": False,
+                "error": "The Shopify timeline could not be loaded."}
+
+    data = {"linked": True, **payload, "error": None}
+    if len(_shopify_timeline_cache) >= _SHOPIFY_TIMELINE_CACHE_MAX:
+        oldest = min(_shopify_timeline_cache, key=lambda k: _shopify_timeline_cache[k]["fetched_at"])
+        _shopify_timeline_cache.pop(oldest, None)
+    _shopify_timeline_cache[key] = {"data": data, "fetched_at": time.time()}
+    return data
+
+
 _reco_context_cache: Dict[str, Any] = {"data": None, "built_at": 0.0}
 _RECO_CONTEXT_TTL_SECONDS = 300
 

@@ -14,8 +14,14 @@ import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
-import type { ShopifyOnlyOrder, SpecialOrder, SpecialOrderActivityEvent } from '@/lib/types'
-import { useSoActivity } from '@/lib/hooks'
+import type {
+  ShopifyOnlyOrder,
+  ShopifyTimeline as ShopifyTimelinePayload,
+  SpecialOrder,
+  SpecialOrderActivityEvent,
+} from '@/lib/types'
+import { useShopifyTimeline, useSoActivity } from '@/lib/hooks'
+import { cn } from '@/lib/utils'
 import {
   AvailableVendors,
   CopyableUpc,
@@ -101,6 +107,81 @@ function eventDetails(details: Record<string, unknown> | string | null): string 
     .filter(([, value]) => value !== null && value !== undefined && value !== '')
     .map(([key, value]) => `${key.replace(/_/g, ' ')}: ${String(value)}`)
   return parts.length > 0 ? parts.join(' · ') : null
+}
+
+function ShopifyTimelinePanel({
+  timeline,
+  isLoading,
+  orderUrl,
+}: {
+  timeline: ShopifyTimelinePayload | undefined
+  isLoading: boolean
+  orderUrl: string | null
+}) {
+  const [showAll, setShowAll] = useState(false)
+
+  if (!isLoading && (!timeline || !timeline.linked)) return null
+
+  const events = timeline?.events ?? []
+  const curated = events.filter((event) => !event.noise)
+  const visible = showAll ? events : curated
+  const hidden = events.length - curated.length
+
+  return (
+    <Section title="Shopify timeline">
+      {isLoading && <Skeleton className="h-24 w-full" />}
+      {timeline?.error && (
+        <p className="text-sm text-muted-foreground">{timeline.error}</p>
+      )}
+      {!isLoading && !timeline?.error && events.length === 0 && (
+        <p className="text-sm text-muted-foreground">Shopify has no timeline entries for this order.</p>
+      )}
+      {visible.length > 0 && (
+        <ol className="space-y-3 border-l pl-4 text-sm">
+          {visible.map((event) => (
+            <li key={event.id}>
+              <p className={cn(
+                event.is_comment ? 'font-medium' : 'text-muted-foreground',
+                event.critical && 'font-medium text-red-700',
+              )}>
+                {/* Staff comments are the reason this panel exists — on order #245382 the only
+                    record of the tyres being missing is a comment. Everything else is context. */}
+                {event.is_comment && <span className="mr-1 text-muted-foreground">&ldquo;</span>}
+                {event.message}
+                {event.is_comment && <span className="ml-0.5 text-muted-foreground">&rdquo;</span>}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {new Date(event.created_at).toLocaleString()}
+                {event.app_title ? ` · ${event.app_title}` : ''}
+              </p>
+            </li>
+          ))}
+        </ol>
+      )}
+      <div className="mt-3 flex items-center gap-3">
+        {hidden > 0 && (
+          <Button variant="outline" size="sm" onClick={() => setShowAll((current) => !current)}>
+            {showAll ? 'Hide payment entries' : `Show all ${events.length} entries`}
+          </Button>
+        )}
+        {orderUrl && (
+          <a
+            href={orderUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs underline decoration-muted-foreground/50 underline-offset-2 hover:text-foreground"
+          >
+            Open in Shopify to comment
+          </a>
+        )}
+      </div>
+      {timeline?.truncated && (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Older entries exist; open the order in Shopify to see them.
+        </p>
+      )}
+    </Section>
+  )
 }
 
 function ActivityPanel({
@@ -233,6 +314,10 @@ export function SpecialOrderDetailDrawer({
     error: activityError,
     revalidate: revalidateActivity,
   } = useSoActivity(order.kind === 'shopify' ? null : order.special_order_id)
+  // Lazy, and only for rows that actually have a Shopify order behind them.
+  const { timeline, isLoading: timelineLoading } = useShopifyTimeline(
+    order.kind === 'shopify' || !order.shopify_order_id ? null : order.special_order_id,
+  )
   const linkDialogId = `link-shopify-order-${order.special_order_id}`
   const refreshAfterMutation = async () => {
     const [worklistResult] = await Promise.allSettled([
@@ -324,6 +409,14 @@ export function SpecialOrderDetailDrawer({
                 error={activityError}
                 onRetry={() => void revalidateActivity()}
               />
+
+              {order.shopify_order_id && order.kind !== 'shopify' && (
+                <ShopifyTimelinePanel
+                  timeline={timeline}
+                  isLoading={timelineLoading}
+                  orderUrl={order.shopify_order_url}
+                />
+              )}
 
               <Separator />
 

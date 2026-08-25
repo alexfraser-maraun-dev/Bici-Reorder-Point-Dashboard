@@ -21,6 +21,7 @@ Auth supports both Shopify app models:
     used directly if set.
 """
 
+import html
 import os
 import re
 import time
@@ -57,6 +58,21 @@ _LINE_ITEMS_PER_PAGE = 50
 _MAX_PAGES = 50
 
 _GID_NUM = re.compile(r"/(\d+)$")
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(value: Optional[str]) -> str:
+    """Timeline messages carry markup (`<a href=...>` on payout and confirmation lines).
+
+    Stripped server-side so the UI can render plain text: the alternative is
+    `dangerouslySetInnerHTML` on a string that originates outside this app, which is a stored-XSS
+    hole for the sake of a link nobody needs in a triage panel.
+    """
+    if not value:
+        return ""
+    return html.unescape(_TAG_RE.sub("", value)).strip()
 
 
 def _gid_to_id(gid: Optional[str]) -> Optional[str]:
@@ -429,6 +445,71 @@ class ShopifyClient:
                 }
                 for li in ((node.get("lineItems") or {}).get("nodes") or [])
             ],
+        }
+
+    # Timeline entries that are payment plumbing rather than anything about where the goods are.
+    # An ALLOW-by-default design: an action we have never seen is far more likely to be signal
+    # than noise, so unknown types surface in the curated view instead of being silently hidden.
+    # Vocabulary sampled from four real orders (`Event.action`), which is stable and typed —
+    # classifying on the message text would break the first time Shopify reworded anything.
+    TIMELINE_NOISE_ACTIONS = frozenset({
+        "payments_charge", "capture_success", "capture_pending", "authorization_success",
+        "emv_capture_success", "emv_authorization_success", "confirmed",
+        "confirmation_number_generated", "customer_added", "customer_removed",
+    })
+
+    _ORDER_TIMELINE_QUERY = """
+    query OrderTimeline($id: ID!, $first: Int!) {
+      node(id: $id) { ... on Order {
+        id
+        name
+        events(first: $first, sortKey: CREATED_AT, reverse: true) {
+          pageInfo { hasNextPage }
+          nodes { __typename id action createdAt message criticalAlert appTitle }
+        }
+      } }
+    }
+    """
+
+    def get_order_timeline(self, order_id: str, limit: int = 60) -> Dict[str, Any]:
+        """One Shopify order's timeline, newest first.
+
+        Read-only by necessity, not by choice: the Admin API exposes no mutation that writes a
+        timeline comment (all 473 were checked; the `comment*` ones are for blog articles). The
+        only writable field that shows up here at all is the order note.
+
+        `author` is deliberately absent — it needs the `read_users` scope, which additionally
+        requires a Plus/Advanced plan. No loss in practice: Shopify embeds the actor's name in
+        `message` ("Ryan Kennedy canceled fulfillment via Manual for 2 items"), and `app_title`
+        separates automation from a human.
+        """
+        data = self._graphql(
+            self._ORDER_TIMELINE_QUERY,
+            {"id": f"gid://shopify/Order/{order_id}", "first": int(limit)},
+        )
+        node = (data or {}).get("node") or {}
+        conn = node.get("events") or {}
+        events = []
+        for e in conn.get("nodes") or []:
+            action = e.get("action")
+            events.append({
+                "id": _gid_to_id(e.get("id")),
+                "created_at": e.get("createdAt"),
+                "action": action,
+                # A staff comment is the single most useful entry here, so it is typed separately
+                # rather than left for the UI to infer from `action`.
+                "is_comment": e.get("__typename") == "CommentEvent",
+                "message": _strip_html(e.get("message")),
+                "app_title": e.get("appTitle"),
+                "critical": bool(e.get("criticalAlert")),
+                # A critical alert is never noise, whatever its action says.
+                "noise": bool(action in self.TIMELINE_NOISE_ACTIONS and not e.get("criticalAlert")),
+            })
+        return {
+            "order_id": str(order_id),
+            "order_name": node.get("name"),
+            "events": events,
+            "truncated": bool((conn.get("pageInfo") or {}).get("hasNextPage")),
         }
 
     def search_orders(self, term: str, limit: int = 10, *, strict: bool = False) -> List[Dict[str, Any]]:
