@@ -489,7 +489,15 @@ def get_settings_overrides() -> dict:
     if cached is not None:
         return cached
     out = {}
-    for r in _rows(f"SELECT setting_key, value_json FROM `{T_SETTINGS}`"):
+    # Newest row per key. The table is MERGE-upserted, but a concurrent write can
+    # leave two rows for one key — live data held both `auto_confirm: true` and
+    # `auto_confirm: false`, and an unordered scan let whichever landed last decide
+    # the match-confirmation policy for the whole process.
+    for r in _rows(f"""
+        SELECT setting_key, value_json FROM `{T_SETTINGS}`
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY setting_key ORDER BY updated_at DESC) = 1
+    """):
         try:
             out[r["setting_key"]] = json.loads(r["value_json"])
         except (TypeError, ValueError):
@@ -1833,6 +1841,11 @@ def get_product_links(status=None, item_id=None, unverified_only=False,
         params.append(bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)))
     if unverified_only:
         where.append("l.llm_verdict IS NULL")
+        # Sibling rows already carry structured evidence — colour and size both
+        # agreeing with a tracked variant, on a page a human confirmed sells the
+        # model. Asking the LLM to re-judge that spends the per-run pair budget
+        # that the genuinely uncertain fuzzy candidates need.
+        where.append("COALESCE(l.source, '') != 'sibling'")
     if active_items_only:
         where.append("COALESCE(t.archived, FALSE) = FALSE")
     clause = f"WHERE {' AND '.join(where)}" if where else ""
@@ -1852,21 +1865,50 @@ def get_product_links(status=None, item_id=None, unverified_only=False,
     """, params=params)
 
 
+def _with_gtin_keys(rows: list) -> set:
+    """Stored match_keys plus the barcode-form key each row's own gtin implies.
+
+    build_match_key leads with the barcode now, so a row written under the older
+    SKU/URL key no longer matches what the scraper regenerates. Carrying both
+    forms keeps tombstones tombstoned and links live across the change, whether
+    or not the one-off re-key (rekey_links_to_gtin) has been applied."""
+    from .matcher import gtin_match_key
+    keys = set()
+    for r in rows:
+        if r.get("match_key"):
+            keys.add(r["match_key"])
+        derived = gtin_match_key(r.get("competitor_id"), r.get("gtin"))
+        if derived:
+            keys.add(derived)
+    return keys
+
+
+def days_since_last_catalog_crawl():
+    """Whole days since the last catalog crawl produced an observation, or None
+    when none ever has. Drives the runner's periodic-sweep floor."""
+    ensure_pi_tables()
+    rows = _rows(f"""
+        SELECT TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(observed_at), DAY) AS days
+        FROM `{T_OBSERVATIONS}` WHERE source = 'catalog'
+    """)
+    return rows[0]["days"] if rows and rows[0].get("days") is not None else None
+
+
 def get_link_match_keys() -> set:
     """All match_keys with any row (any status) — the candidate generator skips
     these so rejected links act as tombstones and the LLM is never re-asked."""
     ensure_pi_tables()
-    rows = _rows(f"SELECT DISTINCT match_key FROM `{T_LINKS}`")
-    return {r["match_key"] for r in rows if r.get("match_key")}
+    return _with_gtin_keys(_rows(
+        f"SELECT DISTINCT match_key, competitor_id, gtin FROM `{T_LINKS}`"))
 
 
 def get_rejected_match_keys() -> set:
     """Match keys a human rejected — the matcher skips these so a rejected listing
     (incl. a fuzzy/UPC auto-match) never returns on the next scrape."""
     ensure_pi_tables()
-    rows = _rows(f"SELECT DISTINCT match_key FROM `{T_LINKS}` "
-                 "WHERE status = 'rejected' AND match_key IS NOT NULL")
-    return {r["match_key"] for r in rows if r.get("match_key")}
+    return _with_gtin_keys(_rows(
+        f"SELECT DISTINCT match_key, competitor_id, gtin FROM `{T_LINKS}` "
+        "WHERE status = 'rejected' AND match_key IS NOT NULL"))
 
 
 def backfill_url_competitor_ids(apply: bool = False) -> dict:
@@ -2316,6 +2358,54 @@ def fetch_and_record_link(link_id: str):
             invalidate_pi_caches()
     except Exception as e:
         print(f"pi: immediate fetch of confirmed link {link_id} failed (next scrape retries): {e}")
+
+
+def rekey_links_to_gtin(apply: bool = False) -> dict:
+    """One-off re-key (dry-run by default) after build_match_key started leading
+    with the barcode.
+
+    Rows written under the older SKU/URL key still carry their own gtin, so the
+    new key is derivable. Without this the scraper's regenerated key finds no row
+    and `insert_product_links` (a MERGE on match_key) writes a *second* row for a
+    listing that already has one. `_with_gtin_keys` keeps both forms working
+    meanwhile, so this is hygiene rather than a prerequisite.
+
+    A stored key that another row already occupies is left alone and reported —
+    two rows collapsing onto one barcode is a duplicate to look at by hand, not
+    something to resolve blindly."""
+    from .matcher import gtin_match_key
+    ensure_pi_tables()
+    rows = _rows(f"""
+        SELECT link_id, match_key, competitor_id, gtin, item_id, status
+        FROM `{T_LINKS}` WHERE gtin IS NOT NULL AND match_key IS NOT NULL
+    """)
+    taken = {r["match_key"] for r in _rows(
+        f"SELECT DISTINCT match_key FROM `{T_LINKS}` WHERE match_key IS NOT NULL")}
+    updates, collisions = [], []
+    for r in rows:
+        new_key = gtin_match_key(r.get("competitor_id"), r.get("gtin"))
+        if not new_key or new_key == r["match_key"]:
+            continue
+        if new_key in taken:
+            collisions.append({"link_id": r["link_id"], "item_id": r.get("item_id"),
+                               "status": r.get("status"), "match_key": new_key})
+            continue
+        taken.add(new_key)
+        updates.append({"link_id": r["link_id"], "match_key": new_key})
+    report = {"applied": bool(apply), "rekeyed": len(updates),
+              "collisions": len(collisions), "collision_sample": collisions[:20],
+              "sample": updates[:20]}
+    if not apply or not updates:
+        return report
+    client = get_bq_client()
+    with _staging_table(T_LINKS, updates) as temp_table_id:
+        client.query(f"""
+            MERGE `{T_LINKS}` T USING `{temp_table_id}` S ON T.link_id = S.link_id
+            WHEN MATCHED THEN UPDATE SET
+                T.match_key = S.match_key, T.updated_at = CURRENT_TIMESTAMP()
+        """).result()
+    invalidate_pi_caches()
+    return report
 
 
 def cleanup_mismatched_links(apply: bool = False) -> dict:

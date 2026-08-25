@@ -50,6 +50,7 @@ const SOURCE_LABEL: Record<string, string> = {
   manual_url: 'tracked URL',
   serp: 'SERP found',
   attr: 'color+size match',
+  sibling: 'same page, color+size',
 }
 
 export function MatchReview() {
@@ -216,8 +217,14 @@ export function MatchReview() {
   // (identical color + size) with a strong fuzzy score. same_model rows are a
   // DIFFERENT variant, so they're never bulk-confirmed; the backend also rejects
   // any color/size mismatch and enforces one confirmed link per (item, store).
+  // 'sibling' rows qualify without an LLM verdict (they never get one): each is a
+  // color+size match against another variant on a page already confirmed to sell
+  // this model, which is what makes approving a model's whole variant set one click.
   const highConfidence = links.filter(
-    (l) => l.status === 'pending' && l.llm_verdict === 'same_variant' && (l.fuzzy_score ?? 0) >= 80
+    (l) =>
+      l.status === 'pending' &&
+      (l.source === 'sibling' ||
+        (l.llm_verdict === 'same_variant' && (l.fuzzy_score ?? 0) >= 80))
   )
 
   return (

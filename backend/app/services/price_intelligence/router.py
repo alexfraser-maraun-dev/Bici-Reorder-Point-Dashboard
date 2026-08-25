@@ -581,6 +581,14 @@ def backfill_url_links(apply: bool = False):
     return repository.backfill_url_competitor_ids(apply=apply)
 
 
+@router.post("/links/rekey-gtin")
+def rekey_links(apply: bool = False):
+    """One-off: re-key links written before build_match_key led with the barcode,
+    so the scraper's regenerated key finds the existing row instead of inserting a
+    duplicate. Dry-run unless apply=true."""
+    return repository.rekey_links_to_gtin(apply=apply)
+
+
 @router.post("/links/cleanup")
 def cleanup_links(apply: bool = False):
     """One-off hygiene: reject color/size-mismatched links and enforce one

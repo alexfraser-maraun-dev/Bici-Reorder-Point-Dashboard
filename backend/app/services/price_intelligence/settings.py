@@ -38,6 +38,8 @@ _SPECS = {
                           "default": lambda: config.SCHEDULE_TIMEZONE},
     # 3. Match confirmation policy (see config.AUTO_CONFIRM for semantics)
     "auto_confirm": {"kind": "bool", "default": lambda: config.AUTO_CONFIRM},
+    "gtin_auto_confirm": {"kind": "bool",
+                          "default": lambda: config.GTIN_AUTO_CONFIRM},
     # 4. Slack messaging job
     "slack_enabled": {"kind": "bool", "default": lambda: config.SLACK_ENABLED},
     "slack_webhook_url": {"kind": "url", "default": lambda: config.SLACK_WEBHOOK_URL,

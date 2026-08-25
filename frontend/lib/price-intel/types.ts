@@ -439,7 +439,11 @@ export interface ProductLink {
   variant_options_json: string | null
   level: 'variant' | 'model' | null
   status: ProductLinkStatus
-  source: 'gtin' | 'llm' | 'human' | 'manual_url'
+  // What the match is evidence of, not who acted on it. 'attr' = colour+size
+  // agreement, 'sibling' = the same, on a page already confirmed to sell the
+  // model. ('serp' and 'attr' were written by the backend before this type
+  // listed them.)
+  source: 'gtin' | 'llm' | 'human' | 'manual_url' | 'serp' | 'attr' | 'sibling'
   confidence: number | null
   fuzzy_score: number | null
   llm_verdict: string | null

@@ -12,6 +12,7 @@ Merchant-API convention, so a 12-digit UPC equals its 13-digit zero-padded EAN).
 Brand/title normalization folds accents ("Cervélo" == "Cervelo") and maps common
 storefront aliases/suffixes ("Trek Bikes" -> "trek").
 """
+import json
 import re
 import unicodedata
 from typing import Optional, Tuple
@@ -106,10 +107,35 @@ def _normalize_brand(value) -> Optional[str]:
 
 def strip_variant_tokens(title: str) -> str:
     """Reduces a variant title toward its model name (drops trailing '- <size/color>'
-    descriptors and bare size tokens)."""
-    text = _VARIANT_TAIL_RE.sub("", title or "")
+    descriptors and bare size tokens).
+
+    An option tail is recognised by its '/' separator before the narrow no-hyphen
+    rule is tried, because real tails are neither short nor hyphen-free: "POC Cytal
+    Helmet - Hydrogen White/Uranium Black Matte / L (56-61cm)" is 47 characters and
+    carries a hyphen inside the size range, so _VARIANT_TAIL_RE alone left the whole
+    colourway attached and the model-grain pass compared a colourway to a model."""
+    text = title or ""
+    while " - " in text:
+        head, tail = text.rsplit(" - ", 1)
+        if "/" not in tail or len(tail) > 80:
+            break
+        text = head
+    text = _VARIANT_TAIL_RE.sub("", text)
     text = _SIZE_TOKEN_RE.sub("", text)
     return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def strip_brand(text, brand) -> str:
+    """Folded `text` with the brand name removed ('POC Cytal Helmet' -> 'cytal
+    helmet'). Falls back to the folded text when removal would empty it (a title
+    that is only the brand)."""
+    folded = _fold(text)
+    brand = _fold(brand)
+    if not folded or not brand:
+        return folded
+    stripped = re.sub(rf"\b{re.escape(brand)}\b", " ", folded)
+    stripped = re.sub(r"\s{2,}", " ", stripped).strip()
+    return stripped or folded
 
 
 def _attr_tokens(value) -> set:
@@ -117,28 +143,70 @@ def _attr_tokens(value) -> set:
     return set(re.findall(r"[a-z0-9]+", _fold(value)))
 
 
+# Trailing fit qualifier on an apparel/helmet size: "L (56-61cm)", "XL (46+)",
+# "S (52-55.5cm)". The size itself is the part in front of it.
+_SIZE_QUALIFIER_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _letter_sizes(value):
+    """The canonical apparel sizes a value names, or None when it doesn't name any.
+
+    Storefronts write one size several ways — "2XL", "L (56-61cm)", "M/L",
+    "Large/X-Large" — and every one of them has to reduce to the same token our
+    attribute_1/2/3 use ("XXL", "Large", "M"). A combined size yields the whole
+    set, so "M/L" agrees with our "Medium" *and* our "Large" (which leaves the
+    routing ambiguous, and ambiguity is what the review queue is for).
+
+    The WHOLE string must be size tokens plus that optional qualifier: a
+    colourway called "Medium Clay Pearl" names a colour, not a size."""
+    folded = _fold(value)
+    if not folded:
+        return None
+    core = _SIZE_QUALIFIER_RE.sub("", folded).strip()
+    if not core:
+        return None
+    tokens = set()
+    for part in core.split("/"):
+        key = part.strip().replace("-", "").replace(" ", "")
+        canon = _LETTER_SIZES.get(key)
+        if canon is None:
+            return None
+        tokens.add(canon)
+    return frozenset(tokens) or None
+
+
 def _canon_size(value):
-    """Classifies a variant option / attribute as a size. Returns ('num', [digits])
-    for numeric sizes ('58', '56cm', '700x28c'), ('letter', canon) for apparel
-    sizes ('Large' -> 'l'), or None when the value isn't a size (i.e. it's a color
-    or other descriptor)."""
+    """Classifies a variant option / attribute as a size. Returns ('letter', {canon})
+    for apparel sizes ('Large' -> {'l'}, 'M/L' -> {'m','l'}), ('num', [digits]) for
+    numeric sizes ('58', '56cm', '700x28c'), or None when the value isn't a size
+    (i.e. it's a color or other descriptor).
+
+    Letters are tested first, and that order is load-bearing: a digit-first test
+    reads "2XL" as the number 2 and "L (56-61cm)" as the numbers 56 and 61, so
+    neither ever equals our "XXL" or "Large" — the size then reads as a *conflict*
+    and `_resolve_by_attributes` suppresses a listing that was a perfect match.
+    That silently cost us most helmet and apparel variants."""
+    letters = _letter_sizes(value)
+    if letters:
+        return ("letter", letters)
     folded = _fold(value)
     if not folded:
         return None
     digits = re.findall(r"\d+", folded)
     if digits:
         return ("num", digits)
-    key = folded.replace("-", "").replace(" ", "")
-    if key in _LETTER_SIZES:
-        return ("letter", _LETTER_SIZES[key])
     return None
 
 
 def _size_value_matches(a, b) -> bool:
-    """Two size values match when their digit sequences ('58' == '58cm') or their
-    canonical letter sizes ('Large' == 'L') agree."""
+    """Two size values match when their digit sequences ('58' == '58cm') agree, or
+    their canonical letter sizes overlap ('Large' == 'L', 'M/L' == 'Medium')."""
     ca, cb = _canon_size(a), _canon_size(b)
-    return ca is not None and ca == cb
+    if ca is None or cb is None or ca[0] != cb[0]:
+        return False
+    if ca[0] == "letter":
+        return bool(ca[1] & cb[1])
+    return ca[1] == cb[1]
 
 
 # Finish/sheen words that qualify a colourway without naming it. Nearly every
@@ -167,6 +235,26 @@ def _color_match(a, b) -> bool:
     ca = re.sub(r"[^a-z0-9]", "", _fold(a))
     cb = re.sub(r"[^a-z0-9]", "", _fold(b))
     return bool(ca) and bool(cb) and (ca in cb or cb in ca)
+
+
+def _listing_colors(options) -> list:
+    """The colour-naming token sets among a listing's variant options.
+
+    Accepts the option list itself or the JSON string a link row stores it as,
+    since both callers hold one or the other."""
+    if isinstance(options, str):
+        try:
+            options = json.loads(options or "[]")
+        except ValueError:
+            return []
+    out = []
+    for option in options or []:
+        if not option or _canon_size(option):
+            continue
+        tokens = _color_tokens(option)
+        if tokens:
+            out.append(tokens)
+    return out
 
 
 def attribute_match_score(options, attrs) -> float:
@@ -242,6 +330,25 @@ def _model_codes(title) -> set:
     }
 
 
+# Trim, tier and technology tokens. A base model and its uprated version share
+# almost all their title text — "Eclipse Spherical Helmet" scores 92 against
+# "Eclipse Pro Spherical Helmet" — so token similarity cannot separate them, and
+# they are two different products. Same rule the LLM verifier applies; enforcing
+# it here keeps trim neighbours from out-ranking genuine matches in the queue.
+_TRIM_TOKENS = frozenset("""
+pro comp expert sport elite advanced premium lite ltd team edition
+sl slx slr sls rs rsl tr ts tt evo plus max mini
+di2 axs etap epsi nfc mips spherical wavecel
+tubeless clincher tubular disc rim
+""".split())
+
+
+def _trim_tokens(title) -> frozenset:
+    """The trim/edition tokens a title carries (see _TRIM_TOKENS)."""
+    return frozenset(t for t in re.findall(r"[a-z0-9]+", _fold(title))
+                     if t in _TRIM_TOKENS)
+
+
 def size_matches_item(competitor_title, item_attrs):
     """Whether a competitor listing's size matches the item's size: True/False, or
     None when either side has no parseable size (can't tell). Used to keep a matrix's
@@ -277,16 +384,45 @@ def model_group_key(item: dict) -> str:
     return f"matrix:{matrix_id}" if matrix_id else f"item:{item.get('item_id')}"
 
 
+# A barcode short enough to be a truncation or a placeholder isn't an identity.
+_MIN_GTIN_DIGITS = 8
+
+
+def _identifying_gtin(value) -> Optional[str]:
+    """The barcode usable as a listing's identity, or None."""
+    gtin = normalize_upc(value)
+    return gtin if gtin and len(gtin) >= _MIN_GTIN_DIGITS else None
+
+
+def gtin_match_key(competitor_id, gtin) -> Optional[str]:
+    """The barcode-based match key for a listing, or None when it has no usable
+    barcode. Namespaced so a barcode can never be confused with a SKU."""
+    ident = _identifying_gtin(gtin)
+    return f"{competitor_id}:gtin:{ident}" if ident else None
+
+
 def build_match_key(competitor_id, scraped: dict) -> str:
     """Stable identity for one scraped competitor listing — the key pi_product_links
-    dedupes and re-attaches on. Prefers a real SKU (survives URL/handle renames),
-    but ignores Shopify's blank-SKU sentinels (_identifying_sku) so a whole
-    catalog's SKU-less listings don't collapse onto one key and fan out."""
-    ident = (
-        _identifying_sku(scraped.get("sku"))
-        or scraped.get("url")
-        or _fold(scraped.get("title"))
-    )
+    dedupes and re-attaches on.
+
+    Barcode first: it is the only per-variant identity some storefronts publish.
+    SmartEtailing stores (The Bike Zone, Oak Bay) carry a UPC on every JSON-LD
+    offer and no SKU at all, so keying on the URL collapsed all 27 colour/size
+    variants of a model onto one key — and `_propose_link` skips keys that
+    already have a row, so 26 of them could never own a link. Measured live: 452
+    such pages, 2,546 variant identities lost, and 43 of 46 barcode-matched
+    observations at The Bike Zone had no link row to re-scrape from.
+
+    Then a real SKU (survives URL/handle renames), ignoring Shopify's blank-SKU
+    sentinels (_identifying_sku) so a catalog's SKU-less listings don't collapse
+    onto one key either. This is the same precedence `scrape_runner`'s diff_key
+    already uses; the two identity functions disagreeing is what hid the bug."""
+    by_gtin = gtin_match_key(competitor_id, scraped.get("gtin"))
+    if by_gtin:
+        return by_gtin
+    ident = (_identifying_sku(scraped.get("sku"))
+             or scraped.get("url")
+             or _fold(scraped.get("title")))
     return f"{competitor_id}:{ident}"
 
 
@@ -306,10 +442,17 @@ class MatchIndex:
         self.title_items = []
         self.model_titles = []  # model/matrix grain (one entry per matrix)
         self.model_items = []
+        # The same two corpora, keyed by brand and with the brand text removed —
+        # see _brandless_corpus for why comparing full titles across a mixed-brand
+        # corpus both depresses every score and invites cross-brand collisions.
+        self.titles_by_brand = {}
+        self.models_by_brand = {}
         self.items = {}
         self.variants_by_matrix = {}  # matrix_id -> tracked sibling rows
         # (model group, competitor) -> pages already confirmed to sell it there.
         self.matrix_pages = {}
+        # (model group, competitor) -> colour token sets already confirmed there.
+        self.matrix_colors = {}
         self.brands = set()
         seen_matrices = set()
         for row in tracked_rows:
@@ -333,6 +476,7 @@ class MatchIndex:
             if title:
                 self.titles.append(title)
                 self.title_items.append(item_id)
+                self._add_branded(self.titles_by_brand, brand, title, item_id)
             # Model-level index: matrix description when the item belongs to a
             # matrix (first variant seen — rows arrive revenue-ranked — anchors
             # it), else the variant-token-stripped title when that differs.
@@ -343,11 +487,13 @@ class MatchIndex:
                     seen_matrices.add(matrix_id)
                     self.model_titles.append(matrix_desc)
                     self.model_items.append(item_id)
+                    self._add_branded(self.models_by_brand, brand, matrix_desc, item_id)
             elif title:
                 stripped = _fold(strip_variant_tokens(row.get("title") or ""))
                 if stripped and stripped != title:
                     self.model_titles.append(stripped)
                     self.model_items.append(item_id)
+                    self._add_branded(self.models_by_brand, brand, stripped, item_id)
         for link in links or []:
             if (
                 link.get("status") == "confirmed"
@@ -359,11 +505,47 @@ class MatchIndex:
                 if link.get("match_key"):
                     confidence = float(link.get("confidence") or 0.9)
                     self.by_link[link["match_key"]] = (str(link["item_id"]), confidence)
+                    # build_match_key now leads with the barcode, so a link stored
+                    # under its old SKU/URL key would go dark the moment the
+                    # scraper regenerates the key. Index the barcode form too, so
+                    # confirmed matches survive the change with or without the
+                    # one-off re-key (repository.rekey_links_to_gtin).
+                    derived = gtin_match_key(link.get("competitor_id"),
+                                             link.get("gtin"))
+                    if derived and derived not in self.by_link:
+                        self.by_link[derived] = (str(link["item_id"]), confidence)
                 page = page_key(link.get("competitor_url"))
                 if page and link.get("competitor_id"):
                     group = model_group_key(self.items[str(link["item_id"])])
                     self.matrix_pages.setdefault(
                         (group, link["competitor_id"]), set()).add(page)
+                    for colors in _listing_colors(link.get("variant_options_json")):
+                        self.matrix_colors.setdefault(
+                            (group, link["competitor_id"]), []).append(colors)
+
+    @staticmethod
+    def _add_branded(corpus: dict, brand, text: str, item_id: str):
+        """Files one title into the per-brand, brand-stripped corpus."""
+        if not brand or not text:
+            return
+        entry = corpus.setdefault(brand, {"texts": [], "items": [], "full": []})
+        entry["texts"].append(strip_brand(text, brand))
+        entry["items"].append(item_id)
+        entry["full"].append(text)
+
+    def _brandless_corpus(self, corpus: dict, brand):
+        """The brand's own titles with the brand text removed, or None.
+
+        Two problems the full-title corpus has, both measured on live data:
+        our titles lead with the brand and most competitors' don't ("Cannondale
+        Synapse Carbon 5" vs "Synapse Carbon 5" scores 74 instead of 100), which
+        pushes real matches under FUZZY_THRESHOLD and mis-sorts the review queue;
+        and scoring across every brand at once lets one brand's model name reach
+        another's. Restricting to the listing's own brand fixes both, and is only
+        possible when we know the brand — brandless listings keep the old
+        whole-corpus behaviour rather than losing their only path to a match."""
+        entry = corpus.get(brand) if brand else None
+        return entry if entry and entry["texts"] else None
 
     def known_pages(self, item_id, competitor_id) -> set:
         """Pages at `competitor_id` already confirmed to hold this item's model.
@@ -408,14 +590,28 @@ class MatchIndex:
                 return False
         return True
 
-    def _off_page(self, item_id, competitor_id, url) -> bool:
+    def _off_page(self, item_id, competitor_id, url, options=None) -> bool:
         """True when this store already sells the model on a DIFFERENT page.
         Their product page holds the whole model, as our matrix does, so a
         listing elsewhere is more likely a neighbouring model (a trim tier, an
         older model year) than a second home for ours. Evidence, not a rule —
-        callers demote, never drop."""
+        callers demote, never drop.
+
+        Unless the page is a *colourway* of the same model, which is the common
+        shape here rather than the exception: one store spreads ASSOS MILLE GT
+        across 37 pages and 356 variants, so confirming one colourway used to
+        demote — and bias the verifier against — the other 36. A colour we have
+        not already confirmed at this store is a new colourway, not a
+        neighbouring model, so the demotion doesn't apply."""
         known = self.known_pages(item_id, competitor_id)
-        return bool(known) and page_key(url) not in known
+        if not known or page_key(url) in known:
+            return False
+        item = self.items.get(str(item_id)) or {}
+        confirmed = self.matrix_colors.get((model_group_key(item), competitor_id))
+        listing = _listing_colors(options)
+        if confirmed and listing:
+            return any(a & b for a in listing for b in confirmed)
+        return True
 
     @classmethod
     def load(cls) -> "MatchIndex":
@@ -490,6 +686,44 @@ class MatchIndex:
             return ("suppress", None)
         return (None, None)
 
+    def _attribute_verdict(self, options, anchor_id, fuzzy_score, off_page,
+                           auto_confirm, anchor_trusted=None):
+        """Structured colour/size resolution against `anchor_id`, as a match()
+        return tuple — or None when there is no structured signal to act on and
+        the caller should fall back to its fuzzy result.
+
+        Shared by both fuzzy bands on purpose. A title that scores >=90 is not
+        evidence about *which variant* a listing is — every colourway of a model
+        scores the same against it — so skipping this for high scorers is how a
+        wrong-colour listing gets treated as a match."""
+        if not (config.ATTR_MATCH_ENABLED and options):
+            return None
+        verdict, target = self._resolve_by_attributes(options, anchor_id)
+        if verdict == "suppress":
+            return None, None, 0.0, None
+        if verdict not in ("confirm", "candidate"):
+            return None
+        # Colour/size agreement only proves "same variant" when the model anchor
+        # it was resolved against is itself credible. Against a weak anchor (a
+        # different model that merely shares a brand) the agreement is a
+        # coincidence, so the pair keeps its real fuzzy score and competes
+        # honestly for the review queue's per-item/per-run budget instead of
+        # topping the sort.
+        if anchor_trusted is None:
+            anchor_trusted = fuzzy_score >= config.ATTR_ANCHOR_MIN_SCORE
+        anchor_trusted = anchor_trusted and not off_page
+        exact = verdict == "confirm" and anchor_trusted
+        if exact and config.ATTR_AUTO_CONFIRM and auto_confirm:
+            return target, "attr_exact", 0.97, None
+        return None, None, 0.0, {
+            "item_id": target,
+            "method": "attr",
+            "confidence": 0.97 if exact else None,
+            "fuzzy_score": round(float(fuzzy_score), 1),
+            "level": "variant",
+            "off_page": off_page,
+        }
+
     def match(self, scraped: dict, match_key: str = None, competitor_id=None):
         """Returns (item_id, method, confidence, candidate).
 
@@ -518,7 +752,9 @@ class MatchIndex:
 
         gtin = normalize_upc(scraped.get("gtin"))
         if gtin and gtin in self.by_upc:
-            if auto_confirm:
+            # Barcode equality is identity, so it confirms under its own setting
+            # rather than the one gating the inference-based tiers below.
+            if settings.get("gtin_auto_confirm"):
                 return self.by_upc[gtin], "gtin", 1.0, None
             return None, None, 0.0, {
                 "item_id": self.by_upc[gtin], "method": "gtin",
@@ -541,10 +777,18 @@ class MatchIndex:
         if not title or (brand and brand not in self.brands):
             return None, None, 0.0, None
 
+        # Compare like with like: within the listing's own brand and with the
+        # brand text removed from both sides when we know it (_brandless_corpus).
+        variants = self._brandless_corpus(self.titles_by_brand, brand)
+        variant_texts = variants["texts"] if variants else self.titles
+        variant_ids = variants["items"] if variants else self.title_items
+        variant_fulls = variants["full"] if variants else self.titles
+        query = strip_brand(title, brand) if variants else title
+
         variant_best = None
-        if self.titles:
+        if variant_texts:
             variant_best = process.extractOne(
-                title, self.titles, scorer=fuzz.token_sort_ratio,
+                query, variant_texts, scorer=fuzz.token_sort_ratio,
                 score_cutoff=CANDIDATE_THRESHOLD,
             )
         if variant_best and variant_best[1] >= FUZZY_THRESHOLD:
@@ -552,17 +796,29 @@ class MatchIndex:
             # Model-code guard: don't silently auto-match when the titles carry
             # conflicting model codes (our "DX1000" vs their "D1000") — the tokens
             # fuzzy scoring can't distinguish. Demote to a review candidate instead.
-            sc, tc = _model_codes(title), _model_codes(self.titles[idx])
+            sc, tc = _model_codes(title), _model_codes(variant_fulls[idx])
             if not (sc and tc and sc.isdisjoint(tc)):
                 # A near-identical title on a page that isn't the model's known
                 # home at this store is the model-year/trim trap ("… Eclipse Pro"
                 # 2025 vs 2026 as two pages), so it goes to review, not straight in.
-                off_page = self._off_page(self.title_items[idx], competitor_id,
-                                          scraped.get("url"))
-                if auto_confirm and not off_page:
-                    return self.title_items[idx], "fuzzy_title", round(score / 100 * 0.8, 3), None
+                off_page = self._off_page(variant_ids[idx], competitor_id,
+                                          scraped.get("url"),
+                                          scraped.get("variant_options"))
+                # A high title score says "same model", never "same variant" —
+                # resolve which variant before treating this as a match.
+                resolved = self._attribute_verdict(
+                    scraped.get("variant_options"), variant_ids[idx], score,
+                    off_page, auto_confirm, anchor_trusted=True)
+                if resolved is not None:
+                    return resolved
+                # Trim/edition tokens are what fuzzy scoring is worst at and what
+                # separates two real products ("Eclipse" vs "Eclipse Pro"), so a
+                # one-sided trim token demotes to review rather than auto-matching.
+                trim_conflict = _trim_tokens(title) != _trim_tokens(variant_fulls[idx])
+                if auto_confirm and not off_page and not trim_conflict:
+                    return variant_ids[idx], "fuzzy_title", round(score / 100 * 0.8, 3), None
                 return None, None, 0.0, {
-                    "item_id": self.title_items[idx], "method": "fuzzy_title",
+                    "item_id": variant_ids[idx], "method": "fuzzy_title",
                     "confidence": round(score / 100 * 0.8, 3),
                     "fuzzy_score": round(float(score), 1), "level": "variant",
                     "off_page": off_page,
@@ -573,49 +829,35 @@ class MatchIndex:
         # and model years are exactly what fuzzy scores can't distinguish.
         candidate = None
         if brand:
+            models = self._brandless_corpus(self.models_by_brand, brand)
+            model_texts = models["texts"] if models else self.model_titles
+            model_ids = models["items"] if models else self.model_items
+            model_query = _fold(strip_variant_tokens(scraped.get("title") or ""))
+            if models:
+                model_query = strip_brand(model_query, brand)
             model_best = None
-            if self.model_titles:
+            if model_texts:
                 model_best = process.extractOne(
-                    _fold(strip_variant_tokens(scraped.get("title") or "")),
-                    self.model_titles, scorer=fuzz.token_sort_ratio,
+                    model_query, model_texts, scorer=fuzz.token_sort_ratio,
                     score_cutoff=CANDIDATE_THRESHOLD,
                 )
             best = None
             if model_best and (not variant_best or model_best[1] >= variant_best[1]):
-                best = ("model", self.model_items[model_best[2]], model_best[1])
+                best = ("model", model_ids[model_best[2]], model_best[1])
             elif variant_best:
-                best = ("variant", self.title_items[variant_best[2]], variant_best[1])
+                best = ("variant", variant_ids[variant_best[2]], variant_best[1])
             if best:
-                off_page = self._off_page(best[1], competitor_id, scraped.get("url"))
+                off_page = self._off_page(best[1], competitor_id,
+                                          scraped.get("url"),
+                                          scraped.get("variant_options"))
                 # Structured attribute pass (Shopify variants): route to the exact
                 # tracked variant, or suppress a clear color/size mismatch, before
                 # falling back to the fuzzy model/variant candidate.
-                options = scraped.get("variant_options")
-                if config.ATTR_MATCH_ENABLED and options:
-                    verdict, target = self._resolve_by_attributes(options, best[1])
-                    if verdict == "suppress":
-                        return None, None, 0.0, None
-                    # Colour/size agreement only proves "same variant" when the
-                    # model anchor it was resolved against is itself credible.
-                    # Against a weak anchor (a different model that merely shares
-                    # a brand) the agreement is a coincidence, so the pair keeps
-                    # its real fuzzy score and competes honestly for the review
-                    # queue's per-item/per-run budget instead of topping the sort.
-                    anchor_trusted = (best[2] >= config.ATTR_ANCHOR_MIN_SCORE
-                                      and not off_page)
-                    if (verdict == "confirm" and anchor_trusted
-                            and config.ATTR_AUTO_CONFIRM and auto_confirm):
-                        return target, "attr_exact", 0.97, None
-                    if verdict in ("confirm", "candidate"):
-                        return None, None, 0.0, {
-                            "item_id": target,
-                            "method": "attr",
-                            "confidence": (0.97 if verdict == "confirm" and anchor_trusted
-                                           else None),
-                            "fuzzy_score": round(float(best[2]), 1),
-                            "level": "variant",
-                            "off_page": off_page,
-                        }
+                resolved = self._attribute_verdict(
+                    scraped.get("variant_options"), best[1], best[2], off_page,
+                    auto_confirm)
+                if resolved is not None:
+                    return resolved
                 candidate = {
                     "item_id": best[1],
                     "fuzzy_score": round(float(best[2]), 1),

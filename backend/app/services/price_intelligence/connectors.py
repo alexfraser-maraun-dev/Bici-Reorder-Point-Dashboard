@@ -788,21 +788,27 @@ def _shopify_listings(url: str) -> list:
     if not variants:
         return []
     cents = lambda c: round(c / 100.0, 2) if isinstance(c, (int, float)) else None
+    base_url = f"{parsed.scheme}://{parsed.netloc}/products/{handle}"
     rows = []
     for chosen in variants:
         pub = chosen.get("public_title") or chosen.get("title")
         title = data.get("title")
         options = [chosen.get(k) for k in ("option1", "option2", "option3")
                    if chosen.get(k) and chosen.get(k) != "Default Title"]
+        vid = chosen.get("id")
         rows.append(_normalized_listing(
             title=f"{title} - {pub}" if pub and pub != "Default Title" else title,
             brand=data.get("vendor"), sku=chosen.get("sku"),
             gtin=str(chosen["barcode"]) if chosen.get("barcode") else None,
-            variant_id=str(chosen.get("id")) if chosen.get("id") else None,
+            variant_id=str(vid) if vid else None,
             variant_options=options, price=cents(chosen.get("price")),
             compare_at_price=cents(chosen.get("compare_at_price")),
             in_stock=bool(chosen.get("available", True)), currency=data.get("currency"),
-            price_scope="variant", extraction_method="shopify_js", url=url,
+            price_scope="variant", extraction_method="shopify_js",
+            # Each row addresses its own variant. A caller that keeps a sibling
+            # (the matrix fan-out) needs a URL that re-scrapes *that* variant —
+            # the bare page URL would resolve to the landing variant's price.
+            url=f"{base_url}?variant={vid}" if vid else url,
         ))
     # URL variant is an identity hint, not permission to discard the others.
     if variant_id:
@@ -832,13 +838,17 @@ class PageScraper:
             return []
         return _magento_graphql_listings(resp.text, url) or extract_listings(resp.text, url)
 
-    def fetch(self, url: str, sku: Optional[str] = None, gtin: Optional[str] = None,
-              variant_id: Optional[str] = None, variant_options=None) -> Optional[dict]:
-        # Shopify: resolve the exact variant via .js first (the PDP HTML only shows
-        # the default variant's price); otherwise fall back to generic page parsing.
+    def resolve(self, listings: list, url: str, sku: Optional[str] = None,
+                gtin: Optional[str] = None, variant_id: Optional[str] = None,
+                variant_options=None) -> Optional[dict]:
+        """Picks the listing that is ours out of a page's listings.
+
+        Split out from fetch() so a caller that wants the page's *other* variants
+        too — the matrix fan-out — can resolve ours without fetching the page a
+        second time."""
         parsed = urlparse(url)
         url_variant = (parse_qs(parsed.query).get("variant") or [None])[0]
-        result = resolve_listing(self.listings(url), {
+        result = resolve_listing(listings, {
             "variant_id": variant_id or url_variant, "sku": sku, "gtin": gtin,
             "variant_options": variant_options or [],
         })
@@ -848,6 +858,13 @@ class PageScraper:
             listing["_matched_by"] = result.get("matched_by")
             listing["_candidates"] = result.get("candidates") or []
         return listing
+
+    def fetch(self, url: str, sku: Optional[str] = None, gtin: Optional[str] = None,
+              variant_id: Optional[str] = None, variant_options=None) -> Optional[dict]:
+        # Shopify: resolve the exact variant via .js first (the PDP HTML only shows
+        # the default variant's price); otherwise fall back to generic page parsing.
+        return self.resolve(self.listings(url), url, sku=sku, gtin=gtin,
+                            variant_id=variant_id, variant_options=variant_options)
 
 
 # ---------------------------------------------------------------------------
@@ -1114,10 +1131,13 @@ class CrawlTargets:
     still can't price instead of walking the catalog alphabetically.
     """
 
-    def __init__(self, brand_names=None, model_tokens=None):
+    def __init__(self, brand_names=None, model_tokens=None, item_tokens=None):
         self.brand_names = sorted({b for b in (brand_names or []) if b})
         self.brand_tokens = _brand_slug_tokens(self.brand_names)
         self.model_tokens = frozenset(model_tokens or ())
+        # Per-item token sets, so a frequency cull can tell "one of several
+        # tokens for this model" from "the only one it has".
+        self.item_tokens = [frozenset(t) for t in (item_tokens or []) if t]
 
     @classmethod
     def from_items(cls, items: dict, unmatched_ids=None) -> "CrawlTargets":
@@ -1125,6 +1145,15 @@ class CrawlTargets:
         the model-token side to items still lacking a confirmed link on the
         competitor about to be crawled; None means every tracked item counts."""
         return ItemTokenIndex(items).targets_for(unmatched_ids)
+
+    def tokens_to_keep(self, common: set) -> set:
+        """Tokens a frequency cull must spare: those belonging to an item that
+        the cull would otherwise leave with no hunted token at all."""
+        keep = set()
+        for tokens in self.item_tokens:
+            if not tokens - common:
+                keep |= tokens
+        return keep
 
     def score_parts(self, path: str):
         """(brand hit as 0/1, distinct model-token hits) for a candidate path.
@@ -1168,11 +1197,14 @@ class ItemTokenIndex:
     def targets_for(self, unmatched_ids=None) -> "CrawlTargets":
         """CrawlTargets whose model tokens come from `unmatched_ids` only
         (None = every tracked item)."""
-        models = set()
+        models, per_item = set(), []
         for item_id, tokens in self.tokens_by_item.items():
             if unmatched_ids is None or item_id in unmatched_ids:
                 models |= tokens
-        return CrawlTargets(brand_names=self.brands, model_tokens=models)
+                if tokens:
+                    per_item.append(tokens)
+        return CrawlTargets(brand_names=self.brands, model_tokens=models,
+                            item_tokens=per_item)
 
 
 def _compile_pattern(pattern) -> Optional[re.Pattern]:
@@ -1272,8 +1304,14 @@ class _HtmlPageCrawler(_CrawlStatsMixin):
 
     # Head/tail budget split. The head is where the value is, but letting it
     # take the whole night would freeze the sweep, and the sweep is what finds
-    # products whose slug spells the model differently than we do.
-    HEAD_BUDGET_SHARE = 0.6
+    # products whose slug spells the model differently than we do — so the tail
+    # keeps a guaranteed share no matter how much the head wants.
+    #
+    # Raised from 0.6: the head is self-limiting (it is re-derived each night
+    # from the items we still can't price, so it shrinks as they get linked)
+    # while the flat 0.6 was skipping known-relevant pages to spend the budget
+    # alphabetically — one store offered 355 ranked candidates and got 180.
+    HEAD_BUDGET_SHARE = 0.8
 
     # Share/absolute-count floors below which the brand gate is self-defeating.
     BRAND_HIT_RATE_FLOOR = 0.02
@@ -1390,7 +1428,14 @@ class _HtmlPageCrawler(_CrawlStatsMixin):
         vocabulary that's generic *here*. A token sitting on a large share of a
         store's catalog can't distinguish anything on it, and hunting it floods
         the head with near-identical accessory pages. Measured per store, so no
-        per-store list has to be maintained by hand."""
+        per-store list has to be maintained by hand.
+
+        What it must not do is cull an item's *last* token. A store that sells a
+        lot of Madone accessories makes `madone` frequent, but `madone` is the
+        only token Trek's Madone has — dropping it doesn't de-noise the head, it
+        removes that model from the hunt altogether. Items with several tokens
+        (`supersix evo`) survive the cull of any one of them, so only the
+        would-be-invisible ones are rescued (see CrawlTargets.tokens_to_keep)."""
         hunted = self.targets.model_tokens
         if not hunted or not paths:
             return hunted
@@ -1399,6 +1444,7 @@ class _HtmlPageCrawler(_CrawlStatsMixin):
             frequency.update(_slug_tokens(path) & hunted)
         limit = max(self.COMMON_TOKEN_FLOOR, int(len(paths) * self.COMMON_TOKEN_SHARE))
         common = {token for token, n in frequency.items() if n > limit}
+        common -= self.targets.tokens_to_keep(common)
         self.common_tokens_dropped = sorted(common)
         return frozenset(hunted - common)
 

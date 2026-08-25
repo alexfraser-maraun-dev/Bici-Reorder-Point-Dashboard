@@ -63,6 +63,14 @@ DISCOVERY_DAYS = int(os.getenv("PI_DISCOVERY_DAYS", "7"))
 # (gtin links + LLM same_variant/resolved same_model).
 AUTO_CONFIRM = _flag("PI_AUTO_CONFIRM")
 
+# Barcode matches are exempt from the above, and on by default. A competitor
+# barcode equal to our UPC is an identity, not a similarity judgement — the tiers
+# AUTO_CONFIRM gates (fuzzy title, colour/size, LLM verdict) are all inferences,
+# and this one isn't. Keeping it manual also costs coverage in a specific way:
+# the storefronts that publish per-variant barcodes are exactly the ones that
+# publish no SKU, so their variants only ever become durable links this way.
+GTIN_AUTO_CONFIRM = _flag("PI_GTIN_AUTO_CONFIRM", "true")
+
 # SERP discovery (SerpApi, engine=google): finds candidate product URLs on
 # competitors we can't crawl (connector_type='unknown'). Only fires for items
 # inside the discovery window that still lack a confirmed link, so search spend
@@ -149,3 +157,9 @@ ATTR_AUTO_CONFIRM = os.getenv("PI_ATTR_AUTO_CONFIRM", "false").lower() == "true"
 # confidence, which would otherwise outrank every genuine candidate in the
 # review queue's priority sort (and burn the per-item / per-run LLM budget).
 ATTR_ANCHOR_MIN_SCORE = float(os.getenv("PI_ATTR_ANCHOR_MIN_SCORE", "80"))
+
+# Matrix fan-out: pages to visit per run purely to complete a model's variant set
+# at a store already confirmed to sell it. One fetch each, and only for pages
+# whose model still has unlinked variants there, so the phase shrinks to nothing
+# as coverage fills in.
+FANOUT_MAX_PAGES = int(os.getenv("PI_FANOUT_MAX_PAGES", "150"))

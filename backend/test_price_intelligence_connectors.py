@@ -490,8 +490,11 @@ class CrawlTargetingTests(unittest.TestCase):
              patch.object(connectors, "polite_get", side_effect=_ok_page(fetched)), \
              patch.object(connectors.config, "MAX_HTML_PRODUCT_PAGES", 5):
             list(conn.iter_products())
-        # 60% of the budget to the head, the rest still sweeps the tail.
-        self.assertEqual(3, conn.targeted_pages_done)
+        # The head takes its share of the budget; whatever is left still sweeps
+        # the tail, however much the head wanted (10 candidates for 5 pages here).
+        head_share = connectors._HtmlPageCrawler.HEAD_BUDGET_SHARE
+        self.assertEqual(int(5 * head_share), conn.targeted_pages_done)
+        self.assertLess(conn.targeted_pages_done, 5, "the tail is never starved")
         self.assertIn("https://s.com/products/cervelo-zzz-frameset", fetched)
         self.assertTrue(conn.cap_hit)  # head was truncated: coverage incomplete
 

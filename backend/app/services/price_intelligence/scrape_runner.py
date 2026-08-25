@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from . import config, repository
 from .connectors import (ItemTokenIndex, PageScraper, build_connector,
                          detect_connector_type)
+from . import matcher
 from .matcher import MatchIndex, build_match_key, _identifying_sku
 
 _scrape_lock = threading.Lock()
@@ -32,6 +33,12 @@ PRICE_EPSILON = 0.005
 # Ranking multiplier for a candidate at a store where the model is already
 # confirmed on a different page (matcher's `off_page`). Demotion, not exclusion.
 OFF_PAGE_RANK_PENALTY = 0.5
+
+# Longest a deployment may go without sweeping competitor catalogs. Discovery is
+# otherwise driven entirely by `needy` (items activated recently and still
+# unlinked), which empties as matching improves — and an empty needy list would
+# quietly end all discovery of models we have never matched.
+CATALOG_SWEEP_MAX_DAYS = 7
 
 
 def get_status() -> dict:
@@ -208,6 +215,219 @@ def _build_events(prev_map, obs, competitor_name, item_lookup):
     return events
 
 
+# Colour AND size both agreeing on a tracked variant (matcher.attribute_match_score
+# gives +1 per matching dimension, and only an exact colour set scores the full +1).
+SIBLING_EXACT_SCORE = 2.0
+
+
+def _sibling_matches(listings: list, siblings: list, taken_ids: set):
+    """Pairs a confirmed page's OTHER listings with our unlinked variants of the
+    same model.
+
+    A confirmed link is a human's assertion that this store sells this model on
+    this page, and the page's own markup already enumerates every variant on it —
+    `PageScraper.listings` returns them all and `resolve` throws all but ours
+    away. Reading the rest costs no extra request and is the only evidence that
+    settles which variant is which on storefronts that publish no SKU.
+
+    Yields (listing, item_id, method) where method is 'gtin' for a barcode
+    equality (an identity) or 'sibling' for an exact colour+size agreement (a
+    strong inference, so it goes to the review queue). Anything less is skipped:
+    this path exists to complete a known model, not to guess at new ones."""
+    by_upc = {}
+    for row in siblings:
+        upc = matcher.normalize_upc(row.get("upc_normalized"))
+        if upc:
+            by_upc[upc] = row
+    for listing in listings:
+        if listing.get("price") is None or listing.get("price_scope") == "range":
+            continue
+        gtin = matcher.normalize_upc(listing.get("gtin"))
+        hit = by_upc.get(gtin) if gtin else None
+        if hit is not None and str(hit["item_id"]) not in taken_ids:
+            yield listing, str(hit["item_id"]), "gtin"
+            continue
+        options = (listing.get("variant_options")
+                   or matcher.parse_variant_options(listing.get("title")))
+        if not options:
+            continue
+        scored = [
+            (matcher.attribute_match_score(
+                options, [s.get("attribute_1"), s.get("attribute_2"),
+                          s.get("attribute_3")]), str(s["item_id"]))
+            for s in siblings
+        ]
+        exact = [item_id for score, item_id in scored if score >= SIBLING_EXACT_SCORE]
+        # Exactly one variant may claim a listing. Several claimants means the
+        # colourway or size is ambiguous on our side, and guessing there is how
+        # one item ends up carrying every variant of a model.
+        if len(exact) == 1 and exact[0] not in taken_ids:
+            yield listing, exact[0], "sibling"
+
+
+class LinkProposer:
+    """Buffers proposed pi_product_links rows and enforces who may propose what.
+
+    Module level rather than a closure in _run so the phases that use it can be
+    driven on their own — the matrix fan-out in particular is worth running (and
+    replaying) without a whole scrape around it.
+    """
+
+    MAX_COLLECTED_CANDIDATES = 5000
+
+    def __init__(self, item_lookup: dict, existing_link_keys: set,
+                 confirmed_pairs: set):
+        self.item_lookup = item_lookup
+        self.existing_link_keys = existing_link_keys
+        self.confirmed_pairs = confirmed_pairs
+        self.pending_links = []
+        self.gtin_links = []
+        # Colour+size matches harvested off pages already confirmed to sell the
+        # model. Kept separate because they bypass the LLM budget and are written
+        # in full rather than sampled (see _fan_out_matrix).
+        self.sibling_links = []
+
+    def propose(self, match_key, candidate, competitor_id, product, item_id=None,
+                method=None, confidence=None):
+        """Buffers a link row and returns it, or None when it isn't allowed.
+
+        Confirmed only for identity matches (item_id set: gtin/attr_exact under
+        their auto-confirm settings); everything else — including gtin/brand+SKU/
+        fuzzy hits in manual-review mode — is a pending proposal for the Matching
+        queue. Skips keys already decided/proposed and (item, competitor) pairs
+        that already hold a confirmed link: a decided pair never gets further
+        proposals."""
+        if match_key in self.existing_link_keys:
+            return None
+        method = method or (candidate or {}).get("method")
+        confidence = confidence if confidence is not None \
+            else (candidate or {}).get("confidence")
+        target_id = str(item_id or candidate["item_id"])
+        if (target_id, competitor_id) in self.confirmed_pairs:
+            return None
+        self.existing_link_keys.add(match_key)
+        is_confirmed = item_id is not None and method in ("gtin", "attr_exact")
+        # A sibling proposal comes off a page a human already confirmed sells this
+        # model, and matched a tracked variant on colour AND size. It is not a
+        # fuzzy guess, so it neither competes for the candidate cap nor spends
+        # LLM budget.
+        if (not is_confirmed and method != "sibling"
+                and len(self.pending_links) >= self.MAX_COLLECTED_CANDIDATES):
+            return None
+        item = self.item_lookup.get(target_id) or {}
+        level = "variant" if is_confirmed else (candidate or {}).get("level", "variant")
+        # A model-grain proposal identifies the model, not the variant: the page's
+        # variant identifiers belong to whichever listing happened to propose
+        # first, so storing one would assert a variant we haven't established
+        # (and would later be re-scraped as though it were ours).
+        model_grain = not is_confirmed and level == "model"
+        if (candidate or {}).get("off_page"):
+            # Ranked below clean candidates so the per-item/per-run review budget
+            # goes to them first — still eligible, just not ahead.
+            base = confidence if confidence is not None \
+                else (candidate.get("fuzzy_score") or 0) / 100
+            confidence = round(base * OFF_PAGE_RANK_PENALTY, 3)
+        row = {
+            "link_id": str(uuid.uuid4()),
+            "item_id": target_id,
+            "competitor_id": competitor_id,
+            "match_key": match_key,
+            "competitor_url": product.get("url"),
+            "competitor_sku": product.get("sku"),
+            "competitor_title": product.get("title"),
+            "gtin": None if model_grain else product.get("gtin"),
+            "variant_id": None if model_grain else product.get("variant_id"),
+            "variant_options_json": json.dumps(product.get("variant_options") or []),
+            "level": level,
+            "status": "confirmed" if is_confirmed else "pending",
+            "source": ("gtin" if method == "gtin"
+                       else "attr" if method in ("attr", "attr_exact")
+                       else "sibling" if method == "sibling"
+                       else "llm"),
+            "confidence": confidence,
+            "fuzzy_score": None if is_confirmed else (candidate or {}).get("fuzzy_score"),
+            "llm_verdict": None,
+            "llm_reason": None,
+            "our_price": item.get("current_retail"),
+            "their_price": product.get("price"),
+            "decided_by": None,
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }
+        if is_confirmed:
+            self.confirmed_pairs.add((target_id, competitor_id))
+            self.gtin_links.append(row)
+        elif method == "sibling":
+            self.sibling_links.append(row)
+        else:
+            self.pending_links.append(row)
+        return row
+
+
+def _fan_out_matrix(link, page_listings, resolved, index, item_lookup, propose,
+                    fanned_pages, run_id, counters) -> list:
+    """Links our other variants of this model to the other variants on this page.
+
+    Variant coverage, not model discovery, is where breadth was being lost: 88%
+    of tracked models had a confirmed link somewhere, but only 43% of variants
+    did — 1 of 27 POC Cytal variants at a store whose page lists all 27 with a
+    barcode each. The catalog crawl can't fix that on its own (every variant of a
+    SKU-less page shares one URL), and it costs a page fetch we're already making.
+
+    Returns observation rows for the variants confirmed by barcode, so their
+    prices land tonight rather than on the next run."""
+    item = item_lookup.get(str(link.get("item_id") or "")) or {}
+    matrix_id = item.get("item_matrix_id")
+    cid = link.get("competitor_id")
+    if not matrix_id or not cid or len(page_listings) < 2:
+        return []
+    page = matcher.page_key(link.get("competitor_url"))
+    if not page or (cid, page) in fanned_pages:
+        return []
+    fanned_pages.add((cid, page))
+
+    siblings = [s for s in index.variants_by_matrix.get(str(matrix_id), [])
+                if str(s["item_id"]) != str(link["item_id"])]
+    if not siblings:
+        return []
+    # Claims made while walking this page. Variants already linked at this store
+    # are blocked by _propose_link's confirmed_pairs guard, which keeps the
+    # one-confirmed-link-per-(item, store) invariant in one place.
+    taken = set()
+    # Identify the link's own listing by its match_key, not its URL: on a
+    # SmartEtailing page all 27 variants share one URL, so a URL test skips the
+    # entire page instead of one row.
+    resolved_key = build_match_key(cid, resolved) if resolved else None
+
+    observations = []
+    for listing, item_id, method in _sibling_matches(page_listings, siblings, taken):
+        match_key = build_match_key(cid, listing)
+        if match_key == resolved_key:
+            continue  # this is the link's own variant
+        row = propose(match_key, None, cid, listing, item_id=item_id,
+                      method=method,
+                      confidence=1.0 if method == "gtin" else None)
+        if row is None:
+            continue
+        taken.add(item_id)
+        counters["siblings_linked"] = counters.get("siblings_linked", 0) + 1
+        if row["status"] != "confirmed":
+            continue
+        observations.append({
+            "observed_at": _now_iso(), "run_id": run_id, "source": "link",
+            "diff_key": f"link:{row['link_id']}", "competitor_id": cid,
+            "url": listing.get("url") or link.get("competitor_url"),
+            "competitor_title": listing.get("title"),
+            "competitor_sku": listing.get("sku"), "gtin": listing.get("gtin"),
+            "match_item_id": item_id, "match_method": "link",
+            "match_confidence": 1.0, "price": listing.get("price"),
+            "compare_at_price": listing.get("compare_at_price"),
+            "currency": listing.get("currency"), "in_stock": listing.get("in_stock"),
+            **_extraction_fields(listing),
+        })
+    return observations
+
+
 def _extraction_fields(product: dict) -> dict:
     return {
         "extraction_method": product.get("extraction_method"),
@@ -278,75 +498,17 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         # the flush step keeps only the best-scoring few per item, up to the
         # per-run pair cap, so the LLM sees quality candidates first. Keys that
         # already have a row (incl. rejections) are never re-proposed.
-        MAX_COLLECTED_CANDIDATES = 5000
         CANDIDATES_PER_ITEM = 5
-        existing_link_keys = repository.get_link_match_keys()
-        pending_links, gtin_links = [], []
-
-        def _propose_link(match_key, candidate, competitor_id, product, item_id=None,
-                          method=None, confidence=None):
-            """Buffers a link row. Confirmed only for auto-confirmed matches
-            (item_id set: gtin/attr_exact with PI_AUTO_CONFIRM on); everything
-            else — including gtin/brand+SKU/fuzzy hits in manual-review mode —
-            is a pending proposal for the Matching queue. Skips keys already
-            decided/proposed and (item, competitor) pairs that already hold a
-            confirmed link: a decided pair never gets further proposals."""
-            if match_key in existing_link_keys:
-                return
-            method = method or (candidate or {}).get("method")
-            confidence = confidence if confidence is not None \
-                else (candidate or {}).get("confidence")
-            target_id = str(item_id or candidate["item_id"])
-            if (target_id, competitor_id) in confirmed_pairs:
-                return
-            existing_link_keys.add(match_key)
-            is_confirmed = item_id is not None and method in ("gtin", "attr_exact")
-            if not is_confirmed and len(pending_links) >= MAX_COLLECTED_CANDIDATES:
-                return
-            item = item_lookup.get(target_id) or {}
-            level = "variant" if is_confirmed else (candidate or {}).get("level", "variant")
-            # A model-grain proposal identifies the model, not the variant: the
-            # page's variant identifiers belong to whichever listing happened to
-            # propose first, so storing one would assert a variant we haven't
-            # established (and would later be re-scraped as though it were ours).
-            model_grain = not is_confirmed and level == "model"
-            if (candidate or {}).get("off_page"):
-                # Ranked below clean candidates so the per-item/per-run review
-                # budget goes to them first — still eligible, just not ahead.
-                base = confidence if confidence is not None \
-                    else (candidate.get("fuzzy_score") or 0) / 100
-                confidence = round(base * OFF_PAGE_RANK_PENALTY, 3)
-            row = {
-                "link_id": str(uuid.uuid4()),
-                "item_id": target_id,
-                "competitor_id": competitor_id,
-                "match_key": match_key,
-                "competitor_url": product.get("url"),
-                "competitor_sku": product.get("sku"),
-                "competitor_title": product.get("title"),
-                "gtin": None if model_grain else product.get("gtin"),
-                "variant_id": None if model_grain else product.get("variant_id"),
-                "variant_options_json": json.dumps(product.get("variant_options") or []),
-                "level": level,
-                "status": "confirmed" if is_confirmed else "pending",
-                "source": ("gtin" if method == "gtin"
-                           else "attr" if method in ("attr", "attr_exact")
-                           else "llm"),
-                "confidence": confidence,
-                "fuzzy_score": None if is_confirmed else (candidate or {}).get("fuzzy_score"),
-                "llm_verdict": None,
-                "llm_reason": None,
-                "our_price": item.get("current_retail"),
-                "their_price": product.get("price"),
-                "decided_by": None,
-                "created_at": _now_iso(),
-                "updated_at": _now_iso(),
-            }
-            if is_confirmed:
-                confirmed_pairs.add((target_id, competitor_id))
-                gtin_links.append(row)
-            else:
-                pending_links.append(row)
+        # confirmed_pairs is filled in just below, once confirmed_links is loaded;
+        # the proposer holds the same set object, so it sees those additions.
+        confirmed_pairs = set()
+        proposer = LinkProposer(item_lookup, repository.get_link_match_keys(),
+                                confirmed_pairs)
+        _propose_link = proposer.propose
+        pending_links = proposer.pending_links
+        gtin_links = proposer.gtin_links
+        sibling_links = proposer.sibling_links
+        existing_link_keys = proposer.existing_link_keys
 
         # Synthetic sources (Google benchmark/suggested) are pulled by their own
         # phase below, not crawled — excluded here so they don't inflate
@@ -362,15 +524,23 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         confirmed_links = repository.get_product_links(status="confirmed", limit=5000)
         # Decided (item, competitor) pairs: _propose_link never proposes into
         # a pair that already holds a confirmed link.
-        confirmed_pairs = {
+        # Updated in place, never rebound: the proposer holds this same set.
+        confirmed_pairs.update(
             (str(l["item_id"]), l.get("competitor_id"))
             for l in confirmed_links if l.get("item_id")
-        }
+        )
         needy = _needs_catalog_discovery(item_lookup, confirmed_links, urls)
-        full_scan = force_full or bool(needy) or not (confirmed_links or urls)
+        # `needy` only counts items activated inside the discovery window, so once
+        # everything recent is linked it empties and catalog crawling would stop
+        # for good — along with any chance of finding the models we have never
+        # matched. The floor keeps a sweep running on its own schedule.
+        stale = repository.days_since_last_catalog_crawl()
+        full_scan = (force_full or bool(needy) or not (confirmed_links or urls)
+                     or (stale is None or stale >= CATALOG_SWEEP_MAX_DAYS))
         print(f"pi: run mode = {'full catalog' if full_scan else 'targeted'} "
               f"(forced={force_full}, items needing discovery={len(needy)}, "
-              f"confirmed links={len(confirmed_links)})")
+              f"confirmed links={len(confirmed_links)}, "
+              f"days since last catalog crawl={stale})")
 
         # --- catalog scrape, one competitor at a time -----------------------
         # Competitors whose catalog actually got crawled this run — the
@@ -578,15 +748,24 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         prev_map = repository.get_latest_observation_map(diff_key_prefix="link:")
         obs_buffer, event_buffer = [], []
         links_done, per_competitor = 0, {}
+        # Several confirmed links can point at one page (siblings already matched
+        # there); fan it out once.
+        fanned_pages = set()
         for link in link_targets:
             try:
+                # One fetch, both jobs: our own variant's price, and every other
+                # variant the page lists (the matrix fan-out below).
+                page_listings = scraper.listings(link["competitor_url"])
                 # Pass the known SKU so Shopify variant resolution works even for
                 # older links stored as the base (non-?variant) product URL.
-                parsed = scraper.fetch(
-                    link["competitor_url"], sku=link.get("competitor_sku"),
+                parsed = scraper.resolve(
+                    page_listings, link["competitor_url"], sku=link.get("competitor_sku"),
                     gtin=link.get("gtin"), variant_id=link.get("variant_id"),
                     variant_options=json.loads(link.get("variant_options_json") or "[]"),
                 )
+                obs_buffer.extend(_fan_out_matrix(
+                    link, page_listings, parsed, index, item_lookup, _propose_link,
+                    fanned_pages, run_id, counters))
                 if parsed is not None and parsed.get("price") is not None:
                     if parsed.get("_matched_by") in ("sku", "gtin", "variant_id", "variant_options"):
                         parsed["price_scope"] = "variant"
@@ -628,6 +807,55 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         _set_status(observations=counters["observations"], changes=counters["changes"])
         for cid, n in per_competitor.items():
             repository.mark_competitor_scraped(cid, f"targeted ({n} links)")
+
+        # --- matrix fan-out --------------------------------------------------
+        # The loop above only visits links whose competitor wasn't crawled this
+        # run, so on a full-scan night it fans out almost nothing. This phase
+        # covers the rest: one representative page per (store, model) that still
+        # has unlinked variants there, one fetch each, and it empties itself as
+        # coverage fills in. `fanned_pages` is shared, so pages the loop above
+        # already handled are never fetched twice.
+        fanout_targets = {}
+        for l in confirmed_links:
+            item = item_lookup.get(str(l.get("item_id") or ""))
+            cid, page = l.get("competitor_id"), matcher.page_key(l.get("competitor_url"))
+            if not (item and cid and page and item.get("item_matrix_id")):
+                continue
+            if (cid, page) in fanned_pages or (cid, page) in fanout_targets:
+                continue
+            siblings = index.variants_by_matrix.get(str(item["item_matrix_id"]), [])
+            if not any((str(s["item_id"]), cid) not in confirmed_pairs
+                       for s in siblings):
+                continue  # every variant of this model is already linked here
+            fanout_targets[(cid, page)] = l
+        targets = list(fanout_targets.values())[:config.FANOUT_MAX_PAGES]
+        _set_status(phase="completing matrix variants", fanout_total=len(targets))
+        obs_buffer, event_buffer = [], []
+        for link in targets:
+            try:
+                listings = scraper.listings(link["competitor_url"])
+                resolved = scraper.resolve(
+                    listings, link["competitor_url"], sku=link.get("competitor_sku"),
+                    gtin=link.get("gtin"), variant_id=link.get("variant_id"),
+                    variant_options=json.loads(link.get("variant_options_json") or "[]"),
+                )
+                for obs in _fan_out_matrix(link, listings, resolved, index,
+                                           item_lookup, _propose_link, fanned_pages,
+                                           run_id, counters):
+                    obs_buffer.append(obs)
+                    name = (competitor_names.get(link.get("competitor_id"))
+                            or urlparse_domain(link["competitor_url"]))
+                    event_buffer.extend(
+                        _build_events(prev_map, obs, name, item_lookup))
+            except Exception as e:
+                errors.append(f"fan-out {link['competitor_url']}: {e}")
+        repository.load_rows(repository.T_OBSERVATIONS, obs_buffer)
+        counters["observations"] += len(obs_buffer)
+        repository.load_rows(repository.T_EVENTS, event_buffer)
+        counters["changes"] += sum(1 for e in event_buffer if not e["acknowledged"])
+        print(f"pi: matrix fan-out: {len(targets)} pages, "
+              f"{counters.get('siblings_linked', 0)} variants linked")
+        _set_status(observations=counters["observations"], changes=counters["changes"])
 
         # --- tracked URLs (feature a) ---------------------------------------
         _set_status(phase="scraping tracked URLs")
@@ -735,7 +963,13 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                     continue
                 per_item[row["item_id"]] = n + 1
                 selected.append(row)
-            repository.insert_product_links(gtin_links + selected)
+            # sibling_links are written in full and unsampled: each already has
+            # colour+size agreement on a page a human confirmed sells the model,
+            # so there is nothing for the sampling to choose between.
+            repository.insert_product_links(gtin_links + sibling_links + selected)
+            print(f"pi: links written — confirmed {len(gtin_links)}, "
+                  f"sibling {len(sibling_links)}, candidates {len(selected)} "
+                  f"of {len(pending_links)}")
             # Always run: pending-unverified rows can come from earlier runs
             # (e.g. demoted links), not just this run's candidates. A clean
             # backlog costs one query.
