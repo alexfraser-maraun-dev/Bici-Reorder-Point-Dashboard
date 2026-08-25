@@ -188,6 +188,34 @@ def resolve_promise(row: Dict[str, Any]) -> Tuple[Optional[date], Optional[str]]
     return None, None
 
 
+# Shopify order-level statuses that mean the customer side is finished. `FULFILLED` is
+# all-lines-shipped (a partly-shipped order reads PARTIALLY_FULFILLED, which is NOT this: the
+# special-order line is usually the one still outstanding, which is normal and correct).
+# `RESTOCKED` means the order was cancelled and the units went back to stock.
+SHOPIFY_CLOSED_STATUSES = {"fulfilled", "restocked"}
+
+
+def shopify_order_closed(row: Dict[str, Any]) -> Optional[str]:
+    """The linked Shopify order is finished while the Lightspeed special order is still open.
+
+    Either the customer was already served some other way and nobody closed the special order,
+    or the order was refunded -- so the special order is not required, or needs checking out in
+    Lightspeed. Both are decisions for CS, and NEITHER is procurement work.
+
+    Measured live 2026-08-25: only 3 of 372 rows, but two of them were 109 and 119 days old and
+    one was the single highest-scoring row on the board -- a ghost sitting at the top of the
+    queue telling a buyer to chase a vendor for a part the customer had already received. Small
+    population, disproportionate damage.
+
+    Deliberately not raised for received rows: `_closeout_action` already routes those to
+    "complete the SO in Lightspeed", which is the same instruction with the right owner.
+    """
+    if not row.get("shopify_order_id") or row.get("link_broken"):
+        return None
+    status = str(row.get("shopify_fulfillment_status") or "").strip().lower()
+    return status if status in SHOPIFY_CLOSED_STATUSES else None
+
+
 def compute_open_clock(row: Dict[str, Any], today: date) -> Dict[str, Any]:
     """When the customer's wait actually began, and whether we noticed late.
 
@@ -401,6 +429,25 @@ def compute_work_state(row: Dict[str, Any], sla: Dict[str, Any], today: date) ->
     severity = sla.get("sla_severity")
     queue_states: List[str] = []
 
+    # A finished Shopify order on a still-open special order outranks every procurement action,
+    # because every one of those actions would be work we should not be doing: allocating a PO,
+    # chasing a vendor, or re-quoting a customer who has already been served or refunded.
+    closed_shopify = shopify_order_closed(row) if stage != "received" else None
+    if closed_shopify:
+        return {
+            "work_state": "shopify_fulfilled",
+            "queue_states": ["shopify_fulfilled"],
+            "next_action": (
+                "Shopify order refunded and restocked — cancel the SO in Lightspeed"
+                if closed_shopify == "restocked" else
+                "Shopify order already fulfilled — check out or cancel the SO in Lightspeed"
+            ),
+            "action_owner": "cs",
+            "action_due_date": today.isoformat(),
+            "closeout_state": None,
+            "shopify_order_closed": closed_shopify,
+        }
+
     if stage in ("open_pool", "unordered_po"):
         queue_states.append("needs_ordering")
     elif stage == "ordered":
@@ -486,6 +533,7 @@ def compute_work_state(row: Dict[str, Any], sla: Dict[str, Any], today: date) ->
         "action_owner": action.get("action_owner"),
         "action_due_date": action.get("action_due_date"),
         "closeout_state": closeout.get("closeout_state"),
+        "shopify_order_closed": shopify_order_closed(row),
     }
 
 
@@ -664,6 +712,20 @@ def compute_priority(row: Dict[str, Any], sla: Dict[str, Any], work: Dict[str, A
     button click would let the worst rows hide from the sort that exists to find them.
     """
     stage = row.get("procurement_stage") or "open_pool"
+
+    # --- The Shopify order is finished: this is cleanup, not a customer emergency ------------
+    # It must NOT reach Band A. Live, SO 44880 sat at 10/10 -- the worst row on the board -- on a
+    # promise "missed by 71 days" for a Shopify order that was fulfilled and partly refunded. The
+    # customer had been dealt with; the breach was an artefact of nobody closing the record, and
+    # scoring it as the top emergency buried three genuine ones.
+    if work.get("work_state") == "shopify_fulfilled":
+        reasons = [f"Linked Shopify order is {work.get('shopify_order_closed')}"
+                   " while this special order is still open"]
+        if row.get("order_id"):
+            # Money is already committed to stock nobody has asked for. Worth a point.
+            reasons.append(f"PO {row['order_id']} is still live against it")
+            return _priority(4, reasons)
+        return _priority(3, reasons)
 
     # --- Band A: a promise we have already broken -------------------------------------------
     # Only a REAL customer quote qualifies. Blowing an inferred window is a planning miss, not a

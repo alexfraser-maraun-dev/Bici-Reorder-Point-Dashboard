@@ -81,12 +81,13 @@ type ActionFilterOrder = {
 // the queue predicate, or it would always come back empty and read as a broken filter.
 const CLEARED_WORK_FILTERS = new Set<ActionFilterKey>(['in_progress', 'done'])
 
-const ACTION_QUEUE_STATES = new Set(['intake', 'needs_ordering', 'vendor_followup', 'promise_needed', 'closeout'])
+const ACTION_QUEUE_STATES = new Set(['intake', 'needs_ordering', 'shopify_fulfilled', 'vendor_followup', 'promise_needed', 'closeout'])
 
 export const ACTION_FILTERS: readonly { key: ActionFilterKey; label: string }[] = [
   { key: 'all', label: 'All actions' },
   { key: 'intake', label: 'Shopify intake' },
   { key: 'needs_ordering', label: 'Needs ordering' },
+  { key: 'shopify_fulfilled', label: 'Shopify already fulfilled' },
   { key: 'vendor_followup', label: 'Vendor follow-up' },
   { key: 'promise_needed', label: 'Promise date needed' },
   { key: 'receipt_exception', label: 'Split shipment / backorder' },
@@ -155,7 +156,8 @@ const VIEWS: {
     key: 'data_issues',
     label: 'Data issues',
     description: 'Missing promises and Shopify links that need a human decision before the record can be trusted.',
-    pred: (order) => order.queue_states.includes('promise_needed') || Boolean(order.link_broken) || order.shopify_match === 'ambiguous',
+    pred: (order) => order.queue_states.includes('promise_needed') || Boolean(order.link_broken)
+      || order.shopify_match === 'ambiguous' || order.queue_states.includes('shopify_fulfilled'),
   },
   {
     key: 'all',
@@ -367,6 +369,7 @@ function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
     action_owner: 'retail',
     action_due_date: order.created_at?.slice(0, 10) ?? null,
     closeout_state: null,
+    shopify_order_closed: null,
     service_promise_date: null,
     service_promise_source: null,
     service_promise_recorded_at: null,

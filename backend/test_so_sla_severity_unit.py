@@ -400,6 +400,64 @@ def test_priority_band_c_is_closeout_age():
     print("test_priority_band_c_is_closeout_age OK")
 
 
+def test_fulfilled_shopify_order_outranks_every_procurement_action():
+    """A finished Shopify order on a still-open SO is CS cleanup, not procurement work.
+
+    Live 2026-08-25: 3 of 372 rows, but one was the highest-scoring row on the whole board --
+    telling a buyer to chase a vendor for a part whose Shopify order was fulfilled and partly
+    refunded 71 days earlier.
+    """
+    def got(**kw):
+        row = _row(procurement_stage="ordered", ordered_date="2026-08-01",
+                   expected_date="2026-08-14", shopify_order_id="7241601646655",
+                   shopify_expected_date="2026-06-10",  # long past: would be promise_missed
+                   vendor_lead_time_days=5, **kw)
+        return sla.build_escalations([row], {}, TODAY)["orders"][0]
+
+    # Baseline: without the fulfilment signal this is the worst kind of row.
+    plain = got(shopify_fulfillment_status="UNFULFILLED")
+    assert plain["sla_severity"] == "promise_missed" and plain["priority_score"] == 10, plain["priority_score"]
+    assert plain["work_state"] == "vendor_followup", plain["work_state"]
+
+    done = got(shopify_fulfillment_status="FULFILLED", order_id="16267")
+    assert done["work_state"] == "shopify_fulfilled", done["work_state"]
+    assert done["queue_states"] == ["shopify_fulfilled"], done["queue_states"]
+    assert done["action_owner"] == "cs", done["action_owner"]
+    assert "check out or cancel" in done["next_action"], done["next_action"]
+    assert done["shopify_order_closed"] == "fulfilled"
+    # The breach is an artefact of nobody closing the record, so it must not reach Band A.
+    assert done["sla_severity"] == "promise_missed"      # the verdict itself is unchanged
+    assert done["priority_score"] == 4, (done["priority_score"], done["priority_reasons"])
+    assert done["actionable"] is True
+
+    # No PO attached: nothing is committed, so a point less.
+    assert got(shopify_fulfillment_status="FULFILLED", order_id=None)["priority_score"] == 3
+
+    # Refunded-and-restocked reads as cancel, not check out.
+    restocked = got(shopify_fulfillment_status="RESTOCKED", order_id="16267")
+    assert "cancel the SO" in restocked["next_action"], restocked["next_action"]
+    assert restocked["shopify_order_closed"] == "restocked"
+
+    # PARTIALLY_FULFILLED is NOT this: the special-order line is usually the one still
+    # outstanding, which is exactly normal. Flagging it would fire on 9 healthy live rows.
+    partial = got(shopify_fulfillment_status="PARTIALLY_FULFILLED")
+    assert partial["work_state"] == "vendor_followup", partial["work_state"]
+    assert partial["shopify_order_closed"] is None
+
+    # A link that no longer resolves proves nothing about the customer.
+    broken = got(shopify_fulfillment_status="FULFILLED", link_broken="7241601646655")
+    assert broken["shopify_order_closed"] is None, broken["shopify_order_closed"]
+
+    # Received rows keep their close-out routing: same instruction, right owner.
+    landed = _row(procurement_stage="received", so_received=True, so_received_date="2026-08-18",
+                  shopify_order_id="7241601646655", shopify_fulfillment_status="FULFILLED",
+                  contacted=True)
+    out = sla.build_escalations([landed], {}, TODAY)["orders"][0]
+    assert out["work_state"] != "shopify_fulfilled", out["work_state"]
+    assert out["closeout_state"] == "lightspeed_completion_pending", out["closeout_state"]
+    print("test_fulfilled_shopify_order_outranks_every_procurement_action OK")
+
+
 def test_priority_is_intrinsic_not_damped_by_parking():
     # Parking records that a human knows about a problem. It does not make the problem smaller,
     # and a score that sank on a button click would hide the worst rows from the sort built to
@@ -435,5 +493,6 @@ if __name__ == "__main__":
     test_placed_orders_are_scored_against_the_vendor_date_not_a_counterfactual()
     test_priority_flags_a_po_that_already_lands_late()
     test_priority_band_c_is_closeout_age()
+    test_fulfilled_shopify_order_outranks_every_procurement_action()
     test_priority_is_intrinsic_not_damped_by_parking()
     print("\nAll SLA severity/ack unit tests passed.")

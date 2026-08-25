@@ -10,11 +10,12 @@ import type {
   SpecialOrderWorkState,
   TriageStage,
 } from '@/lib/types'
-import { SeriousnessBadge, SeverityBadge, SourceBadge } from './special-order-badges'
+import { SeriousnessBadge, SeverityBadge, ShopifyClosedBadge, SourceBadge } from './special-order-badges'
 import { SoWorkActions } from './so-work-actions'
 import {
   AlertCircle,
   ChevronRight,
+  CircleSlash,
   Clock3,
   PackageCheck,
   ShoppingCart,
@@ -55,6 +56,7 @@ const OWNER_LABELS: Record<SpecialOrderActionOwner, string> = {
 const WORK_STATE_LABELS: Record<SpecialOrderWorkState, string> = {
   intake: 'Intake',
   needs_ordering: 'Needs ordering',
+  shopify_fulfilled: 'Shopify fulfilled',
   vendor_followup: 'Vendor follow-up',
   promise_needed: 'Promise needed',
   closeout: 'Close-out',
@@ -72,6 +74,7 @@ const ACCENT: Partial<Record<SpecialOrder['sla_severity'], string>> = {
 const WORK_ACCENT: Partial<Record<SpecialOrderWorkState, string>> = {
   intake: 'bg-violet-500',
   needs_ordering: 'bg-orange-500',
+  shopify_fulfilled: 'bg-violet-500',
   vendor_followup: 'bg-blue-500',
   promise_needed: 'bg-amber-500',
   closeout: 'bg-emerald-500',
@@ -224,6 +227,7 @@ function WorkIcon({ state }: { state: SpecialOrderWorkState }) {
   const className = 'h-4 w-4 shrink-0'
   if (state === 'intake') return <Store className={className} />
   if (state === 'needs_ordering') return <ShoppingCart className={className} />
+  if (state === 'shopify_fulfilled') return <CircleSlash className={className} />
   if (state === 'vendor_followup') return <Truck className={className} />
   if (state === 'closeout') return <PackageCheck className={className} />
   if (state === 'promise_needed') return <AlertCircle className={className} />
@@ -371,7 +375,12 @@ export function SpecialOrderRow({
   const identity = order.kind === 'shopify'
     ? order.shopify_order_name ?? order.special_order_id
     : `SO #${order.special_order_id}`
-  const accent = ACCENT[order.sla_severity] ?? WORK_ACCENT[order.work_state] ?? 'bg-border'
+  // A finished Shopify order takes the stripe off the severity axis for the same reason it
+  // replaces the badge: `sla_severity` is still `promise_missed` on these rows and that breach is
+  // an artefact, so a red stripe next to a violet badge and a 4 tells three different stories.
+  const accent = order.shopify_order_closed
+    ? WORK_ACCENT.shopify_fulfilled
+    : ACCENT[order.sla_severity] ?? WORK_ACCENT[order.work_state] ?? 'bg-border'
   const customer = order.customer_name ?? order.customer_email
   const sourceHref = order.source === 'workorder'
     ? order.workorder_url
@@ -476,7 +485,9 @@ export function SpecialOrderRow({
 
             <div className="space-y-1.5">
               <StagePill order={order} />
-              <div><SeverityBadge severity={order.sla_severity} muted={order.ack_active} /></div>
+              {order.shopify_order_closed
+                ? <div><ShopifyClosedBadge state={order.shopify_order_closed} /></div>
+                : <div><SeverityBadge severity={order.sla_severity} muted={order.ack_active} /></div>}
             </div>
 
             <div className="min-w-0 space-y-1 text-xs">

@@ -99,6 +99,21 @@ describe('SpecialOrderRow decluttering', () => {
     expect(screen.getByText('Shopify order 5d earlier')).toBeInTheDocument()
   })
 
+  it('replaces the SLA verdict when the linked Shopify order is already fulfilled', () => {
+    render(<SpecialOrderRow order={fixture({
+      sla_severity: 'promise_missed',
+      shopify_order_closed: 'fulfilled',
+      work_state: 'shopify_fulfilled',
+      next_action: 'Shopify order already fulfilled — check out or cancel the SO in Lightspeed',
+    })} onReview={vi.fn()} />)
+
+    // "Promise missed" on such a row is an artefact — the customer was served or refunded and
+    // nobody closed the Lightspeed record. Showing both badges would read as two live problems.
+    expect(screen.getByText('Shopify fulfilled')).toBeInTheDocument()
+    expect(screen.queryByText('Promise missed')).not.toBeInTheDocument()
+    expect(screen.getByText(/check out or cancel the SO in Lightspeed/)).toBeInTheDocument()
+  })
+
   it('falls back to the legacy clock for cached rows written before days_open existed', () => {
     render(<SpecialOrderRow order={fixture({ days_open: null, intake_lag_days: null })} onReview={vi.fn()} />)
 

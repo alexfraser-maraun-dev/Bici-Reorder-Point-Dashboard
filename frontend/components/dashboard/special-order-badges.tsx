@@ -24,6 +24,7 @@ import {
   HelpCircle,
   CalendarX,
   Ban,
+  CircleSlash,
   Zap,
   Hourglass,
   ShieldQuestion,
@@ -162,6 +163,25 @@ export function SeriousnessBadge({
     >
       {score}
     </span>
+  )
+}
+
+// Replaces the SLA verdict when the linked Shopify order is finished. It has to REPLACE rather
+// than sit alongside it: such a row often carries a "Promise missed" badge that is an artefact —
+// the customer was served or refunded, and nobody closed the Lightspeed record.
+export function ShopifyClosedBadge({ state }: { state: string }) {
+  const restocked = state === 'restocked'
+  return (
+    <Badge
+      variant="outline"
+      title={restocked
+        ? 'The linked Shopify order was refunded and restocked, but this special order is still open in Lightspeed.'
+        : 'The linked Shopify order is already fulfilled, but this special order is still open in Lightspeed.'}
+      className="gap-1 border-violet-300 bg-violet-100 text-xs font-medium text-violet-800"
+    >
+      <CircleSlash className="h-3 w-3" />
+      {restocked ? 'Shopify restocked' : 'Shopify fulfilled'}
+    </Badge>
   )
 }
 

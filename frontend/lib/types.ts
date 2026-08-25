@@ -422,6 +422,10 @@ export type SlaSeverity =
 export type SpecialOrderWorkState =
   | 'intake'
   | 'needs_ordering'
+  // The linked Shopify order is finished while the Lightspeed SO is still open — the SO is
+  // either not required or needs checking out. Outranks every procurement action, because
+  // each of those would be work we should not be doing.
+  | 'shopify_fulfilled'
   | 'vendor_followup'
   | 'promise_needed'
   | 'closeout'
@@ -812,6 +816,9 @@ export interface SpecialOrder {
   action_owner: SpecialOrderActionOwner | null
   action_due_date: string | null
   closeout_state: string | null
+  /** Set when the linked Shopify order is finished ('fulfilled' | 'restocked'). Never set on
+   *  received rows — close-out already routes those correctly. */
+  shopify_order_closed: string | null
   service_promise_date: string | null
   service_promise_source: 'service_manual' | null
   service_promise_recorded_at: string | null
