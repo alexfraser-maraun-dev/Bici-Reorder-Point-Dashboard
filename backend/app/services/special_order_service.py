@@ -481,6 +481,8 @@ def _normalize(
         # When the matched Shopify order was placed. Often earlier than the Lightspeed SO: the
         # `SO` tag gets added late, and the special order is only raised then.
         "shopify_order_created_at": None,
+        # Units of this SO's SKU the customer is still owed on the linked Shopify order.
+        "shopify_line_unfulfilled": None,
         "shopify_candidates": [],
         # Manual-link audit: who linked it, when, and whether a hand-made link has since broken.
         "link_provenance": None,
@@ -685,6 +687,7 @@ def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> N
     o["shopify_fulfillment_status"] = m.get("shopify_fulfillment_status")
     o["shopify_financial_status"] = m.get("shopify_financial_status")
     o["shopify_order_created_at"] = m.get("shopify_order_created_at")
+    o["shopify_line_unfulfilled"] = m.get("shopify_line_unfulfilled")
     o["shopify_order_url"] = shopify_order_url(m["shopify_order_id"])
     o["shopify_candidates"] = m.get("shopify_candidates") or []
     # Who linked this and when (manual links only), and whether a hand-made link has broken.
@@ -778,11 +781,11 @@ def _enrich_with_shopify(
         so_id = str(o.get("special_order_id"))
         manual_oid = links.get(so_id)
         if manual_oid and manual_oid in index["orders"]:
-            m = shopify_match.manual_match(index, manual_oid)
+            m = shopify_match.manual_match(index, manual_oid, o.get("system_sku"))
             m["_link_provenance"] = provenance.get(so_id)
             return m
         if manual_oid and manual_oid in external["orders"]:
-            m = shopify_match.manual_match(external, manual_oid)
+            m = shopify_match.manual_match(external, manual_oid, o.get("system_sku"))
             m["_link_provenance"] = provenance.get(so_id)
             return m
         m = shopify_match.match_special_order(

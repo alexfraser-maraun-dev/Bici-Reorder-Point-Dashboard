@@ -815,6 +815,8 @@ export interface SpecialOrder {
   next_action: string | null
   action_owner: SpecialOrderActionOwner | null
   action_due_date: string | null
+  /** 'customer_stranded' means the item is recorded as received but the customer's Shopify line
+   *  is still unfulfilled — paid for, supposedly here, and they have not got it. */
   closeout_state: string | null
   /** Set when the linked Shopify order is finished ('fulfilled' | 'restocked'). Never set on
    *  received rows — close-out already routes those correctly. */
@@ -837,6 +839,10 @@ export interface SpecialOrder {
   // When the customer actually placed the Shopify order. Often earlier than `created_date`: the
   // `SO` tag gets added late and the Lightspeed special order is only raised then.
   shopify_order_created_at: string | null
+  /** Units of THIS special order's SKU the customer is still owed on the linked Shopify order.
+   *  Null when unknown (no link, or a cached payload from before per-line quantities existed) —
+   *  absence of evidence is never treated as evidence. */
+  shopify_line_unfulfilled: number | null
   shopify_fulfillment_status: string | null
   shopify_financial_status: string | null
   shopify_candidates: ShopifyCandidate[] // ambiguous only: the orders it could be

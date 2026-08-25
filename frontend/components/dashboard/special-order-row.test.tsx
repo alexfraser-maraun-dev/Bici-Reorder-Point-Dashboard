@@ -114,6 +114,52 @@ describe('SpecialOrderRow decluttering', () => {
     expect(screen.getByText(/check out or cancel the SO in Lightspeed/)).toBeInTheDocument()
   })
 
+  it('shows a stranded customer instead of the silent closed_out verdict', () => {
+    render(<SpecialOrderRow order={fixture({
+      procurement_stage: 'received',
+      procurement_stage_index: 3,
+      so_received: true,
+      so_received_date: '2026-07-22',
+      sla_severity: 'closed_out',
+      closeout_state: 'customer_stranded',
+      work_state: 'closeout',
+      priority_score: 10,
+      priority_band: 'critical',
+      next_action: 'Customer still waiting 34 days after arrival \u2014 fulfil or trace the item',
+    })} onReview={vi.fn()} />)
+
+    // `closed_out` makes SeverityBadge render nothing, which would leave a 10-scoring row with
+    // no visible reason. The delivery clock has stopped; the customer's wait has not.
+    expect(screen.getByText(/^Waiting \d+d$/)).toBeInTheDocument()
+    // Past the 7-day threshold this is a real failure and wears red.
+    expect(screen.getByText(/^Waiting \d+d$/).className).toMatch(/bg-red-600/)
+    expect(screen.getByText(/fulfil or trace the item/)).toBeInTheDocument()
+    expect(screen.getByLabelText(/^Seriousness 10 out of 10/)).toBeInTheDocument()
+  })
+
+  it('keeps a fresh unfulfilled arrival amber rather than alarming red', () => {
+    const today = new Date()
+    const threeDaysAgo = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 3)
+    render(<SpecialOrderRow order={fixture({
+      procurement_stage: 'received',
+      procurement_stage_index: 3,
+      so_received: true,
+      so_received_date: threeDaysAgo.toISOString().slice(0, 10),
+      sla_severity: 'closed_out',
+      closeout_state: 'customer_stranded',
+      work_state: 'closeout',
+      priority_score: 4,
+      priority_band: 'medium',
+      next_action: 'Arrived \u2014 hand over and fulfil in Shopify',
+    })} onReview={vi.fn()} />)
+
+    // Dressing a normal three-day handover in the same red as a month-long strand is how a
+    // warning colour stops meaning anything.
+    const badge = screen.getByText(/^Waiting \d+d$/)
+    expect(badge.className).toMatch(/bg-amber-100/)
+    expect(badge.className).not.toMatch(/bg-red-600/)
+  })
+
   it('falls back to the legacy clock for cached rows written before days_open existed', () => {
     render(<SpecialOrderRow order={fixture({ days_open: null, intake_lag_days: null })} onReview={vi.fn()} />)
 

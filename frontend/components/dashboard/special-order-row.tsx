@@ -10,7 +10,13 @@ import type {
   SpecialOrderWorkState,
   TriageStage,
 } from '@/lib/types'
-import { SeriousnessBadge, SeverityBadge, ShopifyClosedBadge, SourceBadge } from './special-order-badges'
+import {
+  CustomerWaitingBadge,
+  SeriousnessBadge,
+  SeverityBadge,
+  ShopifyClosedBadge,
+  SourceBadge,
+} from './special-order-badges'
 import { SoWorkActions } from './so-work-actions'
 import {
   AlertCircle,
@@ -99,6 +105,16 @@ export function StagePill({ order }: { order: SpecialOrder }) {
       {STAGE_LABELS[stage]}
     </Badge>
   )
+}
+
+/** Whole calendar days from a date string to today, both anchored at local noon. */
+function daysBetween(value: string | null): number | null {
+  if (!value) return null
+  const parsed = Date.parse(`${value.slice(0, 10)}T12:00:00`)
+  if (Number.isNaN(parsed)) return null
+  const now = new Date()
+  const todayNoon = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12).getTime()
+  return Math.max(0, Math.round((todayNoon - parsed) / 86_400_000))
 }
 
 function formatDate(value: string | null): string {
@@ -378,9 +394,15 @@ export function SpecialOrderRow({
   // A finished Shopify order takes the stripe off the severity axis for the same reason it
   // replaces the badge: `sla_severity` is still `promise_missed` on these rows and that breach is
   // an artefact, so a red stripe next to a violet badge and a 4 tells three different stories.
-  const accent = order.shopify_order_closed
-    ? WORK_ACCENT.shopify_fulfilled
-    : ACCENT[order.sla_severity] ?? WORK_ACCENT[order.work_state] ?? 'bg-border'
+  // A stranded customer must not wear the emerald "arrived, all good" stripe that every other
+  // received row gets from WORK_ACCENT.closeout.
+  const stranded = order.closeout_state === 'customer_stranded'
+  const daysSinceArrival = stranded ? daysBetween(order.so_received_date ?? null) : null
+  const accent = stranded
+    ? (daysSinceArrival != null && daysSinceArrival >= 7 ? 'bg-red-600' : 'bg-amber-500')
+    : order.shopify_order_closed
+      ? WORK_ACCENT.shopify_fulfilled
+      : ACCENT[order.sla_severity] ?? WORK_ACCENT[order.work_state] ?? 'bg-border'
   const customer = order.customer_name ?? order.customer_email
   const sourceHref = order.source === 'workorder'
     ? order.workorder_url
@@ -485,9 +507,11 @@ export function SpecialOrderRow({
 
             <div className="space-y-1.5">
               <StagePill order={order} />
-              {order.shopify_order_closed
-                ? <div><ShopifyClosedBadge state={order.shopify_order_closed} /></div>
-                : <div><SeverityBadge severity={order.sla_severity} muted={order.ack_active} /></div>}
+              {order.closeout_state === 'customer_stranded'
+                ? <div><CustomerWaitingBadge days={daysSinceArrival} /></div>
+                : order.shopify_order_closed
+                  ? <div><ShopifyClosedBadge state={order.shopify_order_closed} /></div>
+                  : <div><SeverityBadge severity={order.sla_severity} muted={order.ack_active} /></div>}
             </div>
 
             <div className="min-w-0 space-y-1 text-xs">

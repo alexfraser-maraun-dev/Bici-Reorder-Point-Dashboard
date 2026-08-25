@@ -25,6 +25,7 @@ import {
   CalendarX,
   Ban,
   CircleSlash,
+  UserRoundX,
   Zap,
   Hourglass,
   ShieldQuestion,
@@ -181,6 +182,35 @@ export function ShopifyClosedBadge({ state }: { state: string }) {
     >
       <CircleSlash className="h-3 w-3" />
       {restocked ? 'Shopify restocked' : 'Shopify fulfilled'}
+    </Badge>
+  )
+}
+
+// Received rows carry `sla_severity: 'closed_out'`, so SeverityBadge renders nothing for them —
+// which would leave a stranded customer scoring 9 or 10 with no visible reason. The clock really
+// has stopped for the on-time metric; the customer's wait has not.
+// Mirrors _UNCALLED_WARN_DAYS in so_sla_service.py. Below it, an unfulfilled line is just an
+// arrival waiting to be handed over — normal work. Dressing that in the same red as a customer
+// stranded for a month is how a warning colour stops meaning anything.
+const CUSTOMER_WAITING_WARN_DAYS = 7
+
+export function CustomerWaitingBadge({ days }: { days: number | null }) {
+  const overdue = days != null && days >= CUSTOMER_WAITING_WARN_DAYS
+  return (
+    <Badge
+      variant="outline"
+      title={overdue
+        ? "The item is recorded as received in Lightspeed, but the customer's Shopify line is still unfulfilled — they have paid and do not have it."
+        : "Received, and the customer's Shopify line is not fulfilled yet — hand it over and fulfil."}
+      className={cn(
+        'gap-1 text-xs font-medium',
+        overdue
+          ? 'border-red-700 bg-red-600 text-white'
+          : 'border-amber-200 bg-amber-100 text-amber-800',
+      )}
+    >
+      <UserRoundX className="h-3 w-3" />
+      {days != null && days > 0 ? `Waiting ${days}d` : 'Customer waiting'}
     </Badge>
   )
 }

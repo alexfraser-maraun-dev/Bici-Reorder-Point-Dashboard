@@ -384,6 +384,7 @@ function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
     shopify_order_url: order.shopify_order_url,
     shopify_expected_date: order.shopify_expected_date,
     shopify_order_created_at: order.created_at,
+    shopify_line_unfulfilled: null,
     shopify_fulfillment_status: order.fulfillment_status,
     shopify_financial_status: order.financial_status,
     shopify_candidates: [],

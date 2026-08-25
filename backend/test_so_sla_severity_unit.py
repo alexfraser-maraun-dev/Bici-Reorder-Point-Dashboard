@@ -458,6 +458,60 @@ def test_fulfilled_shopify_order_outranks_every_procurement_action():
     print("test_fulfilled_shopify_order_outranks_every_procurement_action OK")
 
 
+def test_stranded_customer_escalates_but_only_on_shopify_evidence():
+    """A paid customer whose item is "received" but still unfulfilled in Shopify.
+
+    Gated on the per-line Shopify quantity, never on age or `contacted`: live, `contacted` is
+    False on 116 of 118 received rows and 112 of them are already 60+ days past receipt, so
+    ramping on either would put the whole abandoned ready-for-pickup tail at the top of the board.
+    """
+    def got(received, **kw):
+        row = _row(procurement_stage="received", so_received=True, so_received_date=received,
+                   shopify_order_id="7396239900735", contacted=False, **kw)
+        return sla.build_escalations([row], {}, TODAY)["orders"][0]
+
+    # Still owed: escalates with time since arrival, all the way into the top band.
+    assert got("2026-08-19", shopify_line_unfulfilled=2)["priority_score"] == 2   # 1d
+    assert got("2026-08-15", shopify_line_unfulfilled=2)["priority_score"] == 4   # 5d
+    assert got("2026-08-10", shopify_line_unfulfilled=2)["priority_score"] == 6   # 10d
+    assert got("2026-08-01", shopify_line_unfulfilled=2)["priority_score"] == 8   # 19d
+    worst = got("2026-07-01", shopify_line_unfulfilled=2)                          # 50d
+    assert worst["priority_score"] == 10, worst["priority_score"]
+    assert worst["closeout_state"] == "customer_stranded", worst["closeout_state"]
+    assert worst["action_owner"] == "retail"
+    assert "fulfil or trace the item" in worst["next_action"], worst["next_action"]
+    # The delivery SLA still stops at receipt -- only the work ranking changed.
+    assert worst["sla_severity"] == "closed_out", worst["sla_severity"]
+
+    # Handed over: Shopify says the line went out, so the open LS record is data hygiene.
+    handed = got("2025-06-09", shopify_line_unfulfilled=0)                         # 442d
+    assert handed["priority_score"] == 1, handed["priority_score"]
+
+    # No evidence: unchanged low, capped nag. This is the ~113-row abandoned tail; ramping it
+    # would flood the board, which is what stopping the clock at receipt was meant to prevent.
+    blind = got("2025-06-09")
+    # Absent, not just null: this is also the shape of a payload cached before per-line
+    # quantities were fetched, and it must fall through to the old handling rather than escalate.
+    assert blind.get("shopify_line_unfulfilled") is None
+    assert blind["priority_score"] == 4, blind["priority_score"]
+    assert blind["next_action"] == "Arrived — call the customer", blind["next_action"]
+    assert any("has not been called" in r for r in blind["priority_reasons"]), blind["priority_reasons"]
+
+    # A broken link proves nothing about the customer either way.
+    assert got("2026-07-01", shopify_line_unfulfilled=2,
+               link_broken="7396239900735")["priority_score"] == 4
+
+    # A fresh arrival reads as a handover, not a crisis.
+    fresh = got("2026-08-19", shopify_line_unfulfilled=2)
+    assert fresh["next_action"] == "Arrived — hand over and fulfil in Shopify", fresh["next_action"]
+
+    # An open workorder still wins: the bench has to finish the job before anyone hands it over.
+    bench = got("2026-07-01", shopify_line_unfulfilled=2, workorder_id="WO-1",
+                workorder_status="In progress")
+    assert bench["closeout_state"] == "workorder_action_required", bench["closeout_state"]
+    print("test_stranded_customer_escalates_but_only_on_shopify_evidence OK")
+
+
 def test_priority_is_intrinsic_not_damped_by_parking():
     # Parking records that a human knows about a problem. It does not make the problem smaller,
     # and a score that sank on a button click would hide the worst rows from the sort built to
@@ -494,5 +548,6 @@ if __name__ == "__main__":
     test_priority_flags_a_po_that_already_lands_late()
     test_priority_band_c_is_closeout_age()
     test_fulfilled_shopify_order_outranks_every_procurement_action()
+    test_stranded_customer_escalates_but_only_on_shopify_evidence()
     test_priority_is_intrinsic_not_damped_by_parking()
     print("\nAll SLA severity/ack unit tests passed.")

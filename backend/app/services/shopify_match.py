@@ -76,12 +76,21 @@ def build_shopify_index(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "fulfillment_status": r.get("fulfillment_status"),
                 "financial_status": r.get("financial_status"),
                 "skus": set(),
+                # sku -> units still owed to the customer on THAT line. Order-level status
+                # cannot answer "has the customer got this item?" on a multi-line order.
+                "unfulfilled_by_sku": {},
             }
             orders[oid] = o
         sku = _norm_sku(r.get("sku"))
         if not sku:
             continue
         o["skus"].add(sku)
+        unfulfilled = r.get("unfulfilled_quantity")
+        if unfulfilled is not None:
+            # Max, not sum: the same SKU can appear on more than one line of an order, and the
+            # question is whether ANY of it is still owed.
+            prior = o["unfulfilled_by_sku"].get(sku)
+            o["unfulfilled_by_sku"][sku] = max(int(unfulfilled), int(prior or 0))
         by_sku.setdefault(sku, set()).add(oid)
         if o["email"]:
             by_email_sku.setdefault((o["email"], sku), set()).add(oid)
@@ -123,12 +132,14 @@ def _none() -> Dict[str, Any]:
         "shopify_fulfillment_status": None,
         "shopify_financial_status": None,
         "shopify_order_created_at": None,
+        "shopify_line_unfulfilled": None,
         "shopify_candidates": [],
         "_candidates": set(),
     }
 
 
-def _matched(index: Dict[str, Any], oid: str, basis: str) -> Dict[str, Any]:
+def _matched(index: Dict[str, Any], oid: str, basis: str,
+             sku: Optional[str] = None) -> Dict[str, Any]:
     o = index["orders"][oid]
     return {
         "shopify_match": "matched",
@@ -142,6 +153,9 @@ def _matched(index: Dict[str, Any], oid: str, basis: str) -> Dict[str, Any]:
         # order behind it) is sometimes added days later, so this is the earlier, truer start of
         # the customer's wait -- see so_sla_service.compute_open_clock.
         "shopify_order_created_at": o.get("created_at"),
+        # Units of THIS special order's SKU the customer is still owed. None when unknown
+        # (a manual link resolved outside the main index, or a pre-upgrade cached payload).
+        "shopify_line_unfulfilled": (o.get("unfulfilled_by_sku") or {}).get(sku) if sku else None,
         "shopify_candidates": [],
         "_candidates": {oid},
     }
@@ -157,14 +171,16 @@ def _ambiguous(index: Dict[str, Any], candidates: Set[str], basis: str) -> Dict[
         "shopify_fulfillment_status": None,
         "shopify_financial_status": None,
         "shopify_order_created_at": None,
+        "shopify_line_unfulfilled": None,
         "shopify_candidates": candidate_summary(index, candidates),
         "_candidates": set(candidates),
     }
 
 
-def manual_match(index: Dict[str, Any], order_id: str) -> Dict[str, Any]:
+def manual_match(index: Dict[str, Any], order_id: str,
+                 system_sku: Any = None) -> Dict[str, Any]:
     """A human-forced link (so_match_overrides). The order must exist in the index."""
-    return _matched(index, order_id, "manual")
+    return _matched(index, order_id, "manual", _norm_sku(system_sku) or None)
 
 
 def match_special_order(
@@ -202,7 +218,7 @@ def match_special_order(
     for basis, cands in tiers:
         cands = (cands or set()) - blocked
         if len(cands) == 1:
-            return _matched(index, next(iter(cands)), basis)
+            return _matched(index, next(iter(cands)), basis, sku)
         if len(cands) > 1:
             return _ambiguous(index, cands, basis)
 
@@ -223,7 +239,7 @@ def match_special_order(
     )
     if comparable:
         return _ambiguous(index, cands, "sku_conflict")
-    return _matched(index, oid, "sku_only")
+    return _matched(index, oid, "sku_only", sku)
 
 
 def shopify_only_orders(

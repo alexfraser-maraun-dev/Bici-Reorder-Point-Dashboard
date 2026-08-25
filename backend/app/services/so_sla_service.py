@@ -87,8 +87,27 @@ _COMFORTABLE = 2
 _BAND_CEILING = 6
 
 # How long a received order may sit uncalled before close-out becomes the serious thing on it.
+# Only used where there is NO Shopify evidence either way -- see _STRANDED_STEPS.
 _UNCALLED_WARN_DAYS = 7
 _UNCALLED_URGENT_DAYS = 21
+
+# A customer who has PAID and whose item is recorded as received, but whose Shopify line is still
+# unfulfilled, is stranded: we are holding their money and they have nothing. That escalates all
+# the way, because it is a worse failure than a late delivery -- the goods are supposedly here.
+#
+# Gated on Shopify evidence rather than on age or on `contacted`, both of which are unusable:
+# `contacted` is False on 116 of 118 live received rows (nobody maintains it) and 112 of those
+# 118 are already 60+ days past receipt. Ramping on either would have put the entire abandoned
+# ready-for-pickup tail at the top of the board, which is exactly what stopping the SLA clock at
+# receipt was meant to prevent. The unfulfilled Shopify line is the one signal that separates
+# "a customer is stranded" from "nobody closed a record in 2025".
+_STRANDED_STEPS = [(3, 2), (7, 4), (14, 6), (30, 8)]   # days since receipt < limit -> score
+_STRANDED_MAX = 10
+
+# The mirror image: Shopify says the line IS fulfilled, so the customer has the goods and the
+# open Lightspeed record is data hygiene, not a customer problem. Live: SO 40241 had been sitting
+# 442 days post-receipt scoring 4 on an order the customer collected long ago.
+_HANDED_OVER_SCORE = 1
 
 # Why a buyer parked this special order. Free-text notes are allowed alongside, but a code is
 # required -- an un-categorised snooze cannot be reported on, and reporting is the point.
@@ -193,6 +212,24 @@ def resolve_promise(row: Dict[str, Any]) -> Tuple[Optional[date], Optional[str]]
 # special-order line is usually the one still outstanding, which is normal and correct).
 # `RESTOCKED` means the order was cancelled and the units went back to stock.
 SHOPIFY_CLOSED_STATUSES = {"fulfilled", "restocked"}
+
+
+def customer_still_waiting(row: Dict[str, Any]) -> Optional[bool]:
+    """Has the customer actually received this item? True = still owed, False = handed over.
+
+    ``None`` means we cannot tell: no Shopify link, or a cached/manual-link row from before
+    per-line quantities were fetched. Absence of evidence is never treated as evidence -- those
+    rows keep the old `contacted`-based close-out handling rather than being escalated on a guess.
+
+    Per-LINE, not order-level: a multi-line order reads PARTIALLY_FULFILLED whether the
+    outstanding line is the special-order one or somebody else's in-stock item.
+    """
+    if not row.get("shopify_order_id") or row.get("link_broken"):
+        return None
+    unfulfilled = row.get("shopify_line_unfulfilled")
+    if unfulfilled is None:
+        return None
+    return int(unfulfilled) > 0
 
 
 def shopify_order_closed(row: Dict[str, Any]) -> Optional[str]:
@@ -369,7 +406,7 @@ def _workorder_is_open(row: Dict[str, Any]) -> bool:
     return any(word in status for word in closed_words) is False
 
 
-def _closeout_action(row: Dict[str, Any]) -> Dict[str, Any]:
+def _closeout_action(row: Dict[str, Any], today: date) -> Dict[str, Any]:
     """Post-receipt work, kept explicitly outside the delivery SLA."""
     due = _due_from(
         row.get("so_received_date") or row.get("ordered_date") or row.get("created_date"),
@@ -380,6 +417,21 @@ def _closeout_action(row: Dict[str, Any]) -> Dict[str, Any]:
             "closeout_state": "workorder_action_required",
             "next_action": "Part in — finish the workorder",
             "action_owner": "service",
+            "action_due_date": due,
+        }
+    # Checked BEFORE `contacted`, because `contacted` is False on 116 of 118 live received rows
+    # and would otherwise swallow every one of these into "call the customer" — which is wrong
+    # advice when the customer has already been called and the item cannot be found.
+    if customer_still_waiting(row):
+        waiting = _days_since(row.get("so_received_date"), today)
+        return {
+            "closeout_state": "customer_stranded",
+            "next_action": (
+                f"Customer still waiting {_plural(waiting)} after arrival — fulfil or trace the item"
+                if waiting is not None and waiting >= _UNCALLED_WARN_DAYS
+                else "Arrived — hand over and fulfil in Shopify"
+            ),
+            "action_owner": "retail",
             "action_due_date": due,
         }
     if not row.get("contacted"):
@@ -463,7 +515,7 @@ def compute_work_state(row: Dict[str, Any], sla: Dict[str, Any], today: date) ->
     if sla.get("missing_promise"):
         queue_states.append("promise_needed")
 
-    closeout = _closeout_action(row) if stage == "received" else {
+    closeout = _closeout_action(row, today) if stage == "received" else {
         "closeout_state": None,
         "next_action": None,
         "action_owner": None,
@@ -736,11 +788,31 @@ def compute_priority(row: Dict[str, Any], sla: Dict[str, Any], work: Dict[str, A
         score = next((value for limit, value in _LATE_STEPS if late < limit), 10)
         return _priority(score, [f"Promise missed by {_plural(late)}"])
 
-    # --- Band C: received; both clocks stopped, so what is left is close-out age --------------
+    # --- Band C: received; both clocks stopped, so what is left is close-out ------------------
     if stage == "received":
         if work.get("closeout_state") in (None, "complete"):
             return _priority(1, ["Received and closed out"])
         waiting = _days_since(row.get("so_received_date"), today)
+        owed = customer_still_waiting(row)
+
+        if owed is True:
+            # Paid for, recorded as here, and the customer still has not got it. This is the one
+            # close-out case allowed out of the low band -- it is a worse failure than a late
+            # delivery, because the goods are supposedly already in the building.
+            score = (next((value for limit, value in _STRANDED_STEPS if waiting < limit), _STRANDED_MAX)
+                     if waiting is not None else _STRANDED_STEPS[0][1])
+            reason = (f"Customer has been owed this item for {_plural(waiting)} since it arrived"
+                      if waiting is not None else "Customer has not received this item yet")
+            return _priority(score, [reason])
+
+        if owed is False:
+            # Shopify says the line went out. The open Lightspeed record is data hygiene.
+            return _priority(_HANDED_OVER_SCORE,
+                             ["Shopify shows the customer has this item — Lightspeed record is stale"])
+
+        # No Shopify evidence either way. Unchanged behaviour: a low, capped nag on `contacted`,
+        # deliberately NOT ramped, or the ~113 abandoned ready-for-pickup records would flood the
+        # board the moment this shipped.
         if not row.get("contacted") and waiting is not None and waiting >= _UNCALLED_WARN_DAYS:
             reason = f"Arrived {_plural(waiting)} ago and the customer still has not been called"
             return _priority(4 if waiting >= _UNCALLED_URGENT_DAYS else 3, [reason])

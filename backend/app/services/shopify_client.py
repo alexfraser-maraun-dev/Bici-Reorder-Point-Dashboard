@@ -209,7 +209,7 @@ class ShopifyClient:
           closed
           test
           metafield(namespace: "%s", key: "%s") { value }
-          lineItems(first: $lineItems) { nodes { sku } }
+          lineItems(first: $lineItems) { nodes { sku unfulfilledQuantity } }
         }
       }
     }
@@ -235,7 +235,7 @@ class ShopifyClient:
           closed
           test
           metafield(namespace: "%s", key: "%s") { value }
-          lineItems(first: $lineItems) { nodes { sku } }
+          lineItems(first: $lineItems) { nodes { sku unfulfilledQuantity } }
         }
       }
     }
@@ -280,7 +280,7 @@ class ShopifyClient:
         Returns the identical row shape so downstream matching/flagging is unchanged
         (plus the phone / customer-name identity signals the tiered matcher uses):
             {order_id, order_name, email, phone, customer_name, fulfillment_status,
-             financial_status, created_at, eta, sku}
+             financial_status, created_at, eta, sku, unfulfilled_quantity}
 
         Fail-soft remains available for background callers. ``strict=True`` raises when the
         source is unavailable so the dashboard orchestrator can keep Lightspeed rows while
@@ -339,15 +339,20 @@ class ShopifyClient:
                         "created_at": o.get("createdAt"),
                         "eta": eta,
                     }
-                    line_skus = [
-                        li.get("sku") for li in ((o.get("lineItems") or {}).get("nodes") or [])
+                    # `unfulfilled_quantity` is per LINE, which is the only grain that answers
+                    # "has the customer got THIS item?". The order-level status cannot: a
+                    # multi-line order reads PARTIALLY_FULFILLED whether the outstanding line is
+                    # the special-order one or somebody else's in-stock item.
+                    lines = [
+                        (li.get("sku"), li.get("unfulfilledQuantity"))
+                        for li in ((o.get("lineItems") or {}).get("nodes") or [])
                     ]
                     # One row per line item, mirroring the order_line join (a SKU may be None).
-                    if line_skus:
-                        for sku in line_skus:
-                            rows.append({**base, "sku": sku})
+                    if lines:
+                        for sku, unfulfilled in lines:
+                            rows.append({**base, "sku": sku, "unfulfilled_quantity": unfulfilled})
                     else:
-                        rows.append({**base, "sku": None})
+                        rows.append({**base, "sku": None, "unfulfilled_quantity": None})
 
                 page = conn.get("pageInfo") or {}
                 if not page.get("hasNextPage"):
