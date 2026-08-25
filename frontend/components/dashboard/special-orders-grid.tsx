@@ -101,7 +101,10 @@ export function SpecialOrdersGrid({
   unmatchedShopify = [],
   matchActions,
 }: Props) {
-  const [sortKey, setSortKey] = useState<SortKey | 'default'>('default')
+  // Seriousness by default: it is the one column that ranks the WHOLE board on how bad each
+  // situation actually is. 'Priority' (the backend queue order) stays available and remains the
+  // tiebreak — the sort is stable, so rows on the same score keep their operational ordering.
+  const [sortKey, setSortKey] = useState<SortKey | 'default'>('priority_score')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
   const [page, setPage] = useState(1)
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
@@ -171,7 +174,7 @@ export function SpecialOrdersGrid({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="default">Priority</SelectItem>
+              <SelectItem value="default">Priority (work queue order)</SelectItem>
               {SORT_OPTIONS.map((option) => (
                 <SelectItem key={option.key} value={option.key}>{option.label}</SelectItem>
               ))}
