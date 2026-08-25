@@ -122,6 +122,7 @@ def _none() -> Dict[str, Any]:
         "shopify_expected_date": None,
         "shopify_fulfillment_status": None,
         "shopify_financial_status": None,
+        "shopify_order_created_at": None,
         "shopify_candidates": [],
         "_candidates": set(),
     }
@@ -137,6 +138,10 @@ def _matched(index: Dict[str, Any], oid: str, basis: str) -> Dict[str, Any]:
         "shopify_expected_date": o.get("eta"),
         "shopify_fulfillment_status": o.get("fulfillment_status"),
         "shopify_financial_status": o.get("financial_status"),
+        # When the customer actually placed the order. The SO tag (and the Lightspeed special
+        # order behind it) is sometimes added days later, so this is the earlier, truer start of
+        # the customer's wait -- see so_sla_service.compute_open_clock.
+        "shopify_order_created_at": o.get("created_at"),
         "shopify_candidates": [],
         "_candidates": {oid},
     }
@@ -151,6 +156,7 @@ def _ambiguous(index: Dict[str, Any], candidates: Set[str], basis: str) -> Dict[
         "shopify_expected_date": None,
         "shopify_fulfillment_status": None,
         "shopify_financial_status": None,
+        "shopify_order_created_at": None,
         "shopify_candidates": candidate_summary(index, candidates),
         "_candidates": set(candidates),
     }

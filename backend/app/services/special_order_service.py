@@ -478,6 +478,9 @@ def _normalize(
         "shopify_expected_date": None,
         "shopify_fulfillment_status": None,
         "shopify_financial_status": None,
+        # When the matched Shopify order was placed. Often earlier than the Lightspeed SO: the
+        # `SO` tag gets added late, and the special order is only raised then.
+        "shopify_order_created_at": None,
         "shopify_candidates": [],
         # Manual-link audit: who linked it, when, and whether a hand-made link has since broken.
         "link_provenance": None,
@@ -681,6 +684,7 @@ def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> N
     o["shopify_expected_date"] = m["shopify_expected_date"]
     o["shopify_fulfillment_status"] = m.get("shopify_fulfillment_status")
     o["shopify_financial_status"] = m.get("shopify_financial_status")
+    o["shopify_order_created_at"] = m.get("shopify_order_created_at")
     o["shopify_order_url"] = shopify_order_url(m["shopify_order_id"])
     o["shopify_candidates"] = m.get("shopify_candidates") or []
     # Who linked this and when (manual links only), and whether a hand-made link has broken.

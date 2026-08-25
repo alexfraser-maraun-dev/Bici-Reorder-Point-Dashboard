@@ -43,7 +43,14 @@ function fixture(overrides: Partial<SpecialOrder> = {}): SpecialOrder {
     expected_date: '2026-08-24',
     fastest_landing_date: '2026-08-24',
     days_since_creation: 19,
+    days_open: 24,
+    intake_lag_days: 5,
+    earliest_ready_date: '2026-08-25',
+    earliest_ready_basis: 'po_eta_plus_buffer',
     days_lost: 2,
+    priority_score: 6,
+    priority_band: 'high',
+    priority_reasons: ['On track to land 3 days after 2026-08-25'],
     sla_severity: 'stage_stalled',
     ack_active: false,
     ...overrides,
@@ -51,6 +58,54 @@ function fixture(overrides: Partial<SpecialOrder> = {}): SpecialOrder {
 }
 
 afterEach(cleanup)
+
+describe('SpecialOrderRow decluttering', () => {
+  it('puts the store in the header rather than the metadata line', () => {
+    render(<SpecialOrderRow order={fixture()} onReview={vi.fn()} />)
+
+    // The store used to be the fourth item in a `·`-separated line already carrying customer,
+    // System ID and PO — three linked items it could not compete with.
+    const heading = screen.getByText('SO #42').parentElement!
+    expect(within(heading).getByText('Victoria')).toBeInTheDocument()
+  })
+
+  it('drops days-lost and the action due date from the tile', () => {
+    render(<SpecialOrderRow order={fixture()} onReview={vi.fn()} />)
+
+    // Both stay on the record (days_lost is still sortable, action_due_date still orders the
+    // queue) — they are simply not what a buyer reads off the card.
+    expect(screen.queryByText(/d lost/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/due /)).not.toBeInTheDocument()
+    expect(screen.getByText('Confirm the vendor arrival date')).toBeInTheDocument()
+  })
+
+  it('names each date instead of collapsing them onto one stage-dependent row', () => {
+    render(<SpecialOrderRow order={fixture({ procurement_stage: 'open_pool', procurement_stage_index: 0 })} onReview={vi.fn()} />)
+
+    expect(screen.getByText('PO expected')).toBeInTheDocument()
+    expect(screen.getByText('Fastest possible')).toBeInTheDocument()
+    // Previously this stage rendered "Promise" and "Customer promise" as two rows of the same
+    // value — a visible duplicate on every order that had not been placed yet.
+    expect(screen.queryByText('Promise')).not.toBeInTheDocument()
+    expect(screen.getAllByText('Customer promise')).toHaveLength(1)
+  })
+
+  it('shows days open with its seriousness score, and flags a late-tagged Shopify order', () => {
+    render(<SpecialOrderRow order={fixture()} onReview={vi.fn()} />)
+
+    expect(screen.getByText('24')).toBeInTheDocument()
+    expect(screen.getByText('days open')).toBeInTheDocument()
+    expect(screen.getByLabelText(/^Seriousness 6 out of 10/)).toHaveTextContent('6')
+    expect(screen.getByText('Shopify order 5d earlier')).toBeInTheDocument()
+  })
+
+  it('falls back to the legacy clock for cached rows written before days_open existed', () => {
+    render(<SpecialOrderRow order={fixture({ days_open: null, intake_lag_days: null })} onReview={vi.fn()} />)
+
+    expect(screen.getByText('19')).toBeInTheDocument()
+    expect(screen.queryByText(/Shopify order/)).not.toBeInTheDocument()
+  })
+})
 
 describe('SpecialOrderRow source links', () => {
   it('puts product, customer, PO, workorder, and Shopify destinations on the tile', () => {

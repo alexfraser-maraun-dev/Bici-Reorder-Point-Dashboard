@@ -225,6 +225,195 @@ def test_live_window_zero_and_none_return_historical_rows():
     print("test_live_window_zero_and_none_return_historical_rows OK")
 
 
+def test_open_clock_takes_the_earlier_shopify_date():
+    # The `SO` tag was added 6 days after the order went live, so the customer had already been
+    # waiting 6 days before the Lightspeed special order existed.
+    late_tag = _row(created_date="2026-08-15", shopify_order_created_at="2026-08-09T10:00:00-07:00")
+    got = sla.compute_open_clock(late_tag, TODAY)
+    assert got["demand_started_date"] == "2026-08-09", got
+    assert got["demand_started_source"] == "shopify_order", got
+    assert got["days_open"] == 11, got
+    assert got["intake_lag_days"] == 6, got
+
+    # A Shopify order linked AFTER the special order is a later link, not a late tag. No lag.
+    later = _row(created_date="2026-08-09", shopify_order_created_at="2026-08-15T10:00:00-07:00")
+    got = sla.compute_open_clock(later, TODAY)
+    assert got["demand_started_date"] == "2026-08-09", got
+    assert got["demand_started_source"] == "ls_so", got
+    assert got["intake_lag_days"] is None, got
+
+    # Workorder-origin rows carry no Shopify date, so they stay on the Lightspeed SO date --
+    # Workorder.timeIn is when the BIKE was booked in, not when the part was requested.
+    bench = _row(created_date="2026-08-15", source="workorder", workorder_time_in="2026-07-01")
+    got = sla.compute_open_clock(bench, TODAY)
+    assert got["demand_started_date"] == "2026-08-15", got
+    assert got["days_open"] == 5, got
+    assert got["intake_lag_days"] is None, got
+    print("test_open_clock_takes_the_earlier_shopify_date OK")
+
+
+def test_open_clock_never_moves_the_sla_clock():
+    # The whole point of the separation: days_since_creation drives severity, dwell and the
+    # archive window, and must be unaffected by the display clock.
+    row = _row(created_date="2026-08-15", days_since_creation=5,
+               shopify_order_created_at="2026-07-01T10:00:00-07:00")
+    out = sla.build_escalations([row], {}, TODAY)["orders"][0]
+    assert out["days_open"] == 50, out["days_open"]
+    assert out["days_since_creation"] == 5, out["days_since_creation"]
+    assert len(sla.filter_live_window([out], 30)) == 1  # windowed on the LS clock, so it stays
+    print("test_open_clock_never_moves_the_sla_clock OK")
+
+
+def test_earliest_ready_covers_every_basis():
+    def basis(**kw):
+        got = sla.compute_sla(_row(**kw), TODAY)
+        return got["earliest_ready_date"], got["earliest_ready_basis"]
+
+    # Received: the individual SO's own receipt timestamp, nothing added.
+    assert basis(procurement_stage="received", so_received_date="2026-08-18") == \
+        ("2026-08-18", "received")
+    # Ordered: the PO says the box lands 08-25; the customer can have it a buffer day later.
+    assert basis(procurement_stage="ordered", expected_date="2026-08-25") == \
+        ("2026-08-26", "po_eta_plus_buffer")
+    # Unordered with a fastest-path annotation: use it as-is, it already carries the buffer.
+    assert basis(fastest_landing_date="2026-08-24") == ("2026-08-24", "fastest_route")
+    # Annotation skipped (BigQuery hiccup): fall back to today + lead + buffer, never blank.
+    assert basis(vendor_lead_time_days=5) == ("2026-08-26", "lead_time_default")
+    print("test_earliest_ready_covers_every_basis OK")
+
+
+def test_priority_band_a_scales_with_lateness():
+    def score(promise):
+        row = _row(shopify_expected_date=promise, vendor_lead_time_days=5)
+        return sla.build_escalations([row], {}, TODAY)["orders"][0]["priority_score"]
+
+    assert score("2026-08-18") == 7, score("2026-08-18")    # 2 days late
+    assert score("2026-08-16") == 8, score("2026-08-16")    # 4 days late
+    assert score("2026-08-11") == 9, score("2026-08-11")    # 9 days late
+    assert score("2026-07-21") == 10, score("2026-07-21")   # 30 days late
+    print("test_priority_band_a_scales_with_lateness OK")
+
+
+def test_priority_band_b_ramps_on_window_slack():
+    def score(**kw):
+        row = _row(vendor_lead_time_days=5, **kw)
+        return sla.build_escalations([row], {}, TODAY)["orders"][0]["priority_score"]
+
+    # With a real quote: order-by is promise - 6d. Slack -1 / 0 / 3 / 10.
+    assert score(shopify_expected_date="2026-08-25") == 6, score(shopify_expected_date="2026-08-25")
+    assert score(shopify_expected_date="2026-08-26") == 5
+    assert score(shopify_expected_date="2026-08-29") == 4
+    assert score(shopify_expected_date="2026-09-05") == 2
+
+    # With NO quote the inferred window does the same work, so the ~third of the board that was
+    # never quoted is still rankable rather than flat.
+    assert score(could_have_landed="2026-08-25") == 6
+    assert score(could_have_landed="2026-08-26") == 5
+    assert score(could_have_landed="2026-08-29") == 4
+    assert score(could_have_landed="2026-09-05") == 2
+
+    inferred = sla.compute_sla(_row(vendor_lead_time_days=5, could_have_landed="2026-09-05"), TODAY)
+    assert inferred["scoring_window_source"] == "inferred", inferred
+    assert inferred["order_by_date"] is None, inferred  # stays promise-only; never invented
+    print("test_priority_band_b_ramps_on_window_slack OK")
+
+
+def test_priority_bumps_never_manufacture_a_broken_promise():
+    # A comfortable row carrying every bump: no ETA, stalled stage, two missed check-backs.
+    row = _row(procurement_stage="unordered_po", vendor_lead_time_days=5,
+               shopify_expected_date="2026-09-05", flag="no_eta",
+               days_in_stage=40, po_created_date="2026-07-11")
+    ack = {"checkback_date": "2026-08-01", "escalation_level": 2, "work_status": "parked",
+           "pinned_stage": "unordered_po", "reason_code": "other"}
+    got = sla.build_escalations([row], {"1": ack}, TODAY)["orders"][0]
+    assert got["escalation_level"] == 2, got["escalation_level"]
+    # 2 (comfortable) + 3 bumps = 5, capped below the broken-promise band either way.
+    assert got["priority_score"] == 5, (got["priority_score"], got["priority_reasons"])
+    assert got["priority_band"] == "high", got["priority_band"]
+    assert len(got["priority_reasons"]) == 4, got["priority_reasons"]
+
+    # Even from the top of band B the ceiling holds.
+    hot = _row(procurement_stage="unordered_po", vendor_lead_time_days=5,
+               shopify_expected_date="2026-08-25", flag="no_eta",
+               days_in_stage=40, po_created_date="2026-07-11")
+    assert sla.build_escalations([hot], {}, TODAY)["orders"][0]["priority_score"] == 6
+    print("test_priority_bumps_never_manufacture_a_broken_promise OK")
+
+
+def test_placed_orders_are_scored_against_the_vendor_date_not_a_counterfactual():
+    """An unquoted PO is judged late against the vendor's own date, never against
+    `could_have_landed`. Measured live, the counterfactual put 200 of 373 orders on the same
+    score -- it is anchored months back, so every placed order blows it by construction."""
+    def got(**kw):
+        row = _row(procurement_stage="ordered", ordered_date="2026-08-01",
+                   could_have_landed="2026-06-01", vendor_lead_time_days=5, **kw)
+        return sla.build_escalations([row], {}, TODAY)["orders"][0]
+
+    overdue = got(expected_date="2026-08-14")          # customer could have had it 08-15
+    assert overdue["scoring_window_source"] == "po_eta", overdue["scoring_window_source"]
+    assert overdue["window_slack_days"] == -5, overdue["window_slack_days"]
+    assert overdue["priority_score"] == 6, overdue["priority_score"]
+
+    imminent = got(expected_date="2026-08-20")
+    assert imminent["window_slack_days"] == 1 and imminent["priority_score"] == 5, imminent
+
+    healthy = got(expected_date="2026-09-10")
+    assert healthy["window_slack_days"] == 22, healthy["window_slack_days"]
+    assert healthy["priority_score"] == 2, (healthy["priority_score"], healthy["priority_reasons"])
+    print("test_placed_orders_are_scored_against_the_vendor_date_not_a_counterfactual OK")
+
+
+def test_priority_flags_a_po_that_already_lands_late():
+    # The PO is placed and looks healthy, but its own ETA lands after the quoted date.
+    row = _row(procurement_stage="ordered", ordered_date="2026-08-10",
+               expected_date="2026-09-04", shopify_expected_date="2026-09-01",
+               vendor_lead_time_days=5)
+    got = sla.build_escalations([row], {}, TODAY)["orders"][0]
+    assert got["window_slack_days"] == -4, got["window_slack_days"]
+    assert got["priority_score"] == 6, (got["priority_score"], got["priority_reasons"])
+
+    # A completed PO that never carried this line is a backorder nobody was told about: the
+    # slack arithmetic alone reads it as comfortable, the bump is what rescues it.
+    blind = _row(procurement_stage="ordered", ordered_date="2026-08-10",
+                 expected_date="2026-08-25", shopify_expected_date="2026-09-30",
+                 receiving_state="po_complete_so_unreceived", vendor_lead_time_days=5)
+    got = sla.build_escalations([blind], {}, TODAY)["orders"][0]
+    assert got["priority_score"] == 3, (got["priority_score"], got["priority_reasons"])
+    assert any("backordered" in r for r in got["priority_reasons"]), got["priority_reasons"]
+    print("test_priority_flags_a_po_that_already_lands_late OK")
+
+
+def test_priority_band_c_is_closeout_age():
+    def score(**kw):
+        row = _row(procurement_stage="received", so_received=True, **kw)
+        return sla.build_escalations([row], {}, TODAY)["orders"][0]["priority_score"]
+
+    # Fully closed out: nothing left to do.
+    assert score(so_received_date="2026-08-19", contacted=True, completed=True) == 1
+    # Landed yesterday, nobody called yet -- real work, but not urgent.
+    assert score(so_received_date="2026-08-19", contacted=False) == 2
+    assert score(so_received_date="2026-08-10", contacted=False) == 3    # 10 days uncalled
+    assert score(so_received_date="2026-07-15", contacted=False) == 4    # 36 days uncalled
+    # A received order can never reach the broken-promise band, however old.
+    assert score(so_received_date="2026-01-01", contacted=False,
+                 shopify_expected_date="2026-02-01") == 4
+    print("test_priority_band_c_is_closeout_age OK")
+
+
+def test_priority_is_intrinsic_not_damped_by_parking():
+    # Parking records that a human knows about a problem. It does not make the problem smaller,
+    # and a score that sank on a button click would hide the worst rows from the sort built to
+    # find them.
+    row = _row(shopify_expected_date="2026-08-11", vendor_lead_time_days=5)
+    ack = {"checkback_date": "2026-09-01", "work_status": "parked", "reason_code": "vendor_backorder",
+           "pinned_stage": "open_pool", "pinned_promise": "2026-08-11", "pinned_po_eta": None}
+    got = sla.build_escalations([row], {"1": ack}, TODAY)["orders"][0]
+    assert got["ack_active"] is True, got["ack_active"]
+    assert got["actionable"] is False, got["actionable"]
+    assert got["priority_score"] == 9, got["priority_score"]
+    print("test_priority_is_intrinsic_not_damped_by_parking OK")
+
+
 if __name__ == "__main__":
     test_promise_precedence_and_lead_time_source()
     test_backward_schedule_arithmetic()
@@ -237,4 +426,14 @@ if __name__ == "__main__":
     test_operational_work_states_and_closeout_are_separate_from_delivery_sla()
     test_service_promise_clears_promise_needed_queue()
     test_live_window_zero_and_none_return_historical_rows()
+    test_open_clock_takes_the_earlier_shopify_date()
+    test_open_clock_never_moves_the_sla_clock()
+    test_earliest_ready_covers_every_basis()
+    test_priority_band_a_scales_with_lateness()
+    test_priority_band_b_ramps_on_window_slack()
+    test_priority_bumps_never_manufacture_a_broken_promise()
+    test_placed_orders_are_scored_against_the_vendor_date_not_a_counterfactual()
+    test_priority_flags_a_po_that_already_lands_late()
+    test_priority_band_c_is_closeout_age()
+    test_priority_is_intrinsic_not_damped_by_parking()
     print("\nAll SLA severity/ack unit tests passed.")

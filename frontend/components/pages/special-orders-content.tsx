@@ -43,6 +43,13 @@ import { SoLegend, type SoLegendCounts } from '@/components/dashboard/so-legend'
 import { SoScoreboard } from '@/components/dashboard/so-scoreboard'
 import { SpecialOrdersGrid } from '@/components/dashboard/special-orders-grid'
 import {
+  DWELL_BANDS,
+  dwellBand,
+  emptyDwellCounts,
+  stageDwellDays,
+  type DwellCounts,
+} from '@/lib/special-order-triage'
+import {
   AlertTriangle,
   BarChart3,
   FileClock,
@@ -301,6 +308,12 @@ function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
     procurement_stage_index: -1,
     source: 'shopify',
     days_in_stage: days,
+    // A Shopify-only row IS the Shopify order, so the open clock and the order date are the same
+    // thing and there is no intake lag to report.
+    demand_started_date: order.created_at?.slice(0, 10) ?? null,
+    demand_started_source: 'shopify_order',
+    days_open: days,
+    intake_lag_days: null,
     po_created_date: null,
     po_received_date: null,
     po_ref_num: null,
@@ -326,10 +339,22 @@ function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
     receiving_buffer_days: 0,
     order_by_date: null,
     slack_days: null,
+    // Nothing can be scheduled until a Lightspeed special order exists, so there is no landing
+    // date to quote and no window to score against.
+    earliest_ready_date: null,
+    earliest_ready_basis: 'lead_time_default',
+    scoring_window_date: order.shopify_expected_date,
+    scoring_window_source: order.shopify_expected_date ? 'customer_promise' : null,
+    window_slack_days: null,
     stage_sla_days: null,
     days_over_stage_sla: null,
     missing_promise: !order.shopify_expected_date,
     promise_owner: order.shopify_expected_date ? null : 'cs',
+    // Raising the Lightspeed special order is real work, but an order that arrived this morning
+    // is rarely the most serious thing on the board. Backend rows get a computed score.
+    priority_score: 3,
+    priority_band: 'medium',
+    priority_reasons: ['No Lightspeed special order raised yet'],
     ack: null,
     ack_active: false,
     work_status: null,
@@ -355,6 +380,7 @@ function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
     shopify_order_name: order.order_name,
     shopify_order_url: order.shopify_order_url,
     shopify_expected_date: order.shopify_expected_date,
+    shopify_order_created_at: order.created_at,
     shopify_fulfillment_status: order.fulfillment_status,
     shopify_financial_status: order.financial_status,
     shopify_candidates: [],
@@ -629,38 +655,39 @@ function SpecialOrdersContentInner() {
     () => showsClearedWork ? filteredPopulation : filteredPopulation.filter(activeView.pred),
     [activeView, filteredPopulation, showsClearedWork],
   )
-  const viewCounts = useMemo(() => {
-    const counts: Record<ViewKey, number> = {
-      action: 0,
-      needs_ordering: 0,
-      in_transit: 0,
-      ready_to_close: 0,
-      data_issues: 0,
-      all: 0,
+  // Every counter the page renders, in ONE pass.
+  //
+  // These used to be three `useMemo`s running twelve separate `.filter()` sweeps over the same
+  // array (five pipeline predicates, six queue predicates, one legend fold). Adding the per-stage
+  // dwell split would have made it thirty-two. The predicates stay the source of truth — they are
+  // called inside the loop rather than reimplemented — so the strip got richer while the page got
+  // cheaper.
+  const counts = useMemo(() => {
+    const views: Record<ViewKey, number> = {
+      action: 0, needs_ordering: 0, in_transit: 0, ready_to_close: 0, data_issues: 0, all: 0,
     }
-    VIEWS.forEach((item) => {
-      counts[item.key] = showsClearedWork
-        ? filteredPopulation.length
-        : filteredPopulation.filter(item.pred).length
-    })
-    return counts
-  }, [filteredPopulation, showsClearedWork])
-  const pipelineCounts = useMemo(() => {
-    const counts: Record<TriageStage, number> = {
-      shopify: 0,
-      open_pool: 0,
-      unordered_po: 0,
-      ordered: 0,
-      received: 0,
+    const pipeline: Record<TriageStage, number> = {
+      shopify: 0, open_pool: 0, unordered_po: 0, ordered: 0, received: 0,
     }
-    PIPELINE.forEach((stage) => { counts[stage.key] = filteredPopulation.filter(stage.pred).length })
-    return counts
-  }, [filteredPopulation])
-  const legendCounts = useMemo<SoLegendCounts>(() => {
+    const dwell: Record<TriageStage, DwellCounts> = {
+      shopify: emptyDwellCounts(), open_pool: emptyDwellCounts(), unordered_po: emptyDwellCounts(),
+      ordered: emptyDwellCounts(), received: emptyDwellCounts(),
+    }
     const stages: NonNullable<SoLegendCounts['stages']> = {}
     const sources: NonNullable<SoLegendCounts['sources']> = {}
     const severities: NonNullable<SoLegendCounts['severities']> = {}
+
     filteredPopulation.forEach((order) => {
+      for (const item of VIEWS) {
+        // Started/done rows have already left every active queue, so the predicates would filter
+        // them all back out. When one of those statuses is what you asked for, it wins.
+        if (showsClearedWork || item.pred(order)) views[item.key] += 1
+      }
+      for (const stage of PIPELINE) {
+        if (!stage.pred(order)) continue
+        pipeline[stage.key] += 1
+        dwell[stage.key][dwellBand(stageDwellDays(order))] += 1
+      }
       if (order.kind === 'shopify') {
         stages.shopify = (stages.shopify ?? 0) + 1
       } else {
@@ -669,8 +696,10 @@ function SpecialOrdersContentInner() {
       sources[order.source] = (sources[order.source] ?? 0) + 1
       severities[order.sla_severity] = (severities[order.sla_severity] ?? 0) + 1
     })
-    return { stages, sources, severities }
-  }, [filteredPopulation])
+    return { views, pipeline, dwell, legend: { stages, sources, severities } as SoLegendCounts }
+  }, [filteredPopulation, showsClearedWork])
+  const { views: viewCounts, pipeline: pipelineCounts, dwell: dwellCounts } = counts
+  const legendCounts = counts.legend
 
   const filtersActive = search !== '' || storeFilter !== 'all' || sourceFilter !== 'all' ||
     orderTypeFilter !== 'all' || actionFilter !== 'all' || !liveOnly
@@ -730,7 +759,7 @@ function SpecialOrdersContentInner() {
       )}
 
       {isLoading ? (
-        <Skeleton className="h-[140px] w-full rounded-lg" />
+        <Skeleton className="h-[220px] w-full rounded-lg" />
       ) : (
         <section className="rounded-lg border bg-card px-4 py-3" aria-labelledby="pipeline-heading">
           <div className="mb-2 flex items-center justify-between">
@@ -742,15 +771,45 @@ function SpecialOrdersContentInner() {
           <ol className="grid grid-cols-5 divide-x" aria-label="Special order pipeline">
             {PIPELINE.map((stage) => {
               const Icon = stage.icon
+              const bands = dwellCounts[stage.key]
               return (
-                <li key={stage.key} className="flex items-center gap-3 px-4 first:pl-0 last:pr-0">
-                  <span className={cn('rounded-md border p-2', stage.tone)} aria-hidden="true">
-                    <Icon className="h-4 w-4" />
-                  </span>
-                  <span>
-                    <span className="block text-xl font-semibold tabular-nums">{pipelineCounts[stage.key]}</span>
-                    <span className="block text-xs text-muted-foreground">{stage.label}</span>
-                  </span>
+                <li key={stage.key} className="px-4 first:pl-0 last:pr-0">
+                  <div className="flex items-center gap-3">
+                    <span className={cn('rounded-md border p-2', stage.tone)} aria-hidden="true">
+                      <Icon className="h-4 w-4" />
+                    </span>
+                    <span>
+                      <span className="block text-xl font-semibold tabular-nums">{pipelineCounts[stage.key]}</span>
+                      <span className="block text-xs text-muted-foreground">{stage.label}</span>
+                    </span>
+                  </div>
+                  {/* How long these have been in THIS step. Not <li> elements on purpose — the
+                      pipeline list is five items and the e2e assertion depends on that. */}
+                  <dl
+                    className="mt-2 space-y-0.5 text-[11px]"
+                    aria-label={`${stage.label} by time in stage`}
+                  >
+                    {DWELL_BANDS.map((band) => {
+                      const count = bands[band.key]
+                      return (
+                        <div key={band.key} className="flex items-baseline justify-between gap-2">
+                          <dt className={cn(
+                            'text-muted-foreground',
+                            count === 0 && 'text-muted-foreground/50',
+                          )}>
+                            {band.label}
+                          </dt>
+                          <dd className={cn(
+                            'font-medium tabular-nums',
+                            count === 0 && 'text-muted-foreground/50',
+                            count > 0 && band.key === 'stalled' && 'text-red-600',
+                          )}>
+                            {count}
+                          </dd>
+                        </div>
+                      )
+                    })}
+                  </dl>
                 </li>
               )
             })}

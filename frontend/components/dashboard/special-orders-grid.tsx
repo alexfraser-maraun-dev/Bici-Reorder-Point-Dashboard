@@ -29,6 +29,7 @@ export type { MatchActions }
 const PAGE_SIZE = 25
 
 type SortKey =
+  | 'priority_score'
   | 'days_lost'
   | 'fastest_landing_date'
   | 'sla_severity_rank'
@@ -43,6 +44,7 @@ type SortKey =
 type SortDir = 'asc' | 'desc'
 
 const SORT_OPTIONS: { key: SortKey; label: string }[] = [
+  { key: 'priority_score', label: 'Seriousness' },
   { key: 'days_lost', label: 'Days lost' },
   { key: 'sla_severity_rank', label: 'SLA severity' },
   { key: 'fastest_landing_date', label: 'Soonest landing' },
@@ -56,6 +58,7 @@ const SORT_OPTIONS: { key: SortKey; label: string }[] = [
 ]
 
 const DEFAULT_DIR: Partial<Record<SortKey, SortDir>> = {
+  priority_score: 'desc',
   days_lost: 'desc',
   sla_severity_rank: 'asc',
   fastest_landing_date: 'asc',

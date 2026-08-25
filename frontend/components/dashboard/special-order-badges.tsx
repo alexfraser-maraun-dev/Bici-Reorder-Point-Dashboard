@@ -2,7 +2,14 @@
 
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
-import type { ShopifyMatch, ShopifyMatchBasis, SpecialOrderSource, SlaSeverity, TriageStage } from '@/lib/types'
+import type {
+  ShopifyMatch,
+  ShopifyMatchBasis,
+  SpecialOrder,
+  SpecialOrderSource,
+  SlaSeverity,
+  TriageStage,
+} from '@/lib/types'
 import {
   AlertTriangle,
   CircleHelp,
@@ -114,6 +121,45 @@ export function SeverityBadge({ severity, muted }: { severity: SlaSeverity; mute
       <Icon className="h-3 w-3" />
       {config.label}
     </Badge>
+  )
+}
+
+// Seriousness, 1-10. The colour ramp is deliberately coarse -- the number carries the precision,
+// the colour only has to say "look here first". Bands mirror priority_band in so_sla_service.py.
+const PRIORITY_STYLE: Record<SpecialOrder['priority_band'], string> = {
+  low: 'border-slate-200 bg-slate-100 text-slate-600',
+  medium: 'border-amber-200 bg-amber-100 text-amber-800',
+  high: 'border-orange-200 bg-orange-100 text-orange-700',
+  critical: 'border-red-700 bg-red-600 text-white',
+}
+
+export function SeriousnessBadge({
+  score,
+  band,
+  reasons,
+  muted,
+}: {
+  score: number | null | undefined
+  band: SpecialOrder['priority_band'] | null | undefined
+  reasons?: string[]
+  /** Parked/started rows render dimmed. The SCORE never changes — a known problem is still the
+   *  same size — but a row someone is already handling should not shout as loudly. */
+  muted?: boolean
+}) {
+  if (score == null) return null
+  const explanation = reasons?.length ? reasons.join(' · ') : undefined
+  return (
+    <span
+      title={explanation ? `Seriousness ${score}/10 — ${explanation}` : `Seriousness ${score}/10`}
+      aria-label={`Seriousness ${score} out of 10${explanation ? `: ${explanation}` : ''}`}
+      className={cn(
+        'inline-flex h-5 min-w-5 items-center justify-center rounded border px-1 text-xs font-semibold tabular-nums',
+        PRIORITY_STYLE[band ?? 'low'],
+        muted && 'opacity-50',
+      )}
+    >
+      {score}
+    </span>
   )
 }
 

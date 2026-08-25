@@ -731,6 +731,16 @@ export interface SpecialOrder {
   // step stalling?"). An SO can be 92 days old on a PO drafted 2 days ago, or 3 days old on a
   // 48-day-old draft — neither number alone catches both.
   days_in_stage: number | null
+  // A THIRD clock, for display and prioritisation only. `days_open` runs from the earlier of the
+  // Shopify order date and the Lightspeed SO date, because a customer's wait starts when they
+  // ordered, not when we noticed. `days_since_creation` deliberately keeps driving SLA severity,
+  // dwell stats, the archive window and `days_lost` so nothing measured against history moves.
+  demand_started_date: string | null
+  demand_started_source: 'shopify_order' | 'ls_so' | null
+  days_open: number | null
+  // Days the Shopify order pre-dates the Lightspeed SO — the late-tagging discrepancy. Null when
+  // there is no gap or no Shopify order.
+  intake_lag_days: number | null
   po_created_date: string | null
   po_received_date: string | null
   po_ref_num: string | null
@@ -759,6 +769,16 @@ export interface SpecialOrder {
   // last date it could have been ordered has passed.
   order_by_date: string | null
   slack_days: number | null
+  // Soonest the CUSTOMER could collect: lead time (or the PO's own ETA) plus the receiving
+  // buffer. Distinct from `expected_date`, which is when the box lands at the store.
+  earliest_ready_date: string | null
+  earliest_ready_basis: 'received' | 'po_eta_plus_buffer' | 'fastest_route' | 'lead_time_default'
+  // The date this order must land by, quoted or inferred, and the headroom left against it.
+  // Scoring inputs — see `priority_score`. Inferred when nobody ever quoted the customer, which
+  // is roughly a third of the board.
+  scoring_window_date: string | null
+  scoring_window_source: 'customer_promise' | 'po_eta' | 'inferred' | null
+  window_slack_days: number | null
   stage_sla_days: number | null
   days_over_stage_sla: number | null
   missing_promise: boolean
@@ -770,6 +790,14 @@ export interface SpecialOrder {
   fastest_path_tier: 'in_stock' | 'transfer' | 'inbound_po' | 'new_po' | 'received' | null
   could_have_landed: string | null
   days_lost: number | null
+  // Seriousness, 1-10. NOT a restatement of `sla_severity` — that enum is a label with no
+  // resolution (`promise_missed` covers a one-day slip and a forty-day one). 7-10 means a real
+  // customer promise is already broken, scaled by how late; 1-6 is how much room is left before
+  // it lands late; received orders run 1-4 on close-out age. Intrinsic: parking an order mutes
+  // the badge but never lowers the number.
+  priority_score: number
+  priority_band: 'low' | 'medium' | 'high' | 'critical'
+  priority_reasons: string[]
   ack: SoAck | null
   ack_active: boolean
   /** The active status, or null when nothing is currently silencing this row. Distinct from
@@ -799,6 +827,9 @@ export interface SpecialOrder {
   shopify_order_name: string | null
   shopify_order_url: string | null
   shopify_expected_date: string | null   // the customer-promised ETA from Shopify
+  // When the customer actually placed the Shopify order. Often earlier than `created_date`: the
+  // `SO` tag gets added late and the Lightspeed special order is only raised then.
+  shopify_order_created_at: string | null
   shopify_fulfillment_status: string | null
   shopify_financial_status: string | null
   shopify_candidates: ShopifyCandidate[] // ambiguous only: the orders it could be

@@ -109,7 +109,11 @@ class SpecialOrderReceivingContractTest(unittest.TestCase):
             self.assertTrue(result["actionable"])
             self.assertEqual(result["action_owner"], "procurement")
             self.assertEqual(result["action_due_date"], TODAY.isoformat())
-            self.assertIn("backorder or split shipment", result["next_action"])
+            # Wording is state-specific now: a complete PO missing this line reads as a
+            # backorder, a part-received one as a split shipment. Both must name the ETA update.
+            expected = "backordered" if state == "po_complete_so_unreceived" else "this shipment"
+            self.assertIn(expected, result["next_action"])
+            self.assertIn("procurement ETA update", result["next_action"])
 
     def test_live_on_time_score_uses_individual_receipt_not_po_header_date(self):
         promise = [{

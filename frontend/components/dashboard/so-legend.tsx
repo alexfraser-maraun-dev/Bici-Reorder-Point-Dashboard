@@ -161,10 +161,33 @@ export function SoLegend({ counts }: { counts?: SoLegendCounts }) {
               The last date the item can be ordered and still meet a quoted date. Only shown when
               a customer date exists.
             </Row>
+            <Row visual={<span className="text-xs font-medium">PO expected</span>}>
+              When the vendor says the <em>box</em> lands at the store — the purchase order&rsquo;s
+              own arrival date, straight from Lightspeed.
+            </Row>
+            <Row visual={<span className="text-xs font-medium">Fastest possible</span>}>
+              When the <em>customer</em> could actually collect it: the arrival date plus a{' '}
+              receiving buffer. Before a PO exists it is the soonest across every route — in stock,
+              transferable, already inbound, or ordered now at lead time + buffer.
+            </Row>
             <Row visual={<span className="text-xs font-medium">Days open</span>}>
-              Raw age since the special order was created. Useful context, but not a priority
-              signal on its own — a 40-day-old order for a 2-day-lead-time part and one for a
-              20-day part are not the same problem. Prefer <em>Days lost</em>.
+              How long the customer has been waiting, counted from the earlier of the Shopify order
+              date and the Lightspeed special order date. Those differ when an order is{' '}
+              <code className="text-[11px]">SO</code>-tagged days after it went live; the tile says
+              so when the gap is real. Service orders count from the Lightspeed special order —
+              a bike can sit on the rack for a week before anyone finds it needs a part.
+            </Row>
+            <Row visual={<span className="text-xs font-medium">Seriousness</span>}>
+              One 1–10 number to sort the whole board on, driven by the clocks rather than by the
+              severity label — <em>Promise missed</em> covers a one-day slip and a forty-day one.{' '}
+              <span className="font-medium">7–10</span> means a real customer promise is already
+              broken, scaled by how late.{' '}
+              <span className="font-medium">1–6</span> is how much room is left before it lands
+              late, measured against the quoted date or, where nobody quoted one, the date it would
+              have landed had it been ordered when it appeared. Received orders run{' '}
+              <span className="font-medium">1–4</span> on close-out age. No amount of missing ETAs
+              or missed check-backs can push a row into the 7–10 band — only a broken promise does.
+              The score is intrinsic: parking an order dims the badge but never lowers the number.
             </Row>
           </Section>
 

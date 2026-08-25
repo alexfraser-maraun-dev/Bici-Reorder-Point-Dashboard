@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { matchesActionFilter, validActionFilter } from './special-orders-content'
+import { dwellBand, stageDwellDays } from '@/lib/special-order-triage'
+import type { SpecialOrder } from '@/lib/types'
 
 describe('Special Orders action filter', () => {
   it('falls back to all actions for missing or unknown URL values', () => {
@@ -62,4 +64,53 @@ describe('Special Orders action filter', () => {
       expect(matchesActionFilter(order, 'on_track')).toBe(false)
     },
   )
+})
+
+describe('Stage dwell banding', () => {
+  const NOW = new Date('2026-08-20T12:00:00Z')
+
+  afterEach(() => { vi.useRealTimers() })
+
+  function so(overrides: Partial<SpecialOrder>): SpecialOrder {
+    return {
+      kind: 'ls',
+      procurement_stage: 'open_pool',
+      created_date: '2026-08-01',
+      po_created_date: null,
+      ordered_date: null,
+      so_received_date: null,
+      po_received_date: null,
+      ...overrides,
+    } as SpecialOrder
+  }
+
+  it('measures each stage from its own entry date, not total order age', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+
+    // The same 19-day-old special order reads completely differently per stage — which is the
+    // point. `order.days_in_stage` collapses to total age for `ordered` and `received`, so an
+    // "In transit · 11d+" count built on it would mean "the customer asked 11 days ago".
+    expect(stageDwellDays(so({}))).toBe(19)
+    expect(stageDwellDays(so({ procurement_stage: 'unordered_po', po_created_date: '2026-08-16' }))).toBe(4)
+    expect(stageDwellDays(so({ procurement_stage: 'ordered', ordered_date: '2026-08-18' }))).toBe(2)
+    expect(stageDwellDays(so({ procurement_stage: 'received', so_received_date: '2026-08-19' }))).toBe(1)
+    // A Shopify-intake pseudo-row has no Lightspeed stage; it dwells from the order date.
+    expect(stageDwellDays(so({ kind: 'shopify', created_date: '2026-08-13' }))).toBe(7)
+    // Missing stage timestamp falls back to the creation date rather than dropping the row.
+    expect(stageDwellDays(so({ procurement_stage: 'ordered', ordered_date: null }))).toBe(19)
+  })
+
+  it('bands on inclusive upper bounds, and treats an undatable order as stalled', () => {
+    expect(dwellBand(0)).toBe('fresh')
+    expect(dwellBand(1)).toBe('fresh')
+    expect(dwellBand(2)).toBe('early')
+    expect(dwellBand(4)).toBe('early')
+    expect(dwellBand(5)).toBe('ageing')
+    expect(dwellBand(10)).toBe('ageing')
+    expect(dwellBand(11)).toBe('stalled')
+    // An order with no usable date is not a fresh one — defaulting it into `<1d` would quietly
+    // flatter the bucket it lands in.
+    expect(dwellBand(null)).toBe('stalled')
+  })
 })

@@ -10,7 +10,7 @@ import type {
   SpecialOrderWorkState,
   TriageStage,
 } from '@/lib/types'
-import { SeverityBadge, SourceBadge } from './special-order-badges'
+import { SeriousnessBadge, SeverityBadge, SourceBadge } from './special-order-badges'
 import { SoWorkActions } from './so-work-actions'
 import {
   AlertCircle,
@@ -22,8 +22,11 @@ import {
   Truck,
 } from 'lucide-react'
 
+// Measured against live content at 1440px, not guessed: the Status badges need 123px, the widest
+// date row 157px, and the Age cell exactly 105px. The slack that bought went to Next action, whose
+// whole job is now to be read at a glance rather than truncated into a tooltip.
 export const SPECIAL_ORDER_QUEUE_COLUMNS =
-  'grid-cols-[minmax(240px,1.8fr)_minmax(220px,1.55fr)_150px_190px_105px_auto]'
+  'grid-cols-[minmax(240px,1.62fr)_minmax(240px,2fr)_135px_168px_105px_auto]'
 
 export const STAGE_LABELS: Record<TriageStage, string> = {
   shopify: 'Shopify intake',
@@ -186,14 +189,35 @@ export function orderMilestones(order: SpecialOrder): OrderMilestone[] {
   ]
 }
 
-function primaryDate(order: SpecialOrder): { label: string; value: string | null } {
-  if (order.procurement_stage === 'ordered') {
-    return { label: 'Expected', value: order.expected_date ?? order.fastest_landing_date }
-  }
+const READY_BASIS_HINT: Record<SpecialOrder['earliest_ready_basis'], string> = {
+  received: 'Already received.',
+  po_eta_plus_buffer: "The purchase order's expected arrival plus the receiving buffer.",
+  fastest_route: 'Soonest by any route — stock, transfer, an inbound PO, or ordering now (lead time + receiving buffer).',
+  lead_time_default: 'Ordering now: vendor lead time + receiving buffer.',
+}
+
+/** The date rows, fixed rather than stage-dependent.
+ *
+ * These used to collapse to a single stage-chosen row above "Customer promise", which rendered
+ * the promise date twice on every order that had not been placed yet. Naming each date instead
+ * is what makes the difference between them legible: `PO expected` is when the BOX lands at the
+ * store, `Fastest possible` is the earliest the customer could actually collect it. */
+function dateRows(order: SpecialOrder): { label: string; value: string | null; hint?: string }[] {
   if (order.procurement_stage === 'received') {
-    return { label: 'Arrived', value: order.so_received_date ?? order.expected_date }
+    return [
+      { label: 'Arrived', value: order.so_received_date ?? order.expected_date },
+      { label: 'Customer promise', value: order.promise_date },
+    ]
   }
-  return { label: 'Promise', value: order.promise_date }
+  return [
+    { label: 'PO expected', value: order.expected_date },
+    {
+      label: 'Fastest possible',
+      value: order.earliest_ready_date,
+      hint: READY_BASIS_HINT[order.earliest_ready_basis] ?? undefined,
+    },
+    { label: 'Customer promise', value: order.promise_date },
+  ]
 }
 
 function WorkIcon({ state }: { state: SpecialOrderWorkState }) {
@@ -334,7 +358,9 @@ export function SpecialOrderRow({
   /** Refresh the worklist after Start/Done. Omit to render the row read-only. */
   onWorkStateChanged?: () => void | Promise<void>
 }) {
-  const date = primaryDate(order)
+  const dates = dateRows(order)
+  // Cached responses written before the open clock existed carry no `days_open`.
+  const daysOpen = order.days_open ?? order.days_since_creation
   const identity = order.kind === 'shopify'
     ? order.shopify_order_name ?? order.special_order_id
     : `SO #${order.special_order_id}`
@@ -359,7 +385,10 @@ export function SpecialOrderRow({
         <div className="min-w-0 flex-1">
           <div className={cn('grid min-w-0 items-center gap-4 px-4 py-3', SPECIAL_ORDER_QUEUE_COLUMNS)}>
             <div className="min-w-0">
-              <div className="flex min-w-0 items-center gap-2">
+              {/* Wraps because a workorder-origin SO that also has a Shopify order carries four
+                  chips (id, Workorder, Shopify, store), which overflows the column by ~27px and
+                  silently clips the store — the one thing this row was rearranged to surface. */}
+              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
                 <span className="shrink-0 font-mono text-sm font-semibold">{identity}</span>
                 <SourceBadge source={order.source} href={sourceHref} linkLabel={sourceLinkLabel} />
                 {order.shopify_order_url && order.source !== 'shopify' && (
@@ -368,6 +397,15 @@ export function SpecialOrderRow({
                     href={order.shopify_order_url}
                     linkLabel={`Open Shopify order ${order.shopify_order_name ?? identity} in a new tab`}
                   />
+                )}
+                {order.store && (
+                  <Badge
+                    variant="outline"
+                    className="gap-1 border-border bg-secondary text-xs font-medium text-muted-foreground"
+                  >
+                    <Store className="h-3 w-3" aria-hidden="true" />
+                    {order.store}
+                  </Badge>
                 )}
               </div>
               <p className="mt-1 truncate text-sm font-medium" title={order.description ?? 'Special order'}>
@@ -404,13 +442,7 @@ export function SpecialOrderRow({
                     />
                   </>
                 )}
-                {order.store && (
-                  <>
-                    {(hasCustomer || hasSystemId || hasPo) && <span aria-hidden="true">·</span>}
-                    <span>{order.store}</span>
-                  </>
-                )}
-                {!hasCustomer && !hasSystemId && !hasPo && !order.store && (
+                {!hasCustomer && !hasSystemId && !hasPo && (
                   <span>No customer or item details</span>
                 )}
               </div>
@@ -425,7 +457,6 @@ export function SpecialOrderRow({
               </div>
               <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
                 <span>{ownerLabel(order.action_owner)}</span>
-                {order.action_due_date && <span>· due {formatDate(order.action_due_date)}</span>}
                 {order.work_status === 'in_progress' && (
                   <span className="font-medium text-blue-700">· in progress</span>
                 )}
@@ -441,22 +472,33 @@ export function SpecialOrderRow({
               <div><SeverityBadge severity={order.sla_severity} muted={order.ack_active} /></div>
             </div>
 
-            <div className="min-w-0 text-xs">
-              <div className="flex justify-between gap-3">
-                <span className="text-muted-foreground">{date.label}</span>
-                <span className="font-medium tabular-nums">{formatDate(date.value)}</span>
-              </div>
-              <div className="mt-1 flex justify-between gap-3">
-                <span className="text-muted-foreground">Customer promise</span>
-                <span className="font-medium tabular-nums">{formatDate(order.promise_date)}</span>
-              </div>
+            <div className="min-w-0 space-y-1 text-xs">
+              {dates.map((row) => (
+                <div key={row.label} className="flex justify-between gap-3" title={row.hint}>
+                  <span className="text-muted-foreground">{row.label}</span>
+                  <span className="font-medium tabular-nums">{formatDate(row.value)}</span>
+                </div>
+              ))}
             </div>
 
             <div className="text-right">
-              <p className="text-lg font-semibold tabular-nums">{order.days_since_creation ?? '—'}</p>
+              <div className="flex items-center justify-end gap-1.5">
+                <p className="text-lg font-semibold tabular-nums">{daysOpen ?? '—'}</p>
+                <SeriousnessBadge
+                  score={order.priority_score}
+                  band={order.priority_band}
+                  reasons={order.priority_reasons}
+                  muted={order.ack_active}
+                />
+              </div>
               <p className="text-xs text-muted-foreground">days open</p>
-              {order.days_lost != null && order.days_lost > 0 && (
-                <p className="mt-1 text-xs font-medium text-red-600">{order.days_lost}d lost</p>
+              {order.intake_lag_days != null && order.intake_lag_days >= 2 && (
+                <p
+                  className="mt-1 text-[10px] font-medium text-amber-700"
+                  title="The Shopify order was placed before the Lightspeed special order was raised — the customer had already been waiting."
+                >
+                  Shopify order {order.intake_lag_days}d earlier
+                </p>
               )}
             </div>
 
