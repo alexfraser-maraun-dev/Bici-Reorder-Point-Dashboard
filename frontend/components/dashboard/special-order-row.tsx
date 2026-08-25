@@ -335,14 +335,21 @@ function MilestoneRail({
             )
           })}
         </ol>
-        {onWorkStateChanged && (
-          <SoWorkActions
-            order={order}
-            size="compact"
-            className="shrink-0 border-l pl-4"
-            onDone={onWorkStateChanged}
+        {/* The score lives beside the actions, not beside "days open": stacked directly above
+            that label it read as a qualifier on the age rather than a rating of its own. Here it
+            sits where the decision is made. Rendered even without actions so a read-only row
+            still carries its priority. */}
+        <div className="flex shrink-0 items-center gap-3 border-l pl-4">
+          <SeriousnessBadge
+            score={order.priority_score}
+            band={order.priority_band}
+            reasons={order.priority_reasons}
+            muted={order.ack_active}
           />
-        )}
+          {onWorkStateChanged && (
+            <SoWorkActions order={order} size="compact" onDone={onWorkStateChanged} />
+          )}
+        </div>
       </div>
     </div>
   )
@@ -482,15 +489,7 @@ export function SpecialOrderRow({
             </div>
 
             <div className="text-right">
-              <div className="flex items-center justify-end gap-1.5">
-                <p className="text-lg font-semibold tabular-nums">{daysOpen ?? '—'}</p>
-                <SeriousnessBadge
-                  score={order.priority_score}
-                  band={order.priority_band}
-                  reasons={order.priority_reasons}
-                  muted={order.ack_active}
-                />
-              </div>
+              <p className="text-lg font-semibold tabular-nums">{daysOpen ?? '—'}</p>
               <p className="text-xs text-muted-foreground">days open</p>
               {order.intake_lag_days != null && order.intake_lag_days >= 2 && (
                 <p

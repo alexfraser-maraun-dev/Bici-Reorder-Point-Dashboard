@@ -148,12 +148,14 @@ export function SeriousnessBadge({
 }) {
   if (score == null) return null
   const explanation = reasons?.length ? reasons.join(' · ') : undefined
+  // A circle, not a rectangle: it has to read as a rating rather than as a second date or count.
+  // It sat beside "days open" at first and was routinely misread as qualifying that number.
   return (
     <span
       title={explanation ? `Seriousness ${score}/10 — ${explanation}` : `Seriousness ${score}/10`}
       aria-label={`Seriousness ${score} out of 10${explanation ? `: ${explanation}` : ''}`}
       className={cn(
-        'inline-flex h-5 min-w-5 items-center justify-center rounded border px-1 text-xs font-semibold tabular-nums',
+        'inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-xs font-semibold tabular-nums',
         PRIORITY_STYLE[band ?? 'low'],
         muted && 'opacity-50',
       )}

@@ -772,6 +772,7 @@ function SpecialOrdersContentInner() {
             {PIPELINE.map((stage) => {
               const Icon = stage.icon
               const bands = dwellCounts[stage.key]
+              const total = pipelineCounts[stage.key]
               return (
                 <li key={stage.key} className="px-4 first:pl-0 last:pr-0">
                   <div className="flex items-center gap-3">
@@ -783,26 +784,41 @@ function SpecialOrdersContentInner() {
                       <span className="block text-xs text-muted-foreground">{stage.label}</span>
                     </span>
                   </div>
-                  {/* How long these have been in THIS step. Not <li> elements on purpose — the
-                      pipeline list is five items and the e2e assertion depends on that. */}
+                  {/* How long these have been in THIS step. The bar carries the shape at a
+                      glance — a bucket going red is legible before you read a single number —
+                      and the grid keeps the four figures aligned across all five stages.
+                      Not <li> elements on purpose: the pipeline list is five items and the
+                      e2e assertion depends on that. */}
+                  <div
+                    className="mt-3 flex h-1.5 gap-px overflow-hidden rounded-full bg-muted"
+                    aria-hidden="true"
+                  >
+                    {total > 0 && DWELL_BANDS.map((band) => (
+                      bands[band.key] > 0 && (
+                        <span
+                          key={band.key}
+                          className={band.bar}
+                          style={{ width: `${(bands[band.key] / total) * 100}%` }}
+                        />
+                      )
+                    ))}
+                  </div>
                   <dl
-                    className="mt-2 space-y-0.5 text-[11px]"
+                    className="mt-2 grid grid-cols-4 gap-1 text-center"
                     aria-label={`${stage.label} by time in stage`}
                   >
                     {DWELL_BANDS.map((band) => {
                       const count = bands[band.key]
                       return (
-                        <div key={band.key} className="flex items-baseline justify-between gap-2">
-                          <dt className={cn(
-                            'text-muted-foreground',
-                            count === 0 && 'text-muted-foreground/50',
-                          )}>
+                        <div key={band.key} className="flex flex-col-reverse">
+                          <dt className="text-[10px] leading-tight text-muted-foreground">
                             {band.label}
                           </dt>
                           <dd className={cn(
-                            'font-medium tabular-nums',
-                            count === 0 && 'text-muted-foreground/50',
-                            count > 0 && band.key === 'stalled' && 'text-red-600',
+                            'text-sm font-semibold leading-snug tabular-nums',
+                            count === 0
+                              ? 'text-muted-foreground/40'
+                              : band.key === 'stalled' && 'text-red-600',
                           )}>
                             {count}
                           </dd>

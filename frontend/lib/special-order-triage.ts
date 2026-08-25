@@ -13,10 +13,10 @@ export type TriageTone = 'danger' | 'warn' | 'ok'
  * The bands split each scorecard total so a bucket of 8 stops reading the same whether those 8
  * arrived this morning or have been stuck for a month. Upper bounds are inclusive. */
 export const DWELL_BANDS = [
-  { key: 'fresh', label: '<1d', max: 1 },
-  { key: 'early', label: '2–4d', max: 4 },
-  { key: 'ageing', label: '5–10d', max: 10 },
-  { key: 'stalled', label: '11d+', max: Number.POSITIVE_INFINITY },
+  { key: 'fresh', label: '<1d', max: 1, bar: 'bg-emerald-500' },
+  { key: 'early', label: '2–4d', max: 4, bar: 'bg-lime-400' },
+  { key: 'ageing', label: '5–10d', max: 10, bar: 'bg-amber-500' },
+  { key: 'stalled', label: '11d+', max: Number.POSITIVE_INFINITY, bar: 'bg-red-500' },
 ] as const
 
 export type DwellBandKey = (typeof DWELL_BANDS)[number]['key']
