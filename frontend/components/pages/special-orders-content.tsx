@@ -276,6 +276,10 @@ function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
   const days = order.created_at
     ? Math.floor((Date.now() - Date.parse(order.created_at)) / 86_400_000)
     : null
+  // A confirmed bike sale is not a parts special order, and telling someone to "create the
+  // Lightspeed special order" is the parts instruction. On a bike sale the customer has already
+  // confirmed and usually part-paid, and the special order is raised from the workorder.
+  const isBikeSale = order.population === 'bike_sale'
   return {
     special_order_id: order.order_name ?? order.order_id,
     status: 'Shopify',
@@ -333,7 +337,9 @@ function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
     sla_severity: 'no_promise',
     sla_severity_rank: 5,
     sla_owner: 'cs',
-    sla_reason: 'This Shopify order still needs a Lightspeed special order.',
+    sla_reason: isBikeSale
+      ? 'Confirmed bike sale with the bike not in the building; it still needs a Lightspeed special order.'
+      : 'This Shopify order still needs a Lightspeed special order.',
     promise_date: order.shopify_expected_date,
     promise_source: order.shopify_expected_date ? 'shopify_metafield' : null,
     lead_time_days: 0,
@@ -365,7 +371,9 @@ function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
     checkback_due: false,
     work_state: 'intake',
     queue_states: order.shopify_expected_date ? ['intake'] : ['intake', 'promise_needed'],
-    next_action: 'Create the Lightspeed special order',
+    next_action: isBikeSale
+      ? 'Confirmed bike sale — raise the Lightspeed special order'
+      : 'Create the Lightspeed special order',
     action_owner: 'retail',
     action_due_date: order.created_at?.slice(0, 10) ?? null,
     closeout_state: null,
@@ -384,6 +392,7 @@ function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
     shopify_order_url: order.shopify_order_url,
     shopify_expected_date: order.shopify_expected_date,
     shopify_order_created_at: order.created_at,
+    shopify_population: order.population,
     shopify_line_unfulfilled: null,
     shopify_fulfillment_status: order.fulfillment_status,
     shopify_financial_status: order.financial_status,

@@ -282,6 +282,37 @@ def test_override_fold():
     print("test_override_fold OK")
 
 
+def test_population_survives_index_match_and_intake():
+    """Provenance has to cross three layers, each of which rebuilds a fixed-key dict and silently
+    drops anything it does not name. Before this it was discarded the moment the query returned."""
+    rows = [
+        {"order_id": "BIKE", "order_name": "#253005", "email": "rider@x.test", "phone": None,
+         "customer_name": None, "eta": None, "created_at": "2026-08-22T00:00:00Z",
+         "fulfillment_status": "UNFULFILLED", "financial_status": "PARTIALLY_PAID",
+         "population": "bike_sale", "sku": "210000110432", "unfulfilled_quantity": 1},
+        {"order_id": "PARTS", "order_name": "#245382", "email": "other@x.test", "phone": None,
+         "customer_name": None, "eta": None, "created_at": "2026-07-17T00:00:00Z",
+         "fulfillment_status": "UNFULFILLED", "financial_status": "PAID",
+         "population": "so_tag", "sku": "210000113156", "unfulfilled_quantity": 2},
+    ]
+    index = shopify_match.build_shopify_index(rows)
+
+    m = shopify_match.match_special_order("rider@x.test", "210000110432", index)
+    assert m["shopify_match"] == "matched", m
+    assert m["shopify_population"] == "bike_sale", m["shopify_population"]
+
+    # An unmatched row must carry the key too, or callers reading it hit a KeyError-by-omission.
+    none = shopify_match.match_special_order("nobody@x.test", "999", index)
+    assert none["shopify_match"] == "none" and none["shopify_population"] is None
+
+    # The intake ("Unmatched") record drives the operator instruction, so it needs it most:
+    # "create the special order" is the parts wording and is wrong for a confirmed bike sale.
+    intake = {o["order_id"]: o for o in shopify_match.shopify_only_orders(index, {"PARTS"})}
+    assert set(intake) == {"BIKE"}, intake
+    assert intake["BIKE"]["population"] == "bike_sale", intake["BIKE"]
+    print("test_population_survives_index_match_and_intake OK")
+
+
 if __name__ == "__main__":
     test_tiers()
     test_enrich_ambiguity_surfacing_and_overrides()
@@ -289,4 +320,5 @@ if __name__ == "__main__":
     test_broken_manual_link_is_flagged_not_silently_dropped()
     test_late_match_fallback()
     test_override_fold()
+    test_population_survives_index_match_and_intake()
     print("\nAll shopify-match unit tests passed.")

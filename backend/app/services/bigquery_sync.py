@@ -315,24 +315,46 @@ def get_sku_overrides():
 
 def get_shopify_special_orders():
     """
-    Fetches open Shopify special orders (orders tagged 'SO', not yet fulfilled) from the
-    Fivetran Shopify dataset, one row per (order x line SKU). The customer-promised expected
-    date comes from the `special_order_eta` order metafield (namespace 'custom', type date);
-    it is LEFT-joined, so orders without an ETA are still included.
+    Fetches open Shopify special orders from the Fivetran Shopify dataset, one row per
+    (order x line SKU). The customer-promised expected date comes from the `special_order_eta`
+    order metafield (namespace 'custom', type date); it is LEFT-joined, so orders without an ETA
+    are still included.
 
-    Returns a list of dicts: {order_id, order_name, email, fulfillment_status,
+    Population mirrors `ShopifyClient.SPECIAL_ORDER_TAG_QUERY`: an order tagged `SO`, OR a
+    confirmed bike sale carrying ALL of `bikesale` + `bikenothere` + `orderconfirmed`. Kept in
+    step deliberately — this is the fallback for a Shopify outage, and a fallback that quietly
+    returns a narrower board than the live path is worse than no fallback.
+
+    Returns a list of dicts: {order_id, order_name, email, population, fulfillment_status,
     financial_status, created_at (ISO), eta (ISO date or None), sku}. Returns [] on any
     failure so the (Lightspeed-based) special-order triage never breaks when Shopify/BigQuery
     is unavailable.
     """
     query = f"""
-        WITH so AS (
+        -- `order_tag` is one row per (order, tag), so "has all three of X/Y/Z" cannot be a WHERE
+        -- predicate on a join. Aggregating the tags per order first expresses the rule AND kills
+        -- the row fan-out a naive multi-join would introduce.
+        WITH tags AS (
+          SELECT order_id, ARRAY_AGG(DISTINCT LOWER(TRIM(value))) AS tag_list
+          FROM `{SHOPIFY_DATASET}.order_tag`
+          GROUP BY order_id
+        ),
+        so AS (
           SELECT o.id AS order_id, o.name AS order_name, LOWER(TRIM(o.email)) AS email,
                  o.display_fulfillment_status AS fulfillment_status,
-                 o.display_financial_status AS financial_status, o.created_at
+                 o.display_financial_status AS financial_status, o.created_at,
+                 -- The bike stack wins over a hand-applied `SO` tag: it is the more specific
+                 -- signal and the workflow applies it automatically.
+                 CASE WHEN 'bikesale' IN UNNEST(t.tag_list)
+                       AND 'bikenothere' IN UNNEST(t.tag_list)
+                       AND 'orderconfirmed' IN UNNEST(t.tag_list)
+                      THEN 'bike_sale' ELSE 'so_tag' END AS population
           FROM `{SHOPIFY_DATASET}.order` o
-          JOIN `{SHOPIFY_DATASET}.order_tag` ot ON ot.order_id = o.id
-          WHERE LOWER(ot.value) = 'so'
+          JOIN tags t ON t.order_id = o.id
+          WHERE ('so' IN UNNEST(t.tag_list)
+                 OR ('bikesale' IN UNNEST(t.tag_list)
+                     AND 'bikenothere' IN UNNEST(t.tag_list)
+                     AND 'orderconfirmed' IN UNNEST(t.tag_list)))
             AND o.display_fulfillment_status != 'FULFILLED'
             -- Exclude cancelled / archived / test / deleted orders. Financial status is NOT a
             -- filter: the money-on-account refund happens in Lightspeed, so a Shopify refund on an
@@ -350,7 +372,7 @@ def get_shopify_special_orders():
         )
         SELECT
           CAST(so.order_id AS STRING) AS order_id,
-          so.order_name, so.email, so.fulfillment_status, so.financial_status,
+          so.order_name, so.email, so.population, so.fulfillment_status, so.financial_status,
           FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%S%z', so.created_at) AS created_at,
           eta.eta, ol.sku
         FROM so

@@ -12,6 +12,7 @@ import type {
 } from '@/lib/types'
 import {
   AlertTriangle,
+  Bike,
   CircleHelp,
   PackageCheck,
   Inbox,
@@ -133,6 +134,22 @@ const PRIORITY_STYLE: Record<SpecialOrder['priority_band'], string> = {
   medium: 'border-amber-200 bg-amber-100 text-amber-800',
   high: 'border-orange-200 bg-orange-100 text-orange-700',
   critical: 'border-red-700 bg-red-600 text-white',
+}
+
+// A confirmed bike sale, as opposed to a hand-tagged parts special order. Worth showing because
+// the two are different workflows: a bike sale is nearly always raised from a workorder, the
+// customer has usually only part-paid, and the intake instruction differs.
+export function BikeSaleBadge() {
+  return (
+    <Badge
+      variant="outline"
+      title="Confirmed bike sale: the Shopify order carries bikesale + bikenothere + orderconfirmed, meaning the customer confirmed and the bike has to be ordered in."
+      className="gap-1 border-teal-200 bg-teal-100 text-xs font-medium text-teal-800"
+    >
+      <Bike className="h-3 w-3" />
+      Bike sale
+    </Badge>
+  )
 }
 
 export function SeriousnessBadge({

@@ -1,5 +1,7 @@
 """
-Pure matching between live Lightspeed special orders and Shopify `SO`-tagged orders.
+Pure matching between live Lightspeed special orders and the Shopify special-order
+population (orders tagged `SO`, plus confirmed bike sales — see
+`shopify_client.SPECIAL_ORDER_TAG_QUERY`).
 
 A Shopify order carries many line SKUs (bundles); matching the specific LS `system_sku`
 pinpoints the right order. The ETA is order-level. On top of the SKU, identity signals are
@@ -73,6 +75,10 @@ def build_shopify_index(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "name": _norm_name(r.get("customer_name")) or None,
                 "eta": r.get("eta"),
                 "created_at": r.get("created_at"),
+                # Why this order is in the population at all ('so_tag' | 'bike_sale'). A parts
+                # special order and a confirmed bike sale need different instructions, and this
+                # is the only layer that still knows the difference.
+                "population": r.get("population"),
                 "fulfillment_status": r.get("fulfillment_status"),
                 "financial_status": r.get("financial_status"),
                 "skus": set(),
@@ -132,6 +138,7 @@ def _none() -> Dict[str, Any]:
         "shopify_fulfillment_status": None,
         "shopify_financial_status": None,
         "shopify_order_created_at": None,
+        "shopify_population": None,
         "shopify_line_unfulfilled": None,
         "shopify_candidates": [],
         "_candidates": set(),
@@ -153,6 +160,7 @@ def _matched(index: Dict[str, Any], oid: str, basis: str,
         # order behind it) is sometimes added days later, so this is the earlier, truer start of
         # the customer's wait -- see so_sla_service.compute_open_clock.
         "shopify_order_created_at": o.get("created_at"),
+        "shopify_population": o.get("population"),
         # Units of THIS special order's SKU the customer is still owed. None when unknown
         # (a manual link resolved outside the main index, or a pre-upgrade cached payload).
         "shopify_line_unfulfilled": (o.get("unfulfilled_by_sku") or {}).get(sku) if sku else None,
@@ -171,6 +179,7 @@ def _ambiguous(index: Dict[str, Any], candidates: Set[str], basis: str) -> Dict[
         "shopify_fulfillment_status": None,
         "shopify_financial_status": None,
         "shopify_order_created_at": None,
+        "shopify_population": None,
         "shopify_line_unfulfilled": None,
         "shopify_candidates": candidate_summary(index, candidates),
         "_candidates": set(candidates),
@@ -259,6 +268,9 @@ def shopify_only_orders(
             "customer_email": o.get("email"),
             "shopify_expected_date": o.get("eta"),
             "created_at": o.get("created_at"),
+            # Drives the intake instruction: "create the special order" is the parts wording and
+            # is wrong for a confirmed bike sale.
+            "population": o.get("population"),
             "fulfillment_status": o.get("fulfillment_status"),
             "financial_status": o.get("financial_status"),
             "skus": sorted(o.get("skus", [])),

@@ -45,7 +45,7 @@ const SEVERITIES: { key: SlaSeverity; text: string }[] = [
 ]
 
 const STAGES: { key: TriageStage; text: string }[] = [
-  { key: 'shopify', text: 'Shopify intake: the tagged order has not yet been matched to a Lightspeed special order.' },
+  { key: 'shopify', text: 'Shopify intake: the order has not yet been matched to a Lightspeed special order. Bike sales carry a Bike sale badge — those are raised from a workorder rather than created directly.' },
   { key: 'open_pool', text: 'Awaiting PO: the special order exists in Lightspeed but is not attached to a purchase order.' },
   { key: 'unordered_po', text: 'Draft PO: attached to a purchase order that has not been sent to the vendor.' },
   { key: 'ordered', text: 'In transit: the purchase order has been placed and the item is awaiting arrival.' },
@@ -53,7 +53,7 @@ const STAGES: { key: TriageStage; text: string }[] = [
 ]
 
 const SOURCES: { key: SpecialOrderSource; text: string }[] = [
-  { key: 'shopify', text: 'Raised from a Shopify order tagged SO. A customer promise can be recorded here; an explicit save writes that date to the Shopify order.' },
+  { key: 'shopify', text: 'Raised from a Shopify order in the special-order population — tagged SO, or a confirmed bike sale carrying bikesale + bikenothere + orderconfirmed. A customer promise can be recorded here; an explicit save writes that date to the Shopify order.' },
   { key: 'workorder', text: 'Raised from a service workorder. The workorder’s ETA-out describes the bike, not the part; service records a separate parts promise in this tool.' },
   { key: 'neither', text: 'Raised straight into Lightspeed at the counter or by phone. This is a valid intake route, not automatically a data fault.' },
 ]
@@ -172,8 +172,8 @@ export function SoLegend({ counts }: { counts?: SoLegendCounts }) {
             </Row>
             <Row visual={<span className="text-xs font-medium">Days open</span>}>
               How long the customer has been waiting, counted from the earlier of the Shopify order
-              date and the Lightspeed special order date. Those differ when an order is{' '}
-              <code className="text-[11px]">SO</code>-tagged days after it went live; the tile says
+              date and the Lightspeed special order date. Those differ when an order joins the
+              special-order population days after it went live; the tile says
               so when the gap is real. Service orders count from the Lightspeed special order —
               a bike can sit on the rack for a week before anyone finds it needs a part.
             </Row>

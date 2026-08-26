@@ -11,6 +11,7 @@ import type {
   TriageStage,
 } from '@/lib/types'
 import {
+  BikeSaleBadge,
   CustomerWaitingBadge,
   SeriousnessBadge,
   SeverityBadge,
@@ -436,6 +437,7 @@ export function SpecialOrderRow({
                     linkLabel={`Open Shopify order ${order.shopify_order_name ?? identity} in a new tab`}
                   />
                 )}
+                {order.shopify_population === 'bike_sale' && <BikeSaleBadge />}
                 {order.store && (
                   <Badge
                     variant="outline"

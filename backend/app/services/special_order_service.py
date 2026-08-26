@@ -481,6 +481,8 @@ def _normalize(
         # When the matched Shopify order was placed. Often earlier than the Lightspeed SO: the
         # `SO` tag gets added late, and the special order is only raised then.
         "shopify_order_created_at": None,
+        # 'so_tag' | 'bike_sale' — why the linked Shopify order is in the population.
+        "shopify_population": None,
         # Units of this SO's SKU the customer is still owed on the linked Shopify order.
         "shopify_line_unfulfilled": None,
         "shopify_candidates": [],
@@ -652,9 +654,13 @@ _SHOPIFY_FALLBACK_TTL_SECONDS = 3600
 def _shopify_fallback_rows() -> List[Dict[str, Any]]:
     """`SO`-tagged Shopify orders including fulfilled/archived, for the late-match second pass.
 
-    Kept apart from `_shopify_rows()` on purpose: 728 of ~850 orders in the window are already
-    fulfilled. Folding them into the primary index would manufacture ambiguity and fill the
-    "unmatched Shopify orders" list with orders that are genuinely finished.
+    Kept apart from `_shopify_rows()` on purpose: the large majority of orders in the window are
+    already fulfilled. Folding them into the primary index would manufacture ambiguity and fill
+    the "unmatched Shopify orders" list with orders that are genuinely finished.
+
+    Deliberately still `SO`-only, unlike the live population: 392 of the 435 bike-stack orders are
+    fulfilled, so widening this pass would add every one of them as a match candidate -- exactly
+    the failure this split exists to prevent.
     """
     now = time.time()
     cached = _shopify_fallback_cache["rows"]
@@ -687,6 +693,7 @@ def _apply_shopify_match(o: Dict[str, Any], m: Dict[str, Any], today: date) -> N
     o["shopify_fulfillment_status"] = m.get("shopify_fulfillment_status")
     o["shopify_financial_status"] = m.get("shopify_financial_status")
     o["shopify_order_created_at"] = m.get("shopify_order_created_at")
+    o["shopify_population"] = m.get("shopify_population")
     o["shopify_line_unfulfilled"] = m.get("shopify_line_unfulfilled")
     o["shopify_order_url"] = shopify_order_url(m["shopify_order_id"])
     o["shopify_candidates"] = m.get("shopify_candidates") or []
@@ -727,6 +734,11 @@ def _manual_link_index(index: Dict[str, Any], overrides: Dict[str, Any]) -> Dict
     eligible for *automatic* matching by other SOs, and would float any unclaimed one into
     the "Unmatched" Shopify population — a years-old fulfilled order has no business
     appearing there. Empty (no fetch at all) when every link already resolves.
+
+    Note this set SHRINKS whenever the population widens. Adding confirmed bike sales moved ~17
+    orders out of here and into the main index, so they became auto-matchable. That is intended —
+    they are genuine special orders — but it is the one case where the rule above is relaxed, and
+    it happens silently as a side effect of the population definition.
     """
     links = (overrides.get("links") or {}).values()
     missing = sorted({oid for oid in links if oid not in index["orders"]})
@@ -745,8 +757,8 @@ def _enrich_with_shopify(
     fallback_index: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Matches LS SOs to Shopify `SO`-tagged orders and returns the Shopify-only ("Unmatched")
-    population. Open SOs claim their match first. Then recently-completed SOs adopt any Shopify
+    Matches LS SOs to the Shopify special-order population (`SO`-tagged orders plus confirmed
+    bike sales) and returns the Shopify-only ("Unmatched") population. Open SOs claim their match first. Then recently-completed SOs adopt any Shopify
     order still left unmatched — the item is received in Lightspeed (SO completed / "Ready For
     Pickup") but its Shopify order hasn't been fulfilled yet — and join the displayed set so they
     surface under "Matched, received" rather than a false "Unmatched". `completed_orders` is

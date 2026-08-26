@@ -50,8 +50,26 @@ _ETA_KEY = "special_order_eta"
 # precisely the orders that had just been repaired -- ~14% of the live population -- from
 # procurement. An order holds an active special order when it is neither fulfilled nor archived.
 
-# How many orders / line items to pull per page. Orders tagged `SO` are a small population, so
-# a single page is usually enough; pagination is handled anyway for safety.
+# Which Shopify orders count as special orders. TWO independent signals, and the whole rule is
+# defined here once so the live query and the BigQuery mirror cannot drift apart:
+#
+#   `SO`        a parts special order, tagged by hand.
+#   bike stack  a confirmed bike sale for a bike that is NOT in the building. Sales staff confirm
+#               with the customer (`orderconfirmed`) and the system adds `bikenothere` when it has
+#               to be ordered in. ALL THREE are required — each alone means something else
+#               (`bikesale` is on every bike order, `bikeready` comes later in the same workflow).
+#
+# Measured 2026-08-26: 435 orders carry the full stack all-time, 21 of them live, 4 of those also
+# `SO`-tagged. Adding the stack gained 12 definite matches (all email+SKU) and lost none.
+SO_TAG = "SO"
+BIKE_SALE_TAGS = ("bikesale", "bikenothere", "orderconfirmed")
+_BIKE_SALE_CLAUSE = "(" + " AND ".join(f"tag:{tag}" for tag in BIKE_SALE_TAGS) + ")"
+# The OUTER parentheses are load-bearing: `_RECENT_SO_QUERY` appends `AND created_at:>...` to its
+# filter, and without them the date bound would bind to the right-hand arm of the OR alone.
+SPECIAL_ORDER_TAG_QUERY = f"(tag:{SO_TAG} OR {_BIKE_SALE_CLAUSE})"
+
+# How many orders / line items to pull per page. The special-order population is small, so a
+# single page is usually enough; pagination is handled anyway for safety.
 _ORDERS_PER_PAGE = 100
 _LINE_ITEMS_PER_PAGE = 50
 # Hard stop so a runaway cursor loop can never hammer the API.
@@ -61,6 +79,27 @@ _GID_NUM = re.compile(r"/(\d+)$")
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _classify_population(tags: Optional[List[str]]) -> str:
+    """Why this order is in the special-order population: 'bike_sale' or 'so_tag'.
+
+    The tag was previously a pure query predicate, discarded the moment the search returned, so
+    nothing downstream could tell a confirmed bike sale from a parts special order — and they need
+    different instructions from the operator.
+
+    The bike stack WINS when an order carries both (4 of 21 live orders do). It is the more
+    specific signal and the more reliable one: the stack is applied by the sales workflow, while
+    `SO` is added by hand.
+
+    Defaults to `so_tag` rather than raising. The GraphQL filter guarantees one arm matched, so an
+    unrecognised shape means the tag list was unavailable, and mislabelling is a far better failure
+    than dropping a real special order.
+    """
+    lowered = {str(tag).strip().lower() for tag in (tags or [])}
+    if all(tag in lowered for tag in BIKE_SALE_TAGS):
+        return "bike_sale"
+    return "so_tag"
 
 
 def _strip_html(value: Optional[str]) -> str:
@@ -210,7 +249,7 @@ class ShopifyClient:
     # whole query on a scope gap).
     _OPEN_SO_QUERY = """
     query OpenSpecialOrders($cursor: String, $lineItems: Int!) {
-      orders(first: %d, after: $cursor, query: "tag:SO", sortKey: CREATED_AT, reverse: true) {
+      orders(first: %d, after: $cursor, query: "%s", sortKey: CREATED_AT, reverse: true) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id
@@ -224,12 +263,13 @@ class ShopifyClient:
           cancelledAt
           closed
           test
+          tags
           metafield(namespace: "%s", key: "%s") { value }
           lineItems(first: $lineItems) { nodes { sku unfulfilledQuantity } }
         }
       }
     }
-    """ % (_ORDERS_PER_PAGE, _ETA_NAMESPACE, _ETA_KEY)
+    """ % (_ORDERS_PER_PAGE, SPECIAL_ORDER_TAG_QUERY, _ETA_NAMESPACE, _ETA_KEY)
 
     # Same shape as _OPEN_SO_QUERY but WITHOUT the status filters, for the late-match fallback.
     # The date bound is interpolated rather than parameterised because Shopify's `query:` string
@@ -289,9 +329,11 @@ class ShopifyClient:
 
     def get_open_special_orders(self, *, strict: bool = False) -> List[Dict[str, Any]]:
         """
-        Live equivalent of `bigquery_sync.get_shopify_special_orders()`: open Shopify orders
-        tagged `SO` (not fulfilled, not refunded/voided/cancelled/closed/test), one row per
-        (order x line SKU), with the `custom.special_order_eta` metafield as `eta`.
+        Live equivalent of `bigquery_sync.get_shopify_special_orders()`: open Shopify orders in
+        the special-order population (see SPECIAL_ORDER_TAG_QUERY -- `SO`-tagged, or a confirmed
+        bike sale), excluding fulfilled/cancelled/closed/test, one row per (order x line SKU),
+        with the `custom.special_order_eta` metafield as `eta`. Financial status is deliberately
+        NOT a filter: bike sales are routinely only part-paid when the special order is raised.
 
         Returns the identical row shape so downstream matching/flagging is unchanged
         (plus the phone / customer-name identity signals the tiered matcher uses):
@@ -308,7 +350,7 @@ class ShopifyClient:
 
     def _collect_special_orders(self, query: str, *, apply_status_filter: bool,
                                 strict: bool = False) -> List[Dict[str, Any]]:
-        """Page a `tag:SO` order query into the flat (order x line SKU) row shape.
+        """Page a special-order query into the flat (order x line SKU) row shape.
 
         `apply_status_filter` is what separates the live population from the fallback one: the
         dashboard wants only orders still awaiting their item, while the late-match fallback
@@ -328,7 +370,7 @@ class ShopifyClient:
                 )
                 conn = data.get("orders") or {}
                 for o in conn.get("nodes") or []:
-                    # Mirror the BigQuery exclusions (the `tag:SO` search can't express them all).
+                    # Mirror the BigQuery exclusions (the tag search can't express them all).
                     # Fulfilled or archived => the special order is done. See the note on
                     # financial status above for why a refund is NOT an exclusion.
                     if apply_status_filter:
@@ -347,6 +389,7 @@ class ShopifyClient:
                     base = {
                         "order_id": order_id,
                         "order_name": order_name,
+                        "population": _classify_population(o.get("tags")),
                         "email": email,
                         "phone": o.get("phone") or ship.get("phone"),
                         "customer_name": ship.get("name"),

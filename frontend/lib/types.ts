@@ -604,7 +604,12 @@ export interface SoScoreboard {
 // SOs raised directly in Lightspeed with no Shopify order and no workorder behind them.
 export type SpecialOrderSource = 'workorder' | 'shopify' | 'neither'
 
-// Whether a live LS SO was matched to a Shopify `SO`-tagged order.
+// Which signal put a Shopify order in the special-order population. A parts special order is
+// tagged `SO` by hand; a bike sale carries the full `bikesale`+`bikenothere`+`orderconfirmed`
+// stack, applied by the sales workflow when a confirmed bike is not in the building.
+export type ShopifyPopulation = 'so_tag' | 'bike_sale'
+
+// Whether a live LS SO was matched to a Shopify special-order-population order.
 export type ShopifyMatch = 'matched' | 'ambiguous' | 'none'
 
 // Which identity tier produced a match (or made it ambiguous). 'manual' = a human linked it.
@@ -631,13 +636,15 @@ export interface ShopifyCandidate {
 // 'shopify' is the inbound pseudo-stage for orders with no Lightspeed special order yet.
 export type TriageStage = 'shopify' | ProcurementStage
 
-// A Shopify `SO`-tagged order with no matching live LS SO — the "Unmatched" population.
+// A Shopify special-order-population order with no matching live LS SO — the "Unmatched" population.
 export interface ShopifyOnlyOrder {
   order_id: string
   order_name: string | null
   customer_email: string | null
   shopify_expected_date: string | null
   created_at: string | null
+  /** Drives the intake instruction — "create the special order" is the parts wording. */
+  population: ShopifyPopulation | null
   fulfillment_status: string | null
   financial_status: string | null
   skus: string[]
@@ -839,6 +846,10 @@ export interface SpecialOrder {
   // When the customer actually placed the Shopify order. Often earlier than `created_date`: the
   // `SO` tag gets added late and the Lightspeed special order is only raised then.
   shopify_order_created_at: string | null
+  /** Why the linked Shopify order is in the special-order population: a hand-applied `SO` tag,
+   *  or a confirmed bike sale (`bikesale` + `bikenothere` + `orderconfirmed`). The two are
+   *  different workflows and need different instructions. */
+  shopify_population: ShopifyPopulation | null
   /** Units of THIS special order's SKU the customer is still owed on the linked Shopify order.
    *  Null when unknown (no link, or a cached payload from before per-line quantities existed) —
    *  absence of evidence is never treated as evidence. */
