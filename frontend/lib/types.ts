@@ -422,6 +422,9 @@ export type SlaSeverity =
 export type SpecialOrderWorkState =
   | 'intake'
   | 'needs_ordering'
+  // The item is already sellable at the store that raised the special order. Outranks
+  // `needs_ordering`, because raising a purchase order is exactly the work not to do.
+  | 'in_stock'
   // The linked Shopify order is finished while the Lightspeed SO is still open — the SO is
   // either not required or needs checking out. Outranks every procurement action, because
   // each of those would be work we should not be doing.
@@ -825,6 +828,11 @@ export interface SpecialOrder {
   /** 'customer_stranded' means the item is recorded as received but the customer's Shopify line
    *  is still unfulfilled — paid for, supposedly here, and they have not got it. */
   closeout_state: string | null
+  /** Long-form in-stock evidence ("Already in stock at Victoria — 4 sellable, 1 needed…"),
+   *  matching the wording the "Where to order" panel uses. Null unless work_state is in_stock. */
+  in_stock_detail: string | null
+  /** Sellable units at the SO's own store, when the fastest route is existing stock. */
+  in_stock_sellable: number | null
   /** Set when the linked Shopify order is finished ('fulfilled' | 'restocked'). Never set on
    *  received rows — close-out already routes those correctly. */
   shopify_order_closed: string | null

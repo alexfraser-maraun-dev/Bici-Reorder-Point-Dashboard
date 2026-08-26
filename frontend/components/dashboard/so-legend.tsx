@@ -161,6 +161,13 @@ export function SoLegend({ counts }: { counts?: SoLegendCounts }) {
               The last date the item can be ordered and still meet a quoted date. Only shown when
               a customer date exists.
             </Row>
+            <Row visual={<span className="text-xs font-medium text-emerald-700">In stock already</span>}>
+              The item is already sellable at the store that raised the special order, so it needs
+              confirming on the shelf and fulfilling — not ordering. Only shown before a purchase
+              order exists; once one is placed the money is already committed. Where several orders
+              want the same item, stock is allocated <em>oldest first</em>, so two customers waiting
+              on one unit never both see it.
+            </Row>
             <Row visual={<span className="text-xs font-medium">PO expected</span>}>
               When the vendor says the <em>box</em> lands at the store — the purchase order&rsquo;s
               own arrival date, straight from Lightspeed.

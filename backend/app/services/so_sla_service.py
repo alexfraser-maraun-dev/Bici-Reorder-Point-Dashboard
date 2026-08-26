@@ -104,6 +104,11 @@ _UNCALLED_URGENT_DAYS = 21
 _STRANDED_STEPS = [(3, 2), (7, 4), (14, 6), (30, 8)]   # days since receipt < limit -> score
 _STRANDED_MAX = 10
 
+# An item already on the shelf at the store that raised the special order. Raised into the
+# critical band because a customer is waiting on something physically present -- but pinned to its
+# FLOOR so a genuinely longer-overdue case is never trumped.
+_IN_STOCK_OVERDUE_SCORE = 7
+
 # The mirror image: Shopify says the line IS fulfilled, so the customer has the goods and the
 # open Lightspeed record is data hygiene, not a customer problem. Live: SO 40241 had been sitting
 # 442 days post-receipt scoring 4 on an order the customer collected long ago.
@@ -470,6 +475,50 @@ def _closeout_action(row: Dict[str, Any], today: date) -> Dict[str, Any]:
     }
 
 
+# Stages where "it is already on the shelf, do not order it" is the right instruction. Past these
+# the money is spent or the goods have arrived, and the advice would be wrong.
+_PRE_ORDER_STAGES = ("open_pool", "unordered_po")
+
+
+def allocate_in_stock(orders: List[Dict[str, Any]]) -> set:
+    """Which not-yet-ordered special orders can ACTUALLY be served from stock on hand.
+
+    `fastest_path_tier == "in_stock"` is decided per row, and asks "is there enough for THIS one?".
+    Every row answers independently, so six special orders for the same helmet against two units
+    all read as in stock. Allocating oldest-first against the shared pool is the only way the
+    answer stays true once more than one customer wants the same thing -- and the longest-waiting
+    customer has the strongest claim on the one unit.
+
+    Contention is currently zero in the live not-yet-ordered population, but it is real in the
+    already-ordered one (six special orders, one helmet, two units), so it is luck rather than
+    structure that keeps it out of here.
+    """
+    groups: Dict[tuple, List[Dict[str, Any]]] = {}
+    for row in orders:
+        if row.get("procurement_stage") not in _PRE_ORDER_STAGES:
+            continue
+        if row.get("fastest_path_tier") != "in_stock":
+            continue
+        # Absent when the fastest-path annotation was skipped entirely (a BigQuery hiccup). No
+        # evidence of stock is not evidence of stock.
+        if row.get("in_stock_sellable") is None:
+            continue
+        groups.setdefault((str(row.get("item_id")), str(row.get("shop_id"))), []).append(row)
+
+    served = set()
+    for rows in groups.values():
+        # Longest wait first. `days_open` can be None on a row with no usable date; sort those last
+        # rather than letting None crash the comparison.
+        rows.sort(key=lambda r: -(r.get("days_open") or r.get("days_since_creation") or 0))
+        remaining = int(rows[0].get("in_stock_sellable") or 0)
+        for row in rows:
+            need = int(row.get("unit_quantity") or 1)
+            if need <= remaining:
+                remaining -= need
+                served.add(str(row.get("special_order_id")))
+    return served
+
+
 def compute_work_state(row: Dict[str, Any], sla: Dict[str, Any], today: date) -> Dict[str, Any]:
     """Operational next work, intentionally separate from the customer delivery SLA.
 
@@ -498,9 +547,34 @@ def compute_work_state(row: Dict[str, Any], sla: Dict[str, Any], today: date) ->
             "action_due_date": today.isoformat(),
             "closeout_state": None,
             "shopify_order_closed": closed_shopify,
+            "in_stock_detail": None,
         }
 
-    if stage in ("open_pool", "unordered_po"):
+    # Already on the shelf at the store that raised it. Deliberately checked before
+    # `needs_ordering` is even queued: raising a purchase order is precisely the work we do not
+    # want done, and leaving these in the ordering queue also inflates its count with work that
+    # must not happen. `in_stock_allocated` is set by allocate_in_stock(), so stock that cannot
+    # cover everyone waiting only flags the rows it can actually serve.
+    if stage in _PRE_ORDER_STAGES and row.get("in_stock_allocated"):
+        sellable = row.get("in_stock_sellable")
+        store = row.get("store") or "this store"
+        return {
+            "work_state": "in_stock",
+            "queue_states": ["in_stock"],
+            "next_action": "Already in stock — confirm on the shelf and fulfil, don't order",
+            "action_owner": "procurement",
+            "action_due_date": today.isoformat(),
+            "closeout_state": None,
+            "shopify_order_closed": shopify_order_closed(row),
+            # Echoes the wording the "Where to order" panel already uses, so the two surfaces
+            # cannot drift apart.
+            "in_stock_detail": (
+                f"Already in stock at {store} — {sellable} sellable, "
+                f"{int(row.get('unit_quantity') or 1)} needed. Confirm on the shelf before ordering."
+            ),
+        }
+
+    if stage in _PRE_ORDER_STAGES:
         queue_states.append("needs_ordering")
     elif stage == "ordered":
         queue_states.append("in_transit")
@@ -586,6 +660,7 @@ def compute_work_state(row: Dict[str, Any], sla: Dict[str, Any], today: date) ->
         "action_due_date": action.get("action_due_date"),
         "closeout_state": closeout.get("closeout_state"),
         "shopify_order_closed": shopify_order_closed(row),
+        "in_stock_detail": None,
     }
 
 
@@ -788,6 +863,24 @@ def compute_priority(row: Dict[str, Any], sla: Dict[str, Any], work: Dict[str, A
         score = next((value for limit, value in _LATE_STEPS if late < limit), 10)
         return _priority(score, [f"Promise missed by {_plural(late)}"])
 
+    # --- Already on the shelf: raise it, but never let it jump a longer-overdue case ----------
+    # Deliberately BELOW Band A. Placed above it, a promise missed by 40 days on an in-stock item
+    # scored 7 instead of 10 -- the in-stock lift silently capping a genuinely worse case, which is
+    # the one thing this must never do. A broken promise on an item that was on the shelf the whole
+    # time is MORE serious, not less.
+    #
+    # 7 is the FLOOR of the critical band, so 8/9/10 stay exclusive to broken promises scaled by
+    # lateness. Gated on the window having actually passed: a special order raised this morning for
+    # an in-stock item is wasteful, not yet late, and keeps its ordinary Band B score.
+    if work.get("work_state") == "in_stock":
+        slack = sla.get("window_slack_days")
+        if slack is not None and slack < 0:
+            store = row.get("store") or "this store"
+            return _priority(_IN_STOCK_OVERDUE_SCORE, [
+                f"{row.get('in_stock_sellable')} sellable at {store} — "
+                "the customer could be served today",
+            ])
+
     # --- Band C: received; both clocks stopped, so what is left is close-out ------------------
     if stage == "received":
         if work.get("closeout_state") in (None, "complete"):
@@ -923,12 +1016,16 @@ def build_escalations(orders: List[Dict[str, Any]], acks: Dict[str, Dict[str, An
                       today: Optional[date] = None) -> Dict[str, Any]:
     """The full SLA view: every row annotated, plus the counts that drive the tiles."""
     today = today or date.today()
+    # One pass before the per-row loop: allocation is inherently cross-row, and `compute_work_state`
+    # only ever sees one order at a time.
+    in_stock_served = allocate_in_stock(orders)
     rows: List[Dict[str, Any]] = []
     for row in orders:
         # Merged before the SLA runs so everything downstream sees one row shape. This only adds
         # the display clock -- `days_since_creation` is untouched, so severity, dwell and the
         # archive window all keep measuring what they measured before.
-        row = {**row, **compute_open_clock(row, today)}
+        row = {**row, **compute_open_clock(row, today),
+               "in_stock_allocated": str(row.get("special_order_id")) in in_stock_served}
         sla = compute_sla(row, today)
         work = compute_work_state(row, sla, today)
         so_id = str(row.get("special_order_id") or "")
@@ -970,11 +1067,13 @@ def build_escalations(orders: List[Dict[str, Any]], acks: Dict[str, Dict[str, An
         },
         "by_work_state": {
             state: sum(1 for r in rows if r.get("work_state") == state)
-            for state in ("needs_ordering", "vendor_followup", "promise_needed", "closeout", "on_track")
+            for state in ("needs_ordering", "in_stock", "vendor_followup", "promise_needed",
+                          "closeout", "on_track")
         },
         "by_queue_state": {
             state: sum(1 for r in rows if state in (r.get("queue_states") or []))
-            for state in ("needs_ordering", "in_transit", "vendor_followup", "promise_needed", "closeout", "on_track")
+            for state in ("needs_ordering", "in_stock", "in_transit", "vendor_followup",
+                          "promise_needed", "closeout", "on_track")
         },
         "missing_promise_by_owner": {
             o: sum(1 for r in rows if r.get("promise_owner") == o)

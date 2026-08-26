@@ -139,6 +139,28 @@ const PRIORITY_STYLE: Record<SpecialOrder['priority_band'], string> = {
 // A confirmed bike sale, as opposed to a hand-tagged parts special order. Worth showing because
 // the two are different workflows: a bike sale is nearly always raised from a workorder, the
 // customer has usually only part-paid, and the intake instruction differs.
+// The item is already sellable at the store that raised the special order. Replaces the SLA
+// verdict, which on these rows is a stale-window artefact: the goods never needed ordering, so
+// "order by" having passed says nothing useful.
+export function InStockBadge({
+  sellable,
+  detail,
+}: {
+  sellable: number | null | undefined
+  detail: string | null | undefined
+}) {
+  return (
+    <Badge
+      variant="outline"
+      title={detail ?? 'This item is already sellable at the store that raised the special order.'}
+      className="gap-1 border-emerald-200 bg-emerald-100 text-xs font-medium text-emerald-700"
+    >
+      <PackageCheck className="h-3 w-3" />
+      {sellable != null ? `${sellable} in stock` : 'In stock'}
+    </Badge>
+  )
+}
+
 export function BikeSaleBadge() {
   return (
     <Badge

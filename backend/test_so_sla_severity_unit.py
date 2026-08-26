@@ -512,6 +512,91 @@ def test_stranded_customer_escalates_but_only_on_shopify_evidence():
     print("test_stranded_customer_escalates_but_only_on_shopify_evidence OK")
 
 
+def test_in_stock_allocation_never_over_promises():
+    """Six special orders, one helmet, two units. Per-row detection says all six are in stock."""
+    def helmet(soid, days, need=1, **kw):
+        base = dict(special_order_id=soid, procurement_stage="open_pool", item_id="99",
+                    shop_id="2", store="Victoria", unit_quantity=str(need), days_open=days,
+                    fastest_path_tier="in_stock", in_stock_sellable=2)
+        base.update(kw)
+        return _row(**base)
+
+    rows = [helmet("A", 5), helmet("B", 90), helmet("C", 40),
+            helmet("D", 1), helmet("E", 12), helmet("F", 60)]
+    # Oldest first: B (90d) and F (60d) get the two units. Nobody else.
+    assert sla.allocate_in_stock(rows) == {"B", "F"}, sla.allocate_in_stock(rows)
+
+    # A single order needing more than exists is not "in stock" at all.
+    assert sla.allocate_in_stock([helmet("A", 5, need=3)]) == set()
+    # Exactly covering it counts.
+    assert sla.allocate_in_stock([helmet("A", 5, need=2)]) == {"A"}
+
+    # Different stores draw on separate pools; they must not compete.
+    other = helmet("G", 100)
+    other["shop_id"], other["store"] = "3", "Bici Adanac"
+    assert sla.allocate_in_stock([helmet("A", 5), other]) == {"A", "G"}
+
+    # The money is already spent / the goods already arrived: never flag these.
+    for stage in ("ordered", "received"):
+        assert sla.allocate_in_stock([helmet("A", 5, procurement_stage=stage)]) == set()
+
+    # BigQuery hiccup: compute_fastest_path is skipped entirely, so the annotation is absent.
+    # No evidence of stock is not evidence of stock -- and it must not raise.
+    blind = helmet("A", 5)
+    del blind["in_stock_sellable"]
+    assert sla.allocate_in_stock([blind]) == set()
+    assert sla.allocate_in_stock([helmet("A", 5, fastest_path_tier=None)]) == set()
+    print("test_in_stock_allocation_never_over_promises OK")
+
+
+def test_in_stock_replaces_the_order_instruction_and_stays_with_procurement():
+    row = _row(procurement_stage="open_pool", item_id="99", shop_id="2", store="Victoria",
+               unit_quantity="1", days_open=137, days_since_creation=137,
+               created_date="2026-04-05", fastest_path_tier="in_stock", in_stock_sellable=4,
+               vendor_lead_time_days=5)
+    got = sla.build_escalations([row], {}, TODAY)["orders"][0]
+
+    assert got["work_state"] == "in_stock", got["work_state"]
+    assert got["queue_states"] == ["in_stock"]
+    # "Needs a PO — allocate in Lightspeed" is the instruction this replaces: it tells a buyer to
+    # purchase something already sitting on the shelf while a customer waits.
+    assert got["next_action"] == "Already in stock — confirm on the shelf and fulfil, don't order"
+    assert "Needs a PO" not in (got["next_action"] or "")
+    # Still a buyer's call, so ownership does not move.
+    assert got["action_owner"] == "procurement", got["action_owner"]
+    assert "4 sellable, 1 needed" in got["in_stock_detail"], got["in_stock_detail"]
+    assert got["actionable"] is True
+    print("test_in_stock_replaces_the_order_instruction_and_stays_with_procurement OK")
+
+
+def test_in_stock_is_raised_but_never_trumps_a_longer_overdue_case():
+    def score(**kw):
+        row = _row(procurement_stage="open_pool", item_id="99", shop_id="2", store="Victoria",
+                   unit_quantity="1", days_open=137, fastest_path_tier="in_stock",
+                   in_stock_sellable=4, vendor_lead_time_days=5, **kw)
+        return sla.build_escalations([row], {}, TODAY)["orders"][0]
+
+    # Overdue against its inferred window -> lifted to the FLOOR of the critical band.
+    overdue = score(could_have_landed="2026-06-01")
+    assert overdue["window_slack_days"] < 0
+    assert overdue["priority_score"] == 7, (overdue["priority_score"], overdue["priority_reasons"])
+    assert "4 sellable at Victoria" in overdue["priority_reasons"][0]
+
+    # Raised this morning: wasteful, but not yet late. Keeps its ordinary Band B score.
+    fresh = score(could_have_landed="2026-09-30")
+    assert fresh["window_slack_days"] > 0
+    assert fresh["priority_score"] < 7, (fresh["priority_score"], fresh["priority_reasons"])
+
+    # THE CONSTRAINT: a genuinely longer-overdue case must still outrank it. A promise missed by
+    # 40 days scores 10 through Band A even though the item is on the shelf -- which is right,
+    # because the customer's item sat in the shop the whole time.
+    late = score(could_have_landed="2026-06-01", shopify_expected_date="2026-07-11")
+    assert late["priority_score"] == 10, late["priority_score"]
+    assert "Promise missed by 40 days" in late["priority_reasons"][0]
+    assert late["priority_score"] > overdue["priority_score"]
+    print("test_in_stock_is_raised_but_never_trumps_a_longer_overdue_case OK")
+
+
 def test_priority_is_intrinsic_not_damped_by_parking():
     # Parking records that a human knows about a problem. It does not make the problem smaller,
     # and a score that sank on a button click would hide the worst rows from the sort built to
@@ -549,5 +634,8 @@ if __name__ == "__main__":
     test_priority_band_c_is_closeout_age()
     test_fulfilled_shopify_order_outranks_every_procurement_action()
     test_stranded_customer_escalates_but_only_on_shopify_evidence()
+    test_in_stock_allocation_never_over_promises()
+    test_in_stock_replaces_the_order_instruction_and_stays_with_procurement()
+    test_in_stock_is_raised_but_never_trumps_a_longer_overdue_case()
     test_priority_is_intrinsic_not_damped_by_parking()
     print("\nAll SLA severity/ack unit tests passed.")

@@ -173,6 +173,7 @@ def compute_fastest_path(row: Dict[str, Any], ctx: Dict[str, Any],
     could_have = (created + timedelta(days=span)) if created else None
 
     tier = None
+    in_stock_sellable = None
     if stage == "received":
         # Freeze only at the individual SpecialOrder receipt timestamp. A PO header receipt
         # may belong to another line in a split shipment.
@@ -196,10 +197,17 @@ def compute_fastest_path(row: Dict[str, Any], ctx: Dict[str, Any],
             if landing < best:
                 best, tier = landing, c["tier"]
         fastest = best
+        # Carried out because the dashboard has to ALLOCATE this stock across every special order
+        # competing for it, and the tier alone cannot say how many units there are. Free here —
+        # the number is already in hand — where recomputing it later would need the whole context.
+        in_stock_sellable = next(
+            (c["sellable"] for c in options if c["tier"] == "in_stock"), None
+        )
 
     return {
         "fastest_landing_date": fastest.isoformat() if fastest else None,
         "fastest_path_tier": tier,
+        "in_stock_sellable": in_stock_sellable,
         "could_have_landed": could_have.isoformat() if could_have else None,
         "days_lost": max(0, (fastest - could_have).days) if (could_have and fastest) else None,
     }

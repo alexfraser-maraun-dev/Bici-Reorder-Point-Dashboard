@@ -81,12 +81,13 @@ type ActionFilterOrder = {
 // the queue predicate, or it would always come back empty and read as a broken filter.
 const CLEARED_WORK_FILTERS = new Set<ActionFilterKey>(['in_progress', 'done'])
 
-const ACTION_QUEUE_STATES = new Set(['intake', 'needs_ordering', 'shopify_fulfilled', 'vendor_followup', 'promise_needed', 'closeout'])
+const ACTION_QUEUE_STATES = new Set(['intake', 'needs_ordering', 'in_stock', 'shopify_fulfilled', 'vendor_followup', 'promise_needed', 'closeout'])
 
 export const ACTION_FILTERS: readonly { key: ActionFilterKey; label: string }[] = [
   { key: 'all', label: 'All actions' },
   { key: 'intake', label: 'Shopify intake' },
   { key: 'needs_ordering', label: 'Needs ordering' },
+  { key: 'in_stock', label: 'Already in stock' },
   { key: 'shopify_fulfilled', label: 'Shopify already fulfilled' },
   { key: 'vendor_followup', label: 'Vendor follow-up' },
   { key: 'promise_needed', label: 'Promise date needed' },
@@ -137,8 +138,13 @@ const VIEWS: {
   {
     key: 'needs_ordering',
     label: 'Needs ordering',
-    description: 'Shopify intake and Lightspeed orders that still need a supply route confirmed in Lightspeed.',
-    pred: (order) => order.queue_states.includes('intake') || order.queue_states.includes('needs_ordering'),
+    description: 'Shopify intake and Lightspeed orders that still need a supply route confirmed in Lightspeed. Includes orders already sitting in stock — those need confirming, not ordering.',
+    // `in_stock` rows belong in this TAB even though they are deliberately outside the
+    // `needs_ordering` queue state: the buyer working the ordering queue is exactly the person who
+    // needs telling not to order them. They stay out of the needs_ordering COUNT so the queue size
+    // never overstates how much purchasing there is to do.
+    pred: (order) => order.queue_states.includes('intake') || order.queue_states.includes('needs_ordering')
+      || order.queue_states.includes('in_stock'),
   },
   {
     key: 'in_transit',
@@ -377,6 +383,8 @@ function shopifyRow(order: ShopifyOnlyOrder): SpecialOrder {
     action_owner: 'retail',
     action_due_date: order.created_at?.slice(0, 10) ?? null,
     closeout_state: null,
+    in_stock_detail: null,
+    in_stock_sellable: null,
     shopify_order_closed: null,
     service_promise_date: null,
     service_promise_source: null,

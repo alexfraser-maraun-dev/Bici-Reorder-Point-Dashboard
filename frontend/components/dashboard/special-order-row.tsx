@@ -13,6 +13,7 @@ import type {
 import {
   BikeSaleBadge,
   CustomerWaitingBadge,
+  InStockBadge,
   SeriousnessBadge,
   SeverityBadge,
   ShopifyClosedBadge,
@@ -63,6 +64,7 @@ const OWNER_LABELS: Record<SpecialOrderActionOwner, string> = {
 const WORK_STATE_LABELS: Record<SpecialOrderWorkState, string> = {
   intake: 'Intake',
   needs_ordering: 'Needs ordering',
+  in_stock: 'In stock already',
   shopify_fulfilled: 'Shopify fulfilled',
   vendor_followup: 'Vendor follow-up',
   promise_needed: 'Promise needed',
@@ -81,6 +83,7 @@ const ACCENT: Partial<Record<SpecialOrder['sla_severity'], string>> = {
 const WORK_ACCENT: Partial<Record<SpecialOrderWorkState, string>> = {
   intake: 'bg-violet-500',
   needs_ordering: 'bg-orange-500',
+  in_stock: 'bg-emerald-500',
   shopify_fulfilled: 'bg-violet-500',
   vendor_followup: 'bg-blue-500',
   promise_needed: 'bg-amber-500',
@@ -244,6 +247,7 @@ function WorkIcon({ state }: { state: SpecialOrderWorkState }) {
   const className = 'h-4 w-4 shrink-0'
   if (state === 'intake') return <Store className={className} />
   if (state === 'needs_ordering') return <ShoppingCart className={className} />
+  if (state === 'in_stock') return <PackageCheck className={className} />
   if (state === 'shopify_fulfilled') return <CircleSlash className={className} />
   if (state === 'vendor_followup') return <Truck className={className} />
   if (state === 'closeout') return <PackageCheck className={className} />
@@ -399,7 +403,10 @@ export function SpecialOrderRow({
   // received row gets from WORK_ACCENT.closeout.
   const stranded = order.closeout_state === 'customer_stranded'
   const daysSinceArrival = stranded ? daysBetween(order.so_received_date ?? null) : null
-  const accent = stranded
+  const inStock = order.work_state === 'in_stock'
+  const accent = inStock
+    ? WORK_ACCENT.in_stock
+    : stranded
     ? (daysSinceArrival != null && daysSinceArrival >= 7 ? 'bg-red-600' : 'bg-amber-500')
     : order.shopify_order_closed
       ? WORK_ACCENT.shopify_fulfilled
@@ -509,7 +516,9 @@ export function SpecialOrderRow({
 
             <div className="space-y-1.5">
               <StagePill order={order} />
-              {order.closeout_state === 'customer_stranded'
+              {order.work_state === 'in_stock'
+                ? <div><InStockBadge sellable={order.in_stock_sellable} detail={order.in_stock_detail} /></div>
+                : order.closeout_state === 'customer_stranded'
                 ? <div><CustomerWaitingBadge days={daysSinceArrival} /></div>
                 : order.shopify_order_closed
                   ? <div><ShopifyClosedBadge state={order.shopify_order_closed} /></div>
