@@ -76,17 +76,26 @@ class PurchaseOrderSnapshotCache:
             seen.add(order_id)
         return orders
 
-    def peek_orders(self) -> Optional[List[Dict[str, Any]]]:
+    def peek_orders(self, where=None) -> Optional[List[Dict[str, Any]]]:
         """The cached snapshot if it is already fresh, else None. Never triggers a load.
 
         A full walk costs ~40s against ~1,850 purchase orders. Callers who merely *benefit* from
         PO data (the special-order recommendation engine) must not be able to impose that on a
         user; they degrade gracefully instead, while the workbench and the startup warmer keep
         the snapshot populated for everyone.
+
+        ``where`` narrows the copy to the orders a caller actually reads. The copy itself is not
+        optional -- callers must not be able to mutate the shared snapshot -- but its *size* is:
+        copying all ~1,850 orders for a consumer that only looks at drafts put a second full
+        snapshot on the heap of a 512MB worker. Same reasoning as ``_render``, which has always
+        copied only its filtered subset.
         """
         with self._lock:
             if self._orders is not None and self._is_fresh(self.clock()):
-                return deepcopy(self._orders)
+                orders = self._orders if where is None else [
+                    order for order in self._orders if where(order)
+                ]
+                return deepcopy(orders)
         return None
 
     def _render(self, now: float, vendor_id: Optional[str], shop_id: Optional[str],

@@ -222,6 +222,33 @@ def read_root():
 def health_check():
     return {"status": "healthy"}
 
+@app.get("/api/debug/memory")
+def get_memory_debug():
+    """Live RSS plus the entry counts of the caches that can grow with traffic.
+
+    Exists because the 2026-09-02 OOM had to be reconstructed from the CPU chart: the
+    baseline had ratcheted for days with nothing recording which cache was holding it.
+    Counts, never contents — this says how many entries a cache holds, not what is in
+    them."""
+    from app.services.memory_probe import rss_mb
+    from app.services import bigquery_sync as _bq
+    from app.services.price_intelligence import repository as _pi_repo
+    return {
+        "rss_mb": rss_mb(),
+        "caches": {
+            "item_stock": len(_bq._item_stock_cache),
+            "order_cadence": len(_bq._order_cadence_cache),
+            "active_vendor_lead_time": len(_bq._active_vendor_lead_time_cache),
+            "brand_vendor_sourcing": len(_bq._brand_vendor_sourcing_cache),
+            "tagged_items": len(_bq._bq_tag_cache),
+            "lead_times": len(_bq._bq_lead_time_cache),
+            "monthly_category_history": len(_bq._monthly_category_history_cache),
+            "price_intel": len(_pi_repo._caches),
+            "shopify_timeline": len(_shopify_timeline_cache),
+            "health": len(_health_cache),
+        },
+    }
+
 @app.get("/api/replenishment/debug")
 def get_replenishment_debug():
     try:
@@ -350,7 +377,7 @@ def get_replenishment_data(
         # actually re-queried BigQuery, so the run/velocity logging below can fire on a
         # real data refresh instead of on every debounced slider change.
         fetched_at_before = tagged_items_fetched_at("auto-replen")
-        raw_data = fetch_tagged_items_metrics("auto-replen", force_refresh=force_refresh).to_dict(orient="records")
+        raw_data = fetch_tagged_items_metrics("auto-replen", force_refresh=force_refresh)
         data_is_fresh = tagged_items_fetched_at("auto-replen") != fetched_at_before
         lead_times = fetch_lead_times().to_dict(orient="records")
         brand_sourcing_rules = get_brand_sourcing_rules_map()
@@ -753,7 +780,7 @@ def get_forward_coverage(
         from app.services.replenishment_engine import process_recommendations
         from app.services.forecasting import build_seasonal_profiles, project_weeks_of_cover
 
-        raw_data = fetch_tagged_items_metrics("auto-replen", force_refresh=force_refresh).to_dict(orient="records")
+        raw_data = fetch_tagged_items_metrics("auto-replen", force_refresh=force_refresh)
         lead_times = fetch_lead_times().to_dict(orient="records")
         brand_sourcing_rules = get_brand_sourcing_rules_map()
         recommendations = process_recommendations(
@@ -2094,7 +2121,13 @@ def _recommendation_context(rows):
         # tier is simply unavailable and the engine falls back to in-stock / inbound / new-PO.
         # BigQuery is not an alternative here -- its PO data runs ~10 hours behind, which would
         # hide exactly the drafts a buyer opened this morning.
-        open_orders=_safe(lambda: get_po_snapshot_cache().peek_orders() or [], []),
+        # Only unsent drafts are read downstream (_draft_po_candidates skips everything
+        # else), so copy only those out of the shared snapshot rather than all ~1,850.
+        open_orders=_safe(
+            lambda: get_po_snapshot_cache().peek_orders(
+                where=lambda o: o.get("po_state") == "unsent") or [],
+            [],
+        ),
         cadence=f_cadence.result(),
     )
     _reco_context_cache["data"] = ctx

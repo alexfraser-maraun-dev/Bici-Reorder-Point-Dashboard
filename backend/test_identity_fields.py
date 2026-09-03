@@ -194,7 +194,7 @@ class IdentityFieldsTest(unittest.TestCase):
         row = item_row(1001, "NEG-QOH", 55)
         row["current_qoh"] = -5
 
-        with patch("app.services.bigquery_sync.fetch_tagged_items_metrics", return_value=FakeFrame([row])), \
+        with patch("app.services.bigquery_sync.fetch_tagged_items_metrics", return_value=[row]), \
              patch("app.services.bigquery_sync.fetch_lead_times", return_value=FakeFrame([{"vendor_id": 55, "location_id": 3, "lead_time_days": 14}])), \
              patch("app.services.bigquery_sync.get_brand_sourcing_rules_map", return_value={}), \
              patch("app.main.get_sku_overrides", return_value={"NEG-QOH_Bici Adanac": {"manual_desired_level": 40}}), \
@@ -225,7 +225,7 @@ class IdentityFieldsTest(unittest.TestCase):
         row["total_units_sold_30"] = 44
         row["total_units_sold_60"] = 74
 
-        with patch("app.services.bigquery_sync.fetch_tagged_items_metrics", return_value=FakeFrame([row])), \
+        with patch("app.services.bigquery_sync.fetch_tagged_items_metrics", return_value=[row]), \
              patch("app.services.bigquery_sync.fetch_lead_times", return_value=FakeFrame([{"vendor_id": 55, "location_id": 3, "lead_time_days": 14}])), \
              patch("app.services.bigquery_sync.get_brand_sourcing_rules_map", return_value={}), \
              patch("app.main.get_sku_overrides", return_value={}), \

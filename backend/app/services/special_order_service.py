@@ -890,7 +890,30 @@ def _sort_orders(orders: List[Dict[str, Any]]) -> None:
 # Snapshot of the last full build's normalized-but-unenriched rows, so a Shopify-side write
 # (ETA edit, manual match/unmatch) can rebuild the dashboard by re-running just the Shopify
 # pull + matching over these rows instead of paying the whole Lightspeed walk again.
-_pre_enrichment: Dict[str, Any] = {"orders": None, "completed": None, "meta": None}
+_pre_enrichment: Dict[str, Any] = {"orders": None, "completed": None, "meta": None,
+                                   "captured_at": 0.0}
+# The snapshot only has to bridge a full build and a Shopify-side write that follows it,
+# which is a window of seconds to minutes. Holding it indefinitely kept a second full
+# copy of every special-order row resident for the life of the worker, alongside the
+# enriched copy in main's dashboard cache. Past the TTL the rows are dropped and
+# re_enrich_dashboard falls back to a full rebuild — the same path every cold process
+# already takes.
+_PRE_ENRICHMENT_TTL_SECONDS = 900
+
+
+def _pre_enrichment_orders() -> Optional[list]:
+    """The last build's pre-enrichment rows, or None once they have gone stale.
+
+    Clears the whole slot on expiry so the completed rows and meta are released too,
+    rather than lingering until the next full build overwrites them.
+    """
+    if _pre_enrichment.get("orders") is None:
+        return None
+    if time.time() - _pre_enrichment.get("captured_at", 0.0) >= _PRE_ENRICHMENT_TTL_SECONDS:
+        _pre_enrichment.update({"orders": None, "completed": None, "meta": None,
+                                "captured_at": 0.0})
+        return None
+    return _pre_enrichment["orders"]
 
 
 def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Dict[str, Any]:
@@ -1020,6 +1043,8 @@ def get_special_order_dashboard(client: Optional[LightspeedClient] = None) -> Di
         "generated_at": datetime.utcnow().isoformat() + "Z",
     }
     _pre_enrichment["meta"] = copy.deepcopy(dashboard_meta)
+    # Stamped last, so the slot only counts as live once all three parts are in place.
+    _pre_enrichment["captured_at"] = time.time()
     return {
         "orders": orders,
         "summary": _summarize(orders),
@@ -1038,7 +1063,7 @@ def re_enrich_dashboard() -> Optional[Dict[str, Any]]:
     Returns the fresh dashboard payload, or None when no prior full build exists (cold
     process) — the caller then falls back to a full rebuild.
     """
-    pre_orders = _pre_enrichment.get("orders")
+    pre_orders = _pre_enrichment_orders()
     if pre_orders is None:
         return None
     today = date.today()

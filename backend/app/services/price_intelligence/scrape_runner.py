@@ -4,12 +4,15 @@ A run is triggered by POST /scrape or the scheduler, acquires a non-blocking loc
 (409 if one is already going), and does all work on a daemon thread so the HTTP
 request returns immediately (the 120s gunicorn timeout never applies). Live
 progress is kept in an in-memory status dict the UI polls; the durable record is
-one pi_scrape_runs row written at the end.
+one pi_scrape_runs row, opened at the start and updated at the end so that a run
+killed mid-flight (OOM, redeploy) still leaves a marker the scheduler can see.
 
 Memory discipline (512MB budget shared with the API): competitors are scraped
-strictly sequentially, catalogs stream through generators, and observation
-buffers flush to BigQuery per competitor (capped at FLUSH_ROWS), so peak state is
-one page of products plus the small diff/match dicts.
+strictly sequentially, catalogs stream through generators, and every phase flushes
+its observation, event and confirmed-link buffers to BigQuery as they fill (capped
+at FLUSH_ROWS) rather than at the end, so peak state is one page of products plus
+the small diff/match dicts. The match structures are released before the LLM
+verification phase, which loads its own copy.
 """
 import json
 import threading
@@ -47,6 +50,12 @@ def get_status() -> dict:
 
 
 def _set_status(**fields):
+    # Phase changes are the natural sampling points for memory: they bracket the run's
+    # distinct working sets, so a climb can be attributed to a phase rather than
+    # reconstructed from the CPU chart afterwards.
+    if "phase" in fields:
+        from app.services.memory_probe import log_rss
+        fields["rss_mb"] = log_rss(f"scrape phase={fields['phase']}")
     with _status_lock:
         _status.update(fields)
 
@@ -286,6 +295,31 @@ class LinkProposer:
         # model. Kept separate because they bypass the LLM budget and are written
         # in full rather than sampled (see _fan_out_matrix).
         self.sibling_links = []
+        # Totals across every flush, for the end-of-run log line — the buffers
+        # themselves are emptied as they are written.
+        self.gtin_written = 0
+        self.sibling_written = 0
+
+    def flush_confirmed(self, force: bool = False):
+        """Persists buffered identity matches (gtin + sibling) and empties the buffers.
+
+        Unlike pending_links these are deliberately uncapped: they are confirmed matches
+        rather than candidates competing for a review budget, so every one must be
+        written (see the note at the end-of-run write). Uncapped *and* held to the end of
+        the run, though, made them the one run-lifetime accumulator with no ceiling at
+        all, so they go out as they build instead.
+
+        Safe to batch: insert_product_links is an insert-only MERGE on match_key, and
+        existing_link_keys already stops a key being proposed twice in one run.
+        """
+        buffered = len(self.gtin_links) + len(self.sibling_links)
+        if not buffered or (not force and buffered < config.FLUSH_ROWS):
+            return
+        repository.insert_product_links(self.gtin_links + self.sibling_links)
+        self.gtin_written += len(self.gtin_links)
+        self.sibling_written += len(self.sibling_links)
+        del self.gtin_links[:]
+        del self.sibling_links[:]
 
     def propose(self, match_key, candidate, competitor_id, product, item_id=None,
                 method=None, confidence=None):
@@ -455,6 +489,29 @@ def _count_extraction(counters: dict, product: dict):
     counters["extractor_methods"][method] = counters["extractor_methods"].get(method, 0) + 1
 
 
+def _flush_buffers(obs_buffer: list, event_buffer: list, counters: dict,
+                   force: bool = False):
+    """Writes buffered observations and events out, emptying both buffers in place.
+
+    Called mid-loop, not only at phase end. A phase that flushed once at the end held
+    every row it produced -- observations *and* the change events derived from them --
+    on the heap for its whole duration, which on a long confirmed-link or tracked-URL
+    pass is the largest single allocation of the night. The buffers are cleared in place
+    so callers keep their references and no rebinding is needed at the call site.
+
+    Observations and events go to different tables and `prev_map` is read once per phase,
+    so interleaving the writes does not change what gets recorded.
+    """
+    if force or len(obs_buffer) >= config.FLUSH_ROWS:
+        repository.load_rows(repository.T_OBSERVATIONS, obs_buffer)
+        counters["observations"] += len(obs_buffer)
+        del obs_buffer[:]
+    if force or len(event_buffer) >= config.FLUSH_ROWS:
+        repository.load_rows(repository.T_EVENTS, event_buffer)
+        counters["changes"] += sum(1 for e in event_buffer if not e["acknowledged"])
+        del event_buffer[:]
+
+
 def _run(run_id: str, trigger: str, force_full: bool = False):
     started_at = _now_iso()
     counters = {
@@ -463,9 +520,27 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         "ranges_excluded": 0, "fallback_failures": 0, "extractor_methods": {},
     }
     errors = []
+    # Open the run row up front. The end-of-run save in `finally` cannot be relied on as
+    # the restart guard: an OOM kill is SIGKILL, so `finally` never runs, no row lands,
+    # and has_scheduler_blocking_run_on() then sees nothing on reboot — the scheduler's
+    # `due` check spans the rest of the day, so the whole run re-fires within 60s of
+    # boot. A row written here closes that loop, and one left at status='running' with
+    # no finished_at is an accurate record that the run was killed.
+    run_row_opened = False
     try:
         _set_status(phase="preparing")
         repository.ensure_pi_tables()
+        try:
+            repository.save_scrape_run({
+                "run_id": run_id, "started_at": started_at, "finished_at": None,
+                "trigger": trigger, "status": "running", "competitors_done": 0,
+                "urls_done": 0, "observations_count": 0, "changes_count": 0,
+                "error": None, "stats_json": None,
+            })
+            run_row_opened = True
+        except Exception as e:
+            # Non-fatal: the run still works, it just loses its restart guard.
+            print(f"pi: failed to open run record (restart guard inactive): {e}")
 
         # Keep the comparison list current before matching against it.
         try:
@@ -506,8 +581,6 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                                 confirmed_pairs)
         _propose_link = proposer.propose
         pending_links = proposer.pending_links
-        gtin_links = proposer.gtin_links
-        sibling_links = proposer.sibling_links
         existing_link_keys = proposer.existing_link_keys
 
         # Synthetic sources (Google benchmark/suggested) are pulled by their own
@@ -652,14 +725,8 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                         event_buffer.extend(
                             _build_events(prev_map, obs, competitor["name"], item_lookup)
                         )
-                    if len(obs_buffer) >= config.FLUSH_ROWS:
-                        repository.load_rows(repository.T_OBSERVATIONS, obs_buffer)
-                        counters["observations"] += len(obs_buffer)
-                        obs_buffer = []
-                repository.load_rows(repository.T_OBSERVATIONS, obs_buffer)
-                counters["observations"] += len(obs_buffer)
-                repository.load_rows(repository.T_EVENTS, event_buffer)
-                counters["changes"] += sum(1 for e in event_buffer if not e["acknowledged"])
+                    _flush_buffers(obs_buffer, event_buffer, counters)
+                _flush_buffers(obs_buffer, event_buffer, counters, force=True)
                 # Distinguish a healthy crawl from silent failures: a connector that
                 # yields nothing (bad sitemap / blocked) vs one that yields products
                 # but persists none (no tracked-brand overlap) — both looked like
@@ -699,6 +766,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 errors.append(f"{competitor['name']}: {e}")
                 print(f"pi: competitor {competitor['name']} failed: {e}")
             repository.mark_competitor_scraped(cid, comp_status[:200], crawl_state)
+            proposer.flush_confirmed()
             counters["competitors_done"] += 1
             _set_status(competitors_done=counters["competitors_done"],
                         observations=counters["observations"], changes=counters["changes"],
@@ -799,11 +867,9 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             except Exception as e:
                 errors.append(f"link {link['competitor_url']}: {e}")
             links_done += 1
+            _flush_buffers(obs_buffer, event_buffer, counters)
             _set_status(links_done=links_done)
-        repository.load_rows(repository.T_OBSERVATIONS, obs_buffer)
-        counters["observations"] += len(obs_buffer)
-        repository.load_rows(repository.T_EVENTS, event_buffer)
-        counters["changes"] += sum(1 for e in event_buffer if not e["acknowledged"])
+        _flush_buffers(obs_buffer, event_buffer, counters, force=True)
         _set_status(observations=counters["observations"], changes=counters["changes"])
         for cid, n in per_competitor.items():
             repository.mark_competitor_scraped(cid, f"targeted ({n} links)")
@@ -849,10 +915,9 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                         _build_events(prev_map, obs, name, item_lookup))
             except Exception as e:
                 errors.append(f"fan-out {link['competitor_url']}: {e}")
-        repository.load_rows(repository.T_OBSERVATIONS, obs_buffer)
-        counters["observations"] += len(obs_buffer)
-        repository.load_rows(repository.T_EVENTS, event_buffer)
-        counters["changes"] += sum(1 for e in event_buffer if not e["acknowledged"])
+            _flush_buffers(obs_buffer, event_buffer, counters)
+            proposer.flush_confirmed()
+        _flush_buffers(obs_buffer, event_buffer, counters, force=True)
         print(f"pi: matrix fan-out: {len(targets)} pages, "
               f"{counters.get('siblings_linked', 0)} variants linked")
         _set_status(observations=counters["observations"], changes=counters["changes"])
@@ -911,11 +976,9 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 errors.append(f"url {url}: {e}")
                 repository.mark_url_scraped(url_row["url_id"], f"failed: {e}"[:200])
             counters["urls_done"] += 1
+            _flush_buffers(obs_buffer, event_buffer, counters)
             _set_status(urls_done=counters["urls_done"])
-        repository.load_rows(repository.T_OBSERVATIONS, obs_buffer)
-        counters["observations"] += len(obs_buffer)
-        repository.load_rows(repository.T_EVENTS, event_buffer)
-        counters["changes"] += sum(1 for e in event_buffer if not e["acknowledged"])
+        _flush_buffers(obs_buffer, event_buffer, counters, force=True)
         _set_status(observations=counters["observations"], changes=counters["changes"])
 
         # --- Google Merchant benchmark: pulled, not crawled ------------------
@@ -963,13 +1026,25 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                     continue
                 per_item[row["item_id"]] = n + 1
                 selected.append(row)
-            # sibling_links are written in full and unsampled: each already has
-            # colour+size agreement on a page a human confirmed sells the model,
-            # so there is nothing for the sampling to choose between.
-            repository.insert_product_links(gtin_links + sibling_links + selected)
-            print(f"pi: links written — confirmed {len(gtin_links)}, "
-                  f"sibling {len(sibling_links)}, candidates {len(selected)} "
+            # gtin/sibling links are written in full and unsampled: each already has
+            # an identity match (barcode, or colour+size on a page a human confirmed
+            # sells the model), so there is nothing for the sampling to choose between.
+            proposer.flush_confirmed(force=True)
+            repository.insert_product_links(selected)
+            print(f"pi: links written — confirmed {proposer.gtin_written}, "
+                  f"sibling {proposer.sibling_written}, candidates {len(selected)} "
                   f"of {len(pending_links)}")
+            # Every phase above is done with the in-memory match structures, and
+            # verify_candidates() below loads its own copy of the tracked set and the
+            # confirmed links. Release ours first so the two never coexist: together
+            # they are the largest live allocation of the run, and this is its last
+            # phase. Rebound rather than `del`ed so an unbound name cannot turn a
+            # memory tidy-up into a skipped verification.
+            index = token_index = item_lookup = None
+            confirmed_links = link_targets = prev_map = None
+            proposer.item_lookup = {}
+            del proposer.pending_links[:]
+
             # Always run: pending-unverified rows can come from earlier runs
             # (e.g. demoted links), not just this run's candidates. A clean
             # backlog costs one query.
@@ -996,23 +1071,29 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         print(f"pi: scrape run {run_id} failed: {e}")
     finally:
         finished_at = _now_iso()
+        final_row = {
+            "run_id": run_id,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "trigger": trigger,
+            "status": status,
+            "competitors_done": counters["competitors_done"],
+            "urls_done": counters["urls_done"],
+            "observations_count": counters["observations"],
+            "changes_count": counters["changes"],
+            "error": "; ".join(errors)[:1000] if errors else None,
+            "stats_json": json.dumps({
+                k: v for k, v in counters.items()
+                if k not in ("competitors_done", "urls_done", "observations", "changes")
+            }),
+        }
         try:
-            repository.save_scrape_run({
-                "run_id": run_id,
-                "started_at": started_at,
-                "finished_at": finished_at,
-                "trigger": trigger,
-                "status": status,
-                "competitors_done": counters["competitors_done"],
-                "urls_done": counters["urls_done"],
-                "observations_count": counters["observations"],
-                "changes_count": counters["changes"],
-                "error": "; ".join(errors)[:1000] if errors else None,
-                "stats_json": json.dumps({
-                    k: v for k, v in counters.items()
-                    if k not in ("competitors_done", "urls_done", "observations", "changes")
-                }),
-            })
+            # Update the row opened above, so a run stays one row. Only insert here if
+            # opening it failed, which would otherwise lose the run record entirely.
+            if run_row_opened:
+                repository.update_scrape_run(run_id, final_row)
+            else:
+                repository.save_scrape_run(final_row)
         except Exception as e:
             print(f"pi: failed to save run record: {e}")
         # Slack dispatch: best-effort, in finally so a health alert still fires

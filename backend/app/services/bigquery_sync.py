@@ -5,6 +5,7 @@ import json
 import time
 import statistics
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 
 # Initialize BigQuery client lazily to avoid startup crashes
@@ -865,7 +866,8 @@ def fetch_active_vendor_lead_times(active_days: int = 90, force_refresh: bool = 
             "warnings": warnings,
         },
     }
-    _cache_set(_active_vendor_lead_time_cache, cache_key, result)
+    _cache_set(_active_vendor_lead_time_cache, cache_key, result,
+               max_entries=_ADMIN_CACHE_MAX_ENTRIES)
     return result
 
 def fetch_brand_sourcing_rules(force_refresh: bool = False) -> list:
@@ -1041,10 +1043,14 @@ def fetch_monthly_category_history(years: int = 3, force_refresh: bool = False) 
     Validated against live BigQuery (2026-06-16).
     """
     current_time = time.time()
-    if not force_refresh and years in _monthly_category_history_cache:
+    if years in _monthly_category_history_cache:
         cached_data, timestamp = _monthly_category_history_cache[years]
-        if current_time - timestamp < MONTHLY_HISTORY_TTL_SECONDS:
+        if not force_refresh and current_time - timestamp < MONTHLY_HISTORY_TTL_SECONDS:
             return cached_data
+        # Stale (or being force-refreshed): drop it now rather than letting the frame
+        # sit pinned until an identical key overwrites it.
+        _monthly_category_history_cache.pop(years, None)
+        del cached_data
 
     query = f"""
         SELECT
@@ -1377,12 +1383,23 @@ def fetch_inventory_snapshot() -> pd.DataFrame:
 _bq_lead_time_cache = {}
 CACHE_TTL = 300          # 5 minutes — tagged items, lead times
 ADMIN_CACHE_TTL_SECONDS = 900  # 15 minutes — brand sourcing rules, active vendor lead times
-_active_vendor_lead_time_cache = {}
+
+# The caches below split by how their keys are formed. One keyed on a fixed set of
+# parameters (years, lookback_months) can only ever hold a handful of entries, so the
+# free-on-expiry in _cache_get bounds it well enough. One whose key includes anything a
+# caller varies needs a ceiling too, because entries can arrive faster than they age out.
+_ADMIN_CACHE_MAX_ENTRIES = 64
+
+_active_vendor_lead_time_cache = OrderedDict()
 _brand_sourcing_rules_cache = {}
 _brand_sourcing_rules_map_cache = {}
-_brand_vendor_sourcing_cache = {}
+_brand_vendor_sourcing_cache = OrderedDict()
 
-_item_stock_cache = {}
+# Keyed per item, so the ceiling is the tracked catalog rather than the number of
+# distinct item populations ever requested. Sharing entries across callers is the point:
+# two dashboard reads over overlapping item sets used to share nothing.
+_ITEM_STOCK_CACHE_MAX_ENTRIES = 20000
+_item_stock_cache = OrderedDict()
 
 
 def fetch_item_stock(item_ids, force_refresh: bool = False):
@@ -1400,13 +1417,26 @@ def fetch_item_stock(item_ids, force_refresh: bool = False):
     ids = sorted({str(i) for i in item_ids if i})
     if not ids:
         return {}
-    # ~6s per call against a large snapshot table, and this now runs on every dashboard read to
-    # supply `days_lost`. Keyed on the item set so a changed population re-queries.
-    cache_key = f"stock:{hash(tuple(ids))}"
+
+    # ~6s per call against a large snapshot table, and this runs on every dashboard read
+    # to supply `days_lost` — so it has to cache. It is keyed PER ITEM rather than per
+    # requested population: a population key (a hash of the id list) mints a fresh entry
+    # for every distinct set a caller happens to pass, which grows without limit in a
+    # worker that never recycles, and lets two reads over overlapping items share
+    # nothing. Per-item keys bound the cache by the catalog and make the overlap pay.
+    out = {}
+    missing = ids
     if not force_refresh:
-        cached = _cache_get(_item_stock_cache, cache_key)
-        if cached is not None:
-            return cached
+        missing = []
+        for item_id in ids:
+            entry = _cache_get(_item_stock_cache, item_id)
+            if entry is None:
+                missing.append(item_id)
+            else:
+                out.update(entry)
+        if not missing:
+            return out
+
     query = f"""
         WITH latest AS (
             SELECT MAX(snapshot_date_local) AS d FROM `{LS_DATASET}.v_master_snapshot_latest`
@@ -1421,16 +1451,22 @@ def fetch_item_stock(item_ids, force_refresh: bool = False):
     """
     from google.cloud import bigquery as _bq
     job_config = _bq.QueryJobConfig(query_parameters=[
-        _bq.ArrayQueryParameter("item_ids", "STRING", ids),
+        _bq.ArrayQueryParameter("item_ids", "STRING", missing),
         _bq.ArrayQueryParameter("shop_ids", "INT64", list(TARGET_SHOP_IDS)),
     ])
-    out = {}
+    # Seeded empty so that an item the query returns no row for is cached as "no stock"
+    # below. The `qoh > 0` filter means that is the common case, and without the seed
+    # every zero-stock item would miss the cache on every call and be re-queried forever.
+    fetched = {item_id: {} for item_id in missing}
     for r in get_bq_client().query(query, job_config=job_config).result():
-        out[(r.item_id, r.shop_id)] = {
+        fetched.setdefault(r.item_id, {})[(r.item_id, r.shop_id)] = {
             "sellable": int(r.sellable or 0),
             "qoh": int(r.qoh or 0),
         }
-    _item_stock_cache[cache_key] = (out, time.time())
+    for item_id, rows in fetched.items():
+        _cache_set(_item_stock_cache, item_id, rows,
+                   max_entries=_ITEM_STOCK_CACHE_MAX_ENTRIES)
+        out.update(rows)
     return out
 
 
@@ -1578,21 +1614,41 @@ def fetch_order_cadence(lookback_months: int = 12, force_refresh: bool = False):
             # order forces it (a PO is a deliberate act). Affects effort, never the date.
             "is_routine": int(r.sample_size) >= 24,
         }
-    _order_cadence_cache[cache_key] = (out, time.time())
+    _cache_set(_order_cadence_cache, cache_key, out)
     return out
 
 
 def _cache_get(cache: dict, key):
+    """Serves a live entry, and *frees* a stale one.
+
+    Dropping the expired entry matters as much as not serving it: these caches hold
+    query results and pandas frames in a single long-lived Render worker, so an entry
+    that is merely "not returned" still pins its payload until an identical key happens
+    to overwrite it. For a key that never recurs, that is forever.
+    """
     cached = cache.get(key)
     if not cached:
         return None
     data, timestamp = cached
-    if time.time() - timestamp < ADMIN_CACHE_TTL_SECONDS:
-        return data
-    return None
+    if time.time() - timestamp >= ADMIN_CACHE_TTL_SECONDS:
+        cache.pop(key, None)
+        return None
+    if isinstance(cache, OrderedDict):
+        cache.move_to_end(key)
+    return data
 
-def _cache_set(cache: dict, key, data):
+def _cache_set(cache: dict, key, data, max_entries: int = None):
+    """Stores an entry, evicting the least-recently-used once `max_entries` is passed.
+
+    `max_entries` is for caches whose key space is driven by request shape rather than
+    by a fixed set of parameters — expiry alone cannot bound those, because entries
+    arrive faster than they age out. Pass an OrderedDict for the bound to apply.
+    """
     cache[key] = (data, time.time())
+    if max_entries and isinstance(cache, OrderedDict):
+        cache.move_to_end(key)
+        while len(cache) > max_entries:
+            cache.popitem(last=False)
 
 def invalidate_brand_sourcing_cache():
     _brand_sourcing_rules_cache.clear()
@@ -1606,10 +1662,12 @@ def fetch_lead_times(lookback_months: int = 3, force_refresh: bool = False) -> p
     """
     current_time = time.time()
     
-    if not force_refresh and lookback_months in _bq_lead_time_cache:
+    if lookback_months in _bq_lead_time_cache:
         cached_data, timestamp = _bq_lead_time_cache[lookback_months]
-        if current_time - timestamp < CACHE_TTL:
+        if not force_refresh and current_time - timestamp < CACHE_TTL:
             return cached_data
+        _bq_lead_time_cache.pop(lookback_months, None)
+        del cached_data
 
     query = f"""
         WITH lead_time_samples AS (
@@ -1791,7 +1849,8 @@ def fetch_brand_vendor_sourcing(
             "distinct_items": int(d["distinct_items"]),
         })
 
-    _cache_set(_brand_vendor_sourcing_cache, cache_key, sourcing)
+    _cache_set(_brand_vendor_sourcing_cache, cache_key, sourcing,
+               max_entries=_ADMIN_CACHE_MAX_ENTRIES)
     return sourcing
 
 
@@ -1892,19 +1951,26 @@ def tagged_items_fetched_at(tag_name: str = "auto-replen") -> float:
     entry = _bq_tag_cache.get(tag_name)
     return entry[1] if entry else 0.0
 
-def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: bool = False) -> pd.DataFrame:
+def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: bool = False) -> list:
     """
     Fetches product, inventory, sales, and PO metrics from the trusted latest
     master snapshot view for qualified replenishment items. Stockout counts are
     still calculated from item_shop_history because the snapshot view does not
     expose trailing stockout days.
+
+    Returns a list of row dicts, and caches that rather than the DataFrame behind it.
+    Every caller converted the frame with .to_dict(orient="records") on arrival, so
+    keeping the frame meant the cache pinned a second, redundant representation of the
+    largest result set in the process for the whole TTL.
     """
     current_time = time.time()
     
-    if not force_refresh and tag_name in _bq_tag_cache:
+    if tag_name in _bq_tag_cache:
         cached_data, timestamp = _bq_tag_cache[tag_name]
-        if current_time - timestamp < CACHE_TTL:
+        if not force_refresh and current_time - timestamp < CACHE_TTL:
             return cached_data
+        _bq_tag_cache.pop(tag_name, None)
+        del cached_data
 
     query = f"""
         WITH 
@@ -2031,9 +2097,11 @@ def fetch_tagged_items_metrics(tag_name: str = "auto-replen", force_refresh: boo
         LEFT JOIN sale_day_counts sdc ON s.item_id = sdc.item_id AND s.shop_id = sdc.location_id
     """
     client = get_bq_client()
-    df = client.query(query).to_dataframe()
-    _bq_tag_cache[tag_name] = (df, time.time())
-    return df
+    # Straight to records: the DataFrame is an intermediate here, so let it go out of
+    # scope rather than holding it for the life of the cache entry.
+    records = client.query(query).to_dataframe().to_dict(orient="records")
+    _bq_tag_cache[tag_name] = (records, time.time())
+    return records
 
 
 def get_replenishment_debug_counts() -> dict:

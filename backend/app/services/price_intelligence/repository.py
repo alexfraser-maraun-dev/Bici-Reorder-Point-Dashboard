@@ -2640,6 +2640,33 @@ def save_scrape_run(row: dict):
     load_rows(T_RUNS, [row])
 
 
+def update_scrape_run(run_id: str, fields: dict):
+    """Fills in the run row that scrape_runner._run opens before it starts work.
+
+    DML is safe here because load_rows writes via a load job rather than the streaming
+    buffer (see its docstring) — a row inserted moments ago is immediately updatable.
+    """
+    if not fields:
+        return
+    ensure_pi_tables()
+    assignments, params = [], [
+        bigquery.ScalarQueryParameter("run_id", "STRING", run_id)
+    ]
+    schema = {f.name: f.field_type for f in _table_schema(T_RUNS)}
+    for i, (key, value) in enumerate(fields.items()):
+        if key == "run_id" or key not in schema:
+            continue
+        name = f"v{i}"
+        assignments.append(f"{key} = @{name}")
+        params.append(bigquery.ScalarQueryParameter(name, schema[key], value))
+    if not assignments:
+        return
+    get_bq_client().query(
+        f"UPDATE `{T_RUNS}` SET {', '.join(assignments)} WHERE run_id = @run_id",
+        job_config=bigquery.QueryJobConfig(query_parameters=params),
+    ).result()
+
+
 def get_scrape_runs(limit: int = 30):
     ensure_pi_tables()
     return _rows(f"SELECT * FROM `{T_RUNS}` ORDER BY started_at DESC LIMIT {int(limit)}")
