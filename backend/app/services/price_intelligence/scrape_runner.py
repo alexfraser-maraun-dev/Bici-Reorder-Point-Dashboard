@@ -284,11 +284,20 @@ class LinkProposer:
 
     MAX_COLLECTED_CANDIDATES = 5000
 
+    # Methods that assert an identity rather than infer one. A rejected
+    # (item, store) pair still admits these: a barcode, a brand+SKU hit or an
+    # exact colour+size resolution is new evidence, not a retry of the guess the
+    # human turned down. Everything else (fuzzy titles, partial colour/size) is
+    # blocked for that pair — see propose().
+    IDENTITY_METHODS = frozenset(
+        {"gtin", "brand_sku", "attr", "attr_exact", "sibling"})
+
     def __init__(self, item_lookup: dict, existing_link_keys: set,
-                 confirmed_pairs: set):
+                 confirmed_pairs: set, rejected_pairs: set = None):
         self.item_lookup = item_lookup
         self.existing_link_keys = existing_link_keys
         self.confirmed_pairs = confirmed_pairs
+        self.rejected_pairs = rejected_pairs or set()
         self.pending_links = []
         self.gtin_links = []
         # Colour+size matches harvested off pages already confirmed to sell the
@@ -339,6 +348,14 @@ class LinkProposer:
         target_id = str(item_id or candidate["item_id"])
         if (target_id, competitor_id) in self.confirmed_pairs:
             return None
+        # A rejection used to tombstone one match_key, so the sibling listing for
+        # the same item at the same store came straight back the next night —
+        # three Tucker III listings, rejected one at a time, forever. Block the
+        # pair for inferred proposals; identity-grade ones still get through, so
+        # a store that starts carrying the right variant isn't shut out.
+        if (method not in self.IDENTITY_METHODS
+                and (target_id, competitor_id) in self.rejected_pairs):
+            return None
         self.existing_link_keys.add(match_key)
         is_confirmed = item_id is not None and method in ("gtin", "attr_exact")
         # A sibling proposal comes off a page a human already confirmed sells this
@@ -376,6 +393,11 @@ class LinkProposer:
             "status": "confirmed" if is_confirmed else "pending",
             "source": ("gtin" if method == "gtin"
                        else "attr" if method in ("attr", "attr_exact")
+                       # Colour/size resolved, but not exactly on both — the queue
+                       # badges this differently so it stops claiming a
+                       # "color+size match" over a row whose own note says the
+                       # colour or size differs.
+                       else "attr_partial" if method == "attr_partial"
                        else "sibling" if method == "sibling"
                        else "llm"),
             "confidence": confidence,
@@ -578,7 +600,8 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         # the proposer holds the same set object, so it sees those additions.
         confirmed_pairs = set()
         proposer = LinkProposer(item_lookup, repository.get_link_match_keys(),
-                                confirmed_pairs)
+                                confirmed_pairs,
+                                repository.get_rejected_pairs())
         _propose_link = proposer.propose
         pending_links = proposer.pending_links
         existing_link_keys = proposer.existing_link_keys

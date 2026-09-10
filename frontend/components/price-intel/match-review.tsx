@@ -50,6 +50,11 @@ const SOURCE_LABEL: Record<string, string> = {
   manual_url: 'tracked URL',
   serp: 'SERP found',
   attr: 'color+size match',
+  // Colour/size resolved, but not exactly on both dimensions — their "Bronco
+  // White" against our "Satin White" shares only the word "white". Labelled
+  // apart from `attr` because the queue used to badge these "color+size match"
+  // over a row whose own note said the colour or size differed.
+  attr_partial: 'partial color/size',
   sibling: 'same page, color+size',
 }
 

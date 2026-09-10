@@ -443,7 +443,11 @@ export interface ProductLink {
   // agreement, 'sibling' = the same, on a page already confirmed to sell the
   // model. ('serp' and 'attr' were written by the backend before this type
   // listed them.)
-  source: 'gtin' | 'llm' | 'human' | 'manual_url' | 'serp' | 'attr' | 'sibling'
+  // 'attr' resolved colour AND size exactly; 'attr_partial' resolved one of
+  // them, or matched on a shared generic colour word — a weaker claim that
+  // carries its own badge and confidence.
+  source: 'gtin' | 'llm' | 'human' | 'manual_url' | 'serp' | 'attr'
+    | 'attr_partial' | 'sibling'
   confidence: number | null
   fuzzy_score: number | null
   llm_verdict: string | null

@@ -177,5 +177,80 @@ class CrawlStateRepositoryTests(unittest.TestCase):
         self.assertNotIn("STARTS_WITH", mock_rows.call_args.args[0])
 
 
+class CleanupReanchorTests(unittest.TestCase):
+    """The hygiene sweep must repair the queue, not just empty it.
+
+    Live shape: Steed's Tucker III L/XL and S/M listings were both stored against
+    our M/L item (combined sizes used to agree on overlap). Both are correct
+    matches pointed at the wrong variant of the same matrix, so rejecting them
+    would throw away real coverage AND tombstone the (item, store) pair.
+    """
+
+    MODEL = "Sweet Protection Tucker III 2Vi Mips Helmet"
+
+    def _tracked(self, item_id, colour, size):
+        return {"item_id": item_id, "title": self.MODEL, "brand": "Sweet Protection",
+                "sku": f"s{item_id}", "upc_normalized": None, "item_matrix_id": "t1",
+                "matrix_description": self.MODEL, "attribute_1": colour,
+                "attribute_2": size, "attribute_3": None}
+
+    def _link(self, link_id, title, status="pending"):
+        # Every row is stored against our Matte Black / M/L item.
+        return {"link_id": link_id, "item_id": "357", "competitor_id": "steed",
+                "status": status, "competitor_title": title,
+                "competitor_url": f"https://steedcycles.com/{link_id}",
+                "variant_options_json": None, "source": "attr",
+                "confidence": 0.97, "fuzzy_score": 100.0, "llm_verdict": None,
+                "item_attribute_1": "Matte Black", "item_attribute_2": "M/L",
+                "item_attribute_3": None}
+
+    def _sweep(self, links):
+        tracked = [
+            self._tracked("357", "Matte Black", "M/L"),
+            self._tracked("356", "Matte Black", "S/M"),
+            self._tracked("358", "Matte Black", "L/XL"),
+            self._tracked("355", "Satin White", "L/XL"),
+        ]
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "get_product_links",
+                          side_effect=[[], links]), \
+             patch.object(repository, "get_tracked_products", return_value=tracked):
+            return repository.cleanup_mismatched_links(apply=False)
+
+    def test_a_wrong_size_link_is_repointed_not_rejected(self):
+        report = self._sweep([
+            self._link("a", f"{self.MODEL} - Matte Black / L/XL (59-61cm)"),
+            self._link("b", f"{self.MODEL} - Matte Black / S/M (53-56cm)"),
+        ])
+        self.assertEqual(2, report["reanchored_exact"])
+        self.assertEqual(0, report["attr_reject_pending"])
+        moves = {s["to_item_id"] for s in report["reanchor_samples"]}
+        self.assertEqual({"358", "356"}, moves)
+
+    def test_an_uncertain_colourway_moves_as_partial_rather_than_rejecting(self):
+        """We stock no Bronco White. Rejecting would tombstone the pair, which is
+        too strong for a colourway we simply cannot name — it goes to review."""
+        report = self._sweep([
+            self._link("c", f"{self.MODEL} - Bronco White / L/XL (59-61cm)"),
+        ])
+        self.assertEqual(1, report["reanchored_partial"])
+        self.assertEqual(0, report["attr_reject_pending"])
+        self.assertEqual("attr_partial", report["reanchor_samples"][0]["as"])
+
+    def test_a_link_with_no_matching_sibling_is_still_rejected(self):
+        report = self._sweep([
+            self._link("d", f"{self.MODEL} - Neon Yellow / XXL"),
+        ])
+        self.assertEqual(0, report["reanchored_exact"] + report["reanchored_partial"])
+        self.assertEqual(1, report["attr_reject_pending"])
+
+    def test_a_correctly_anchored_link_is_left_alone(self):
+        report = self._sweep([
+            self._link("e", f"{self.MODEL} - Matte Black / M/L (56-59cm)"),
+        ])
+        self.assertEqual(0, report["reanchored_exact"] + report["reanchored_partial"])
+        self.assertEqual(0, report["attr_reject_pending"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,11 +19,15 @@ Mirrors digest.py: lazy client, ANTHROPIC_API_KEY guard, best-effort — the
 caller swallows failures so scrape data is never lost.
 """
 import json
-import re
 
 from . import config, matcher, repository, settings
 
 _anthropic_client = None
+
+# A candidate that lost the one-variant-per-(item, store) slot keeps its place in
+# the queue but not its rank — same idea as scrape_runner's OFF_PAGE_RANK_PENALTY
+# (kept local: scrape_runner imports this module).
+PAIR_LOSS_RANK_PENALTY = 0.5
 
 SYSTEM_PROMPT = (
     "You verify product matches for a bicycle retailer's price-comparison tool. "
@@ -123,24 +127,27 @@ def _build_pair(link: dict, item: dict, known_page: str = None) -> dict:
     }
 
 
-def _size_matches(size: str, attr: str) -> bool:
-    """Competitor size tokens rarely equal our attribute strings verbatim
-    ("700 x 25c" vs "700c x 25mm"), so also compare their digit sequences."""
-    size, attr = size.strip().lower(), attr.strip().lower()
-    if size == attr:
-        return True
-    size_digits = re.findall(r"\d+", size)
-    return bool(size_digits) and size_digits == re.findall(r"\d+", attr)
+def _variant_attrs(variant: dict) -> list:
+    return [variant.get("attribute_1"), variant.get("attribute_2"),
+            variant.get("attribute_3")]
 
 
-def _resolve_model_anchor(item: dict, competitor_size, tracked_by_matrix: dict):
+def _listing_options(link: dict) -> list:
+    """A listing's variant options: the connector's structured values when it
+    recovered them, else what the title tail carries."""
+    return (json.loads(link.get("variant_options_json") or "[]")
+            or matcher.parse_variant_options(link.get("competitor_title")))
+
+
+def _resolve_model_anchor(item: dict, competitor_size, tracked_by_matrix: dict,
+                          options: list = None):
     """For a same_model verdict, picks the tracked variant the link should attach
     to. Returns (item_id, resolved, note) — resolved False means ambiguous (stays
     pending for a human to pick the variant), and note explains an unresolvable
     size so the queue row says why our variant is shown next to a different one.
 
     A competitor variant pairs with exactly ONE of our variants, so a matrix
-    item only auto-confirms when the extracted size matches exactly one tracked
+    item only auto-confirms when the listing resolves to exactly one tracked
     variant — even a lone tracked variant has a specific size, and anchoring an
     unverified size to it is how one item ends up carrying every competitor
     variant of the model."""
@@ -149,12 +156,26 @@ def _resolve_model_anchor(item: dict, competitor_size, tracked_by_matrix: dict):
     if not variants:
         # Non-matrix item: there is no other variant it could be.
         return str(item["item_id"]), True, None
+    # Colour AND size, scored by the matcher. Filtering on size alone returns one
+    # hit per colourway, so in any multi-colour model this never saw the single
+    # hit it needs — the re-anchor could not fire at all, and the queue kept
+    # showing our M/L beside their L/XL with the LLM's own note saying so.
+    if options:
+        scored = [(matcher.attribute_match_score(options, _variant_attrs(v)), v)
+                  for v in variants]
+        best = max(s for s, _ in scored)
+        top = [v for s, v in scored if s == best]
+        if best > 0 and len(top) == 1:
+            # Re-anchoring to a better-fitting sibling is an improvement even on
+            # a partial fit; only an exact colour+size fit (2.0) is safe to
+            # auto-confirm on, so `resolved` asks for the full score.
+            return str(top[0]["item_id"]), best >= 2.0, None
     if competitor_size:
         size = str(competitor_size)
         hits = [
             v for v in variants
             if any(
-                _size_matches(size, str(v.get(a) or ""))
+                matcher._size_value_matches(size, str(v.get(a) or ""))
                 for a in ("attribute_1", "attribute_2", "attribute_3")
                 if v.get(a)
             )
@@ -221,39 +242,43 @@ def verify_candidates(max_pairs: int = None) -> dict:
     # The best attribute (color+size) match wins the slot; a lower-scoring one that
     # already claimed it is demoted back to pending. A pre-existing confirmed link
     # (prior run / human) always blocks — change it with reject-and-replace.
+    #
+    # This runs whether or not auto-confirm is on. It used to sit inside the
+    # auto-confirm branches only, and auto-confirm is off by default, so in normal
+    # operation nothing ever competed: every plausible listing landed in the queue
+    # independently and one item could spend all five of its per-run slots on
+    # near-duplicates of a single model. Losing rows still reach the queue — a
+    # human may disagree about which variant won — but ranked below the winner.
     claimed_in_run = {}  # pair -> (update_dict, score)
+    auto_confirm = settings.get("auto_confirm")
+
+    def _demote(update: dict, note: str):
+        update["status"] = "pending"
+        update["llm_reason"] = (
+            f"{update.get('llm_reason') or ''} [{note}]"
+        ).strip()[:300]
+        if update.get("confidence") is not None:
+            update["confidence"] = round(
+                float(update["confidence"]) * PAIR_LOSS_RANK_PENALTY, 3)
 
     def _claim_pair(item_id: str, competitor_id, update: dict, link: dict, item: dict) -> bool:
         pair = (str(item_id), competitor_id)
         if pair in confirmed_pairs:
-            update["status"] = "pending"
-            update["llm_reason"] = (
-                f"{update.get('llm_reason') or ''} "
-                "[item already has a confirmed link at this store]"
-            ).strip()[:300]
+            _demote(update, "item already has a confirmed link at this store")
             return False
-        # Structured options when the connector recovered them; the title tail is
-        # the fallback for listings that carry the variant only in their name.
-        options = (json.loads(link.get("variant_options_json") or "[]")
-                   or matcher.parse_variant_options(link.get("competitor_title")))
         score = matcher.attribute_match_score(
-            options,
+            _listing_options(link),
             [item.get("attribute_1"), item.get("attribute_2"), item.get("attribute_3")],
         )
         prev = claimed_in_run.get(pair)
         if prev is not None and score <= prev[1]:
-            update["status"] = "pending"
-            update["llm_reason"] = (
-                f"{update.get('llm_reason') or ''} [a closer variant match won this store]"
-            ).strip()[:300]
+            _demote(update, "a closer variant match won this store")
             return False
         if prev is not None:
-            prev[0]["status"] = "pending"
-            prev[0]["llm_reason"] = (
-                f"{prev[0].get('llm_reason') or ''} [superseded by a closer variant match]"
-            ).strip()[:300]
-            stats["confirmed"] -= 1
-            stats["pending"] += 1
+            _demote(prev[0], "superseded by a closer variant match")
+            if auto_confirm:
+                stats["confirmed"] -= 1
+                stats["pending"] += 1
         claimed_in_run[pair] = (update, score)
         return True
 
@@ -319,36 +344,36 @@ def verify_candidates(max_pairs: int = None) -> dict:
             }
             if verdict == "same_variant":
                 update.update(level="variant")
-                if not settings.get("auto_confirm"):
-                    # Manual-review mode: the verdict is triage annotation only —
-                    # the human confirms from the Matching queue.
-                    stats["pending"] += 1
-                elif _claim_pair(link["item_id"], link.get("competitor_id"), update, link, item):
+                # Competing always; only the confirm itself waits on auto-confirm.
+                # In manual-review mode the verdict is triage annotation and the
+                # human confirms from the Matching queue.
+                won = _claim_pair(link["item_id"], link.get("competitor_id"),
+                                  update, link, item)
+                if won and auto_confirm:
                     update.update(status="confirmed", confidence=0.95)
                     stats["confirmed"] += 1
                 else:
                     stats["pending"] += 1
             elif verdict == "same_model":
                 anchor_id, resolved, note = _resolve_model_anchor(
-                    item, result.get("competitor_size"), tracked_by_matrix
+                    item, result.get("competitor_size"), tracked_by_matrix,
+                    _listing_options(link),
                 )
-                # Re-anchoring to the size-matched variant is useful triage even
-                # when the confirm itself waits for a human.
+                # Re-anchoring to the colour+size-matched variant is useful triage
+                # even when the confirm itself waits for a human.
                 update.update(item_id=anchor_id, level="model")
                 if note:
                     update["llm_reason"] = (
                         f"{update['llm_reason']} [{note}]"
                     ).strip()[:300]
-                if not (settings.get("auto_confirm") and resolved):
-                    stats["pending"] += 1
-                else:
+                anchor_item = by_id.get(str(anchor_id), item)
+                won = _claim_pair(anchor_id, link.get("competitor_id"),
+                                  update, link, anchor_item)
+                if won and resolved and auto_confirm:
                     update.update(status="confirmed", confidence=0.85)
-                    anchor_item = by_id.get(str(anchor_id), item)
-                    if _claim_pair(anchor_id, link.get("competitor_id"), update, link, anchor_item):
-                        stats["confirmed"] += 1
-                    else:
-                        update.update(status="pending")
-                        stats["pending"] += 1
+                    stats["confirmed"] += 1
+                else:
+                    stats["pending"] += 1
             elif verdict == "different":
                 if link.get("source") == "gtin":
                     # Barcode says same product, LLM says different — a real

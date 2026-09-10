@@ -25,6 +25,14 @@ from . import config, repository, settings
 FUZZY_THRESHOLD = 90
 CANDIDATE_THRESHOLD = 60
 
+# Confidence for an attribute resolution that landed on a credible model anchor
+# but did NOT agree exactly on both colour and size (their "Bronco White" against
+# our "Satin White"). Below the 0.97 an exact resolution earns and above a bare
+# fuzzy title score, so the queue sorts it between the two. A resolution against
+# an untrusted anchor still carries no confidence at all — it keeps its real
+# fuzzy score (see _attribute_verdict).
+ATTR_PARTIAL_CONFIDENCE = 0.75
+
 # Apparel letter sizes normalized to a canonical token so "Large" == "L".
 _LETTER_SIZES = {
     "xxs": "xxs", "xs": "xs", "s": "s", "sm": "s", "small": "s",
@@ -198,15 +206,56 @@ def _canon_size(value):
     return None
 
 
-def _size_value_matches(a, b) -> bool:
-    """Two size values match when their digit sequences ('58' == '58cm') agree, or
-    their canonical letter sizes overlap ('Large' == 'L', 'M/L' == 'Medium')."""
+def _best_grade(grades):
+    """The strongest of a run of "exact"/"partial"/None agreements: "exact",
+    "partial", or False when a comparable dimension agreed on nothing."""
+    best = False
+    for g in grades:
+        if g == "exact":
+            return "exact"
+        if g == "partial":
+            best = "partial"
+    return best
+
+
+def _size_agreement(a, b):
+    """How two size values agree: "exact", "partial", or None.
+
+    exact   - the same size however it is spelled ('58' == '58cm',
+              'L (56-61cm)' == 'Large', 'L/XL' == 'L/XL (59-61cm)').
+    partial - one side names a SINGLE size that the other's COMBINED size covers
+              ('M/L' vs our 'Medium'). A store selling one M/L item against our
+              separate M and L is genuinely ambiguous, and ambiguity is what the
+              review queue is for.
+    None    - no agreement, INCLUDING two different combined sizes.
+
+    That last rule is the one worth stating plainly. Overlap alone used to count,
+    so 'M/L' agreed with 'L/XL' (they share L) and with 'S/M' (they share M) —
+    every size in a brand's size run matched its neighbours. For a helmet or a
+    jersey 'M/L' is one atomic SKU size, not "medium or large". Measured live:
+    Steed's Tucker III L/XL and S/M listings were both proposed against our M/L
+    item, badged 'color+size match', while our actual L/XL and S/M sat unmatched
+    in the same matrix.
+    """
     ca, cb = _canon_size(a), _canon_size(b)
     if ca is None or cb is None or ca[0] != cb[0]:
-        return False
-    if ca[0] == "letter":
-        return bool(ca[1] & cb[1])
-    return ca[1] == cb[1]
+        return None
+    if ca[0] == "num":
+        return "exact" if ca[1] == cb[1] else None
+    sa, sb = ca[1], cb[1]
+    if sa == sb:
+        return "exact"
+    # Proper subset, and the covered side names exactly one size.
+    if (len(sa) == 1 and sa < sb) or (len(sb) == 1 and sb < sa):
+        return "partial"
+    return None
+
+
+def _size_value_matches(a, b) -> bool:
+    """Whether two size values agree at all (see _size_agreement). Kept as the
+    predicate `attributes_conflict` and `size_matches_item` suppress on, so
+    suppression stays exactly as conservative as it has been."""
+    return _size_agreement(a, b) is not None
 
 
 # Finish/sheen words that qualify a colourway without naming it. Nearly every
@@ -224,17 +273,41 @@ def _color_tokens(value) -> set:
     return (tokens - _FINISH_WORDS) or tokens
 
 
-def _color_match(a, b) -> bool:
-    """Whether two color values plausibly refer to the same color. Shares a
-    colour-naming token, OR one alnum-only spelling contains the other so
-    spacing/camelCase variants agree ('blackSeries' == 'Black Series', 'Green' ~
-    'Steel Green'). Deliberately lenient: a false 'match' just keeps a link for
-    human review; a false 'mismatch' would wrongly tombstone a real match."""
-    if _color_tokens(a) & _color_tokens(b):
-        return True
+def _color_agreement(a, b):
+    """How two colour values agree: "exact", "partial", or None.
+
+    exact   - the same colour-naming tokens, finish words aside ('Matte Black'
+              == 'Gloss Black').
+    partial - they share a colour-naming token, or one alnum-only spelling
+              contains the other so spacing/camelCase variants agree
+              ('blackSeries' == 'Black Series', 'Green' ~ 'Steel Green') — but
+              the token sets are not equal.
+    None    - nothing in common.
+
+    partial is still an agreement, not a mismatch: 'Matte White/Silver' vs
+    'Matte White' has this exact shape and IS the same colourway, and a false
+    mismatch would wrongly tombstone it. What partial no longer does is earn
+    exact-match confidence — 'Satin White' and 'Bronco White' are two colourways
+    sharing one generic word, and treating that as a colour match is how a
+    wrong-colour listing reached the queue badged 'color+size match'.
+    """
+    ta, tb = _color_tokens(a), _color_tokens(b)
+    if ta and ta == tb:
+        return "exact"
+    if ta & tb:
+        return "partial"
     ca = re.sub(r"[^a-z0-9]", "", _fold(a))
     cb = re.sub(r"[^a-z0-9]", "", _fold(b))
-    return bool(ca) and bool(cb) and (ca in cb or cb in ca)
+    if ca and cb and (ca in cb or cb in ca):
+        return "partial"
+    return None
+
+
+def _color_match(a, b) -> bool:
+    """Whether two color values plausibly refer to the same color (see
+    _color_agreement). Deliberately lenient: a false 'match' just keeps a link
+    for human review; a false 'mismatch' would wrongly tombstone a real match."""
+    return _color_agreement(a, b) is not None
 
 
 def _listing_colors(options) -> list:
@@ -273,7 +346,13 @@ def attribute_match_score(options, attrs) -> float:
     a_col = [a for a in attrs if not _canon_size(a)]
     score = 0.0
     if o_sz and a_sz:
-        score += 1.0 if any(_size_value_matches(o, a) for o in o_sz for a in a_sz) else -2.0
+        grades = {_size_agreement(o, a) for o in o_sz for a in a_sz}
+        if "exact" in grades:
+            score += 1.0
+        elif "partial" in grades:
+            score += 0.5        # their combined size covers ours (M/L vs Medium)
+        else:
+            score -= 2.0
     if o_col and a_col:
         # Finish words excluded on both sides, as in _color_match: otherwise
         # their "Matte Black/Frequency Orange" never reads as an exact match for
@@ -292,11 +371,20 @@ def attribute_match_score(options, attrs) -> float:
 def parse_variant_options(competitor_title):
     """Best-effort recovery of a competitor variant's options from its title, e.g.
     'Factor Monza Force - Steel Green / 58' -> ['Steel Green', '58']. Returns []
-    when the title has no ' - Option / Option' tail (nothing to compare)."""
+    when the title has no ' - Option / Option' tail (nothing to compare).
+
+    Options are separated by a SPACED slash, which is how Shopify joins them. A
+    bare slash belongs to the option value itself, so splitting on every '/'
+    shattered exactly the values that carry one: 'Matte Black / L/XL (59-61cm)'
+    became ['Matte Black', 'L', 'XL (59-61cm)'], re-breaking the combined size
+    into halves that then matched their neighbours; and the two-tone colourway
+    'Hydrogen White/Uranium Black Matte / L (56-61cm)' was cut into two colours.
+    """
     if not competitor_title or " - " not in competitor_title:
         return []
     tail = competitor_title.rsplit(" - ", 1)[1]
-    return [p.strip() for p in tail.split("/") if p.strip()]
+    parts = [p.strip() for p in re.split(r"\s+/\s+", tail) if p.strip()]
+    return parts or ([tail.strip()] if tail.strip() else [])
 
 
 def attributes_conflict(options, attrs) -> bool:
@@ -631,8 +719,11 @@ class MatchIndex:
         variant it really is by comparing color/size against our attribute_1/2/3.
 
         Returns one of:
-          ("confirm", item_id)   - color AND size match exactly one tracked variant
-          ("candidate", item_id) - one dimension matches, the other is unknown
+          ("confirm", item_id)   - color AND size agree EXACTLY with exactly one
+                                   tracked variant
+          ("candidate", item_id) - agreement that isn't exact on both dimensions,
+                                   an exact hit on more than one variant, or one
+                                   dimension matching while the other is unknown
           ("suppress", None)     - a dimension clearly conflicts (wrong color/size)
                                    with every comparable tracked variant
           (None, None)           - not enough structured signal; use fuzzy fallback
@@ -658,28 +749,39 @@ class MatchIndex:
                                  s.get("attribute_3")) if a and str(a).strip()]
             s_sizes = [a for a in attrs if _canon_size(a)]
             s_colors = [a for a in attrs if not _canon_size(a)]
+            # "exact" / "partial" / False for a comparable dimension, None when
+            # the dimension can't be compared at all.
             size_state = None
             if opt_sizes and s_sizes:
                 size_comparable = True
-                size_state = any(_size_value_matches(o, a)
-                                 for o in opt_sizes for a in s_sizes)
-                size_hit = size_hit or size_state
+                size_state = _best_grade(_size_agreement(o, a)
+                                         for o in opt_sizes for a in s_sizes)
+                size_hit = size_hit or bool(size_state)
             color_state = None
             if opt_colors and s_colors:
                 color_comparable = True
-                color_state = any(_color_match(o, a)
-                                  for o in opt_colors for a in s_colors)
-                color_hit = color_hit or color_state
+                color_state = _best_grade(_color_agreement(o, a)
+                                          for o in opt_colors for a in s_colors)
+                color_hit = color_hit or bool(color_state)
             if size_state and color_state:
-                both.append(str(s["item_id"]))
+                both.append((str(s["item_id"]),
+                             size_state == "exact" and color_state == "exact"))
             elif (size_state and color_state is None) or (color_state and size_state is None):
                 partial.append(str(s["item_id"]))
 
-        if len(both) == 1:
-            return ("confirm", both[0])
+        exact_ids = [i for i, is_exact in both if is_exact]
+        if len(exact_ids) == 1:
+            return ("confirm", exact_ids[0])
         if both or partial:
-            # Exact-but-ambiguous, or one dimension matched — let a human confirm.
-            return ("candidate", (both or partial)[0])
+            # Exact-but-ambiguous, not exact on both dimensions, or one dimension
+            # matched — let a human confirm. Rank by attribute score rather than
+            # taking the first sibling: siblings arrive revenue-ranked, so "first"
+            # is arbitrary, and that arbitrariness is what proposed their L/XL
+            # listing against our M/L item while our L/XL sat in the same matrix.
+            pool = exact_ids or [i for i, _ in both] or partial
+            best = max(pool, key=lambda i: attribute_match_score(
+                options, self._item_attrs(i)))
+            return ("candidate", best)
         # No supported variant. Suppress only on a conflict we could actually see
         # (a dimension was comparable and matched nothing) — ambiguity falls back.
         if (size_comparable and not size_hit) or (color_comparable and not color_hit):
@@ -717,8 +819,17 @@ class MatchIndex:
             return target, "attr_exact", 0.97, None
         return None, None, 0.0, {
             "item_id": target,
-            "method": "attr",
-            "confidence": 0.97 if exact else None,
+            # A resolution that isn't exact on both dimensions is a weaker claim
+            # than "this IS the variant", so it carries its own method all the way
+            # to the queue's source badge — which otherwise reads "color+size
+            # match" over a row whose own note says the colour or size differs.
+            "method": "attr" if exact else "attr_partial",
+            # Against an untrusted anchor there is still no confidence to give:
+            # the pair keeps its real fuzzy score and competes honestly for the
+            # review budget (the ATTR_ANCHOR_MIN_SCORE gate above).
+            "confidence": (0.97 if exact
+                           else ATTR_PARTIAL_CONFIDENCE if anchor_trusted
+                           else None),
             "fuzzy_score": round(float(fuzzy_score), 1),
             "level": "variant",
             "off_page": off_page,

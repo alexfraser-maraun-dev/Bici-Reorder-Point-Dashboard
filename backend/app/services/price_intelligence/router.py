@@ -591,8 +591,9 @@ def rekey_links(apply: bool = False):
 
 @router.post("/links/cleanup")
 def cleanup_links(apply: bool = False):
-    """One-off hygiene: reject color/size-mismatched links and enforce one
-    confirmed link per (item, store). Dry-run unless apply=true."""
+    """One-off hygiene: re-anchor color/size-mismatched links onto the sibling
+    variant they actually describe, reject the ones with no such sibling, and
+    enforce one confirmed link per (item, store). Dry-run unless apply=true."""
     return repository.cleanup_mismatched_links(apply=apply)
 
 

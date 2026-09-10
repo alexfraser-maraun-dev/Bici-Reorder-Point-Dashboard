@@ -1860,7 +1860,12 @@ def get_product_links(status=None, item_id=None, unverified_only=False,
         LEFT JOIN {SQL_TRACKED_DEDUPED.format(table=T_TRACKED)} t
           ON t.item_id = l.item_id
         {clause}
-        ORDER BY l.fuzzy_score DESC, l.created_at DESC
+        -- Confidence first, falling back to the title score, which is the sort
+        -- the scrape runner already uses to spend its review budget. Sorting on
+        -- fuzzy_score alone put the queue exactly the wrong way up: a gtin or
+        -- brand+SKU proposal stores no fuzzy score, and BigQuery sorts NULL last
+        -- on DESC, so the strongest evidence sat below every 100% title guess.
+        ORDER BY COALESCE(l.confidence, l.fuzzy_score / 100) DESC, l.created_at DESC
         LIMIT {int(limit)}
     """, params=params)
 
@@ -1909,6 +1914,25 @@ def get_rejected_match_keys() -> set:
     return _with_gtin_keys(_rows(
         f"SELECT DISTINCT match_key, competitor_id, gtin FROM `{T_LINKS}` "
         "WHERE status = 'rejected' AND match_key IS NOT NULL"))
+
+
+def get_rejected_pairs() -> set:
+    """(item_id, competitor_id) pairs a human or the verifier rejected.
+
+    Tombstoning the match_key alone only stops that exact listing: the sibling
+    listing for the same item at the same store is a different key, so it was
+    proposed again on the next run and the same wrong product family refilled the
+    queue one variant at a time. The proposer blocks inferred proposals into these
+    pairs; identity-grade ones (barcode, brand+SKU, exact colour+size) still get
+    through — see LinkProposer.IDENTITY_METHODS."""
+    ensure_pi_tables()
+    return {
+        (str(r["item_id"]), r["competitor_id"])
+        for r in _rows(
+            f"SELECT DISTINCT item_id, competitor_id FROM `{T_LINKS}` "
+            "WHERE status = 'rejected' AND item_id IS NOT NULL "
+            "AND competitor_id IS NOT NULL")
+    }
 
 
 def backfill_url_competitor_ids(apply: bool = False) -> dict:
@@ -1990,7 +2014,7 @@ def reject_competitor_listing(item_id: str, competitor_id, url, decided_by: str 
     # matcher's match_key. Not filtered on competitor — a URL belongs to one store,
     # so bans of a mislabeled-competitor listing must still find it.
     obs = _rows(f"""
-        SELECT competitor_id, competitor_sku, url, competitor_title
+        SELECT competitor_id, competitor_sku, url, competitor_title, gtin
         FROM `{T_OBSERVATIONS}`
         WHERE match_item_id = @iid AND COALESCE(url, '') = @url
         ORDER BY observed_at DESC LIMIT 1
@@ -2029,9 +2053,13 @@ def reject_competitor_listing(item_id: str, competitor_id, url, decided_by: str 
     # 3) Tombstone the matcher's match_key (the no-link fuzzy/catalog path). Rebuild
     #    exactly what the scraper writes (SKU-preferred) so rejected_keys blocks it.
     key_cid = o.get("competitor_id") or cid or ""
+    # The barcode has to travel with the key AND onto the stored row. Without it
+    # build_match_key produced the SKU/URL form while the scraper regenerates the
+    # barcode form, and _with_gtin_keys had no gtin to derive the other form from —
+    # so a ban on a barcode-carrying listing never actually stuck.
     match_key = build_match_key(key_cid, {
         "sku": o.get("competitor_sku"), "url": o.get("url"),
-        "title": o.get("competitor_title"),
+        "title": o.get("competitor_title"), "gtin": o.get("gtin"),
     })
     existing = _rows(f"SELECT status FROM `{T_LINKS}` WHERE match_key = @mk LIMIT 1",
                      params=[bigquery.ScalarQueryParameter("mk", "STRING", match_key)])
@@ -2046,7 +2074,7 @@ def reject_competitor_listing(item_id: str, competitor_id, url, decided_by: str 
             "link_id": str(uuid.uuid4()), "item_id": iid,
             "competitor_id": key_cid or cid, "match_key": match_key,
             "competitor_url": o.get("url"), "competitor_sku": o.get("competitor_sku"),
-            "competitor_title": o.get("competitor_title"), "gtin": None,
+            "competitor_title": o.get("competitor_title"), "gtin": o.get("gtin"),
             "level": "variant", "status": "rejected", "source": "human",
             "confidence": None, "fuzzy_score": None, "llm_verdict": None,
             "llm_reason": "rejected from tracked-products breakdown", "our_price": None,
@@ -2409,31 +2437,65 @@ def rekey_links_to_gtin(apply: bool = False) -> dict:
 
 
 def cleanup_mismatched_links(apply: bool = False) -> dict:
-    """One-off hygiene sweep (dry-run by default). Rejects links whose competitor
+    """One-off hygiene sweep (dry-run by default). For links whose competitor
     color/size conflicts with the item's attributes (both confirmed and pending),
-    then enforces one confirmed link per (item_id, competitor) by keeping the best
-    survivor and rejecting the rest. When applying, also nulls match_item_id on the
-    observations those wrong CONFIRMED links attributed, so market columns + the
-    price-history chart correct immediately. Returns a report."""
+    first tries to RE-ANCHOR the link onto the sibling variant it actually
+    describes, and rejects only the ones with no such sibling. Then enforces one
+    confirmed link per (item_id, competitor) by keeping the best survivor and
+    rejecting the rest. When applying, also nulls match_item_id on the observations
+    those wrong CONFIRMED links attributed, so market columns + the price-history
+    chart correct immediately. Returns a report.
+
+    Re-anchoring is what makes this worth running after a matching fix rather than
+    just a purge: their L/XL listing sitting against our M/L item is not junk, it
+    is a correct match pointed at the wrong variant of the same matrix."""
     from collections import defaultdict
-    from .matcher import parse_variant_options, attributes_conflict
+    from .matcher import MatchIndex, parse_variant_options, attributes_conflict
     ensure_pi_tables()
     confirmed = get_product_links(status="confirmed", limit=5000)
     pending = get_product_links(status="pending", limit=5000)
+    index = MatchIndex(get_tracked_products(include_excluded=True))
 
     def attrs(l):
         return [l.get("item_attribute_1"), l.get("item_attribute_2"), l.get("item_attribute_3")]
 
-    attr_reject = [
-        l for l in confirmed + pending
-        if attributes_conflict(parse_variant_options(l.get("competitor_title")), attrs(l))
-    ]
+    def options(l):
+        """The connector's structured options when it recovered them, else the
+        title tail — the precedence the verifier already uses."""
+        try:
+            stored = json.loads(l.get("variant_options_json") or "[]")
+        except ValueError:
+            stored = []
+        return stored or parse_variant_options(l.get("competitor_title"))
+
+    # link_id -> (the variant it actually describes, the source that describes
+    # how well). A "candidate" resolution is re-anchored too, and deliberately:
+    # rejecting it would tombstone the (item, store) pair, which is far too
+    # strong for a colourway we simply can't name with certainty. It lands
+    # pending instead, which is what a fresh scrape of the same listing proposes.
+    reanchor = {}
+    attr_reject = []
+    for l in confirmed + pending:
+        opts = options(l)
+        if not attributes_conflict(opts, attrs(l)):
+            continue
+        verdict, target = index._resolve_by_attributes(opts, l.get("item_id"))
+        if (verdict in ("confirm", "candidate") and target
+                and str(target) != str(l.get("item_id"))):
+            reanchor[l["link_id"]] = (
+                str(target), "attr" if verdict == "confirm" else "attr_partial")
+        else:
+            attr_reject.append(l)
     attr_ids = {l["link_id"] for l in attr_reject}
 
     surviving = [l for l in confirmed if l["link_id"] not in attr_ids]
     by_pair = defaultdict(list)
     for l in surviving:
-        by_pair[(l.get("item_id"), l.get("competitor_id"))].append(l)
+        # Group on the corrected owner so the 1:1 rule is enforced against where
+        # each link is about to point, not where it currently points.
+        moved = reanchor.get(l["link_id"])
+        by_pair[(moved[0] if moved else l.get("item_id"),
+                 l.get("competitor_id"))].append(l)
 
     def rank(l):
         return (l.get("llm_verdict") == "same_variant",
@@ -2450,13 +2512,25 @@ def cleanup_mismatched_links(apply: bool = False) -> dict:
     obs_targets = [l for l in confirmed
                    if l["link_id"] in reject_ids and l.get("competitor_url")]
 
+    # A link that is moving to another variant is not also being rejected.
+    reanchor = {lid: v for lid, v in reanchor.items() if lid not in reject_ids}
+    by_link = {l["link_id"]: l for l in confirmed + pending}
+
     report = {
         "applied": apply,
+        "reanchored_exact": sum(1 for _, s in reanchor.values() if s == "attr"),
+        "reanchored_partial": sum(1 for _, s in reanchor.values() if s == "attr_partial"),
         "attr_reject_confirmed": sum(1 for l in attr_reject if l["status"] == "confirmed"),
         "attr_reject_pending": sum(1 for l in attr_reject if l["status"] == "pending"),
         "dupe_reject_confirmed": len(dupe_reject),
         "total_links_rejected": len(reject_ids),
         "observation_listings_reattributed": len(obs_targets),
+        "reanchor_samples": [
+            {"status": by_link[lid]["status"], "from_item_id": by_link[lid].get("item_id"),
+             "from_attrs": attrs(by_link[lid]), "to_item_id": iid, "as": source,
+             "competitor_title": by_link[lid].get("competitor_title")}
+            for lid, (iid, source) in list(reanchor.items())[:12]
+        ],
         "samples": [
             {"status": l["status"], "item_id": l.get("item_id"), "attrs": attrs(l),
              "competitor_title": l.get("competitor_title")}
@@ -2473,6 +2547,35 @@ def cleanup_mismatched_links(apply: bool = False) -> dict:
             "updated_at=CURRENT_TIMESTAMP() WHERE link_id IN UNNEST(@ids)",
             job_config=bigquery.QueryJobConfig(query_parameters=[
                 bigquery.ArrayQueryParameter("ids", "STRING", list(reject_ids))]),
+        ).result()
+    if reanchor:
+        # Zip two arrays by position — a struct-array parameter for what is a
+        # plain id->id map buys nothing. The stale verdict is cleared with the
+        # move: it was written about the variant the row no longer points at, so
+        # the next run re-verifies (get_product_links unverified_only).
+        link_ids = list(reanchor)
+        new_ids = [reanchor[lid][0] for lid in link_ids]
+        sources = [reanchor[lid][1] for lid in link_ids]
+        client.query(
+            f"""UPDATE `{T_LINKS}` l
+                SET item_id = m.new_item_id, level = 'variant', source = m.new_source,
+                    -- A link confirmed against the wrong variant, now landing on
+                    -- one it only partially fits, goes back to a human.
+                    status = CASE WHEN m.new_source = 'attr_partial'
+                                  THEN 'pending' ELSE l.status END,
+                    llm_verdict = NULL, llm_reason = NULL,
+                    updated_at = CURRENT_TIMESTAMP()
+                FROM (
+                  SELECT lid AS link_id, nid AS new_item_id, src AS new_source
+                  FROM UNNEST(@link_ids) AS lid WITH OFFSET o1
+                  JOIN UNNEST(@new_ids) AS nid WITH OFFSET o2 ON o1 = o2
+                  JOIN UNNEST(@sources) AS src WITH OFFSET o3 ON o1 = o3
+                ) m
+                WHERE l.link_id = m.link_id""",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("link_ids", "STRING", link_ids),
+                bigquery.ArrayQueryParameter("new_ids", "STRING", new_ids),
+                bigquery.ArrayQueryParameter("sources", "STRING", sources)]),
         ).result()
     if obs_targets:
         keys = [f"{l['item_id']}|{l.get('competitor_id') or ''}|{l['competitor_url']}"
@@ -2517,7 +2620,7 @@ def sweep_domain_for_item(item_id: str, url: str, decided_by: str = "Dashboard")
     ).result()
     # 2) tombstone fuzzy listings (attributed to the item at the domain, no link row)
     listings = _rows(f"""
-        SELECT competitor_id, url AS o_url, competitor_sku, competitor_title
+        SELECT competitor_id, url AS o_url, competitor_sku, competitor_title, gtin
         FROM `{T_OBSERVATIONS}`
         WHERE match_item_id = @iid AND url IS NOT NULL
           AND NET.REG_DOMAIN(url) = NET.REG_DOMAIN(@url) AND url != @url
@@ -2530,7 +2633,8 @@ def sweep_domain_for_item(item_id: str, url: str, decided_by: str = "Dashboard")
     for r in listings:
         cid = r.get("competitor_id") or ""
         mk = build_match_key(cid, {"sku": r.get("competitor_sku"), "url": r.get("o_url"),
-                                   "title": r.get("competitor_title")})
+                                   "title": r.get("competitor_title"),
+                                   "gtin": r.get("gtin")})
         if mk in existing or mk == keep_key:
             continue
         existing.add(mk)
@@ -2538,7 +2642,7 @@ def sweep_domain_for_item(item_id: str, url: str, decided_by: str = "Dashboard")
             "link_id": str(uuid.uuid4()), "item_id": str(item_id),
             "competitor_id": r.get("competitor_id"), "match_key": mk,
             "competitor_url": r.get("o_url"), "competitor_sku": r.get("competitor_sku"),
-            "competitor_title": r.get("competitor_title"), "gtin": None,
+            "competitor_title": r.get("competitor_title"), "gtin": r.get("gtin"),
             "level": "variant", "status": "rejected", "source": "human",
             "confidence": None, "fuzzy_score": None, "llm_verdict": None,
             "llm_reason": "superseded by a pinned URL at this store", "our_price": None,
@@ -2566,7 +2670,8 @@ def reject_conflicting_links(item_id: str, domain: str, decided_by: str = "Dashb
     get_bq_client().query(
         f"UPDATE `{T_LINKS}` SET status = 'rejected', decided_by = @actor, "
         "updated_at = CURRENT_TIMESTAMP() "
-        "WHERE item_id = @item_id AND source IN ('gtin', 'llm', 'attr') "
+        "WHERE item_id = @item_id "
+        "AND source IN ('gtin', 'llm', 'attr', 'attr_partial') "
         "AND status IN ('confirmed', 'pending') "
         "AND STRPOS(COALESCE(competitor_url, ''), @domain) > 0",
         job_config=bigquery.QueryJobConfig(query_parameters=[
