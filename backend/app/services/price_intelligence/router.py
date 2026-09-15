@@ -567,10 +567,11 @@ def item_search_index_status():
 def list_links(status: Optional[str] = None, item_id: Optional[str] = None,
                limit: int = 500):
     # The pending queue is a to-do list: links frozen by their item's archival
-    # don't belong in it. Confirmed/rejected views keep full history.
+    # don't belong in it (nor in the set-aside view, which is the queue's
+    # overflow). Confirmed/rejected views keep full history.
     return repository.get_product_links(
         status=status, item_id=item_id,
-        active_items_only=(status == "pending"), limit=limit,
+        active_items_only=(status in ("pending", "superseded")), limit=limit,
     )
 
 
@@ -595,6 +596,23 @@ def cleanup_links(apply: bool = False):
     variant they actually describe, reject the ones with no such sibling, and
     enforce one confirmed link per (item, store). Dry-run unless apply=true."""
     return repository.cleanup_mismatched_links(apply=apply)
+
+
+@router.post("/links/reconcile-superseded")
+def reconcile_superseded(apply: bool = False):
+    """Queue hygiene, both directions: pending candidates on a pair that already
+    holds a confirmed link are set aside (status='superseded' — parked, not
+    rejected); set-aside rows whose confirmed link is gone come back to pending.
+    The nightly run does this too. Dry-run unless apply=true."""
+    return repository.reconcile_superseded_links(apply=apply)
+
+
+@router.post("/links/reanchor-pending")
+def reanchor_pending(apply: bool = False):
+    """Move pending candidates onto the sibling variant their colour/size names
+    exactly (a listing proposed against the wrong variant of the right matrix).
+    Confirmed rows are never touched. Dry-run unless apply=true."""
+    return repository.reanchor_pending_links(apply=apply)
 
 
 @router.post("/links/{link_id}/decision")

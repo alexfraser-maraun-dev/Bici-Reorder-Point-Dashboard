@@ -424,7 +424,23 @@ export interface MatrixCoverage {
   last_observed_at: string | null
 }
 
-export type ProductLinkStatus = 'pending' | 'confirmed' | 'rejected'
+// 'rejected' is a permanent tombstone (the listing is never proposed again, for
+// any variant). 'superseded' is parked, not tombstoned: the item already holds a
+// confirmed link at that store, so this candidate is out of the queue until that
+// link is rejected — then it comes back as pending.
+export type ProductLinkStatus = 'pending' | 'confirmed' | 'rejected' | 'superseded'
+
+// Outcome of one confirm/reject decision as the backend reports it.
+// `superseded` on a confirm = how many of the pair's other candidates were set
+// aside because this one won.
+export interface LinkDecisionResult {
+  link_id?: string
+  status?: 'confirmed' | 'rejected' | 'skipped' | 'superseded' | 'error'
+  reason?: string
+  can_replace?: boolean
+  replaced?: number
+  superseded?: number
+}
 
 export interface ProductLink {
   link_id: string

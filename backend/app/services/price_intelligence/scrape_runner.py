@@ -342,6 +342,14 @@ class LinkProposer:
         proposals."""
         if match_key in self.existing_link_keys:
             return None
+        # One listing, two spellings: the catalog crawl keys a Shopify variant on
+        # its SKU (products.json carries no barcode) while the fan-out keys the
+        # same variant on the barcode it reads from /products/<handle>.js. When
+        # the SKU is the barcode, the second row was a pending duplicate of an
+        # already-confirmed link — "already linked, skipped" in the queue.
+        aliases = matcher.match_key_aliases(competitor_id, product or {})
+        if aliases & self.existing_link_keys:
+            return None
         method = method or (candidate or {}).get("method")
         confidence = confidence if confidence is not None \
             else (candidate or {}).get("confidence")
@@ -357,6 +365,7 @@ class LinkProposer:
                 and (target_id, competitor_id) in self.rejected_pairs):
             return None
         self.existing_link_keys.add(match_key)
+        self.existing_link_keys.update(aliases)
         is_confirmed = item_id is not None and method in ("gtin", "attr_exact")
         # A sibling proposal comes off a page a human already confirmed sells this
         # model, and matched a tracked variant on colour AND size. It is not a
@@ -1077,6 +1086,22 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         except Exception as e:
             errors.append(f"match verification: {e}")
             print(f"pi: match verification failed: {e}")
+
+        # --- queue reconciliation ---------------------------------------------
+        # Pending candidates on a pair that now holds a confirmed link are set
+        # aside; set-aside rows whose confirmed link went away come back. Its own
+        # try so an LLM failure above can't skip it, and after verification so
+        # the in-run losers of a just-confirmed winner are covered.
+        _set_status(phase="reconciling links")
+        try:
+            recon = repository.reconcile_superseded_links(apply=True)
+            counters["links_reconciled"] = {
+                "superseded": recon["superseded"], "restored": recon["restored"]}
+            print(f"pi: link reconciliation: superseded {recon['superseded']}, "
+                  f"restored {recon['restored']}")
+        except Exception as e:
+            errors.append(f"link reconciliation: {e}")
+            print(f"pi: link reconciliation failed: {e}")
 
         # --- LLM digest: best-effort, never fails the run --------------------
         _set_status(phase="generating digest")

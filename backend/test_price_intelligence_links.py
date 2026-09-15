@@ -26,21 +26,33 @@ class BulkLinkDecisionTests(unittest.TestCase):
             result = repository.decide_links_bulk(
                 ["l1", "l2", "l3"], "confirmed", decided_by="Buyer")
 
+        # l2 lost the (i1, c1) slot to l1 in this same selection, so the confirm's
+        # set-aside statement parks it — reported as what it now is, not "skipped".
         self.assertEqual(
-            ["confirmed", "skipped", "rejected"],
+            ["confirmed", "superseded", "rejected"],
             [row["status"] for row in result["results"]],
         )
+        self.assertTrue(result["results"][1]["can_replace"])
         self.assertEqual(["l1"], result["confirmed_link_ids"])
-        self.assertEqual(1, client.query.call_count)
-        sql = client.query.call_args.args[0]
+        # One decision DML, then one set-aside DML for the pairs just confirmed.
+        self.assertEqual(2, client.query.call_count)
+        decision, park = client.query.call_args_list
+        sql = decision.args[0]
         self.assertIn("UPDATE", sql)
         self.assertIn("UNNEST(@decided_ids)", sql)
         params = {
             param.name: param.values if hasattr(param, "values") else param.value
-            for param in client.query.call_args.kwargs["job_config"].query_parameters
+            for param in decision.kwargs["job_config"].query_parameters
         }
         self.assertEqual(["l1"], params["confirmed_ids"])
         self.assertEqual(["l1", "l3"], params["decided_ids"])
+        self.assertIn("status = 'superseded'", park.args[0])
+        park_params = {
+            param.name: param.values if hasattr(param, "values") else param.value
+            for param in park.kwargs["job_config"].query_parameters
+        }
+        self.assertEqual(["i1|c1"], park_params["pairs"])
+        self.assertEqual(["l1"], park_params["exclude_ids"])
 
     def test_existing_confirmed_link_skips_without_dml(self):
         selected = [{
@@ -204,7 +216,7 @@ class CleanupReanchorTests(unittest.TestCase):
                 "item_attribute_1": "Matte Black", "item_attribute_2": "M/L",
                 "item_attribute_3": None}
 
-    def _sweep(self, links):
+    def _sweep(self, links, confirmed=()):
         tracked = [
             self._tracked("357", "Matte Black", "M/L"),
             self._tracked("356", "Matte Black", "S/M"),
@@ -213,7 +225,7 @@ class CleanupReanchorTests(unittest.TestCase):
         ]
         with patch.object(repository, "ensure_pi_tables"), \
              patch.object(repository, "get_product_links",
-                          side_effect=[[], links]), \
+                          side_effect=[list(confirmed), links]), \
              patch.object(repository, "get_tracked_products", return_value=tracked):
             return repository.cleanup_mismatched_links(apply=False)
 
@@ -250,6 +262,28 @@ class CleanupReanchorTests(unittest.TestCase):
         ])
         self.assertEqual(0, report["reanchored_exact"] + report["reanchored_partial"])
         self.assertEqual(0, report["attr_reject_pending"])
+
+    def test_a_reanchor_into_a_confirmed_pair_lands_superseded(self):
+        """Our L/XL already has a confirmed Steed link; the L/XL listing that
+        was sitting on our M/L is repointed there, but parked, not queued."""
+        confirmed = dict(
+            self._link("k", f"{self.MODEL} - Matte Black / L/XL (59-61cm)", status="confirmed"),
+            item_id="358", item_attribute_2="L/XL")
+        report = self._sweep(
+            [self._link("a", f"{self.MODEL} - Matte Black / L/XL (59-61cm)")],
+            confirmed=[confirmed])
+        self.assertEqual(1, report["reanchored_exact"])
+        self.assertEqual(1, report["reanchored_superseded"])
+        self.assertEqual(0, report["dupe_reject_confirmed"])
+        sample = report["reanchor_samples"][0]
+        self.assertEqual(("358", "superseded"), (sample["to_item_id"], sample["as_status"]))
+
+    def test_a_reanchor_into_an_open_pair_keeps_its_status(self):
+        report = self._sweep([
+            self._link("a", f"{self.MODEL} - Matte Black / L/XL (59-61cm)"),
+        ])
+        self.assertEqual(0, report["reanchored_superseded"])
+        self.assertEqual("pending", report["reanchor_samples"][0]["as_status"])
 
 
 if __name__ == "__main__":

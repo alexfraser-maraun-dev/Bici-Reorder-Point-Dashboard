@@ -387,6 +387,27 @@ def parse_variant_options(competitor_title):
     return parts or ([tail.strip()] if tail.strip() else [])
 
 
+def listing_options(row: dict) -> list:
+    """A stored listing's variant options: the connector's structured values when
+    it recovered them (`variant_options_json`), else what the title tail carries.
+
+    One precedence for everyone who reasons about a link row — the verifier, the
+    confirm guards, the cleanup sweeps. The SmartEtailing stores (The Bike Zone,
+    Oak Bay) publish a bare model title ("Ventral MIPS") and carry the colour/size
+    only in the structured options, so a reader that consults the title alone is
+    blind to exactly the variants that are hardest to tell apart."""
+    raw = row.get("variant_options_json") if row else None
+    stored = []
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            parsed = []
+        if isinstance(parsed, list):
+            stored = [str(o).strip() for o in parsed if o and str(o).strip()]
+    return stored or parse_variant_options((row or {}).get("competitor_title"))
+
+
 def attributes_conflict(options, attrs) -> bool:
     """True when a competitor variant's options clearly conflict (size or color)
     with our item's attributes — the same conservative rule the matcher uses to
@@ -512,6 +533,38 @@ def build_match_key(competitor_id, scraped: dict) -> str:
              or scraped.get("url")
              or _fold(scraped.get("title")))
     return f"{competitor_id}:{ident}"
+
+
+# A SKU that is nothing but 12-14 digits is, on every storefront we crawl, the
+# variant's barcode typed into the SKU field (Racer Sportif, Wheels of Bloor).
+_BARCODE_SKU_RE = re.compile(r"^\d{12,14}$")
+
+
+def match_key_aliases(competitor_id, scraped: dict) -> set:
+    """The OTHER spellings one physical listing can be keyed under, for
+    existence checks in the proposer only.
+
+    A catalog crawl (Shopify products.json) sees the SKU but no barcode and keys
+    the listing `{cid}:{sku}`; the fan-out reads the same variant from
+    /products/<handle>.js with its barcode and keys it `{cid}:gtin:{digits}`. When
+    the SKU *is* the barcode, those are two rows for one listing — and the
+    second one, proposed pending against an item the first already links, is the
+    "already linked, skipped" row in the review queue.
+
+    Only ever compare these against `existing_link_keys`. They must never widen
+    `rejected_keys` or `by_link`: `match()` checks rejections before every tier,
+    so a SKU-form rejection derived onto the barcode form would silently shadow
+    a confirmed barcode-form link at the same store."""
+    aliases = set()
+    sku_raw = str(scraped.get("sku") or "").strip()
+    sku = _identifying_sku(sku_raw)
+    if sku and _BARCODE_SKU_RE.match(sku_raw):
+        derived = gtin_match_key(competitor_id, sku_raw)
+        if derived:
+            aliases.add(derived)
+    if sku and gtin_match_key(competitor_id, scraped.get("gtin")):
+        aliases.add(f"{competitor_id}:{sku}")
+    return aliases
 
 
 class MatchIndex:

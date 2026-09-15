@@ -279,5 +279,92 @@ class RejectedPairSuppressionTests(unittest.TestCase):
         self.assertEqual("attr_partial", row["source"])
 
 
+class DualKeyAliasTests(unittest.TestCase):
+    """One listing, two match_key spellings. The catalog crawl keys a Shopify
+    variant on its SKU (products.json has no barcode); the fan-out keys the same
+    variant on the barcode from /products/<handle>.js. When the SKU is the
+    barcode, the second row was a pending duplicate of a confirmed link."""
+
+    SKU = "0012345678905"
+
+    def test_a_barcode_length_sku_aliases_the_gtin_key(self):
+        aliases = matcher.match_key_aliases("c1", {"sku": self.SKU})
+        self.assertEqual({"c1:gtin:12345678905"}, aliases)
+
+    def test_a_listing_with_barcode_and_numeric_sku_aliases_the_sku_key(self):
+        aliases = matcher.match_key_aliases("c1", {"sku": self.SKU, "gtin": self.SKU})
+        self.assertEqual({"c1:gtin:12345678905", f"c1:{self.SKU}"}, aliases)
+
+    def test_a_short_numeric_sku_is_not_a_barcode(self):
+        self.assertEqual(set(), matcher.match_key_aliases("c1", {"sku": "12345"}))
+        self.assertEqual(set(), matcher.match_key_aliases("c1", {"sku": "POC39285361T"}))
+
+    def _proposer(self, existing):
+        return scrape_runner.LinkProposer({"1": {"current_retail": 99.0}}, existing, set())
+
+    def test_proposer_skips_a_listing_already_linked_under_its_barcode_spelling(self):
+        proposer = self._proposer({"c1:gtin:12345678905"})
+        row = proposer.propose(
+            f"c1:{self.SKU}",
+            {"item_id": "1", "method": "attr", "confidence": 0.97,
+             "fuzzy_score": 93.0, "level": "variant"},
+            "c1", {"sku": self.SKU, "url": "https://c1.com/p/1", "title": "x"})
+        self.assertIsNone(row)
+
+    def test_proposer_skips_a_listing_already_linked_under_its_sku_spelling(self):
+        proposer = self._proposer({f"c1:{self.SKU}"})
+        row = proposer.propose(
+            "c1:gtin:12345678905", None, "c1",
+            {"sku": self.SKU, "gtin": self.SKU, "url": "https://c1.com/p/1", "title": "x"},
+            item_id="1", method="gtin", confidence=1.0)
+        self.assertIsNone(row)
+
+    def test_an_admitted_proposal_reserves_its_other_spelling_for_the_run(self):
+        proposer = self._proposer(set())
+        row = proposer.propose(
+            f"c1:{self.SKU}",
+            {"item_id": "1", "method": "attr", "confidence": 0.97,
+             "fuzzy_score": 93.0, "level": "variant"},
+            "c1", {"sku": self.SKU, "url": "https://c1.com/p/1", "title": "x"})
+        self.assertIsNotNone(row)
+        self.assertIn("c1:gtin:12345678905", proposer.existing_link_keys)
+
+    def test_rejected_keys_are_not_widened_by_sku_aliases(self):
+        """A SKU-form rejection must never shadow a barcode-form confirmed link:
+        match() checks rejections before every tier, so the confirmed link would
+        go dark and its price observations would stop."""
+        tracked = [_item("1", "Continental GP5000 S TR", "Black", "700c x 25mm", brand="Continental")]
+        confirmed = [{"status": "confirmed", "item_id": "1", "competitor_id": "c1",
+                      "match_key": "c1:gtin:12345678905", "gtin": self.SKU,
+                      "confidence": 1.0, "competitor_url": "https://c1.com/p/1",
+                      "variant_options_json": None}]
+        index = matcher.MatchIndex(tracked, links=confirmed,
+                                   rejected_keys={f"c1:{self.SKU}"})
+        item_id, method, confidence, _ = index.match(
+            {"title": "GP5000 S TR", "brand": "Continental", "sku": self.SKU,
+             "gtin": self.SKU, "url": "https://c1.com/p/1"},
+            match_key="c1:gtin:12345678905", competitor_id="c1")
+        self.assertEqual(("1", "link", 1.0), (item_id, method, confidence))
+
+
+class ListingOptionsTests(unittest.TestCase):
+    def test_structured_options_win_over_the_title_tail(self):
+        row = {"variant_options_json": '["Hydrogen White Matt", "Medium"]',
+               "competitor_title": "Ventral MIPS - Other / Large"}
+        self.assertEqual(["Hydrogen White Matt", "Medium"], matcher.listing_options(row))
+
+    def test_blank_or_malformed_options_fall_back_to_the_title(self):
+        self.assertEqual(["Black", "58"], matcher.listing_options(
+            {"variant_options_json": "[]", "competitor_title": "Monza - Black / 58"}))
+        self.assertEqual(["Black", "58"], matcher.listing_options(
+            {"variant_options_json": "not json", "competitor_title": "Monza - Black / 58"}))
+        self.assertEqual(["Black", "58"], matcher.listing_options(
+            {"variant_options_json": '["", null]', "competitor_title": "Monza - Black / 58"}))
+
+    def test_a_bare_title_and_no_options_is_empty(self):
+        self.assertEqual([], matcher.listing_options(
+            {"variant_options_json": None, "competitor_title": "Ventral MIPS"}))
+
+
 if __name__ == "__main__":
     unittest.main()

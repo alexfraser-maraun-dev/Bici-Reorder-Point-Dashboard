@@ -29,6 +29,37 @@ export function isMapViolation(p: {
     && p.market_min_in_stock < floor - 0.01
 }
 
+// The colour/size a competitor listing names, for the Matching queue. The
+// connector's structured options win (`variant_options_json`, e.g.
+// ["Hydrogen White Matt","Medium"]) — on SmartEtailing stores (The Bike Zone,
+// Oak Bay) the title is the bare model name ("Ventral MIPS") and the options are
+// the ONLY place the variant lives. Shopify/Magento titles carry it as a
+// " - Colour / Size" tail, which is the fallback. Null when neither says.
+export function listingVariantLabel(link: {
+  variant_options_json?: string | null
+  competitor_title?: string | null
+}): string | null {
+  if (link.variant_options_json) {
+    try {
+      const parsed: unknown = JSON.parse(link.variant_options_json)
+      if (Array.isArray(parsed)) {
+        const parts = parsed
+          .map((p) => (p == null ? '' : String(p).trim()))
+          .filter((p) => p !== '')
+        if (parts.length > 0) return parts.join(' / ')
+      }
+    } catch {
+      // malformed JSON: fall through to the title
+    }
+  }
+  const title = link.competitor_title ?? ''
+  const cut = title.lastIndexOf(' - ')
+  if (cut === -1) return null
+  const tail = title.slice(cut + 3).trim()
+  if (!tail) return null
+  return tail.split(/\s+\/\s+/).map((p) => p.trim()).filter(Boolean).join(' / ')
+}
+
 // Consistent identifier sub-line: brand · UPC <value> · System ID <system sku>.
 // "System ID" is the Lightspeed system SKU — the identifier the user actually
 // searches on in LS (not the internal item_id, which only appears in the URL).

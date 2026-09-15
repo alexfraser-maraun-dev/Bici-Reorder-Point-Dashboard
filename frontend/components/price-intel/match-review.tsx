@@ -2,10 +2,12 @@
 
 // Human review of pending product links: near-miss fuzzy candidates the LLM
 // couldn't confidently confirm or reject. Confirming persists the link — the
-// listing matches instantly on every future scrape; rejecting is a permanent
-// tombstone (the pair is never proposed again).
+// listing matches instantly on every future scrape — and sets aside the pair's
+// other candidates (status 'superseded': parked, they return if that link is
+// later rejected); rejecting is a permanent tombstone (the listing is never
+// proposed again, for any variant).
 
-import { useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useMemo, useState } from 'react'
 import { mutate as globalMutate } from 'swr'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
@@ -24,16 +26,35 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
-import { itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
+import { itemIdentity, lightspeedItemUrl, listingVariantLabel } from '@/lib/price-intel/format'
 import {
   ApiError, apiPost, useCompetitors, usePriceIntelSummary, useProductLinks,
 } from '@/lib/price-intel/hooks'
 import type {
-  ProductLink, VariantCandidate, VariantSelectionRequired,
+  LinkDecisionResult, ProductLink, ProductLinkStatus, VariantCandidate,
+  VariantSelectionRequired,
 } from '@/lib/price-intel/types'
 import { Check, CheckCheck, ExternalLink, Layers, Link2, X } from 'lucide-react'
 
 const fmt = (v: number | null | undefined) => (v == null ? '—' : `$${Number(v).toFixed(2)}`)
+
+const itemAttributes = (l: ProductLink) =>
+  [l.item_attribute_1, l.item_attribute_2, l.item_attribute_3]
+    .filter((a): a is string => !!a && a.trim() !== '')
+
+const STATUS_LABEL: Record<ProductLinkStatus, string> = {
+  pending: 'Pending',
+  confirmed: 'Confirmed',
+  rejected: 'Rejected',
+  superseded: 'Set aside',
+}
+
+const STATUS_HINT: Record<ProductLinkStatus, string> = {
+  pending: "competitor listings the matcher couldn't settle — confirmed links match instantly on future scrapes",
+  confirmed: 'live matches — each one is re-scraped nightly',
+  rejected: 'tombstoned listings — never proposed again, for any variant',
+  superseded: 'parked because the item already has a confirmed link at that store — confirm one here to swap it in',
+}
 
 const VERDICT_TONE: Record<string, string> = {
   same_variant: 'bg-emerald-50 text-emerald-700 border-emerald-200',
@@ -59,7 +80,7 @@ const SOURCE_LABEL: Record<string, string> = {
 }
 
 export function MatchReview() {
-  const [statusFilter, setStatusFilter] = useState<'pending' | 'confirmed' | 'rejected'>('pending')
+  const [statusFilter, setStatusFilter] = useState<ProductLinkStatus>('pending')
   const { links, isLoading, mutate } = useProductLinks(statusFilter)
   const { competitors } = useCompetitors()
   const { mutate: mutateSummary } = usePriceIntelSummary()
@@ -75,8 +96,10 @@ export function MatchReview() {
   // confirm/reject. Cleared whenever the status filter changes so a stale selection
   // can't leak across tabs.
   const [selected, setSelected] = useState<Set<string>>(new Set())
-
-  useEffect(() => { setSelected(new Set()) }, [statusFilter])
+  const changeStatusFilter = (next: ProductLinkStatus) => {
+    setSelected(new Set())
+    setStatusFilter(next)
+  }
 
   const competitorById = useMemo(
     () => new Map(competitors.map((c) => [c.competitor_id, c.name])),
@@ -94,6 +117,42 @@ export function MatchReview() {
   const allSelected = selectable && links.length > 0 && links.every((l) => selected.has(l.link_id))
   const toggleAll = () =>
     setSelected(allSelected ? new Set() : new Set(links.map((l) => l.link_id)))
+
+  // The pending queue is reviewed item by item: order by our item, then store,
+  // then evidence, and put a header above each item so "2 candidates at The
+  // Bike Zone" reads as two labelled rows under one heading rather than two
+  // lookalike rows scattered by score. The other views stay flat.
+  const grouped = statusFilter === 'pending'
+  const storeName = useCallback(
+    (l: ProductLink) =>
+      l.competitor_id ? competitorById.get(l.competitor_id) ?? 'competitor' : 'tracked URL',
+    [competitorById]
+  )
+  const orderedLinks = useMemo(() => {
+    if (!grouped) return links
+    const evidence = (l: ProductLink) => l.confidence ?? (l.fuzzy_score ?? 0) / 100
+    const attrs = (l: ProductLink) => itemAttributes(l).join(' / ')
+    return [...links].sort((a, b) =>
+      (a.item_title ?? '').localeCompare(b.item_title ?? '')
+      || attrs(a).localeCompare(attrs(b))
+      || (a.item_id ?? '').localeCompare(b.item_id ?? '')
+      || storeName(a).localeCompare(storeName(b))
+      || evidence(b) - evidence(a))
+  }, [links, grouped, storeName])
+  // item_id -> "The Bike Zone ×2 · Racer Sportif ×1" for the group headers.
+  const storeCounts = useMemo(() => {
+    const counts = new Map<string, Map<string, number>>()
+    if (!grouped) return counts
+    for (const l of links) {
+      const key = l.item_id ?? ''
+      const stores = counts.get(key) ?? new Map<string, number>()
+      const store = storeName(l)
+      stores.set(store, (stores.get(store) ?? 0) + 1)
+      counts.set(key, stores)
+    }
+    return counts
+  }, [links, grouped, storeName])
+  const columnCount = (selectable ? 1 : 0) + (grouped ? 0 : 1) + 4
 
   // "This match is wrong — here's the right URL": records the pasted URL as
   // the permanent truth for this item at that store and tombstones the
@@ -153,36 +212,45 @@ export function MatchReview() {
     try {
       // The confirm endpoint is guarded: it may reject (color/size mismatch) or
       // skip (item already linked at that store), so tally the real outcomes.
-      let results: Array<{ status?: string; can_replace?: boolean }>
+      // A confirm also sets aside the pair's other pending candidates — the
+      // backend reports how many, so the toast can say so.
+      let results: LinkDecisionResult[]
+      let setAside = 0
       if (linkIds.length > 1) {
         const batch = await apiPost('/api/price-intel/links/decisions', {
           link_ids: linkIds,
           status,
         })
         results = Array.isArray(batch.results) ? batch.results : []
+        setAside = Number(batch.superseded ?? 0)
       } else {
         results = [await apiPost(`/api/price-intel/links/${linkIds[0]}/decision`, { status })]
       }
-      // Single confirm blocked by an existing match at that store → offer to override.
-      if (status === 'confirmed' && linkIds.length === 1 && results[0]?.status === 'skipped'
-          && results[0]?.can_replace) {
+      // Single confirm blocked by an existing match at that store → offer to
+      // override. A set-aside row confirmed from the "Set aside" view lands here
+      // every time: that is how a parked candidate is swapped in.
+      if (status === 'confirmed' && linkIds.length === 1 && results[0]?.can_replace
+          && (results[0]?.status === 'skipped' || results[0]?.status === 'superseded')) {
         if (window.confirm('This item is already matched to another listing at this store. Reject that one and use this match instead?')) {
           results = [await apiPost(`/api/price-intel/links/${linkIds[0]}/decision`,
             { status, replace: true })]
         }
       }
+      if (linkIds.length === 1) setAside = Number(results[0]?.superseded ?? 0)
       if (status === 'rejected') {
         toast.success(linkIds.length === 1 ? 'Match rejected' : `${linkIds.length} matches rejected`)
       } else {
         const tally = results.reduce((acc: Record<string, number>, r) => {
-          const s = (r?.status as string) || 'confirmed'
+          const s = r?.status ?? 'confirmed'
           acc[s] = (acc[s] ?? 0) + 1
           return acc
         }, {})
         const parts = [
           tally.confirmed && `${tally.confirmed} confirmed`,
+          tally.superseded && `${tally.superseded} set aside (already linked)`,
           tally.skipped && `${tally.skipped} skipped (already linked)`,
           tally.rejected && `${tally.rejected} rejected (mismatch)`,
+          setAside > 0 && `${setAside} alternative${setAside === 1 ? '' : 's'} set aside`,
         ].filter(Boolean)
         toast.success(parts.join(' · ') || 'Done')
       }
@@ -239,18 +307,18 @@ export function MatchReview() {
           <div className="flex items-center gap-2">
             <h3 className="text-sm font-semibold">Match review</h3>
             <span className="text-xs text-muted-foreground">
-              competitor listings the matcher couldn&apos;t settle — confirmed links match instantly on future scrapes
+              {STATUS_HINT[statusFilter]}
             </span>
           </div>
           <div className="flex items-center gap-2">
-            <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as typeof statusFilter)}>
+            <Select value={statusFilter} onValueChange={(v) => changeStatusFilter(v as ProductLinkStatus)}>
               <SelectTrigger className="w-36">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="pending">Pending</SelectItem>
-                <SelectItem value="confirmed">Confirmed</SelectItem>
-                <SelectItem value="rejected">Rejected</SelectItem>
+                {(Object.keys(STATUS_LABEL) as ProductLinkStatus[]).map((s) => (
+                  <SelectItem key={s} value={s}>{STATUS_LABEL[s]}</SelectItem>
+                ))}
               </SelectContent>
             </Select>
             {highConfidence.length > 0 && (
@@ -288,7 +356,9 @@ export function MatchReview() {
           <p className="py-8 text-center text-sm text-muted-foreground">
             {statusFilter === 'pending'
               ? 'Nothing to review — new candidates arrive after each nightly scrape.'
-              : `No ${statusFilter} links yet.`}
+              : statusFilter === 'superseded'
+                ? 'Nothing set aside.'
+                : `No ${statusFilter} links yet.`}
           </p>
         ) : (
           <Table>
@@ -302,7 +372,7 @@ export function MatchReview() {
                       aria-label="Select all pending matches" />
                   </TableHead>
                 )}
-                <TableHead>Our item</TableHead>
+                {!grouped && <TableHead>Our item</TableHead>}
                 <TableHead>Competitor listing</TableHead>
                 <TableHead className="text-right">Prices</TableHead>
                 <TableHead>Signal</TableHead>
@@ -310,12 +380,61 @@ export function MatchReview() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {links.map((link: ProductLink) => {
+              {orderedLinks.map((link: ProductLink, index: number) => {
                 const busy = deciding.has(link.link_id)
-                const itemAttributes = [link.item_attribute_1, link.item_attribute_2, link.item_attribute_3]
-                  .filter((a): a is string => !!a && a.trim() !== '')
+                const attributes = itemAttributes(link)
+                const variant = listingVariantLabel(link)
+                // Shopify/Magento titles already end in " - Colour / Size"; only
+                // SmartEtailing's bare model titles need the label appended.
+                const appendVariant = variant !== null
+                  && !(link.competitor_title ?? '').toLowerCase().includes(variant.toLowerCase())
+                const newGroup = grouped
+                  && (index === 0 || orderedLinks[index - 1].item_id !== link.item_id)
+                const stores = storeCounts.get(link.item_id ?? '')
+                const ourItem = (
+                  <>
+                    {link.item_id ? (
+                      <a href={lightspeedItemUrl(link.item_id)} target="_blank"
+                         rel="noopener noreferrer" title="Open in Lightspeed"
+                         className="block whitespace-normal break-words text-sm font-medium leading-snug hover:underline">
+                        {link.item_title ?? 'Untracked item'}
+                        {attributes.length > 0 ? (
+                          <span className="font-normal text-muted-foreground"> — {attributes.join(' / ')}</span>
+                        ) : null}
+                      </a>
+                    ) : (
+                      <p className="whitespace-normal break-words text-sm font-medium leading-snug">
+                        {link.item_title ?? 'Untracked item'}
+                      </p>
+                    )}
+                    <p className="whitespace-normal break-words text-xs text-muted-foreground">
+                      {itemIdentity({
+                        brand: link.item_brand,
+                        upc: link.item_upc,
+                        systemSku: link.item_system_sku,
+                      })}
+                    </p>
+                  </>
+                )
                 return (
-                  <TableRow key={link.link_id} className={cn(busy && 'opacity-50')}>
+                  <Fragment key={link.link_id}>
+                  {newGroup && (
+                    <TableRow className="bg-muted/40 hover:bg-muted/40">
+                      <TableCell colSpan={columnCount} className="py-2">
+                        <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-1">
+                          <div className="min-w-0">{ourItem}</div>
+                          {stores && (
+                            <span className="text-xs text-muted-foreground">
+                              {[...stores.entries()]
+                                .map(([store, n]) => `${store} ×${n}`)
+                                .join(' · ')}
+                            </span>
+                          )}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )}
+                  <TableRow className={cn(busy && 'opacity-50')}>
                     {selectable && (
                       <TableCell className="align-top">
                         <Checkbox checked={selected.has(link.link_id)} disabled={busy}
@@ -323,35 +442,21 @@ export function MatchReview() {
                                   aria-label="Select match" />
                       </TableCell>
                     )}
-                    <TableCell className="max-w-80 align-top">
-                      {link.item_id ? (
-                        <a href={lightspeedItemUrl(link.item_id)} target="_blank"
-                           rel="noopener noreferrer" title="Open in Lightspeed"
-                           className="block whitespace-normal break-words text-sm font-medium leading-snug hover:underline">
-                          {link.item_title ?? 'Untracked item'}
-                          {itemAttributes.length > 0 ? (
-                            <span className="font-normal text-muted-foreground"> — {itemAttributes.join(' / ')}</span>
-                          ) : null}
-                        </a>
-                      ) : (
-                        <p className="whitespace-normal break-words text-sm font-medium leading-snug">
-                          {link.item_title ?? 'Untracked item'}
-                        </p>
-                      )}
-                      <p className="whitespace-normal break-words text-xs text-muted-foreground">
-                        {itemIdentity({
-                          brand: link.item_brand,
-                          upc: link.item_upc,
-                          systemSku: link.item_system_sku,
-                        })}
-                      </p>
-                    </TableCell>
+                    {!grouped && (
+                      <TableCell className="max-w-80 align-top">{ourItem}</TableCell>
+                    )}
                     <TableCell className="max-w-80 align-top">
                       <div className="flex items-start gap-1.5">
                         <span className="whitespace-normal break-words text-sm leading-snug">
                           {link.competitor_title
                             ?? link.competitor_url?.replace(/^https?:\/\//, '')
                             ?? 'competitor listing'}
+                          {/* The variant the listing names. On SmartEtailing
+                              stores the title is the bare model name and this
+                              is the only place the colour/size shows. */}
+                          {appendVariant ? (
+                            <span className="text-muted-foreground"> — {variant}</span>
+                          ) : null}
                         </span>
                         {link.competitor_url && (
                           <a href={link.competitor_url} target="_blank" rel="noopener noreferrer"
@@ -360,11 +465,16 @@ export function MatchReview() {
                           </a>
                         )}
                       </div>
+                      {!variant && attributes.length > 0 && (
+                        <p className="whitespace-normal break-words text-xs text-amber-700">
+                          no variant info on this listing — open the link to check which one it is
+                        </p>
+                      )}
                       <p className="whitespace-normal break-words text-xs text-muted-foreground">
-                        {link.competitor_id
-                          ? competitorById.get(link.competitor_id) ?? 'competitor'
-                          : 'tracked URL'}
-                        {link.competitor_sku ? ` · ${link.competitor_sku}` : ''}
+                        {storeName(link)}
+                        {link.gtin
+                          ? ` · UPC ${link.gtin}`
+                          : link.competitor_sku ? ` · SKU ${link.competitor_sku}` : ''}
                       </p>
                     </TableCell>
                     <TableCell className="text-right text-sm tabular-nums">
@@ -405,18 +515,22 @@ export function MatchReview() {
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center justify-end gap-0.5">
+                        {(statusFilter === 'pending' || statusFilter === 'superseded') && (
+                          <Button variant="ghost" size="sm" disabled={busy}
+                                  title={statusFilter === 'superseded'
+                                    ? 'Use this match instead of the confirmed one at this store'
+                                    : 'Confirm match'}
+                                  onClick={() => decide([link.link_id], 'confirmed')}>
+                            <Check className="h-4 w-4 text-emerald-600" />
+                          </Button>
+                        )}
                         {statusFilter === 'pending' && (
-                          <>
-                            <Button variant="ghost" size="sm" title="Confirm match" disabled={busy}
-                                    onClick={() => decide([link.link_id], 'confirmed')}>
-                              <Check className="h-4 w-4 text-emerald-600" />
-                            </Button>
-                            <Button variant="ghost" size="sm" title="Reject (never suggest again)"
-                                    disabled={busy}
-                                    onClick={() => decide([link.link_id], 'rejected')}>
-                              <X className="h-4 w-4 text-rose-600" />
-                            </Button>
-                          </>
+                          <Button variant="ghost" size="sm"
+                                  title="Reject — never suggest this listing again (for any variant)"
+                                  disabled={busy}
+                                  onClick={() => decide([link.link_id], 'rejected')}>
+                            <X className="h-4 w-4 text-rose-600" />
+                          </Button>
                         )}
                         {link.item_id && statusFilter !== 'rejected' && (
                           <Button variant="ghost" size="sm" disabled={busy}
@@ -428,6 +542,7 @@ export function MatchReview() {
                       </div>
                     </TableCell>
                   </TableRow>
+                  </Fragment>
                 )
               })}
             </TableBody>

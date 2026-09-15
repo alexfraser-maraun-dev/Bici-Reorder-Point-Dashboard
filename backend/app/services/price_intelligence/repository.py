@@ -231,6 +231,10 @@ def ensure_pi_tables():
             # "pre-matched URL catalog". match_key identifies one scraped
             # listing (see matcher.build_match_key); one row per match_key.
             # A 'rejected' row is a tombstone — its key is never re-proposed.
+            # A 'superseded' row is parked, not tombstoned: its (item, competitor)
+            # pair already holds a confirmed link, so it is out of the review
+            # queue but never feeds rejected_keys, and it comes back to 'pending'
+            # if that confirmed link is later rejected (reconcile_superseded_links).
             f"""CREATE TABLE IF NOT EXISTS `{T_LINKS}` (
                 link_id STRING NOT NULL,
                 item_id STRING,
@@ -2039,7 +2043,7 @@ def reject_competitor_listing(item_id: str, competitor_id, url, decided_by: str 
             f"UPDATE `{T_LINKS}` SET status = 'rejected', decided_by = @actor, "
             "updated_at = CURRENT_TIMESTAMP() "
             "WHERE item_id = @iid AND COALESCE(competitor_url, '') = @url "
-            "AND status IN ('confirmed', 'pending')", id_url_params)
+            "AND status IN ('confirmed', 'pending', 'superseded')", id_url_params)
 
     # 2) Disable any tracked-URL pin at this URL so the URL phase stops re-scraping.
     urls_disabled = 0
@@ -2133,7 +2137,9 @@ def upsert_human_link(row: dict):
 
 def update_link_verdicts(rows: list):
     """Update-only MERGE on link_id, applying LLM verdicts. Skips rows a human
-    has already decided."""
+    has already decided, and rows that stopped being pending while the LLM batch
+    was in flight — the verifier only ever fetches pending rows, so anything else
+    was confirmed or set aside by someone else and must not be written back."""
     if not rows:
         return
     ensure_pi_tables()
@@ -2144,15 +2150,169 @@ def update_link_verdicts(rows: list):
             MERGE `{T_LINKS}` T
             USING `{temp_table_id}` S
             ON T.link_id = S.link_id
-            WHEN MATCHED AND T.decided_by IS NULL AND T.source NOT IN ('human', 'manual_url')
+            WHEN MATCHED AND T.decided_by IS NULL AND T.status = 'pending'
+                 AND T.source NOT IN ('human', 'manual_url')
             THEN UPDATE SET {set_clause}
         """).result()
     invalidate_pi_caches()
 
 
-def decide_link(link_id: str, status: str, decided_by: str = "Dashboard"):
-    """Human confirm/reject from the review UI — permanent (never auto-overwritten)."""
+# --- 'superseded': parked, not tombstoned -------------------------------------
+#
+# A (item, competitor) pair holds at most one confirmed link. Every other pending
+# candidate for that pair is redundant the moment one is confirmed — but rejecting
+# it would tombstone that listing for EVERY item (rejected_keys is checked before
+# any tier in matcher.match), which is far too strong for "not needed here". So
+# such rows are set aside instead: out of the review queue, still holding their
+# match_key (never re-proposed), never feeding rejected_keys, and restored to
+# pending if the pair's confirmed link is later rejected.
+#
+# Neither direction writes decided_by. update_link_verdicts only touches rows
+# with decided_by IS NULL, so a restored row that carried an actor would be sent
+# to the LLM every night and its verdict silently dropped. Provenance goes in
+# llm_reason as a bracketed note (the verifier's own convention).
+SUPERSEDED_NOTE = "[set aside: item already has a confirmed link at this store]"
+_PAIR_KEY_SQL = "CONCAT(COALESCE(item_id, ''), '|', COALESCE(competitor_id, ''))"
+
+
+def _pair_key(item_id, competitor_id) -> str:
+    return f"{item_id or ''}|{competitor_id or ''}"
+
+
+def _supersede_pending_for_pairs(pairs: list, exclude_link_ids: list = None) -> int:
+    """Set aside every pending row on the given (item_id, competitor_id) pairs,
+    except the listed link_ids (the row that was just confirmed). One DML."""
+    keys = list(dict.fromkeys(_pair_key(i, c) for i, c in pairs))
+    if not keys:
+        return 0
+    job = get_bq_client().query(
+        f"UPDATE `{T_LINKS}` SET status = 'superseded', "
+        "llm_reason = SUBSTR(TRIM(CONCAT(COALESCE(llm_reason, ''), ' ', @note)), 1, 300), "
+        "updated_at = CURRENT_TIMESTAMP() "
+        f"WHERE status = 'pending' AND {_PAIR_KEY_SQL} IN UNNEST(@pairs) "
+        "AND link_id NOT IN UNNEST(@exclude_ids)",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("note", "STRING", SUPERSEDED_NOTE),
+            bigquery.ArrayQueryParameter("pairs", "STRING", keys),
+            bigquery.ArrayQueryParameter(
+                "exclude_ids", "STRING",
+                [str(x) for x in (exclude_link_ids or [])]),
+        ]),
+    )
+    job.result()
+    invalidate_pi_caches()
+    return job.num_dml_affected_rows or 0
+
+
+def _superseded_rows_without_confirmed_link(pairs: list = None) -> list:
+    """Set-aside rows whose (item, competitor) pair no longer holds a confirmed
+    link — the ones a rejection has made relevant again."""
+    where, params = "", []
+    if pairs is not None:
+        keys = list(dict.fromkeys(_pair_key(i, c) for i, c in pairs))
+        if not keys:
+            return []
+        where = (f"AND CONCAT(COALESCE(s.item_id, ''), '|', "
+                 "COALESCE(s.competitor_id, '')) IN UNNEST(@pairs)")
+        params = [bigquery.ArrayQueryParameter("pairs", "STRING", keys)]
+    return _rows(f"""
+        SELECT s.link_id, s.item_id, s.competitor_id, s.competitor_title, s.source
+        FROM `{T_LINKS}` s
+        LEFT JOIN `{T_LINKS}` c
+          ON c.item_id = s.item_id
+         AND COALESCE(c.competitor_id, '') = COALESCE(s.competitor_id, '')
+         AND c.status = 'confirmed'
+        WHERE s.status = 'superseded' AND c.link_id IS NULL {where}
+    """, params=params)
+
+
+def _restore_superseded(link_ids: list) -> int:
+    """Put set-aside rows back in the review queue, dropping the set-aside note."""
+    ids = [str(x) for x in link_ids if x]
+    if not ids:
+        return 0
+    job = get_bq_client().query(
+        f"UPDATE `{T_LINKS}` SET status = 'pending', "
+        "llm_reason = NULLIF(TRIM(REPLACE(COALESCE(llm_reason, ''), @note, '')), ''), "
+        "updated_at = CURRENT_TIMESTAMP() "
+        "WHERE link_id IN UNNEST(@ids) AND status = 'superseded'",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("note", "STRING", SUPERSEDED_NOTE),
+            bigquery.ArrayQueryParameter("ids", "STRING", ids),
+        ]),
+    )
+    job.result()
+    invalidate_pi_caches()
+    return job.num_dml_affected_rows or 0
+
+
+def reconcile_superseded_links(apply: bool = False) -> dict:
+    """Idempotent sweep, both directions (dry-run by default): pending rows on a
+    pair that already holds a confirmed link are set aside; set-aside rows whose
+    pair no longer holds one come back to pending.
+
+    Runs at the end of every scrape run and on demand. The per-decision writers
+    (confirm_link, the verifier's _claim_pair, the cleanup re-anchor) keep the
+    queue clean in the common case; this catches what they can't see — a human
+    confirming while a run's snapshot of confirmed pairs is already taken, a
+    confirmed link rejected through the breakdown Ban, an older row from before
+    the status existed."""
     ensure_pi_tables()
+    to_park = _rows(f"""
+        SELECT p.link_id, p.item_id, p.competitor_id, p.competitor_title, p.source
+        FROM `{T_LINKS}` p
+        JOIN `{T_LINKS}` c
+          ON c.item_id = p.item_id
+         AND COALESCE(c.competitor_id, '') = COALESCE(p.competitor_id, '')
+         AND c.status = 'confirmed'
+        WHERE p.status = 'pending' AND p.item_id IS NOT NULL
+        GROUP BY 1, 2, 3, 4, 5
+    """)
+    to_restore = _superseded_rows_without_confirmed_link()
+
+    def sample(r):
+        return {k: r.get(k) for k in
+                ("link_id", "item_id", "competitor_id", "competitor_title", "source")}
+
+    report = {
+        "applied": apply,
+        "superseded": len(to_park),
+        "restored": len(to_restore),
+        "supersede_samples": [sample(r) for r in to_park[:20]],
+        "restore_samples": [sample(r) for r in to_restore[:20]],
+    }
+    if not apply:
+        return report
+    if to_park:
+        get_bq_client().query(
+            f"UPDATE `{T_LINKS}` SET status = 'superseded', "
+            "llm_reason = SUBSTR(TRIM(CONCAT(COALESCE(llm_reason, ''), ' ', @note)), 1, 300), "
+            "updated_at = CURRENT_TIMESTAMP() "
+            "WHERE link_id IN UNNEST(@ids) AND status = 'pending'",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("note", "STRING", SUPERSEDED_NOTE),
+                bigquery.ArrayQueryParameter(
+                    "ids", "STRING", [str(r["link_id"]) for r in to_park]),
+            ]),
+        ).result()
+    if to_restore:
+        _restore_superseded([r["link_id"] for r in to_restore])
+    invalidate_pi_caches()
+    return report
+
+
+def decide_link(link_id: str, status: str, decided_by: str = "Dashboard"):
+    """Human confirm/reject from the review UI — permanent (never auto-overwritten).
+
+    Rejecting a CONFIRMED link frees its (item, store) pair, so the candidates
+    that were set aside behind it come straight back to the queue."""
+    ensure_pi_tables()
+    prior = None
+    if status == "rejected":
+        rows = _rows(
+            f"SELECT status, item_id, competitor_id FROM `{T_LINKS}` WHERE link_id = @lid",
+            params=[bigquery.ScalarQueryParameter("lid", "STRING", str(link_id))])
+        prior = rows[0] if rows else None
     get_bq_client().query(
         f"UPDATE `{T_LINKS}` SET status = @status, decided_by = @actor, "
         "confidence = IF(@status = 'confirmed', 1.0, confidence), "
@@ -2163,6 +2323,10 @@ def decide_link(link_id: str, status: str, decided_by: str = "Dashboard"):
             bigquery.ScalarQueryParameter("lid", "STRING", str(link_id)),
         ]),
     ).result()
+    if prior and prior.get("status") == "confirmed":
+        pair = [(prior.get("item_id"), prior.get("competitor_id"))]
+        _restore_superseded(
+            [r["link_id"] for r in _superseded_rows_without_confirmed_link(pair)])
     invalidate_pi_caches()
 
 
@@ -2207,7 +2371,7 @@ def decide_links_bulk(link_ids: list, status: str,
     rules as ``confirm_link``; later selected candidates for an already-occupied
     item/store pair are skipped. Reject decisions need no per-row guard.
     """
-    from .matcher import parse_variant_options, attributes_conflict
+    from .matcher import listing_options, attributes_conflict
 
     ensure_pi_tables()
     ids = list(dict.fromkeys(str(link_id) for link_id in link_ids if link_id))
@@ -2227,6 +2391,7 @@ def decide_links_bulk(link_ids: list, status: str,
 
     selected_rows = _rows(f"""
         SELECT l.link_id, l.item_id, l.competitor_id, l.competitor_title, l.status,
+               l.variant_options_json,
                t.attribute_1 AS a1, t.attribute_2 AS a2, t.attribute_3 AS a3
         FROM `{T_LINKS}` l
         LEFT JOIN `{T_TRACKED}` t ON t.item_id = l.item_id
@@ -2267,7 +2432,7 @@ def decide_links_bulk(link_ids: list, status: str,
             results.append({"link_id": link_id, "status": "confirmed",
                             "reason": "already confirmed"})
             continue
-        if attributes_conflict(parse_variant_options(row.get("competitor_title")),
+        if attributes_conflict(listing_options(row),
                                [row.get("a1"), row.get("a2"), row.get("a3")]):
             rejected_ids.append(link_id)
             results.append({"link_id": link_id, "status": "rejected",
@@ -2285,7 +2450,26 @@ def decide_links_bulk(link_ids: list, status: str,
         results.append({"link_id": link_id, "status": "confirmed", "replaced": 0})
 
     _update_link_decisions(confirmed_ids, rejected_ids, decided_by)
-    return {"results": results, "confirmed_link_ids": confirmed_ids}
+    # The pairs just confirmed no longer need their other candidates in the
+    # queue — set them aside (not rejected: see SUPERSEDED_NOTE). A selected row
+    # that was skipped because a sibling in this same selection took the pair is
+    # among them, so report it as what it now is.
+    superseded = 0
+    if confirmed_ids:
+        won_pairs = {
+            (str(selected_by_id[lid].get("item_id") or ""),
+             str(selected_by_id[lid].get("competitor_id") or ""))
+            for lid in confirmed_ids
+        }
+        superseded = _supersede_pending_for_pairs(list(won_pairs), confirmed_ids)
+        for res in results:
+            row = selected_by_id.get(res["link_id"])
+            if (res.get("status") == "skipped" and row is not None
+                    and (str(row.get("item_id") or ""),
+                         str(row.get("competitor_id") or "")) in won_pairs):
+                res["status"] = "superseded"
+    return {"results": results, "confirmed_link_ids": confirmed_ids,
+            "superseded": superseded}
 
 
 def confirm_link(link_id: str, decided_by: str = "Dashboard", replace: bool = False) -> dict:
@@ -2298,11 +2482,13 @@ def confirm_link(link_id: str, decided_by: str = "Dashboard", replace: bool = Fa
         skipped unless replace=True, in which case the existing confirmed link(s)
         at that store are rejected first and this one takes over (the override
         path from the Matching tab).
-    Returns {status: confirmed|rejected|skipped|error, reason, can_replace?, replaced?}."""
-    from .matcher import parse_variant_options, attributes_conflict
+    Returns {status: confirmed|rejected|skipped|error, reason, can_replace?,
+    replaced?, superseded?} — `superseded` counts the pair's other pending
+    candidates that were set aside because this one won."""
+    from .matcher import listing_options, attributes_conflict
     ensure_pi_tables()
     rows = _rows(f"""
-        SELECT l.item_id, l.competitor_id, l.competitor_title,
+        SELECT l.item_id, l.competitor_id, l.competitor_title, l.variant_options_json,
                t.attribute_1 AS a1, t.attribute_2 AS a2, t.attribute_3 AS a3
         FROM `{T_LINKS}` l LEFT JOIN `{T_TRACKED}` t ON t.item_id = l.item_id
         WHERE l.link_id = @lid
@@ -2310,7 +2496,7 @@ def confirm_link(link_id: str, decided_by: str = "Dashboard", replace: bool = Fa
     if not rows:
         return {"status": "error", "reason": "link not found"}
     l = rows[0]
-    if attributes_conflict(parse_variant_options(l.get("competitor_title")),
+    if attributes_conflict(listing_options(l),
                            [l.get("a1"), l.get("a2"), l.get("a3")]):
         decide_link(link_id, "rejected", decided_by=decided_by)
         return {"status": "rejected", "reason": "color/size mismatch with the item"}
@@ -2336,7 +2522,9 @@ def confirm_link(link_id: str, decided_by: str = "Dashboard", replace: bool = Fa
             ]),
         ).result()
     decide_link(link_id, "confirmed", decided_by=decided_by)
-    return {"status": "confirmed", "replaced": len(dupes)}
+    superseded = _supersede_pending_for_pairs(
+        [(l["item_id"], l.get("competitor_id"))], [link_id])
+    return {"status": "confirmed", "replaced": len(dupes), "superseded": superseded}
 
 
 def fetch_and_record_link(link_id: str):
@@ -2436,6 +2624,111 @@ def rekey_links_to_gtin(apply: bool = False) -> dict:
     return report
 
 
+def _apply_link_reanchors(client, moves: dict) -> None:
+    """Move link rows onto other variants in one DML. `moves` maps link_id ->
+    (new_item_id, new_source, new_status) where new_status '' keeps the row's
+    current status. Zips parallel arrays by position — a struct-array parameter
+    for what is a plain id->id map buys nothing.
+
+    The stale verdict is cleared with the move: it was written about the variant
+    the row no longer points at, so the next run re-verifies (get_product_links
+    unverified_only). A row set aside by the move carries the set-aside note
+    instead, so it reads the same as any other parked row."""
+    if not moves:
+        return
+    link_ids = list(moves)
+    new_ids = [str(moves[lid][0]) for lid in link_ids]
+    sources = [moves[lid][1] for lid in link_ids]
+    statuses = [moves[lid][2] or "" for lid in link_ids]
+    client.query(
+        f"""UPDATE `{T_LINKS}` l
+            SET item_id = m.new_item_id, level = 'variant', source = m.new_source,
+                status = CASE WHEN m.new_status != '' THEN m.new_status ELSE l.status END,
+                llm_verdict = NULL,
+                llm_reason = CASE WHEN m.new_status = 'superseded' THEN @note ELSE NULL END,
+                updated_at = CURRENT_TIMESTAMP()
+            FROM (
+              SELECT lid AS link_id, nid AS new_item_id, src AS new_source, st AS new_status
+              FROM UNNEST(@link_ids) AS lid WITH OFFSET o1
+              JOIN UNNEST(@new_ids) AS nid WITH OFFSET o2 ON o1 = o2
+              JOIN UNNEST(@sources) AS src WITH OFFSET o3 ON o1 = o3
+              JOIN UNNEST(@statuses) AS st WITH OFFSET o4 ON o1 = o4
+            ) m
+            WHERE l.link_id = m.link_id""",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("note", "STRING", SUPERSEDED_NOTE),
+            bigquery.ArrayQueryParameter("link_ids", "STRING", link_ids),
+            bigquery.ArrayQueryParameter("new_ids", "STRING", new_ids),
+            bigquery.ArrayQueryParameter("sources", "STRING", sources),
+            bigquery.ArrayQueryParameter("statuses", "STRING", statuses)]),
+    ).result()
+
+
+def reanchor_pending_links(apply: bool = False) -> dict:
+    """Move pending candidates onto the sibling variant their colour/size names
+    exactly (dry-run by default). Confirmed rows are never touched.
+
+    cleanup_mismatched_links only visits rows whose options CONFLICT with the
+    item, and a partial colour agreement is not a conflict — their single-colour
+    "Hydrogen White Matt / Medium" sat on our two-tone "Hydrogen White/Uranium
+    Black Matt w/Logo / Medium" (they share 'hydrogen white') while the exact
+    sibling "Hydrogen White Matt / Medium" existed in the same matrix. Rows
+    proposed before the matcher ranked siblings by attribute score are all in
+    that shape, and nothing re-visited them.
+
+    Only an exact, unique resolution ("confirm") moves a row; a "candidate" is
+    the best of a partial pool and moving on it would just churn. A row whose
+    destination pair already holds a confirmed link is set aside there
+    (SUPERSEDED_NOTE) rather than queued."""
+    from .matcher import MatchIndex, listing_options
+    ensure_pi_tables()
+    pending = get_product_links(status="pending", active_items_only=True, limit=5000)
+    confirmed = get_product_links(status="confirmed", limit=5000)
+    confirmed_pairs = {(str(l["item_id"]), l.get("competitor_id"))
+                       for l in confirmed if l.get("item_id")}
+    # Archived items are excluded from this index, so a move never lands on one.
+    tracked = get_tracked_products(include_excluded=True)
+    index = MatchIndex(tracked)
+    by_item = {str(t["item_id"]): t for t in tracked}
+
+    def attrs(t):
+        return [a for a in (t.get("attribute_1"), t.get("attribute_2"),
+                            t.get("attribute_3")) if a and str(a).strip()]
+
+    moves, samples = {}, []
+    for l in pending:
+        opts = listing_options(l)
+        if not opts:
+            continue
+        verdict, target = index._resolve_by_attributes(opts, l.get("item_id"))
+        if verdict != "confirm" or not target or str(target) == str(l.get("item_id")):
+            continue
+        parked = (str(target), l.get("competitor_id")) in confirmed_pairs
+        moves[l["link_id"]] = (str(target), "attr", "superseded" if parked else "")
+        if len(samples) < 40:
+            samples.append({
+                "link_id": l["link_id"], "competitor_id": l.get("competitor_id"),
+                "competitor_title": l.get("competitor_title"), "options": opts,
+                "from_item_id": l.get("item_id"),
+                "from_attrs": [l.get("item_attribute_1"), l.get("item_attribute_2"),
+                               l.get("item_attribute_3")],
+                "to_item_id": str(target),
+                "to_attrs": attrs(by_item.get(str(target), {})),
+                "as_status": "superseded" if parked else "pending",
+            })
+    report = {
+        "applied": apply,
+        "moved": sum(1 for _, _, st in moves.values() if st == ""),
+        "moved_and_superseded": sum(1 for _, _, st in moves.values() if st == "superseded"),
+        "samples": samples,
+    }
+    if not apply or not moves:
+        return report
+    _apply_link_reanchors(get_bq_client(), moves)
+    invalidate_pi_caches()
+    return report
+
+
 def cleanup_mismatched_links(apply: bool = False) -> dict:
     """One-off hygiene sweep (dry-run by default). For links whose competitor
     color/size conflicts with the item's attributes (both confirmed and pending),
@@ -2450,7 +2743,7 @@ def cleanup_mismatched_links(apply: bool = False) -> dict:
     just a purge: their L/XL listing sitting against our M/L item is not junk, it
     is a correct match pointed at the wrong variant of the same matrix."""
     from collections import defaultdict
-    from .matcher import MatchIndex, parse_variant_options, attributes_conflict
+    from .matcher import MatchIndex, listing_options, attributes_conflict
     ensure_pi_tables()
     confirmed = get_product_links(status="confirmed", limit=5000)
     pending = get_product_links(status="pending", limit=5000)
@@ -2459,14 +2752,7 @@ def cleanup_mismatched_links(apply: bool = False) -> dict:
     def attrs(l):
         return [l.get("item_attribute_1"), l.get("item_attribute_2"), l.get("item_attribute_3")]
 
-    def options(l):
-        """The connector's structured options when it recovered them, else the
-        title tail — the precedence the verifier already uses."""
-        try:
-            stored = json.loads(l.get("variant_options_json") or "[]")
-        except ValueError:
-            stored = []
-        return stored or parse_variant_options(l.get("competitor_title"))
+    options = listing_options
 
     # link_id -> (the variant it actually describes, the source that describes
     # how well). A "candidate" resolution is re-anchored too, and deliberately:
@@ -2516,10 +2802,29 @@ def cleanup_mismatched_links(apply: bool = False) -> dict:
     reanchor = {lid: v for lid, v in reanchor.items() if lid not in reject_ids}
     by_link = {l["link_id"]: l for l in confirmed + pending}
 
+    # Where each moved row lands, status-wise. A partial fit goes back to a
+    # human. A pending row moving onto a pair that (after this sweep) still holds
+    # a confirmed link is set aside there, not queued: the variant it names is
+    # already matched at that store. Everything else keeps its status.
+    kept_pairs = {pair for pair, links in by_pair.items()
+                  if any(l["link_id"] not in reject_ids for l in links)}
+    moves = {}
+    for lid, (target, source) in reanchor.items():
+        row = by_link[lid]
+        if (row["status"] == "pending"
+                and (target, row.get("competitor_id")) in kept_pairs):
+            status = "superseded"
+        elif source == "attr_partial":
+            status = "pending"
+        else:
+            status = ""
+        moves[lid] = (target, source, status)
+
     report = {
         "applied": apply,
         "reanchored_exact": sum(1 for _, s in reanchor.values() if s == "attr"),
         "reanchored_partial": sum(1 for _, s in reanchor.values() if s == "attr_partial"),
+        "reanchored_superseded": sum(1 for _, _, st in moves.values() if st == "superseded"),
         "attr_reject_confirmed": sum(1 for l in attr_reject if l["status"] == "confirmed"),
         "attr_reject_pending": sum(1 for l in attr_reject if l["status"] == "pending"),
         "dupe_reject_confirmed": len(dupe_reject),
@@ -2528,6 +2833,7 @@ def cleanup_mismatched_links(apply: bool = False) -> dict:
         "reanchor_samples": [
             {"status": by_link[lid]["status"], "from_item_id": by_link[lid].get("item_id"),
              "from_attrs": attrs(by_link[lid]), "to_item_id": iid, "as": source,
+             "as_status": moves[lid][2] or by_link[lid]["status"],
              "competitor_title": by_link[lid].get("competitor_title")}
             for lid, (iid, source) in list(reanchor.items())[:12]
         ],
@@ -2548,35 +2854,8 @@ def cleanup_mismatched_links(apply: bool = False) -> dict:
             job_config=bigquery.QueryJobConfig(query_parameters=[
                 bigquery.ArrayQueryParameter("ids", "STRING", list(reject_ids))]),
         ).result()
-    if reanchor:
-        # Zip two arrays by position — a struct-array parameter for what is a
-        # plain id->id map buys nothing. The stale verdict is cleared with the
-        # move: it was written about the variant the row no longer points at, so
-        # the next run re-verifies (get_product_links unverified_only).
-        link_ids = list(reanchor)
-        new_ids = [reanchor[lid][0] for lid in link_ids]
-        sources = [reanchor[lid][1] for lid in link_ids]
-        client.query(
-            f"""UPDATE `{T_LINKS}` l
-                SET item_id = m.new_item_id, level = 'variant', source = m.new_source,
-                    -- A link confirmed against the wrong variant, now landing on
-                    -- one it only partially fits, goes back to a human.
-                    status = CASE WHEN m.new_source = 'attr_partial'
-                                  THEN 'pending' ELSE l.status END,
-                    llm_verdict = NULL, llm_reason = NULL,
-                    updated_at = CURRENT_TIMESTAMP()
-                FROM (
-                  SELECT lid AS link_id, nid AS new_item_id, src AS new_source
-                  FROM UNNEST(@link_ids) AS lid WITH OFFSET o1
-                  JOIN UNNEST(@new_ids) AS nid WITH OFFSET o2 ON o1 = o2
-                  JOIN UNNEST(@sources) AS src WITH OFFSET o3 ON o1 = o3
-                ) m
-                WHERE l.link_id = m.link_id""",
-            job_config=bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ArrayQueryParameter("link_ids", "STRING", link_ids),
-                bigquery.ArrayQueryParameter("new_ids", "STRING", new_ids),
-                bigquery.ArrayQueryParameter("sources", "STRING", sources)]),
-        ).result()
+    if moves:
+        _apply_link_reanchors(client, moves)
     if obs_targets:
         keys = [f"{l['item_id']}|{l.get('competitor_id') or ''}|{l['competitor_url']}"
                 for l in obs_targets]
@@ -2609,7 +2888,7 @@ def sweep_domain_for_item(item_id: str, url: str, decided_by: str = "Dashboard")
     client.query(
         f"UPDATE `{T_LINKS}` SET status = 'rejected', decided_by = @actor, "
         "updated_at = CURRENT_TIMESTAMP() "
-        "WHERE item_id = @iid AND status IN ('confirmed', 'pending') "
+        "WHERE item_id = @iid AND status IN ('confirmed', 'pending', 'superseded') "
         "AND competitor_url IS NOT NULL "
         "AND NET.REG_DOMAIN(competitor_url) = NET.REG_DOMAIN(@url) "
         "AND match_key != @keep",
@@ -2672,7 +2951,7 @@ def reject_conflicting_links(item_id: str, domain: str, decided_by: str = "Dashb
         "updated_at = CURRENT_TIMESTAMP() "
         "WHERE item_id = @item_id "
         "AND source IN ('gtin', 'llm', 'attr', 'attr_partial') "
-        "AND status IN ('confirmed', 'pending') "
+        "AND status IN ('confirmed', 'pending', 'superseded') "
         "AND STRPOS(COALESCE(competitor_url, ''), @domain) > 0",
         job_config=bigquery.QueryJobConfig(query_parameters=[
             bigquery.ScalarQueryParameter("actor", "STRING", decided_by),

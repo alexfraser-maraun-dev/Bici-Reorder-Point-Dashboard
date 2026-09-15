@@ -14,6 +14,9 @@ Verdicts write back to the links table:
                   except gtin-sourced proposals (a barcode/LLM conflict goes
                   to a human, not a tombstone)
   uncertain    -> stays pending for human review
+  any verdict whose (item, competitor) pair already holds a confirmed link
+               -> superseded (parked out of the queue, not a tombstone; see
+                  repository.SUPERSEDED_NOTE) — the pair is decided already
 
 Mirrors digest.py: lazy client, ANTHROPIC_API_KEY guard, best-effort — the
 caller swallows failures so scrape data is never lost.
@@ -134,9 +137,9 @@ def _variant_attrs(variant: dict) -> list:
 
 def _listing_options(link: dict) -> list:
     """A listing's variant options: the connector's structured values when it
-    recovered them, else what the title tail carries."""
-    return (json.loads(link.get("variant_options_json") or "[]")
-            or matcher.parse_variant_options(link.get("competitor_title")))
+    recovered them, else what the title tail carries (matcher.listing_options —
+    the one precedence every reader of a link row shares)."""
+    return matcher.listing_options(link)
 
 
 def _resolve_model_anchor(item: dict, competitor_size, tracked_by_matrix: dict,
@@ -261,10 +264,21 @@ def verify_candidates(max_pairs: int = None) -> dict:
             update["confidence"] = round(
                 float(update["confidence"]) * PAIR_LOSS_RANK_PENALTY, 3)
 
+    def _set_aside(update: dict):
+        """The pair already holds a confirmed link (a prior run, or a human), so
+        this candidate is not competing for anything: park it out of the queue.
+        Demoting it to pending used to leave it there forever — with a verdict
+        set it was never re-fetched, and the queue never hid it, so a human
+        would confirm it and be told the item was already linked."""
+        update["status"] = "superseded"
+        update["llm_reason"] = (
+            f"{update.get('llm_reason') or ''} {repository.SUPERSEDED_NOTE}"
+        ).strip()[:300]
+
     def _claim_pair(item_id: str, competitor_id, update: dict, link: dict, item: dict) -> bool:
         pair = (str(item_id), competitor_id)
         if pair in confirmed_pairs:
-            _demote(update, "item already has a confirmed link at this store")
+            _set_aside(update)
             return False
         score = matcher.attribute_match_score(
             _listing_options(link),
@@ -283,8 +297,8 @@ def verify_candidates(max_pairs: int = None) -> dict:
         return True
 
     client = _get_anthropic_client()
-    stats = {"pairs": 0, "confirmed": 0, "rejected": 0, "pending": 0, "errors": 0,
-             "input_tokens": 0, "output_tokens": 0}
+    stats = {"pairs": 0, "confirmed": 0, "rejected": 0, "pending": 0,
+             "superseded": 0, "errors": 0, "input_tokens": 0, "output_tokens": 0}
     updates = []
     now = repository.utcnow_iso()
 
@@ -353,7 +367,7 @@ def verify_candidates(max_pairs: int = None) -> dict:
                     update.update(status="confirmed", confidence=0.95)
                     stats["confirmed"] += 1
                 else:
-                    stats["pending"] += 1
+                    stats[update["status"]] += 1
             elif verdict == "same_model":
                 anchor_id, resolved, note = _resolve_model_anchor(
                     item, result.get("competitor_size"), tracked_by_matrix,
@@ -373,7 +387,7 @@ def verify_candidates(max_pairs: int = None) -> dict:
                     update.update(status="confirmed", confidence=0.85)
                     stats["confirmed"] += 1
                 else:
-                    stats["pending"] += 1
+                    stats[update["status"]] += 1
             elif verdict == "different":
                 if link.get("source") == "gtin":
                     # Barcode says same product, LLM says different — a real
