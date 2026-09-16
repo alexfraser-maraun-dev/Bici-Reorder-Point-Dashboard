@@ -22,10 +22,13 @@ def _default_digest_prompt():
     return digest.DEFAULT_SYSTEM_PROMPT
 
 
-# kind: bool | int | text | timezone | url. secret values are masked in
-# describe() and never echoed back to the browser.
+# kind: bool | int | text | timezone | url | choice. secret values are masked
+# in describe() and never echoed back to the browser.
 _SPECS = {
-    # 1. LLM digest
+    # 1. LLM digest. digest_enabled gates the nightly generation itself (no LLM
+    # call when off); the manual "Regenerate" button in the Digest tab still
+    # works. Whether the narrative is *posted* is the separate Slack switch.
+    "digest_enabled": {"kind": "bool", "default": lambda: True},
     "digest_prompt": {"kind": "text", "default": _default_digest_prompt,
                       "max_len": 20000},
     # 2. Nightly run timing
@@ -49,11 +52,23 @@ _SPECS = {
                                  "secret": True},
     "slack_send_digest": {"kind": "bool", "default": lambda: True},
     "slack_map_pings": {"kind": "bool", "default": lambda: True},
+    # Undercut (competitor crossed below our retail on a non-MAP item) is
+    # recorded like any event but only pings when opted in — the user turned
+    # these off in July because they were noise next to the MAP pings.
+    "slack_undercut_pings": {"kind": "bool", "default": lambda: False},
     "slack_health_alerts": {"kind": "bool", "default": lambda: True},
     "slack_max_priority_pings": {"kind": "int", "default": lambda: 15,
                                  "min": 0, "max": 100},
-    "slack_max_digest_moves": {"kind": "int", "default": lambda: 15,
-                               "min": 0, "max": 100},
+    # The "Competitor price changes" message: the run's price drops/increases
+    # rolled up to one line per product (matrix or item) × store. Replaces the
+    # old "Notable moves" appendix on the digest (slack_max_digest_moves).
+    "slack_price_changes": {"kind": "bool", "default": lambda: True},
+    "slack_price_change_min_pct": {"kind": "int", "default": lambda: 0,
+                                   "min": 0, "max": 100},
+    "slack_price_change_directions": {"kind": "choice", "default": lambda: "both",
+                                      "choices": ("both", "drops", "increases")},
+    "slack_max_price_changes": {"kind": "int", "default": lambda: 15,
+                                "min": 1, "max": 50},
     # 5. Google Merchant Center benchmark phase. Toggleable here so the pull can
     # be stopped without a redeploy; the merchant id and credentials stay env-only
     # (they're deployment identity, not an operating preference).
@@ -80,7 +95,12 @@ def _validate(key: str, spec: dict, value):
     if not isinstance(value, str):
         raise ValueError(f"{key} must be a string")
     value = value.strip()
-    if kind == "timezone":
+    if kind == "choice":
+        # Explicit branch: an unknown kind would otherwise fall through to the
+        # permissive string rule and store any text as a "valid" choice.
+        if value not in spec["choices"]:
+            raise ValueError(f"{key} must be one of {', '.join(spec['choices'])}")
+    elif kind == "timezone":
         try:
             ZoneInfo(value)
         except Exception:
@@ -128,6 +148,9 @@ def describe() -> list:
             "default": _mask(default) if secret else default,
             "overridden": key in overrides,
             "secret": secret,
+            # Lets the console render a choice as a select without hardcoding
+            # the options twice.
+            "choices": list(spec["choices"]) if spec.get("choices") else None,
         })
     return out
 

@@ -98,9 +98,12 @@ def build_digest_stats(run_id: str) -> dict:
 
     # A muted store is kept out of the LLM's input too — otherwise the narrative
     # would still talk about the moves the user silenced. Only the families this
-    # query actually carries; stock events never reach the digest.
+    # query actually carries; stock events never reach the digest. The digest is
+    # written for Slack, so a Slack-muted store is dropped here as well.
     mute_sql, mute_params = repository.sql_event_mute_filter(
         groups=("mute_price_alerts", "mute_map_alerts"))
+    slack_sql, slack_params = repository.sql_slack_mute_filter()
+    predicates = " ".join(f"AND {sql}" for sql in (mute_sql, slack_sql) if sql)
     changes = rows(f"""
         SELECT event_type, item_title AS item, competitor_name AS competitor,
                old_price, new_price, pct_change
@@ -108,10 +111,10 @@ def build_digest_stats(run_id: str) -> dict:
         WHERE run_id = @run_id
           AND event_type IN ('price_drop', 'price_increase', 'map_violation',
                              'undercut')
-          {f'AND {mute_sql}' if mute_sql else ''}
+          {predicates}
         ORDER BY ABS(COALESCE(pct_change, 0)) DESC
         LIMIT 15
-    """, extra_params=mute_params)
+    """, extra_params=mute_params + slack_params)
 
     gaps = rows(f"""
         WITH matched AS (

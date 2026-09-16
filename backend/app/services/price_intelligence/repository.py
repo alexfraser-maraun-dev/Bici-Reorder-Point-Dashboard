@@ -74,6 +74,12 @@ MUTABLE_EVENT_GROUPS = {
     "mute_map_alerts": ("map_violation",),
 }
 
+# Slack-only mute, stored in the same settings_json blob. Unlike the families
+# above it never touches the change feed or the unread badge: the store's events
+# are still shown in the app, they just don't make it into any Slack message
+# (MAP/undercut pings, the price-changes rollup, or the digest LLM's input).
+SLACK_MUTE_KEY = "mute_slack"
+
 
 def sql_market_sources(alias: str = "") -> str:
     col = f"{alias}.source" if alias else "source"
@@ -556,25 +562,39 @@ def get_competitors(include_disabled: bool = True):
     return rows
 
 
+def _competitor_settings(competitor: dict) -> dict:
+    """Parsed settings_json for one competitor row, or {} when absent or
+    unparseable — a bad blob must fail open (keep alerting), never silently
+    mute a store."""
+    raw = competitor.get("settings_json")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def muted_event_competitors() -> dict:
     """{mute key: [competitor_id, ...]} for stores muted in the Competitors tab.
 
     Reads the cached competitor list, so this costs nothing on the hot path."""
     out = {key: [] for key in MUTABLE_EVENT_GROUPS}
     for c in get_competitors():
-        raw = c.get("settings_json")
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            continue
-        if not isinstance(data, dict):
-            continue
+        data = _competitor_settings(c)
         for key in MUTABLE_EVENT_GROUPS:
+            # Only a literal true mutes (the router rejects anything else).
             if data.get(key) is True:
                 out[key].append(str(c["competitor_id"]))
     return out
+
+
+def slack_muted_competitor_ids() -> set:
+    """Competitor ids whose events must stay out of every Slack message. Same
+    literal-true rule as the feed mutes; same cached read."""
+    return {str(c["competitor_id"]) for c in get_competitors()
+            if _competitor_settings(c).get(SLACK_MUTE_KEY) is True}
 
 
 def sql_event_mute_filter(alias: str = "", groups=None):
@@ -594,10 +614,26 @@ def sql_event_mute_filter(alias: str = "", groups=None):
             continue
         name = f"muted_{i}"
         quoted = ", ".join(f"'{t}'" for t in types)
-        clauses.append(f"NOT ({prefix}competitor_id IN UNNEST(@{name})"
+        # COALESCE: a tracked-URL event can carry a NULL competitor_id, and
+        # `NOT (NULL IN UNNEST(...) AND TRUE)` is NULL in BigQuery — without it,
+        # muting any one store silently dropped every competitor-less event.
+        clauses.append(f"NOT (COALESCE({prefix}competitor_id, '') IN UNNEST(@{name})"
                        f" AND {prefix}event_type IN ({quoted}))")
         params.append(bigquery.ArrayQueryParameter(name, "STRING", ids))
     return " AND ".join(clauses), params
+
+
+def sql_slack_mute_filter(alias: str = ""):
+    """(predicate, params) dropping Slack-muted competitors from an event query
+    that feeds a Slack message (today: the digest LLM's notable_changes).
+    ("", []) when no store is Slack-muted. Parameter name is distinct from the
+    feed mutes' muted_{i} so the two predicates can share one query."""
+    ids = sorted(slack_muted_competitor_ids())
+    if not ids:
+        return "", []
+    prefix = f"{alias}." if alias else ""
+    return (f"NOT (COALESCE({prefix}competitor_id, '') IN UNNEST(@slack_muted))",
+            [bigquery.ArrayQueryParameter("slack_muted", "STRING", ids)])
 
 
 def _competitor_settings_json(value):

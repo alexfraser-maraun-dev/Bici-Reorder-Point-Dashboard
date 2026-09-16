@@ -12,18 +12,29 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import {
-  apiPost, updatePriceIntelSettings, usePriceIntelSettings,
+  apiPost, patchCompetitorSettings, updatePriceIntelSettings, useCompetitors,
+  usePriceIntelSettings,
 } from '@/lib/price-intel/hooks'
-import type { AdminSetting } from '@/lib/price-intel/types'
+import { parseCompetitorSettings } from '@/lib/price-intel/format'
+import type { AdminSetting, Competitor } from '@/lib/price-intel/types'
 import {
-  CalendarClock, GitMerge, MessageSquare, RotateCcw, Send, Sparkles,
+  BellOff, CalendarClock, GitMerge, MessageSquare, RotateCcw, Send, Sparkles,
 } from 'lucide-react'
 
 type Changes = Record<string, string | number | boolean | null>
+
+const DIRECTION_LABEL: Record<string, string> = {
+  both: 'Drops & increases',
+  drops: 'Drops only',
+  increases: 'Increases only',
+}
 
 function SectionCard({ icon, title, description, overridden, children }: {
   icon: React.ReactNode
@@ -53,19 +64,99 @@ function SectionCard({ icon, title, description, overridden, children }: {
   )
 }
 
-function SwitchRow({ label, hint, checked, onChange }: {
+function SwitchRow({ label, hint, checked, onChange, disabled }: {
   label: string
   hint?: string
   checked: boolean
   onChange: (v: boolean) => void
+  disabled?: boolean
 }) {
   return (
-    <div className="flex items-center justify-between gap-4">
+    <div className={disabled ? 'flex items-center justify-between gap-4 opacity-60'
+                             : 'flex items-center justify-between gap-4'}>
       <div>
         <Label className="text-sm">{label}</Label>
         {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
       </div>
-      <Switch checked={checked} onCheckedChange={onChange} />
+      <Switch checked={checked} onCheckedChange={onChange} disabled={disabled} />
+    </div>
+  )
+}
+
+function SubHeading({ children }: { children: React.ReactNode }) {
+  return (
+    <p className="border-t pt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+      {children}
+    </p>
+  )
+}
+
+// Per-store Slack switches. Each flip is its own PATCH (merged on the server)
+// with an optimistic SWR update, so it never waits on — or races — the
+// "Save Slack settings" button, and the Competitors tab sees the same row.
+function StoresInSlack() {
+  const { competitors, mutate } = useCompetitors()
+  const [pending, setPending] = useState<Set<string>>(new Set())
+  const stores = competitors.filter((c) => c.enabled && c.connector_type !== 'benchmark')
+
+  const setInSlack = async (store: Competitor, inSlack: boolean) => {
+    const settings = parseCompetitorSettings(store.settings_json)
+    const next = { ...settings }
+    if (inSlack) delete next.mute_slack
+    else next.mute_slack = true
+    const optimistic = competitors.map((c) => c.competitor_id === store.competitor_id
+      ? { ...c, settings_json: Object.keys(next).length ? JSON.stringify(next) : null }
+      : c)
+    setPending((prev) => new Set(prev).add(store.competitor_id))
+    try {
+      await mutate(optimistic, { revalidate: false })
+      await patchCompetitorSettings(store.competitor_id, { mute_slack: inSlack ? null : true })
+      await mutate()
+      toast.success(inSlack ? `${store.name} is back in Slack` : `${store.name} muted in Slack`)
+    } catch (e) {
+      await mutate() // back to the server's truth
+      toast.error(e instanceof Error ? e.message : 'Failed to update store')
+    } finally {
+      setPending((prev) => {
+        const n = new Set(prev)
+        n.delete(store.competitor_id)
+        return n
+      })
+    }
+  }
+
+  if (stores.length === 0) {
+    return <p className="text-xs text-muted-foreground">No enabled stores yet.</p>
+  }
+  return (
+    <div className="grid gap-2 sm:grid-cols-2">
+      {stores.map((store) => {
+        const settings = parseCompetitorSettings(store.settings_json)
+        const inSlack = settings.mute_slack !== true
+        // A feed-muted family never reaches Slack regardless of this switch;
+        // say so, or the switch looks like it does nothing.
+        const feedMuted = [
+          settings.mute_price_alerts && 'price',
+          settings.mute_map_alerts && 'MAP',
+        ].filter(Boolean) as string[]
+        return (
+          <div key={store.competitor_id}
+               className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
+            <div className="min-w-0">
+              <p className="truncate text-sm">{store.name}</p>
+              {feedMuted.length > 0 && (
+                <p className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                  <BellOff className="h-3 w-3" />
+                  {feedMuted.join(' & ')} alerts muted in the app (never reach Slack)
+                </p>
+              )}
+            </div>
+            <Switch checked={inSlack} disabled={pending.has(store.competitor_id)}
+                    onCheckedChange={(v) => void setInSlack(store, v)}
+                    aria-label={`${store.name} in Slack`} />
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -121,8 +212,12 @@ export function AdminConsole() {
     try {
       const res = await apiPost('/api/price-intel/notify/test')
       const r = res?.results ?? {}
+      const status = (ok: boolean | undefined) => (ok ? 'ok' : 'failed')
       toast.success(
-        `Test sent — digest: ${r.digest ? 'ok' : 'failed'}, MAP ping: ${r.map_ping ? 'ok' : 'failed'} (${res.alerts_webhook} webhook)`
+        `Test sent — MAP ping: ${status(r.map_ping)}, price changes: ${status(r.price_changes)}, `
+        + `digest: ${status(r.digest)}`
+        + (r.undercut_ping !== undefined ? `, undercut ping: ${status(r.undercut_ping)}` : '')
+        + ` (${res.alerts_webhook} webhook)`
       )
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Slack test failed')
@@ -139,10 +234,12 @@ export function AdminConsole() {
     )
   }
 
-  // --- section: digest prompt ------------------------------------------------
+  // --- section: digest -------------------------------------------------------
+  const digestEnabled = Boolean(val('digest_enabled'))
   const promptDefault = String(byKey.digest_prompt?.default ?? '')
   const promptValue = String(val('digest_prompt') ?? '')
-  const promptOverridden = Boolean(byKey.digest_prompt?.overridden)
+  const digestOverridden = Boolean(byKey.digest_prompt?.overridden)
+    || Boolean(byKey.digest_enabled?.overridden)
 
   // --- section: schedule -----------------------------------------------------
   const hour = Number(val('schedule_hour') ?? 2)
@@ -152,26 +249,63 @@ export function AdminConsole() {
 
   // --- section: slack ---------------------------------------------------------
   const slackToggleKeys = [
-    'slack_enabled', 'slack_send_digest', 'slack_map_pings', 'slack_health_alerts',
-    'slack_max_priority_pings', 'slack_max_digest_moves',
+    'slack_enabled', 'slack_send_digest', 'slack_map_pings', 'slack_undercut_pings',
+    'slack_health_alerts', 'slack_max_priority_pings', 'slack_price_changes',
+    'slack_price_change_min_pct', 'slack_price_change_directions', 'slack_max_price_changes',
   ]
   const webhookConfigured = (key: string) => Boolean(byKey[key]?.value)
+  const directionChoices = byKey.slack_price_change_directions?.choices
+    ?? ['both', 'drops', 'increases']
+
+  const numberField = (key: string, label: string, fallback: number, min: number, max: number,
+                       hint?: string) => (
+    <div className="space-y-1.5">
+      <Label className="text-sm">{label}</Label>
+      <Input
+        type="number" min={min} max={max}
+        value={String(val(key) ?? fallback)}
+        onChange={(e) => {
+          const n = parseInt(e.target.value, 10)
+          setVal(key, Number.isNaN(n) ? min : Math.min(max, Math.max(min, n)))
+        }}
+      />
+      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
+    </div>
+  )
 
   return (
     <div className="grid items-start gap-4 lg:grid-cols-2">
       <SectionCard
         icon={<Sparkles className="h-4 w-4 text-violet-600" />}
-        title="Daily digest prompt"
-        overridden={promptOverridden}
-        description="System prompt for the LLM market digest generated after each nightly run. Leave as-is to use the built-in prompt; edits apply from the next digest."
+        title="LLM market digest"
+        overridden={digestOverridden}
+        description="A short market narrative written by the model after each nightly run, shown in the Digest tab and optionally posted to Slack."
       >
-        <Textarea
-          value={promptValue}
-          onChange={(e) => setVal('digest_prompt', e.target.value)}
-          rows={14}
-          className="font-mono text-xs leading-relaxed"
-          spellCheck={false}
+        <SwitchRow
+          label="Generate digest after each nightly run"
+          hint={digestEnabled
+            ? 'Off = no LLM call at night. The Digest tab keeps the last one and its Regenerate button still works.'
+            : 'Nightly generation is off. Regenerate in the Digest tab still works; the Slack post is paused.'}
+          checked={digestEnabled}
+          onChange={(v) => {
+            setVal('digest_enabled', v)
+            void save({ digest_enabled: v },
+              v ? 'Nightly digest enabled' : 'Nightly digest disabled')
+          }}
         />
+        <div className="space-y-1.5">
+          <Label className="text-sm">System prompt</Label>
+          <p className="text-xs text-muted-foreground">
+            Leave as-is to use the built-in prompt; edits apply from the next digest.
+          </p>
+          <Textarea
+            value={promptValue}
+            onChange={(e) => setVal('digest_prompt', e.target.value)}
+            rows={12}
+            className="font-mono text-xs leading-relaxed"
+            spellCheck={false}
+          />
+        </div>
         <div className="flex items-center justify-between gap-2">
           <span className="text-xs text-muted-foreground">
             {promptValue.trim().length.toLocaleString()} characters
@@ -278,7 +412,7 @@ export function AdminConsole() {
         overridden={slackToggleKeys.some((k) => byKey[k]?.overridden)
           || Boolean(byKey.slack_webhook_url?.overridden)
           || Boolean(byKey.slack_alerts_webhook_url?.overridden)}
-        description="Post-run notifications: the market digest, MAP-violation pings, and scrape-health alerts."
+        description="Post-run messages, each behind its own switch: MAP/undercut pings, competitor price changes, the LLM digest, and scrape-health alerts. Store switches at the bottom apply to all of them."
       >
         <SwitchRow
           label="Slack notifications"
@@ -288,8 +422,8 @@ export function AdminConsole() {
         />
         <div className="space-y-3">
           {([
-            ['slack_webhook_url', 'Main webhook', 'Digest + health alerts'],
-            ['slack_alerts_webhook_url', 'Alerts webhook', 'MAP pings (falls back to main when unset)'],
+            ['slack_webhook_url', 'Main webhook', 'Price changes, digest + health alerts'],
+            ['slack_alerts_webhook_url', 'Alerts webhook', 'MAP / undercut pings (falls back to main when unset)'],
           ] as const).map(([key, label, hint]) => (
             <div key={key} className="space-y-1.5">
               <div className="flex items-center gap-2">
@@ -321,36 +455,71 @@ export function AdminConsole() {
             </div>
           ))}
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          <SwitchRow label="Daily digest message"
-                     checked={Boolean(val('slack_send_digest'))}
-                     onChange={(v) => setVal('slack_send_digest', v)} />
+
+        <SubHeading>Alerts</SubHeading>
+        <div className="grid gap-3 sm:grid-cols-2">
           <SwitchRow label="MAP violation pings"
+                     hint="One red ping per listing that crossed below our MAP floor."
                      checked={Boolean(val('slack_map_pings'))}
                      onChange={(v) => setVal('slack_map_pings', v)} />
+          <SwitchRow label="Undercut pings"
+                     hint="One red ping per listing that crossed below our price on a non-MAP item."
+                     checked={Boolean(val('slack_undercut_pings'))}
+                     onChange={(v) => setVal('slack_undercut_pings', v)} />
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          {numberField('slack_max_priority_pings', 'Max pings per run', 15, 0, 100,
+                       'The rest roll up into one “…and N more” line.')}
+        </div>
+
+        <SubHeading>Competitor price changes</SubHeading>
+        <SwitchRow
+          label="Price changes message"
+          hint="One message per run: the change feed's price drops and increases rolled up per product × store, e.g. “SuperSix EVO 5 (6 variants) +20% → $3,199.93 — Primeau Velo”."
+          checked={Boolean(val('slack_price_changes'))}
+          onChange={(v) => setVal('slack_price_changes', v)}
+        />
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div className="space-y-1.5">
+            <Label className="text-sm">Direction</Label>
+            <Select value={String(val('slack_price_change_directions') ?? 'both')}
+                    onValueChange={(v) => setVal('slack_price_change_directions', v)}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {directionChoices.map((c) => (
+                  <SelectItem key={c} value={c}>{DIRECTION_LABEL[c] ?? c}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          {numberField('slack_price_change_min_pct', 'Min % change', 0, 0, 100,
+                       '0 = every change the feed records.')}
+          {numberField('slack_max_price_changes', 'Max products per message', 15, 1, 50)}
+        </div>
+
+        <SubHeading>Digest &amp; health</SubHeading>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <SwitchRow label="Post digest to Slack"
+                     hint={digestEnabled
+                       ? 'The LLM narrative, posted ahead of the price changes.'
+                       : 'Turn on digest generation (LLM market digest card) to post it.'}
+                     disabled={!digestEnabled}
+                     checked={Boolean(val('slack_send_digest'))}
+                     onChange={(v) => setVal('slack_send_digest', v)} />
           <SwitchRow label="Scrape health alerts"
+                     hint="Red message when a run fails or finishes partial."
                      checked={Boolean(val('slack_health_alerts'))}
                      onChange={(v) => setVal('slack_health_alerts', v)} />
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          <div className="space-y-1.5">
-            <Label className="text-sm">Max MAP pings per run</Label>
-            <Input
-              type="number" min={0} max={100}
-              value={String(val('slack_max_priority_pings') ?? 15)}
-              onChange={(e) => setVal('slack_max_priority_pings', parseInt(e.target.value, 10) || 0)}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-sm">Max moves in digest</Label>
-            <Input
-              type="number" min={0} max={100}
-              value={String(val('slack_max_digest_moves') ?? 15)}
-              onChange={(e) => setVal('slack_max_digest_moves', parseInt(e.target.value, 10) || 0)}
-            />
-          </div>
-        </div>
-        <div className="flex items-center justify-between gap-2">
+
+        <SubHeading>Stores in Slack</SubHeading>
+        <p className="text-xs text-muted-foreground">
+          Off keeps a store in the change feed but out of every Slack message (for undercut
+          pings this is the only per-store mute). Saves immediately.
+        </p>
+        <StoresInSlack />
+
+        <div className="flex items-center justify-between gap-2 border-t pt-3">
           <Button variant="outline" size="sm" disabled={testingSlack}
                   onClick={() => void sendSlackTest()}>
             <Send className="h-4 w-4" /> Send test messages

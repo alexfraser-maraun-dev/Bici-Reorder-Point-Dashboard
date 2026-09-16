@@ -20,7 +20,9 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { ApiError, apiPost, useCompetitors, useTrackedUrls } from '@/lib/price-intel/hooks'
-import { itemIdentity, lightspeedItemUrl } from '@/lib/price-intel/format'
+import {
+  itemIdentity, lightspeedItemUrl, parseCompetitorSettings,
+} from '@/lib/price-intel/format'
 import type {
   Competitor, CompetitorCrawlSettings, TrackedUrl, VariantCandidate,
   VariantSelectionRequired,
@@ -61,32 +63,29 @@ function crawlCoverage(json: string | null | undefined):
   }
 }
 
-function parseSettings(json: string | null | undefined): CompetitorCrawlSettings {
-  if (!json) return {}
-  try {
-    const parsed = JSON.parse(json)
-    return parsed && typeof parsed === 'object' ? parsed : {}
-  } catch {
-    return {}
-  }
-}
-
 // Muting is invisible until you open the dialog, so the row says so — otherwise
 // a store that stopped appearing in the feed just looks broken.
 function MutedBadge({ settings }: { settings: CompetitorCrawlSettings }) {
-  const muted = [
+  const feed = [
     settings.mute_price_alerts && 'price',
     settings.mute_stock_alerts && 'stock',
     settings.mute_map_alerts && 'MAP',
   ].filter(Boolean) as string[]
-  if (muted.length === 0) return null
-  const label = muted.length > 1
-    ? `${muted.slice(0, -1).join(', ')} & ${muted[muted.length - 1]}`
-    : muted[0]
+  const slack = settings.mute_slack === true
+  if (feed.length === 0 && !slack) return null
+  const join = (parts: string[]) => parts.length > 1
+    ? `${parts.slice(0, -1).join(', ')} & ${parts[parts.length - 1]}`
+    : parts[0]
+  const label = join([...feed, ...(slack ? ['Slack'] : [])])
+  // The two kinds hide different things, so the tooltip says which.
+  const title = [
+    feed.length > 0 && `${join(feed)} alerts are muted — they stay out of the change feed and Slack`,
+    slack && 'Slack is muted — the store stays in the change feed but out of every Slack message',
+  ].filter(Boolean).join('. ')
   return (
     <Badge variant="outline"
            className="gap-1 border-slate-200 bg-slate-50 px-1.5 py-0 text-[11px] text-slate-500"
-           title={`${label} alerts are muted for this store — they stay out of the change feed and Slack`}>
+           title={title}>
       <BellOff className="h-3 w-3" />
       {label} muted
     </Badge>
@@ -105,12 +104,15 @@ function CompetitorSettingsDialog(
 ) {
   const [form, setForm] = useState<CompetitorCrawlSettings>({})
   const [saving, setSaving] = useState(false)
-  // Re-seed the form whenever a different competitor's dialog is opened.
+  // Re-seed the form whenever the dialog opens (it closes with seededFor
+  // cleared, so reopening the same store re-reads the row — the Admin tab's
+  // Slack switches can change it behind this dialog's back).
   const [seededFor, setSeededFor] = useState<string | null>(null)
   if (competitor && seededFor !== competitor.competitor_id) {
     setSeededFor(competitor.competitor_id)
-    setForm(parseSettings(competitor.settings_json))
+    setForm(parseCompetitorSettings(competitor.settings_json))
   }
+  if (!competitor && seededFor !== null) setSeededFor(null)
 
   const set = <K extends keyof CompetitorCrawlSettings>(
     key: K, value: CompetitorCrawlSettings[K],
@@ -154,7 +156,8 @@ function CompetitorSettingsDialog(
         <DialogHeader>
           <DialogTitle>Settings — {competitor?.name}</DialogTitle>
           <DialogDescription>
-            Notification mutes apply everywhere; crawl fields left blank use the
+            Alert mutes hide this store&apos;s events in the app and Slack; the
+            Slack switch only affects Slack. Crawl fields left blank use the
             global default and only affect the nightly catalog crawl.
           </DialogDescription>
         </DialogHeader>
@@ -197,6 +200,19 @@ function CompetitorSettingsDialog(
               <Switch checked={form.mute_map_alerts !== true}
                       onCheckedChange={(on) =>
                         set('mute_map_alerts', on ? undefined : true)} />
+            </div>
+            <div className="flex items-center justify-between rounded-md border p-3">
+              <div className="pr-3">
+                <Label className="text-xs">Slack messages</Label>
+                <p className="text-[11px] text-muted-foreground">
+                  Off keeps this store in the change feed but out of every
+                  Slack message — MAP/undercut pings, price changes and the
+                  digest.
+                </p>
+              </div>
+              <Switch checked={form.mute_slack !== true}
+                      onCheckedChange={(on) =>
+                        set('mute_slack', on ? undefined : true)} />
             </div>
             <p className="text-[11px] text-muted-foreground">
               Muting only hides events — they keep being recorded, so turning an
@@ -447,7 +463,7 @@ export function CompetitorManager() {
                     <TableCell className="font-medium">
                       <span className="flex items-center gap-1.5">
                         {c.name}
-                        <MutedBadge settings={parseSettings(c.settings_json)} />
+                        <MutedBadge settings={parseCompetitorSettings(c.settings_json)} />
                       </span>
                     </TableCell>
                     <TableCell>

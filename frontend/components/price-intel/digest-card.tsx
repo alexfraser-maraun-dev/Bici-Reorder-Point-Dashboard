@@ -5,7 +5,7 @@ import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { apiPost, useLatestDigest } from '@/lib/price-intel/hooks'
+import { apiPost, useLatestDigest, usePriceIntelSettings } from '@/lib/price-intel/hooks'
 import { RefreshCw, Sparkles } from 'lucide-react'
 
 // Minimal markdown rendering (headings, bold, lists) — the digest is trusted
@@ -46,6 +46,10 @@ function renderInline(text: string) {
 
 export function DigestCard() {
   const { digest, isLoading, mutate } = useLatestDigest()
+  const { settings } = usePriceIntelSettings()
+  // Nightly generation can be switched off in Admin; the card keeps showing
+  // the last digest, and Regenerate still works, so say why nothing new lands.
+  const nightlyOff = settings.some((s) => s.key === 'digest_enabled' && s.value === false)
   const [regenerating, setRegenerating] = useState(false)
 
   const regenerate = async () => {
@@ -89,6 +93,11 @@ export function DigestCard() {
             <RefreshCw className={regenerating ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} /> Regenerate
           </Button>
         </div>
+        {nightlyOff && (
+          <p className="text-xs text-muted-foreground">
+            Nightly generation is off (Admin → LLM market digest); Regenerate still works.
+          </p>
+        )}
         {isLoading ? (
           <Skeleton className="h-40 rounded-lg" />
         ) : digest?.digest_md ? (

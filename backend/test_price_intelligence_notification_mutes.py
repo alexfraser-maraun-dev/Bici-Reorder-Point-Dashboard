@@ -102,8 +102,93 @@ class MutedCompetitorTests(unittest.TestCase):
         with patch.object(repository, "get_competitors",
                           return_value=[_competitor("a", {"mute_price_alerts": True})]):
             sql, _ = repository.sql_event_mute_filter(alias="e")
-        self.assertIn("e.competitor_id IN UNNEST(@muted_0)", sql)
+        self.assertIn("COALESCE(e.competitor_id, '') IN UNNEST(@muted_0)", sql)
         self.assertIn("e.event_type IN", sql)
+
+    def test_null_competitor_rows_survive_the_predicate(self):
+        """A tracked-URL event can carry a NULL competitor_id. Without the
+        COALESCE, `NOT (NULL IN UNNEST(...) AND TRUE)` is NULL in BigQuery and
+        muting any one store silently dropped every competitor-less event."""
+        with patch.object(repository, "get_competitors",
+                          return_value=[_competitor("a", {"mute_price_alerts": True})]):
+            sql, _ = repository.sql_event_mute_filter()
+        self.assertIn("COALESCE(competitor_id, '') IN UNNEST(@muted_0)", sql)
+        self.assertNotIn("(competitor_id IN UNNEST", sql)
+
+
+class SlackMuteTests(unittest.TestCase):
+    """mute_slack is Slack-only: it never reaches the feed predicates, only the
+    Python filter in notify and the digest LLM's input query."""
+
+    def test_only_literal_true_slack_mutes(self):
+        competitors = [
+            _competitor("a", {"mute_slack": True}),
+            _competitor("b", {"mute_slack": "true"}),
+            _competitor("c", {"mute_price_alerts": True}),
+            _competitor("d", {"mute_slack": False}),
+            _competitor("e"),
+        ]
+        with patch.object(repository, "get_competitors", return_value=competitors):
+            self.assertEqual({"a"}, repository.slack_muted_competitor_ids())
+            # …and the feed mutes don't pick it up.
+            feed = repository.muted_event_competitors()
+        self.assertEqual(["c"], feed["mute_price_alerts"])
+        self.assertEqual([], feed["mute_map_alerts"])
+
+    def test_predicate_is_empty_when_nobody_is_slack_muted(self):
+        with patch.object(repository, "get_competitors",
+                          return_value=[_competitor("a", {"mute_price_alerts": True})]):
+            self.assertEqual(("", []), repository.sql_slack_mute_filter())
+
+    def test_predicate_uses_its_own_parameter_and_coalesces(self):
+        with patch.object(repository, "get_competitors",
+                          return_value=[_competitor("a", {"mute_slack": True}),
+                                        _competitor("b", {"mute_slack": True})]):
+            sql, params = repository.sql_slack_mute_filter(alias="e")
+        self.assertEqual("NOT (COALESCE(e.competitor_id, '') IN UNNEST(@slack_muted))", sql)
+        self.assertEqual(["slack_muted"], [p.name for p in params])
+        self.assertEqual(["a", "b"], list(params[0].values))
+
+    def test_feed_query_ignores_the_slack_mute(self):
+        with patch.object(repository, "ensure_pi_tables"), \
+             patch.object(repository, "get_competitors",
+                          return_value=[_competitor("a", {"mute_slack": True})]), \
+             patch.object(repository, "_rows", return_value=[]) as rows:
+            repository.get_change_events(days=14, limit=200)
+        self.assertNotIn("slack_muted", rows.call_args.args[0])
+        self.assertEqual(["days"], [p.name for p in rows.call_args.kwargs["params"]])
+
+    def test_digest_input_drops_slack_muted_stores_alongside_feed_mutes(self):
+        captured = []
+
+        class _Client:
+            def query(self, sql, job_config=None):
+                captured.append((sql, job_config))
+                return MagicMock(**{"result.return_value": []})
+
+        competitors = [_competitor("a", {"mute_price_alerts": True}),
+                       _competitor("b", {"mute_slack": True})]
+        with patch.object(digest, "get_bq_client", return_value=_Client()), \
+             patch.object(repository, "get_tracked_products", return_value=[]), \
+             patch.object(repository, "get_competitors", return_value=competitors):
+            digest.build_digest_stats("run-1")
+
+        sql, cfg = next((sql, cfg) for sql, cfg in captured
+                        if "pct_change" in sql and "event_type IN" in sql)
+        self.assertIn("@muted_0", sql)
+        self.assertIn("NOT (COALESCE(competitor_id, '') IN UNNEST(@slack_muted))", sql)
+        self.assertEqual(["run_id", "muted_0", "slack_muted"],
+                         [p.name for p in cfg.query_parameters])
+
+    def test_router_accepts_only_booleans_for_the_slack_mute(self):
+        from fastapi import HTTPException
+        from app.services.price_intelligence import router
+        router._validate_competitor_settings({"mute_slack": True})
+        router._validate_competitor_settings({"mute_slack": False, "brand_filter": "auto"})
+        with self.assertRaises(HTTPException):
+            router._validate_competitor_settings({"mute_slack": "true"})
+        with self.assertRaises(HTTPException):
+            router._validate_competitor_settings({"mute_slak": True})  # typo → 400
 
 
 class MuteReachesEveryReadPathTests(unittest.TestCase):
@@ -120,7 +205,7 @@ class MuteReachesEveryReadPathTests(unittest.TestCase):
              patch.object(repository, "_rows", return_value=[]) as rows:
             repository.get_change_events(days=14, limit=200)
         sql = rows.call_args.args[0]
-        self.assertIn("NOT (competitor_id IN UNNEST(@muted_0)", sql)
+        self.assertIn("NOT (COALESCE(competitor_id, '') IN UNNEST(@muted_0)", sql)
         # Muted rows must be gone before the LIMIT, or a noisy store eats the page.
         self.assertLess(sql.index("@muted_0"), sql.index("LIMIT"))
         names = [p.name for p in rows.call_args.kwargs["params"]]
@@ -157,7 +242,7 @@ class MuteReachesEveryReadPathTests(unittest.TestCase):
                    and "event_type IN" in sql]
         self.assertEqual(1, len(changes))
         sql, cfg = changes[0]
-        self.assertIn("NOT (competitor_id IN UNNEST(@muted_0)", sql)
+        self.assertIn("NOT (COALESCE(competitor_id, '') IN UNNEST(@muted_0)", sql)
         self.assertIn("'price_drop', 'price_increase'", sql)
         # Stock events never reach the digest, so that clause must not appear.
         self.assertNotIn("out_of_stock", sql)

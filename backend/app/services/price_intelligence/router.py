@@ -96,9 +96,11 @@ _COMPETITOR_SETTING_KEYS = {
     "request_interval_seconds", "max_product_pages", "max_catalog_pages",
     "max_sitemap_fetches", "max_candidate_urls", "sitemap_urls",
     "confine_to_domain",
-    # notification mutes (repository.MUTABLE_EVENT_GROUPS)
+    # notification mutes (repository.MUTABLE_EVENT_GROUPS) + the Slack-only mute
     *repository.MUTABLE_EVENT_GROUPS,
+    repository.SLACK_MUTE_KEY,
 }
+_BOOL_SETTING_KEYS = (*repository.MUTABLE_EVENT_GROUPS, repository.SLACK_MUTE_KEY)
 
 
 def _validate_competitor_settings(settings):
@@ -130,7 +132,7 @@ def _validate_competitor_settings(settings):
         except (TypeError, ValueError):
             raise HTTPException(status_code=400,
                                 detail="request_interval_seconds must be a positive number")
-    for key in repository.MUTABLE_EVENT_GROUPS:
+    for key in _BOOL_SETTING_KEYS:
         # Only a literal true mutes (see repository.muted_event_competitors), so a
         # string "false" would silently read as "not muted" — reject it outright.
         if key in settings and not isinstance(settings[key], bool):
@@ -168,6 +170,31 @@ def create_or_update_competitor(payload: Dict[str, Any], background_tasks: Backg
     if not payload.get("connector_type"):
         background_tasks.add_task(_detect, dict(row))
     return {"status": "success", "competitor": row}
+
+
+@router.patch("/competitors/{competitor_id}/settings")
+def patch_competitor_settings(competitor_id: str, payload: Dict[str, Any]):
+    """Merge a partial settings change into a store's settings_json on the
+    server: {"patch": {key: value | null}} — null deletes the key. Used by the
+    Admin tab's per-store Slack switches, which would otherwise have to
+    round-trip the whole row (racing each other on a stale copy and, for a
+    store still detecting its connector, re-queueing detection)."""
+    patch = payload.get("patch")
+    if not isinstance(patch, dict) or not patch:
+        raise HTTPException(status_code=400, detail="patch is required")
+    row = next((c for c in repository.get_competitors()
+                if str(c.get("competitor_id")) == str(competitor_id)), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="competitor not found")
+    merged = dict(repository._competitor_settings(row))
+    for key, value in patch.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    _validate_competitor_settings(merged)
+    updated = repository.upsert_competitor({**row, "settings": merged})
+    return {"status": "success", "competitor": updated}
 
 
 @router.delete("/competitors/{competitor_id}")
@@ -691,6 +718,35 @@ def list_changes(days: int = 14, acknowledged: Optional[bool] = None,
         days=days, acknowledged=acknowledged, competitor_id=competitor_id,
         event_types=event_types, min_abs_pct=min_pct, brand=brand, limit=limit,
     )
+
+
+@router.get("/changes/grouped")
+def list_changes_grouped(days: int = 14, acknowledged: Optional[bool] = None,
+                         competitor_id: Optional[str] = None,
+                         min_pct: Optional[float] = None, brand: Optional[str] = None,
+                         direction: str = "both", sort: str = "recent",
+                         limit: int = 200):
+    """Price drops/increases rolled up per product (matrix or item) × store —
+    the same rollup the Slack price-changes message uses (change_groups), so the
+    feed and the channel agree. Feed mutes apply (inside get_change_events);
+    the Slack-only mute does not — the store is still in the app.
+
+    `acknowledged=false` filters at the event level, so a partially read group
+    shows only its unread variants. `sort`: recent (latest change first, the
+    feed's default) or magnitude (biggest move first, Slack's order)."""
+    from . import change_groups
+    events = repository.get_change_events(
+        days=days, acknowledged=acknowledged, competitor_id=competitor_id,
+        event_types=list(change_groups.direction_event_types(direction)),
+        min_abs_pct=min_pct, brand=brand, limit=3000,
+    )
+    tracked_by_id = {str(p.get("item_id")): p
+                     for p in repository.get_tracked_products(include_archived=True)}
+    groups = change_groups.group_price_changes(events, tracked_by_id)
+    if sort != "magnitude":
+        groups = change_groups.sort_by_recency(groups)
+    return {"groups": groups[:max(int(limit), 0)], "event_count": len(events),
+            "truncated": len(events) >= 3000}
 
 
 @router.post("/changes/ack")

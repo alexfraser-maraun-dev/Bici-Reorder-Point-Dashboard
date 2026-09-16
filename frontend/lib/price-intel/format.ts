@@ -1,6 +1,22 @@
 // Shared display helpers so "our products" look identical everywhere in the
 // price-intelligence UI.
 
+import type { CompetitorCrawlSettings } from './types'
+
+// pi_competitors.settings_json → object; anything unreadable is "no
+// settings" rather than an error (the backend fails open the same way).
+export function parseCompetitorSettings(
+  json: string | null | undefined,
+): CompetitorCrawlSettings {
+  if (!json) return {}
+  try {
+    const parsed = JSON.parse(json)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
 // Lightspeed Retail item detail page (opens the product in the LS back office).
 export const lightspeedItemUrl = (itemId: string) =>
   `https://us.merchantos.com/?name=item.views.item&form_name=view&id=${encodeURIComponent(itemId)}&tab=details`

@@ -1104,13 +1104,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             print(f"pi: link reconciliation failed: {e}")
 
         # --- LLM digest: best-effort, never fails the run --------------------
-        _set_status(phase="generating digest")
-        try:
-            from . import digest
-            digest.generate_digest(run_id)
-        except Exception as e:
-            errors.append(f"digest: {e}")
-            print(f"pi: digest generation failed: {e}")
+        _maybe_generate_digest(run_id, errors)
 
         status = "partial" if errors else "success"
     except Exception as e:
@@ -1157,6 +1151,22 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                         if k not in ("competitors_done", "urls_done", "observations", "changes")
                     })
         _scrape_lock.release()
+
+
+def _maybe_generate_digest(run_id: str, errors: list):
+    """Nightly digest, behind the admin console's digest_enabled switch: off
+    means no LLM call at all (the Digest tab's manual Regenerate still works).
+    Best-effort — a failure is recorded on the run but never fails it."""
+    from . import digest, settings as pi_settings
+    if not pi_settings.get("digest_enabled"):
+        print("pi: digest generation disabled; skipping")
+        return
+    _set_status(phase="generating digest")
+    try:
+        digest.generate_digest(run_id)
+    except Exception as e:
+        errors.append(f"digest: {e}")
+        print(f"pi: digest generation failed: {e}")
 
 
 def urlparse_domain(url: str) -> str:

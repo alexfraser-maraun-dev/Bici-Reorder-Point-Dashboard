@@ -53,6 +53,9 @@ export interface CompetitorCrawlSettings {
   mute_price_alerts?: boolean
   mute_stock_alerts?: boolean
   mute_map_alerts?: boolean
+  // Slack-only mute: the store stays in the change feed and badge but is
+  // dropped from every Slack message (pings, price changes, digest input).
+  mute_slack?: boolean
 }
 
 export interface TrackedUrl {
@@ -162,6 +165,63 @@ export interface ChangeFeedFilters {
   eventTypes?: ChangeEventType[]
   minPct?: number | null
   brand?: string | null
+}
+
+export type ChangeDirection = 'both' | 'drops' | 'increases'
+
+// Price drops/increases rolled up per product (matrix or item) × store — the
+// same rollup the Slack price-changes message uses (backend change_groups).
+export interface ChangeGroupEvent {
+  event_id: string
+  item_id: string | null
+  variant: string | null
+  event_type: ChangeEventType
+  old_price: number | null
+  new_price: number | null
+  pct_change: number | null
+  url: string | null
+  occurred_at: string
+  acknowledged: boolean
+}
+
+export interface ChangeGroup {
+  group_key: string
+  product_kind: 'matrix' | 'item' | 'listing'
+  item_matrix_id: string | null
+  item_id: string | null
+  title: string
+  brand: string | null
+  competitor_id: string | null
+  competitor_name: string | null
+  direction: 'drop' | 'increase' | 'mixed'
+  variants_changed: number
+  variants_total: number | null
+  pct_min: number | null
+  pct_max: number | null
+  pct_abs_max: number
+  new_price_min: number | null
+  new_price_max: number | null
+  old_price_min: number | null
+  old_price_max: number | null
+  our_price_min: number | null
+  our_price_max: number | null
+  url: string | null
+  first_occurred_at: string
+  last_occurred_at: string
+  unread_count: number
+  acknowledged: boolean
+  event_ids: string[]
+  events: ChangeGroupEvent[]
+}
+
+export interface ChangeGroupFilters {
+  days?: number
+  unacknowledgedOnly?: boolean
+  competitorId?: string | null
+  minPct?: number | null
+  brand?: string | null
+  direction?: ChangeDirection
+  sort?: 'recent' | 'magnitude'
 }
 
 export interface ScrapeStatus {
@@ -544,4 +604,7 @@ export interface AdminSetting {
   default: string | number | boolean | null
   overridden: boolean
   secret: boolean
+  // Present for "choice" settings so the console can render a select
+  // without hardcoding the options a second time.
+  choices?: string[] | null
 }

@@ -1,5 +1,6 @@
 'use client'
 
+import { useSWRConfig } from 'swr'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { PriceIntelKpiCards } from '@/components/price-intel/kpi-cards'
 import { ScrapeStatusButton } from '@/components/price-intel/scrape-status-button'
@@ -22,6 +23,9 @@ export function PriceIntelligenceContent() {
   const { summary, isLoading, mutate: mutateSummary } = usePriceIntelSummary()
   const { products, mutate: mutateTracked } = useTrackedProducts()
   const { mutate: mutateChanges } = useChangeFeed()
+  // Grouped-feed keys vary with the feed's filters; revalidate whichever are
+  // mounted instead of subscribing this page to one more BigQuery read.
+  const { mutate: globalMutate } = useSWRConfig()
   const { mutate: mutateLinks } = useProductLinks('pending')
   const [tab, setTab] = useState('tracked')
   const [quickFilter, setQuickFilter] = useState<string | null>(null)
@@ -38,6 +42,7 @@ export function PriceIntelligenceContent() {
     void mutateSummary()
     void mutateTracked()
     void mutateChanges()
+    void globalMutate((key) => typeof key === 'string' && key.includes('/api/price-intel/changes/grouped'))
     void mutateLinks()
   }
 

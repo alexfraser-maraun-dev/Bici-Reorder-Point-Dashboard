@@ -8,7 +8,10 @@ import type {
   AdminSetting,
   ChangeEvent,
   ChangeFeedFilters,
+  ChangeGroup,
+  ChangeGroupFilters,
   Competitor,
+  CompetitorCrawlSettings,
   Digest,
   ItemCompetitorPrice,
   ItemObservation,
@@ -137,6 +140,43 @@ export function useChangeFeed(filters: ChangeFeedFilters = {}) {
     `${baseUrl()}/api/price-intel/changes?${params}`, fetcher, swrConfig
   )
   return { events: data ?? [], error, isLoading, mutate }
+}
+
+// Price drops/increases grouped per product × store (see ChangeGroup). The
+// query reads up to 3,000 events, so callers pass enabled=false until the
+// grouped view is actually shown.
+export function useChangeGroups(filters: ChangeGroupFilters = {}, enabled = true) {
+  const params = new URLSearchParams({ days: String(filters.days ?? 14) })
+  if (filters.unacknowledgedOnly) params.set('acknowledged', 'false')
+  if (filters.competitorId) params.set('competitor_id', filters.competitorId)
+  if (filters.minPct != null && filters.minPct > 0) params.set('min_pct', String(filters.minPct))
+  if (filters.brand) params.set('brand', filters.brand)
+  if (filters.direction && filters.direction !== 'both') params.set('direction', filters.direction)
+  if (filters.sort && filters.sort !== 'recent') params.set('sort', filters.sort)
+  const { data, error, isLoading, mutate } = useSWR<{
+    groups: ChangeGroup[]; event_count: number; truncated: boolean
+  }>(enabled ? `${baseUrl()}/api/price-intel/changes/grouped?${params}` : null,
+     fetcher, swrConfig)
+  return {
+    groups: data?.groups ?? [],
+    eventCount: data?.event_count ?? 0,
+    truncated: data?.truncated ?? false,
+    error, isLoading, mutate,
+  }
+}
+
+// Partial settings_json change for one store, merged on the server — null
+// deletes a key. Used by switches that flip a single flag, so two quick
+// toggles can't race each other on a stale copy of the row.
+export function patchCompetitorSettings(
+  competitorId: string,
+  patch: Partial<Record<keyof CompetitorCrawlSettings, unknown>>,
+): Promise<{ status: string; competitor: Competitor }> {
+  return apiPost(
+    `/api/price-intel/competitors/${encodeURIComponent(competitorId)}/settings`,
+    { patch },
+    'PATCH',
+  )
 }
 
 export function useProductLinks(status: string | null = 'pending') {
