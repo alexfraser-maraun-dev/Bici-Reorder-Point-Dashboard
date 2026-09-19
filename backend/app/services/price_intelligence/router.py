@@ -346,6 +346,9 @@ def _link_url_to_item(url: str, item_id: str, competitor_id=None, label=None,
                 "variant_options_json": json.dumps(parsed.get("variant_options") or []),
                 "price_low": parsed.get("price_low"),
                 "price_high": parsed.get("price_high"),
+                "stock_status": parsed.get("stock_status"),
+                "reported_quantity": parsed.get("reported_quantity"),
+                "quantity_kind": parsed.get("quantity_kind"),
             }])
             if url_id:
                 repository.mark_url_scraped(url_id, "success")
@@ -523,6 +526,18 @@ def list_tracked_matrices(days: int = 7):
 def matrix_coverage(matrix_id: str, days: int = 45):
     """Per-competitor variant coverage / undercut for one matrix."""
     return repository.get_matrix_coverage(matrix_id, days=days)
+
+
+@router.get("/stock")
+def stock_intelligence():
+    """Variant-level competitor availability and reliability metrics."""
+    return repository.get_stock_intelligence()
+
+
+@router.get("/stock/history")
+def stock_history(item_id: str, competitor_key: str, days: int = 90):
+    """Daily observations loaded only when a Stock-tab row is expanded."""
+    return repository.get_stock_history(item_id, competitor_key, days=days)
 
 
 @router.post("/tracked/track-matrix")

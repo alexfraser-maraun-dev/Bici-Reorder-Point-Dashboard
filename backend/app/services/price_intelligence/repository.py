@@ -324,6 +324,11 @@ def ensure_pi_tables():
             "variant_options_json": "STRING",
             "price_low": "FLOAT64",
             "price_high": "FLOAT64",
+            # Optional competitor-reported inventory. `in_stock` remains the
+            # authoritative compatibility field for all existing price logic.
+            "stock_status": "STRING",
+            "reported_quantity": "INT64",
+            "quantity_kind": "STRING",
         })
         _ensure_columns(client, T_LINKS, {
             "variant_id": "STRING",
@@ -1657,6 +1662,167 @@ def get_item_observations(item_id: str, days: int = 120):
     ])
 
 
+def _stock_status_sql(alias: str = "o") -> str:
+    """Richer status with a compatibility fallback for pre-feature history."""
+    return (
+        f"COALESCE(NULLIF({alias}.stock_status, ''), "
+        f"IF({alias}.in_stock IS TRUE, 'in_stock', "
+        f"IF({alias}.in_stock IS FALSE, 'out_of_stock', 'unknown')))"
+    )
+
+
+def get_stock_intelligence():
+    """Current competitor stock plus 30/90-day variant-level reliability metrics.
+
+    One canonical observation per local day prevents a full catalog pass and a
+    targeted URL pass from double-weighting the same competitor/item. Missing
+    nights remain missing; availability is explicitly a share of observed nights.
+    """
+    ensure_pi_tables()
+    cached = _cache_get("stock_intelligence")
+    if cached is not None:
+        return cached
+    tracked = SQL_TRACKED_DEDUPED.format(table=T_TRACKED)
+    rows = _rows(f"""
+        WITH base AS (
+            SELECT
+                DATE(o.observed_at, 'America/Vancouver') AS observed_day,
+                COALESCE(o.competitor_id,
+                         CONCAT('url:', COALESCE(NET.REG_DOMAIN(o.url), o.url))) AS competitor_key,
+                o.competitor_id, o.match_item_id, o.url, o.observed_at, o.source,
+                o.match_method, o.price_scope, o.in_stock,
+                {_stock_status_sql('o')} AS stock_status,
+                o.reported_quantity, o.quantity_kind, o.extraction_method,
+                t.sku, t.system_sku, t.brand, t.title, t.item_matrix_id,
+                t.matrix_description, t.attribute_1, t.attribute_2, t.attribute_3
+            FROM `{T_OBSERVATIONS}` o
+            JOIN {tracked} t ON t.item_id = o.match_item_id
+            WHERE o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
+              AND COALESCE(t.archived, FALSE) = FALSE
+              AND {sql_market_sources('o')}
+              AND (COALESCE(o.price_scope, 'variant') = 'variant'
+                   OR (o.price_scope = 'product' AND t.item_matrix_id IS NULL))
+        ),
+        daily AS (
+            SELECT * FROM base
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY competitor_key, match_item_id, observed_day
+                ORDER BY CASE source WHEN 'link' THEN 0 WHEN 'url' THEN 1 ELSE 2 END,
+                         observed_at DESC
+            ) = 1
+        ),
+        latest AS (
+            SELECT * FROM daily
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY competitor_key, match_item_id
+                ORDER BY observed_day DESC, observed_at DESC
+            ) = 1
+        ),
+        known AS (
+            SELECT *,
+                   LAG(in_stock) OVER (
+                       PARTITION BY competitor_key, match_item_id
+                       ORDER BY observed_day) AS previous_in_stock
+            FROM daily
+            WHERE in_stock IS NOT NULL
+        ),
+        bounded AS (
+            SELECT *,
+                   MAX(IF(in_stock, observed_day, NULL)) OVER (
+                       PARTITION BY competitor_key, match_item_id) AS last_in_stock_day
+            FROM known
+        ),
+        metrics AS (
+            SELECT competitor_key, match_item_id,
+                   COUNTIF(observed_day >= DATE_SUB(
+                       CURRENT_DATE('America/Vancouver'), INTERVAL 29 DAY)) AS observed_nights_30d,
+                   COUNTIF(observed_day >= DATE_SUB(
+                       CURRENT_DATE('America/Vancouver'), INTERVAL 29 DAY)
+                       AND in_stock) AS in_stock_nights_30d,
+                   COUNTIF(observed_day >= DATE_SUB(
+                       CURRENT_DATE('America/Vancouver'), INTERVAL 89 DAY)
+                       AND in_stock AND previous_in_stock IS FALSE) AS restocks_90d,
+                   ANY_VALUE(last_in_stock_day) AS last_in_stock_day,
+                   MIN(IF(NOT in_stock AND
+                              (last_in_stock_day IS NULL OR observed_day > last_in_stock_day),
+                          observed_day, NULL)) AS current_out_of_stock_since
+            FROM bounded
+            GROUP BY competitor_key, match_item_id
+        )
+        SELECT
+            l.match_item_id AS item_id, l.sku, l.system_sku, l.brand, l.title,
+            l.item_matrix_id, l.matrix_description,
+            l.attribute_1, l.attribute_2, l.attribute_3,
+            l.competitor_key, l.competitor_id,
+            COALESCE(c.name, NET.REG_DOMAIN(l.url), 'Tracked URL') AS competitor_name,
+            l.url, l.price_scope, l.in_stock, l.stock_status,
+            l.reported_quantity, l.quantity_kind, l.extraction_method,
+            l.observed_at AS last_observed_at,
+            COALESCE(m.observed_nights_30d, 0) AS observed_nights_30d,
+            COALESCE(m.in_stock_nights_30d, 0) AS in_stock_nights_30d,
+            SAFE_DIVIDE(m.in_stock_nights_30d, m.observed_nights_30d)
+                AS availability_rate_30d,
+            COALESCE(m.restocks_90d, 0) AS restocks_90d,
+            IF(l.in_stock IS FALSE, m.current_out_of_stock_since, NULL)
+                AS out_of_stock_since,
+            IF(l.in_stock IS FALSE AND m.current_out_of_stock_since IS NOT NULL,
+               DATE_DIFF(CURRENT_DATE('America/Vancouver'),
+                         m.current_out_of_stock_since, DAY), NULL) AS outage_days,
+            IF(l.in_stock IS FALSE AND m.last_in_stock_day IS NULL, TRUE, FALSE)
+                AS outage_censored,
+            l.observed_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR) AS stale
+        FROM latest l
+        LEFT JOIN metrics m
+          ON m.competitor_key = l.competitor_key
+         AND m.match_item_id = l.match_item_id
+        LEFT JOIN `{T_COMPETITORS}` c ON c.competitor_id = l.competitor_id
+        ORDER BY IF(l.in_stock IS FALSE, 0, 1), availability_rate_30d, l.brand, l.title
+    """)
+    _cache_set("stock_intelligence", rows)
+    return rows
+
+
+def get_stock_history(item_id: str, competitor_key: str, days: int = 90):
+    """Canonical daily stock observations for one Stock-tab row."""
+    ensure_pi_tables()
+    days = max(7, min(int(days), 365))
+    tracked = SQL_TRACKED_DEDUPED.format(table=T_TRACKED)
+    points = _rows(f"""
+        WITH base AS (
+            SELECT DATE(o.observed_at, 'America/Vancouver') AS observed_day,
+                   COALESCE(o.competitor_id,
+                            CONCAT('url:', COALESCE(NET.REG_DOMAIN(o.url), o.url)))
+                       AS competitor_key,
+                   o.observed_at, o.source, o.url, o.in_stock,
+                   {_stock_status_sql('o')} AS stock_status,
+                   o.reported_quantity, o.quantity_kind
+            FROM `{T_OBSERVATIONS}` o
+            JOIN {tracked} t ON t.item_id = o.match_item_id
+            WHERE o.match_item_id = @item_id
+              AND o.observed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+              AND {sql_market_sources('o')}
+              AND (COALESCE(o.price_scope, 'variant') = 'variant'
+                   OR (o.price_scope = 'product' AND t.item_matrix_id IS NULL))
+        )
+        SELECT observed_day, observed_at, url, in_stock, stock_status,
+               reported_quantity, quantity_kind
+        FROM base
+        WHERE competitor_key = @competitor_key
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY observed_day
+            ORDER BY CASE source WHEN 'link' THEN 0 WHEN 'url' THEN 1 ELSE 2 END,
+                     observed_at DESC
+        ) = 1
+        ORDER BY observed_day
+    """, params=[
+        bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
+        bigquery.ScalarQueryParameter("competitor_key", "STRING", competitor_key),
+        bigquery.ScalarQueryParameter("days", "INT64", days),
+    ])
+    return {"item_id": str(item_id), "competitor_key": competitor_key,
+            "days": days, "points": points}
+
+
 def get_item_price_history(item_id: str, days: int = 120):
     """Change-point-compressed price history for the expandable chart: our price
     line + one line per competitor. Both series are reduced server-side (SQL LAG)
@@ -2606,6 +2772,9 @@ def fetch_and_record_link(link_id: str):
                 "variant_id": parsed.get("variant_id"),
                 "variant_options_json": json.dumps(parsed.get("variant_options") or []),
                 "price_low": parsed.get("price_low"), "price_high": parsed.get("price_high"),
+                "stock_status": parsed.get("stock_status"),
+                "reported_quantity": parsed.get("reported_quantity"),
+                "quantity_kind": parsed.get("quantity_kind"),
             }])
             invalidate_pi_caches()
     except Exception as e:

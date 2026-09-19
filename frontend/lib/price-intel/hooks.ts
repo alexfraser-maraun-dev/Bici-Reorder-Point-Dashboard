@@ -25,6 +25,8 @@ import type {
   ProductLink,
   ScrapeRun,
   ScrapeStatus,
+  StockHistory,
+  StockIntelligenceRow,
   TrackedMatrix,
   TrackedProduct,
   TrackedUrl,
@@ -239,6 +241,32 @@ export function useItemPriceHistory(itemId: string | null, days: number = 60) {
       ? `${baseUrl()}/api/price-intel/tracked/${encodeURIComponent(itemId)}/price-history?days=${days}`
       : null,
     fetcher, swrConfig
+  )
+  return { history: data, error, isLoading }
+}
+
+// Mounted only while the Stock tab is active, so its historical BigQuery
+// aggregation never delays the normal Price Intelligence page.
+export function useStockIntelligence() {
+  const { data, error, isLoading, mutate } = useSWR<StockIntelligenceRow[]>(
+    `${baseUrl()}/api/price-intel/stock`, fetcher, swrConfig
+  )
+  return { rows: data ?? [], error, isLoading, mutate }
+}
+
+// Lazy per-row history: pass null until the row is expanded.
+export function useStockHistory(
+  itemId: string | null,
+  competitorKey: string | null,
+  days: number = 90,
+) {
+  const { data, error, isLoading } = useSWR<StockHistory>(
+    itemId && competitorKey
+      ? `${baseUrl()}/api/price-intel/stock/history?item_id=${encodeURIComponent(itemId)}`
+        + `&competitor_key=${encodeURIComponent(competitorKey)}&days=${days}`
+      : null,
+    fetcher,
+    swrConfig,
   )
   return { history: data, error, isLoading }
 }

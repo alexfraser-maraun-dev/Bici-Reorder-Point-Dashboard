@@ -501,6 +501,9 @@ def _extraction_fields(product: dict) -> dict:
         "variant_options_json": json.dumps(product.get("variant_options") or []),
         "price_low": product.get("price_low"),
         "price_high": product.get("price_high"),
+        "stock_status": product.get("stock_status"),
+        "reported_quantity": product.get("reported_quantity"),
+        "quantity_kind": product.get("quantity_kind"),
     }
 
 
@@ -518,6 +521,17 @@ def _count_extraction(counters: dict, product: dict):
     counters["ranges_excluded"] += int(product.get("price_scope") == "range")
     method = product.get("extraction_method") or "unknown"
     counters["extractor_methods"][method] = counters["extractor_methods"].get(method, 0) + 1
+    stock_status = product.get("stock_status") or "unknown"
+    counters["stock_status_counts"][stock_status] = (
+        counters["stock_status_counts"].get(stock_status, 0) + 1)
+    quantity = product.get("reported_quantity")
+    counters["quantities_reported"] += int(quantity is not None)
+    counters["stock_conflicts"] += int(
+        quantity is not None and (
+            (quantity == 0 and product.get("in_stock") is True)
+            or (quantity > 0 and product.get("in_stock") is False)
+        )
+    )
 
 
 def _flush_buffers(obs_buffer: list, event_buffer: list, counters: dict,
@@ -549,6 +563,7 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
         "competitors_done": 0, "urls_done": 0, "observations": 0, "changes": 0,
         "variants_extracted": 0, "exact_resolutions": 0, "ambiguous_pages": 0,
         "ranges_excluded": 0, "fallback_failures": 0, "extractor_methods": {},
+        "quantities_reported": 0, "stock_conflicts": 0, "stock_status_counts": {},
     }
     errors = []
     # Open the run row up front. The end-of-run save in `finally` cannot be relied on as

@@ -310,6 +310,62 @@ def _to_price(value) -> Optional[float]:
         return None
 
 
+def _to_stock_quantity(value) -> Optional[int]:
+    """Parse a publicly reported unit count without ever guessing.
+
+    Inventory fields are optional diagnostics: malformed stock markup must not
+    make an otherwise valid price listing disappear. Booleans are rejected
+    explicitly because ``True`` is an ``int`` in Python and would otherwise be
+    recorded as one unit.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if number < 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _quantity_fields(value) -> tuple[Optional[int], Optional[str]]:
+    """Return (quantity, precision) for schema.org QuantitativeValue shapes."""
+    if isinstance(value, dict):
+        for key, kind in (("value", "exact"), ("maxValue", "upper_bound"),
+                          ("minValue", "lower_bound")):
+            quantity = _to_stock_quantity(value.get(key))
+            if quantity is not None:
+                return quantity, kind
+        return None, None
+    quantity = _to_stock_quantity(value)
+    return quantity, "exact" if quantity is not None else None
+
+
+def _stock_status(availability=None, in_stock=None, low_stock: bool = False) -> str:
+    """Normalize richer public availability without changing the legacy bool."""
+    raw = re.sub(r"[^a-z]", "", str(availability or "").lower())
+    if "preorder" in raw or "presale" in raw:
+        return "preorder"
+    if "backorder" in raw:
+        return "backorder"
+    if in_stock is False and not raw:
+        return "out_of_stock"
+    if "limitedavailability" in raw or "lowstock" in raw or low_stock:
+        return "low_stock"
+    if any(token in raw for token in (
+        "outofstock", "soldout", "discontinued", "unavailable",
+    )):
+        return "out_of_stock"
+    if "instock" in raw or "available" in raw:
+        return "in_stock"
+    if in_stock is True:
+        return "in_stock"
+    if in_stock is False:
+        return "out_of_stock"
+    return "unknown"
+
+
 def _iter_jsonld_products(soup: BeautifulSoup):
     for script in soup.find_all("script", type="application/ld+json"):
         try:
@@ -331,16 +387,21 @@ def _iter_jsonld_products(soup: BeautifulSoup):
 
 def _offer_fields(offer: dict) -> dict:
     price = _to_price(offer.get("price") or offer.get("lowPrice"))
-    availability = str(offer.get("availability") or "").lower()
+    availability = str(offer.get("availability") or "")
     in_stock = None
     if availability:
-        in_stock = "instock" in availability or "limitedavailability" in availability
+        normalized = availability.lower()
+        in_stock = "instock" in normalized or "limitedavailability" in normalized
+    quantity, quantity_kind = _quantity_fields(offer.get("inventoryLevel"))
     return {
         "price": price,
         "price_low": _to_price(offer.get("lowPrice")),
         "price_high": _to_price(offer.get("highPrice")),
         "currency": offer.get("priceCurrency"),
         "in_stock": in_stock,
+        "stock_status": _stock_status(availability, in_stock),
+        "reported_quantity": quantity,
+        "quantity_kind": quantity_kind,
     }
 
 
@@ -415,7 +476,8 @@ def _normalized_listing(**values) -> dict:
         "title": None, "brand": None, "sku": None, "gtin": None,
         "variant_id": None, "variant_options": [], "price": None,
         "compare_at_price": None, "price_low": None, "price_high": None,
-        "currency": None, "in_stock": None, "price_scope": "product",
+        "currency": None, "in_stock": None, "stock_status": "unknown",
+        "reported_quantity": None, "quantity_kind": None, "price_scope": "product",
         "extraction_method": None, "url": None,
     }
     row.update(values)
@@ -484,6 +546,8 @@ def _magento_listings(soup: BeautifulSoup, url: str) -> list:
         regular = _to_price((price_cfg.get("oldPrice") or {}).get("amount"))
         stock_cfg = stock.get(child_id) or stock.get(str(sku)) or {}
         in_stock = stock_cfg.get("isSalable")
+        quantity = _to_stock_quantity(stock_cfg.get("qty"))
+        low_stock = bool(stock_cfg.get("lowStock") or stock_cfg.get("isLowStock"))
         rows.append(_normalized_listing(
             title=(f"{base_title} - {' / '.join(options)}" if base_title and options else base_title),
             brand=base_brand, sku=str(sku) if sku else None,
@@ -496,6 +560,9 @@ def _magento_listings(soup: BeautifulSoup, url: str) -> list:
                 if isinstance(o, dict) and o.get("priceCurrency")), None)
                 if isinstance(product, dict) else None,
             in_stock=bool(in_stock) if in_stock is not None else None,
+            stock_status=_stock_status(in_stock=in_stock, low_stock=low_stock),
+            reported_quantity=quantity,
+            quantity_kind="exact" if quantity is not None else None,
             price_scope="variant", extraction_method="magento_json_config", url=url,
         ))
     return [r for r in rows if r.get("price") is not None]
@@ -563,6 +630,8 @@ def _jsonld_listings(soup: BeautifulSoup, url: str) -> list:
                     _options_from_label(sku)
                     or _options_from_label(spec_labels.get(_gtin_key(gtin)))
                 )
+            scope = "range" if is_range else (
+                "variant" if (variants or offers_in_source > 1) else "product")
             rows.append(_normalized_listing(
                 title=source.get("name") or product.get("name"), brand=_brand_name(source.get("brand")) or brand,
                 sku=str(sku) if sku else None, gtin=gtin,
@@ -570,7 +639,11 @@ def _jsonld_listings(soup: BeautifulSoup, url: str) -> list:
                 variant_options=variant_options,
                 price=low if is_range else price, price_low=low, price_high=high,
                 currency=fields.get("currency"), in_stock=fields.get("in_stock"),
-                price_scope="range" if is_range else ("variant" if (variants or offers_in_source > 1) else "product"),
+                stock_status=fields.get("stock_status"),
+                reported_quantity=(fields.get("reported_quantity")
+                                   if scope == "variant" else None),
+                quantity_kind=(fields.get("quantity_kind") if scope == "variant" else None),
+                price_scope=scope,
                 extraction_method="jsonld", url=url,
             ))
     # ProductGroup children are often repeated as standalone Product nodes in
@@ -582,6 +655,7 @@ def _jsonld_listings(soup: BeautifulSoup, url: str) -> list:
             row.get("variant_id"), row.get("sku"), row.get("gtin"),
             tuple(row.get("variant_options") or []), row.get("price"),
             row.get("price_low"), row.get("price_high"), row.get("in_stock"),
+            row.get("stock_status"), row.get("reported_quantity"), row.get("quantity_kind"),
         )
         existing = deduped.get(key)
         if existing is None:
@@ -627,7 +701,8 @@ def extract_listings(html: str, url: str) -> list:
         title=_meta("og:title") or (soup.title.get_text(strip=True) if soup.title else None),
         brand=_meta("product:brand"), price=price,
         currency=_meta("product:price:currency", "og:price:currency"),
-        in_stock=in_stock, price_scope="product", extraction_method="opengraph_microdata",
+        in_stock=in_stock, stock_status=_stock_status(availability, in_stock),
+        price_scope="product", extraction_method="opengraph_microdata",
         url=url,
     )]
 
@@ -684,6 +759,8 @@ def _magento_graphql_listings(html: str, url: str) -> list:
             compare_at_price=regular_price if regular_price and regular_price > price else None,
             currency=final.get("currency") or regular.get("currency"),
             in_stock=(stock_status == "IN_STOCK") if stock_status else None,
+            stock_status=_stock_status(
+                stock_status, (stock_status == "IN_STOCK") if stock_status else None),
             price_scope="variant", extraction_method="magento_graphql", url=url,
         ))
     # Embedded config often carries UPCs/custom stock metadata omitted from the
@@ -691,9 +768,11 @@ def _magento_graphql_listings(html: str, url: str) -> list:
     static_by_sku = {r.get("sku"): r for r in _magento_listings(soup, url) if r.get("sku")}
     for row in rows:
         static = static_by_sku.get(row.get("sku")) or {}
-        for field in ("gtin", "in_stock"):
+        for field in ("gtin", "in_stock", "reported_quantity", "quantity_kind"):
             if row.get(field) is None:
                 row[field] = static.get(field)
+        if row.get("stock_status") in (None, "unknown"):
+            row["stock_status"] = static.get("stock_status") or "unknown"
         if not row.get("variant_options"):
             row["variant_options"] = static.get("variant_options") or []
     with _magento_graphql_lock:
@@ -737,11 +816,14 @@ def resolve_listing(listings: list, target_identity: Optional[dict] = None) -> d
                 "listing": listings[0], "candidates": listings}
     prices = [float(r["price"]) for r in listings if r.get("price") is not None]
     currencies = {r.get("currency") for r in listings if r.get("currency")}
+    known_stock = [r.get("in_stock") for r in listings if r.get("in_stock") is not None]
     summary = _normalized_listing(
         title=listings[0].get("title"), brand=listings[0].get("brand"),
         price=min(prices), price_low=min(prices), price_high=max(prices),
         currency=next(iter(currencies)) if len(currencies) == 1 else None,
         in_stock=any(r.get("in_stock") is True for r in listings),
+        stock_status=("in_stock" if any(value is True for value in known_stock)
+                      else "out_of_stock" if known_stock else "unknown"),
         price_scope="range", extraction_method="ambiguous_variant_set",
         url=listings[0].get("url"),
     )
@@ -804,6 +886,7 @@ def _shopify_listings(url: str) -> list:
             variant_options=options, price=cents(chosen.get("price")),
             compare_at_price=cents(chosen.get("compare_at_price")),
             in_stock=bool(chosen.get("available", True)), currency=data.get("currency"),
+            stock_status=_stock_status(in_stock=bool(chosen.get("available", True))),
             price_scope="variant", extraction_method="shopify_js",
             # Each row addresses its own variant. A caller that keeps a sibling
             # (the matrix fan-out) needs a URL that re-scrapes *that* variant —
@@ -989,6 +1072,10 @@ class ShopifyJsonConnector(_CrawlStatsMixin):
                         "price": _to_price(variant.get("price")),
                         "compare_at_price": _to_price(variant.get("compare_at_price")),
                         "in_stock": bool(variant.get("available", True)),
+                        "stock_status": _stock_status(
+                            in_stock=bool(variant.get("available", True))),
+                        "reported_quantity": None,
+                        "quantity_kind": None,
                         "url": variant_url,
                         "variant_id": str(vid) if vid else None,
                         "currency": None,

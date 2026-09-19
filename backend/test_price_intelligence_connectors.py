@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import unittest
 from unittest.mock import patch
 
@@ -51,6 +52,40 @@ class PrimeauMagentoExtractionTests(unittest.TestCase):
         changed = {r["sku"]: r["price"] for r in extract_listings(reordered, URL)}
         self.assertEqual(original, changed)
 
+    def test_public_child_quantity_is_kept_on_the_correct_variant(self):
+        config = {
+            "[data-role=swatch-options]": {
+                "Magento_Swatches/js/swatch-renderer": {"jsonConfig": {
+                    "index": {"1001": {"93": "10"}, "1002": {"93": "11"}},
+                    "attributes": {"93": {"options": [
+                        {"id": "10", "label": "Blue"},
+                        {"id": "11", "label": "Red"},
+                    ]}},
+                    "sku": {"1001": "BLUE", "1002": "RED"},
+                    "optionPrices": {
+                        "1001": {"finalPrice": {"amount": 100}},
+                        "1002": {"finalPrice": {"amount": 100}},
+                    },
+                    "stockInfo": {
+                        "1001": {"isSalable": True, "qty": 5},
+                        "1002": {"isSalable": False, "qty": 0},
+                    },
+                }}
+            }
+        }
+        html = (
+            '<script type="text/x-magento-init">' + json.dumps(config) + '</script>'
+            '<script type="application/ld+json">'
+            '{"@type":"Product","name":"Widget","offers":{"priceCurrency":"CAD"}}'
+            '</script>'
+        )
+        rows = {row["sku"]: row for row in extract_listings(html, URL)}
+        self.assertEqual(5, rows["BLUE"]["reported_quantity"])
+        self.assertEqual("exact", rows["BLUE"]["quantity_kind"])
+        self.assertEqual("in_stock", rows["BLUE"]["stock_status"])
+        self.assertEqual(0, rows["RED"]["reported_quantity"])
+        self.assertEqual("out_of_stock", rows["RED"]["stock_status"])
+
 
 class GenericStructuredDataTests(unittest.TestCase):
     def test_single_offer_is_product_scope(self):
@@ -78,6 +113,26 @@ class GenericStructuredDataTests(unittest.TestCase):
         row = resolve_listing(extract_listings(html, URL), {"gtin": "1234567890123"})["listing"]
         self.assertEqual(["Blue", "M"], row["variant_options"])
         self.assertFalse(row["in_stock"])
+        self.assertEqual("out_of_stock", row["stock_status"])
+
+    def test_inventory_level_and_limited_availability_are_structured_stock(self):
+        html = '''<script type="application/ld+json">{"@type":"ProductGroup","name":"Jersey",
+        "hasVariant":[{"@type":"Product","name":"Jersey M","sku":"JM","size":"M",
+        "offers":{"@type":"Offer","price":"99.95","availability":"https://schema.org/LimitedAvailability",
+        "inventoryLevel":{"@type":"QuantitativeValue","value":2}}}]}</script>'''
+        row = extract_listings(html, URL)[0]
+        self.assertTrue(row["in_stock"])
+        self.assertEqual("low_stock", row["stock_status"])
+        self.assertEqual(2, row["reported_quantity"])
+        self.assertEqual("exact", row["quantity_kind"])
+
+    def test_preorder_is_preserved_without_becoming_in_stock(self):
+        html = '''<script type="application/ld+json">{"@type":"Product","name":"Future Bike",
+        "offers":{"@type":"Offer","price":"999","availability":"https://schema.org/PreOrder"}}</script>'''
+        row = parse_product_page(html, URL)
+        self.assertFalse(row["in_stock"])
+        self.assertEqual("preorder", row["stock_status"])
+        self.assertIsNone(row["reported_quantity"])
 
     def test_product_group_graph_duplicates_are_collapsed(self):
         child = {"@type": "Product", "name": "Jersey M", "sku": "JM",
@@ -129,6 +184,8 @@ class ShopifyRegressionTests(unittest.TestCase):
         self.assertEqual("S2", row["sku"])
         self.assertEqual(110.0, row["price"])
         self.assertFalse(row["in_stock"])
+        self.assertEqual("out_of_stock", row["stock_status"])
+        self.assertIsNone(row["reported_quantity"])
         self.assertEqual("shopify_js", row["extraction_method"])
 
 

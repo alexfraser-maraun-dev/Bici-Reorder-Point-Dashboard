@@ -11,12 +11,13 @@ import { CompetitorManager } from '@/components/price-intel/competitor-manager'
 import { DigestCard } from '@/components/price-intel/digest-card'
 import { MatchReview } from '@/components/price-intel/match-review'
 import { AdminConsole } from '@/components/price-intel/admin-console'
+import { StockIntelligence } from '@/components/price-intel/stock-intelligence'
 import {
   usePriceIntelSummary, useTrackedProducts, useChangeFeed, useProductLinks,
 } from '@/lib/price-intel/hooks'
 import { isMapViolation } from '@/lib/price-intel/format'
 import { Badge } from '@/components/ui/badge'
-import { Bell, GitMerge, Globe, Settings2, Sparkles, Table2 } from 'lucide-react'
+import { Bell, GitMerge, Globe, PackageSearch, Settings2, Sparkles, Table2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 
 export function PriceIntelligenceContent() {
@@ -43,6 +44,7 @@ export function PriceIntelligenceContent() {
     void mutateTracked()
     void mutateChanges()
     void globalMutate((key) => typeof key === 'string' && key.includes('/api/price-intel/changes/grouped'))
+    void globalMutate((key) => typeof key === 'string' && key.includes('/api/price-intel/stock'))
     void mutateLinks()
   }
 
@@ -55,7 +57,7 @@ export function PriceIntelligenceContent() {
         <div>
           <h1 className="text-xl font-semibold tracking-tight">Price Intelligence</h1>
           <p className="text-sm text-muted-foreground">
-            Competitor prices for your top-revenue and pinned products, scraped nightly.
+            Competitor price and stock signals for tracked products, scraped nightly.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-3">
@@ -79,6 +81,9 @@ export function PriceIntelligenceContent() {
                 {unread > 99 ? '99+' : unread}
               </Badge>
             )}
+          </TabsTrigger>
+          <TabsTrigger value="stock" className="gap-1.5">
+            <PackageSearch className="h-4 w-4" /> Stock
           </TabsTrigger>
           <TabsTrigger value="matching" className="gap-1.5">
             <GitMerge className="h-4 w-4" /> Matching
@@ -105,6 +110,9 @@ export function PriceIntelligenceContent() {
         </TabsContent>
         <TabsContent value="changes" className="mt-4">
           <ChangeFeed />
+        </TabsContent>
+        <TabsContent value="stock" className="mt-4">
+          <StockIntelligence />
         </TabsContent>
         <TabsContent value="matching" className="mt-4">
           <MatchReview />

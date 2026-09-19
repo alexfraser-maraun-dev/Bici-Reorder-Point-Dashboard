@@ -130,6 +130,63 @@ export interface ItemPriceHistory {
   competitors: PriceHistoryCompetitor[]
 }
 
+export type StockStatus =
+  | 'in_stock'
+  | 'low_stock'
+  | 'out_of_stock'
+  | 'preorder'
+  | 'backorder'
+  | 'unknown'
+
+export interface StockIntelligenceRow {
+  item_id: string
+  sku: string | null
+  system_sku: string | null
+  brand: string | null
+  title: string | null
+  item_matrix_id: string | null
+  matrix_description: string | null
+  attribute_1: string | null
+  attribute_2: string | null
+  attribute_3: string | null
+  competitor_key: string
+  competitor_id: string | null
+  competitor_name: string
+  url: string | null
+  price_scope: 'variant' | 'product' | null
+  in_stock: boolean | null
+  stock_status: StockStatus
+  reported_quantity: number | null
+  quantity_kind: 'exact' | 'upper_bound' | 'lower_bound' | null
+  extraction_method: string | null
+  last_observed_at: string
+  observed_nights_30d: number
+  in_stock_nights_30d: number
+  availability_rate_30d: number | null
+  restocks_90d: number
+  out_of_stock_since: string | null
+  outage_days: number | null
+  outage_censored: boolean
+  stale: boolean
+}
+
+export interface StockHistoryPoint {
+  observed_day: string
+  observed_at: string
+  url: string | null
+  in_stock: boolean | null
+  stock_status: StockStatus
+  reported_quantity: number | null
+  quantity_kind: 'exact' | 'upper_bound' | 'lower_bound' | null
+}
+
+export interface StockHistory {
+  item_id: string
+  competitor_key: string
+  days: number
+  points: StockHistoryPoint[]
+}
+
 export type ChangeEventType =
   | 'price_drop'
   | 'price_increase'
