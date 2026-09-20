@@ -302,13 +302,25 @@ export function PoTracker() {
       critical: 0, very_late: 0, late: 0, due_soon: 0, no_eta: 0, on_track: 0, receiving: 0,
       alertable: 0, acknowledged: 0, expected_faster_than_median: 0,
     }
+    // Still-to-arrive dollars per tier (qty × unit cost of unreceived units). On the
+    // lateness tiers nothing has been received so this equals the PO value; on the
+    // receiving tile it is only the open remainder.
+    const cost: Record<PoWatchTriage, number> & { alertable: number } = {
+      critical: 0, very_late: 0, late: 0, due_soon: 0, no_eta: 0, on_track: 0, receiving: 0,
+      alertable: 0,
+    }
     for (const o of baseFiltered) {
+      const open = Math.max(0, o.cost_ordered - o.cost_received)
       result[o.triage] += 1
-      if (o.alertable) result.alertable += 1
+      cost[o.triage] += open
+      if (o.alertable) {
+        result.alertable += 1
+        cost.alertable += open
+      }
       if (o.ack?.active) result.acknowledged += 1
       if (o.flags.includes('expected_faster_than_median')) result.expected_faster_than_median += 1
     }
-    return result
+    return { ...result, cost }
   }, [baseFiltered])
 
   const filtered = useMemo(() => {
@@ -380,11 +392,15 @@ export function PoTracker() {
             <button
               key={tier}
               onClick={() => setTriageFilter(active ? null : tier)}
+              title="Cost of units not yet received (qty × unit cost)"
               className={`rounded-xl border p-3 text-left transition-colors hover:bg-muted/50 ${meta_.card} ${active ? 'bg-muted ring-2 ring-ring' : 'bg-card'}`}
             >
               <div className="text-xs text-muted-foreground">{meta_.label}</div>
-              <div className="text-2xl font-semibold">
+              <div className="text-2xl font-semibold tabular-nums">
                 {isLoading ? '—' : counts[tier]}
+              </div>
+              <div className="mt-0.5 text-[11px] text-muted-foreground tabular-nums">
+                {isLoading ? '\u00a0' : `${money.format(counts.cost[tier])}${tier === 'receiving' ? ' open' : ''}`}
               </div>
             </button>
           )
@@ -394,9 +410,12 @@ export function PoTracker() {
       {!isLoading && meta && (
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <Timer className="h-3.5 w-3.5" />
-          {counts.alertable} PO(s) are ≥{meta.alert_days_late_threshold}d late with nothing received and unacknowledged (Slack-alertable)
-          · {counts.acknowledged} snoozed
-          · {counts.expected_faster_than_median} promised faster than the vendor&apos;s median lead time
+          <span>
+            {counts.alertable} PO(s) ({money.format(counts.cost.alertable)}) are ≥{meta.alert_days_late_threshold}d late
+            with nothing received and unacknowledged (Slack-alertable)
+          </span>
+          <span>· {counts.acknowledged} snoozed</span>
+          <span>· {counts.expected_faster_than_median} promised faster than the vendor&apos;s median lead time</span>
         </div>
       )}
 
