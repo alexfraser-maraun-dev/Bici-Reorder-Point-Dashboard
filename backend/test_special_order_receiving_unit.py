@@ -92,6 +92,45 @@ class SpecialOrderReceivingContractTest(unittest.TestCase):
         self.assertEqual(row["so_received_date"], "2026-08-21")
         self.assertEqual(row["po_received_date"], "2026-08-19")
 
+    def test_checked_out_completed_so_is_received_not_in_transit(self):
+        # SO 45451: completed + "Completed" in Lightspeed, rescued onto the board by an open
+        # Shopify order, was falling back to its placed PO and reading "In transit".
+        raw = _raw_so(status="Completed", completed="true", timestamp="2026-09-21T18:47:54+00:00")
+        raw["OrderLine"]["checkedIn"] = "1"
+        row = _normalize(raw, _po(received_date="2026-08-20"))
+        self.assertTrue(row["so_received"])
+        self.assertTrue(row["so_checked_out"])
+        self.assertEqual(row["procurement_stage"], "received")
+        self.assertEqual(row["receiving_state"], "so_received")
+
+        row.update(shopify_order_id="gid://shopify/Order/1", shopify_line_unfulfilled=1)
+        result = so_sla_service.build_escalations([row], {}, TODAY)["orders"][0]
+        self.assertNotIn("in_transit", result["queue_states"])
+        self.assertEqual(result["closeout_state"], "shopify_fulfillment_pending")
+        self.assertIn("fulfil the Shopify order", result["next_action"])
+
+    def test_done_and_paid_workorder_is_closed(self):
+        self.assertFalse(so_sla_service._workorder_is_open(
+            {"workorder_id": "37259", "workorder_status": "Done & Paid"}))
+        self.assertTrue(so_sla_service._workorder_is_open(
+            {"workorder_id": "1", "workorder_status": "Waiting - Parts"}))
+
+    def test_checked_out_so_without_open_shopify_order_needs_no_closeout(self):
+        raw = _raw_so(status="Completed", completed="true")
+        del raw["OrderLine"]  # filled from stock, no PO
+        row = _normalize(raw, _po())
+        self.assertEqual(row["procurement_stage"], "received")
+        result = so_sla_service.build_escalations([row], {}, TODAY)["orders"][0]
+        self.assertEqual(result["closeout_state"], "complete")
+
+    def test_completed_so_with_nothing_checked_in_is_not_received(self):
+        # Looks like a cancellation, not a hand-over.
+        raw = _raw_so(status="Completed", completed="true")
+        raw["OrderLine"]["checkedIn"] = "0"
+        row = _normalize(raw, _po())
+        self.assertFalse(row["so_received"])
+        self.assertEqual(row["procurement_stage"], "ordered")
+
     def test_split_or_backorder_state_is_actionable_vendor_followup(self):
         for state in ("po_receiving", "po_complete_so_unreceived"):
             row = _normalize(

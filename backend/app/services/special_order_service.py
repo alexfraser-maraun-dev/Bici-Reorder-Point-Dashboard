@@ -82,6 +82,28 @@ def _status_is_received(status: str) -> bool:
     return any(has_phrase(key) for key in _RECEIVED_STATUS_KEYS)
 
 
+def _is_checked_out(so: Dict[str, Any]) -> bool:
+    """True if Lightspeed shows this SO as checked out to the customer (status "Completed").
+
+    A completed SO only reaches the dashboard via the Shopify rescue path, and "Completed" is
+    not a received keyword, so without this it fell back to its PO and read "In transit"
+    (SO 45451, 2026-09-24). Measured live over 120d: 840 of 847 "Completed" SOs had a checked-in
+    PO line or no PO at all (filled from stock). The 7 whose PO line shows nothing checked in
+    look like cancellations, so an explicit ``checkedIn`` of 0 vetoes the receipt.
+    """
+    if not _coerce_bool(so.get("completed")):
+        return False
+    if (so.get("status") or "").strip().lower() != "completed":
+        return False
+    checked_in = (so.get("OrderLine") or {}).get("checkedIn")
+    if checked_in is not None:
+        try:
+            return float(checked_in) > 0
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def derive_receiving_state(*, so_received: bool, po_receiving_started: bool,
                            po_received_date: Optional[str], po_complete: bool) -> str:
     """Keep individual-SO receipt separate from purchase-order receiving context.
@@ -360,7 +382,8 @@ def _normalize(
     customer_id = so.get("customerID")
     shop_id = str(so.get("shopID")) if so.get("shopID") is not None else None
     status = so.get("status") or "Unknown"
-    so_received = _status_is_received(status)
+    so_checked_out = _is_checked_out(so)
+    so_received = _status_is_received(status) or so_checked_out
     contacted = _coerce_bool(so.get("contacted"))
 
     # Service-bench linkage: an SO raised from a workorder reaches its Workorder via
@@ -463,6 +486,8 @@ def _normalize(
         # Individual receipt is authoritative from SpecialOrder.status. `completed` remains a
         # separate lifecycle flag because a completed/cancelled SO is not necessarily received.
         "so_received": so_received,
+        # Handed over at the till. Close-out then only owes the Shopify side, if anything.
+        "so_checked_out": so_checked_out,
         "so_received_date": so_received_date.isoformat() if so_received_date else None,
         # Customer
         "customer_id": customer_id,

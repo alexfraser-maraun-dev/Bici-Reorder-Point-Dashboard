@@ -407,7 +407,9 @@ def _workorder_is_open(row: Dict[str, Any]) -> bool:
     # declaring it complete would lose the service follow-up from the close-out queue.
     if not status:
         return True
-    closed_words = ("complete", "completed", "closed", "finished", "invoiced", "cancel")
+    # "Done & Paid" is Lightspeed's system "paid" status; missing it kept SO 45451's finished,
+    # paid-for build reading "finish the workorder" (2026-09-24).
+    closed_words = ("complete", "completed", "closed", "finished", "invoiced", "cancel", "done & paid")
     return any(word in status for word in closed_words) is False
 
 
@@ -423,6 +425,29 @@ def _closeout_action(row: Dict[str, Any], today: date) -> Dict[str, Any]:
             "next_action": "Part in — finish the workorder",
             "action_owner": "service",
             "action_due_date": due,
+        }
+    # Already handed over at the till: "trace the item" or "call the customer" would be wrong.
+    # All that can be left is an open Shopify order still showing the line as owed.
+    if row.get("so_checked_out"):
+        fulfillment = str(row.get("shopify_fulfillment_status") or "").strip().lower()
+        shopify_owed = bool(
+            row.get("shopify_order_id")
+            and not row.get("matched_via_closed_order")
+            and fulfillment not in ("fulfilled", "restocked")
+            and customer_still_waiting(row) is not False
+        )
+        if shopify_owed:
+            return {
+                "closeout_state": "shopify_fulfillment_pending",
+                "next_action": "Checked out in Lightspeed — fulfil the Shopify order",
+                "action_owner": "cs",
+                "action_due_date": due,
+            }
+        return {
+            "closeout_state": "complete",
+            "next_action": None,
+            "action_owner": None,
+            "action_due_date": None,
         }
     # Checked BEFORE `contacted`, because `contacted` is False on 116 of 118 live received rows
     # and would otherwise swallow every one of these into "call the customer" — which is wrong
