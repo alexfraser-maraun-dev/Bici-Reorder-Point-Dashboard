@@ -242,9 +242,14 @@ def build_observation(view, *, run_id, observed_at, item_id, competitor_id,
 
 
 def _collect(views, *, resolver, run_id, observed_at, competitor_id, source,
-             price_attr, country=None):
-    """Turns report rows into observation rows, counting why rows were dropped."""
+             price_attr, country=None, flush=None):
+    """Turns report rows into observation rows, counting why rows were dropped.
+
+    With `flush`, rows are handed to it every config.FLUSH_ROWS and the returned
+    list holds only what was never flushed (nothing, by the end). Without it, every
+    row is returned — the dry-run and test path."""
     rows, stats = [], {"returned": 0, "unresolved": 0, "no_price": 0, "wrong_currency": 0}
+    written = 0
     for view in views:
         stats["returned"] += 1
         price, currency = _price_parts(getattr(view, price_attr, None))
@@ -266,7 +271,15 @@ def _collect(views, *, resolver, run_id, observed_at, competitor_id, source,
             competitor_id=competitor_id, source=source, price=price,
             currency=currency or "CAD", country=country,
         ))
-    stats["written"] = len(rows)
+        if flush is not None and len(rows) >= config.FLUSH_ROWS:
+            flush(rows)
+            written += len(rows)
+            rows = []
+    if flush is not None and rows:
+        flush(rows)
+        written += len(rows)
+        rows = []
+    stats["written"] = written + len(rows)
     return rows, stats
 
 
@@ -311,6 +324,23 @@ def run_benchmark_sync(run_id: str, observed_at: str, dry_run: bool = False) -> 
     """
     country = config.GOOGLE_BENCHMARK_COUNTRY or "CA"
     client = _report_client()
+    try:
+        return _pull(client, country, run_id, observed_at, dry_run)
+    finally:
+        _close_client(client)
+
+
+def _close_client(client):
+    """Closes the client's gRPC channel. Each run builds a new client; left open,
+    every night's channel (and its buffers) stayed resident for the life of the
+    worker. Best-effort: a failure to close must not fail the run."""
+    try:
+        client.transport.close()
+    except Exception as exc:
+        logger.warning("google benchmark: closing the report client failed: %s", exc)
+
+
+def _pull(client, country, run_id, observed_at, dry_run):
     resolver = OfferResolver()
     stats = {"country": country,
              "offer_map_variants": len(resolver.by_variant),
@@ -326,23 +356,28 @@ def run_benchmark_sync(run_id: str, observed_at: str, dry_run: bool = False) -> 
                        for r in _search(client, INSIGHTS_QUERY)),
                       "suggested_price", None))
 
-    collected = []
+    # Rows are written as they are built, FLUSH_ROWS at a time. Collecting both
+    # reports first held ~24k observation dicts plus their NDJSON copy at once — the
+    # largest single memory step of the nightly run (2026-09). Consequence: if the
+    # second pull fails, the first pull's rows are already written; they are
+    # append-only snapshots, so that is a complete snapshot for that source.
+    if not dry_run:
+        ensure_competitors()
+    flush = None if dry_run else (
+        lambda rows: repository.load_rows(repository.T_OBSERVATIONS, rows))
+    stats["observations"] = 0
     for competitor_id, source, label, views, price_attr, view_country in pulls:
-        rows, stats[label] = _collect(
+        _unflushed, stats[label] = _collect(
             views, resolver=resolver, run_id=run_id, observed_at=observed_at,
             competitor_id=competitor_id, source=source, price_attr=price_attr,
-            country=view_country,
+            country=view_country, flush=flush,
         )
-        collected.append((competitor_id, rows))
+        written = stats[label]["written"]
+        stats["observations"] += written
+        if not dry_run:
+            repository.mark_competitor_scraped(
+                competitor_id, "success" if written else "success_no_products")
 
-    stats["observations"] = sum(len(rows) for _, rows in collected)
     if dry_run:
         stats["dry_run"] = True
-        return stats
-
-    ensure_competitors()
-    for competitor_id, rows in collected:
-        repository.load_rows(repository.T_OBSERVATIONS, rows)
-        repository.mark_competitor_scraped(
-            competitor_id, "success" if rows else "success_no_products")
     return stats

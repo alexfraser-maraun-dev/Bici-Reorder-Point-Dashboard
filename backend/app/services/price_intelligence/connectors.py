@@ -670,6 +670,30 @@ def _jsonld_listings(soup: BeautifulSoup, url: str) -> list:
 def extract_listings(html: str, url: str) -> list:
     """Return every independently identifiable price listing on a product page."""
     soup = BeautifulSoup(html, "lxml")
+    try:
+        return _extract_listings_from_soup(soup, url)
+    finally:
+        soup.decompose()
+
+
+def page_listings(html: str, url: str) -> list:
+    """A fetched product page's listings: Magento GraphQL when the storefront
+    exposes it, else static extraction — from ONE parse of the page.
+
+    The crawl used to build a separate lxml tree for each of the two (every
+    non-Magento page was parsed twice). Trees are full of parent/sibling reference
+    cycles, so they are only reclaimed by the cycle collector; at a few hundred
+    pages a night they were a large part of the scrape's memory churn. decompose()
+    breaks the cycles so the tree is freed as soon as we are done with it."""
+    soup = BeautifulSoup(html, "lxml")
+    try:
+        return (_magento_graphql_listings_from_soup(soup, url)
+                or _extract_listings_from_soup(soup, url))
+    finally:
+        soup.decompose()
+
+
+def _extract_listings_from_soup(soup: BeautifulSoup, url: str) -> list:
     magento = _magento_listings(soup, url)
     if magento:
         return magento
@@ -707,14 +731,13 @@ def extract_listings(html: str, url: str) -> list:
     )]
 
 
-def _magento_graphql_listings(html: str, url: str) -> list:
+def _magento_graphql_listings_from_soup(soup: BeautifulSoup, url: str) -> list:
     """Use anonymous Magento GraphQL when the storefront exposes it.
 
     Capability failures are cached for an hour so disabled endpoints cost one
     probe, not one request per product. Static extraction remains authoritative
     fallback and this helper is never used by the pure offline extractor.
     """
-    soup = BeautifulSoup(html, "lxml")
     if not soup.find("script", type="text/x-magento-init"):
         return []
     parent = next(_iter_jsonld_products(soup), {})
@@ -919,7 +942,9 @@ class PageScraper:
             if resp is not None:
                 print(f"pi: {resp.status_code} fetching tracked url {url}")
             return []
-        return _magento_graphql_listings(resp.text, url) or extract_listings(resp.text, url)
+        html = resp.text
+        del resp
+        return page_listings(html, url)
 
     def resolve(self, listings: list, url: str, sku: Optional[str] = None,
                 gtin: Optional[str] = None, variant_id: Optional[str] = None,
@@ -1568,8 +1593,13 @@ class _HtmlPageCrawler(_CrawlStatsMixin):
         if resp is None or resp.status_code != 200:
             return
         self.pages_done += 1
-        for parsed in (_magento_graphql_listings(resp.text, url)
-                       or extract_listings(resp.text, url)):
+        html = resp.text
+        # Don't hold the response (body bytes + decoded text) across the yields
+        # below, which span the caller's BigQuery flushes.
+        del resp
+        listings = page_listings(html, url)
+        del html
+        for parsed in listings:
             if not parsed.get("brand"):
                 parsed["brand"] = _slug_brand(slug, self._brand_names)
             parsed["url"] = url
@@ -1740,10 +1770,20 @@ class GenericSitemapConnector(_HtmlPageCrawler):
             sitemap_url = queue.pop(0)
             resp = self._get(sitemap_url.strip())
             fetches += 1
-            if resp is None or resp.status_code != 200 or "<" not in resp.text[:200]:
+            if resp is None or resp.status_code != 200:
                 continue
-            locs = re.findall(r"<loc>([^<]+)</loc>", resp.text)
-            if "<sitemapindex" in resp.text:
+            # Decode once: requests re-decodes `.text` on every access (running
+            # charset detection over the whole body when the server sends no
+            # charset), and sitemaps run to tens of MB. Neither the body nor the
+            # text is kept past this block, so they aren't held across the yields.
+            text = resp.text
+            del resp
+            if "<" not in text[:200]:
+                continue
+            locs = re.findall(r"<loc>([^<]+)</loc>", text)
+            is_index = "<sitemapindex" in text
+            del text
+            if is_index:
                 # One level of nesting: children go on the queue with the same
                 # locale confinement as the top-level sources, product-hinting
                 # and Canadian-hinting first so the fetch budget is spent well.

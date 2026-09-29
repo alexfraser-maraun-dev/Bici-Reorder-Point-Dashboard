@@ -15,6 +15,8 @@ the small diff/match dicts. The match structures are released before the LLM
 verification phase, which loads its own copy.
 """
 import json
+import os
+import signal
 import threading
 import time
 import uuid
@@ -916,6 +918,11 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             links_done += 1
             _flush_buffers(obs_buffer, event_buffer, counters)
             _set_status(links_done=links_done)
+            # The longest phase, and the only one with no phase-change sample inside
+            # it — without this a climb here reads as belonging to the next phase.
+            if links_done % 250 == 0:
+                from app.services.memory_probe import log_rss
+                log_rss(f"scrape confirmed links {links_done}/{len(link_targets)}")
         _flush_buffers(obs_buffer, event_buffer, counters, force=True)
         _set_status(observations=counters["observations"], changes=counters["changes"])
         for cid, n in per_competitor.items():
@@ -1050,6 +1057,11 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 errors.append(f"google benchmark: {e}")
                 counters["google_benchmark"] = {"error": str(e)[:200]}
                 print(f"pi: google benchmark failed: {e}")
+            # The largest measured step of the run (+40-59 MB a night, 2026-09): ~24k
+            # proto rows plus the offer map, all garbage by now. Hand it back before
+            # verification loads the tracked set again.
+            from app.services.memory_probe import trim
+            trim("after Google benchmark")
 
         repository.invalidate_pi_caches()
 
@@ -1091,6 +1103,11 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
             confirmed_links = link_targets = prev_map = None
             proposer.item_lookup = {}
             del proposer.pending_links[:]
+            # The rest of the run-lifetime state: every link match key ever written
+            # (grows nightly), the decided pairs, and the fan-out's link dicts, which
+            # would otherwise keep part of confirmed_links alive through verification.
+            proposer = _propose_link = existing_link_keys = pending_links = None
+            confirmed_pairs = fanout_targets = targets = fanned_pages = None
 
             # Always run: pending-unverified rows can come from earlier runs
             # (e.g. demoted links), not just this run's candidates. A clean
@@ -1165,6 +1182,11 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                         k: v for k, v in counters.items()
                         if k not in ("competitors_done", "urls_done", "observations", "changes")
                     })
+        # Every structure of the run is garbage now, but glibc keeps the freed pages
+        # in its arenas: without this, each night's working set stayed resident and
+        # stacked on the last until the worker was OOM-killed (2026-09-24, -28).
+        from app.services.memory_probe import trim
+        trim("end of scrape run")
         _scrape_lock.release()
 
 
@@ -1193,6 +1215,71 @@ def urlparse_domain(url: str) -> str:
 # Nightly scheduler (in-process; Render starter tier never idles the process out)
 # ---------------------------------------------------------------------------
 _scheduler_started = False
+# Monotonic time this worker process imported the runner — i.e. booted.
+_PROCESS_STARTED = time.monotonic()
+
+
+def _under_gunicorn() -> bool:
+    """True when a gunicorn master will respawn this process if it exits.
+
+    Self-recycling is only a restart when something respawns us; under a bare
+    `uvicorn` (local dev) SIGTERM would just stop the server. The parent's command
+    line is the reliable signal on Linux; SERVER_SOFTWARE (set by gunicorn's
+    arbiter) covers anything without /proc."""
+    try:
+        with open(f"/proc/{os.getppid()}/cmdline", "rb") as fh:
+            if b"gunicorn" in fh.read():
+                return True
+    except OSError:
+        pass
+    return os.environ.get("SERVER_SOFTWARE", "").startswith("gunicorn")
+
+
+def _recycle_marker(day: str) -> str:
+    return os.path.join(config.RECYCLE_MARKER_DIR, f"pi_recycle_{day}")
+
+
+def _maybe_recycle_before_scrape(day: str) -> bool:
+    """Restarts the worker when it is already heavy as the nightly run comes due.
+    Returns True when the restart was triggered (the caller must not start a run;
+    the respawned worker's scheduler will).
+
+    The safety net for the 2026-09 OOMs: each nightly run left ~75-100 MB resident,
+    and the 4th-5th night's run started from ~450 MB and was killed. A fresh worker
+    starts the run at ~210 MB and peaks ~100 MB above that. Nobody is using the
+    tool at 02:30, and the startup warm-ups refill the caches on boot.
+
+    At most once per day: the marker lives in the container's /tmp, which survives a
+    worker restart, so a worker whose boot warm-ups alone exceed the threshold still
+    cannot restart-loop. If the marker can't be written we don't restart at all —
+    without it there is no loop guard."""
+    if not config.PRESCRAPE_RECYCLE_ENABLED:
+        return False
+    from app.services.memory_probe import rss_mb
+    rss = rss_mb()
+    if not rss or rss <= config.PRESCRAPE_RECYCLE_MB:
+        return False
+    marker = _recycle_marker(day)
+    if os.path.exists(marker):
+        return False  # already restarted for today's run; go ahead on this worker
+    if not _under_gunicorn():
+        print(f"pi: worker RSS {rss} MB is above {config.PRESCRAPE_RECYCLE_MB:g} MB "
+              f"but no gunicorn master would respawn it; not restarting")
+        return False
+    try:
+        with open(marker, "w") as fh:
+            fh.write(f"{rss}\n")
+    except OSError as e:
+        print(f"pi: could not write recycle marker {marker} ({e}); not restarting")
+        return False
+    print(f"pi: worker RSS {rss} MB is above {config.PRESCRAPE_RECYCLE_MB:g} MB before "
+          f"the nightly scrape for {day}; restarting the worker so the run starts "
+          f"from a fresh baseline")
+    # Graceful: uvicorn finishes in-flight requests, the gunicorn master spawns a
+    # replacement, and that worker's scheduler fires the run (the `due` window
+    # spans the rest of the day).
+    os.kill(os.getpid(), signal.SIGTERM)
+    return True
 
 
 def start_scheduler():
@@ -1223,13 +1310,19 @@ def _scheduler_loop():
                 )
                 if due and get_status().get("status") != "running":
                     today = now.strftime("%Y-%m-%d")
+                    # A just-booted worker waits out its cache warm-ups first.
+                    settling = (time.monotonic() - _PROCESS_STARTED
+                                < config.SCHEDULER_BOOT_SETTLE_SECONDS)
                     # BQ-backed guard so restarts/redeploys can't double-run a
                     # night; counts failed scheduled attempts as terminal too.
-                    if last_attempt_date != today and \
+                    if last_attempt_date != today and not settling and \
                             not repository.has_scheduler_blocking_run_on(today, tz_name):
+                        # Set before a recycle too: a worker that is draining after
+                        # SIGTERM must not start the run itself.
                         last_attempt_date = today
-                        print(f"pi: scheduler firing nightly scrape for {today}")
-                        start_scrape(trigger="scheduled")
+                        if not _maybe_recycle_before_scrape(today):
+                            print(f"pi: scheduler firing nightly scrape for {today}")
+                            start_scrape(trigger="scheduled")
         except Exception as e:
             print(f"pi: scheduler tick failed: {e}")
         time.sleep(60)

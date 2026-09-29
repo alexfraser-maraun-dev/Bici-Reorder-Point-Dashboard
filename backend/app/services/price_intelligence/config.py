@@ -117,6 +117,18 @@ SCHEDULE_HOUR_LOCAL = int(os.getenv("PI_SCHEDULE_HOUR_LOCAL", "2"))
 SCHEDULE_MINUTE_LOCAL = int(os.getenv("PI_SCHEDULE_MINUTE_LOCAL", "30"))
 SCHEDULE_TIMEZONE = os.getenv("PI_SCHEDULE_TIMEZONE", "America/Vancouver")
 
+# Pre-scrape worker recycle (the 512MB safety net). When the nightly run comes due
+# and the worker's RSS is already above this, the worker restarts itself first so
+# the scrape starts from a fresh ~210 MB baseline instead of stacking its ~100 MB
+# peak on whatever the last few days left behind. At most once a day (marker file
+# in PI_RECYCLE_MARKER_DIR), and only under gunicorn, whose master respawns it.
+PRESCRAPE_RECYCLE_ENABLED = _flag("PI_PRESCRAPE_RECYCLE_ENABLED", "true")
+PRESCRAPE_RECYCLE_MB = float(os.getenv("PI_PRESCRAPE_RECYCLE_MB", "300"))
+RECYCLE_MARKER_DIR = os.getenv("PI_RECYCLE_MARKER_DIR", "/tmp")
+# A freshly booted worker runs four cache warm-ups at once; don't start a scrape on
+# top of them. Applies after any restart, not just a recycle.
+SCHEDULER_BOOT_SETTLE_SECONDS = int(os.getenv("PI_SCHEDULER_BOOT_SETTLE_SECONDS", "300"))
+
 # Slack notifications (best-effort, posted after each run from the scrape thread).
 # Off until a webhook is set, so existing deployments are unaffected. The digest
 # and health alerts go to SLACK_WEBHOOK_URL; MAP/undercut priority pings go to

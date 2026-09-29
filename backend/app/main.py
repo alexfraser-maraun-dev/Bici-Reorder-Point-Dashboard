@@ -222,6 +222,10 @@ def read_root():
 def health_check():
     return {"status": "healthy"}
 
+# Monotonic time this worker imported the app, i.e. booted.
+_WORKER_STARTED = time.monotonic()
+
+
 @app.get("/api/debug/memory")
 def get_memory_debug():
     """Live RSS plus the entry counts of the caches that can grow with traffic.
@@ -230,11 +234,27 @@ def get_memory_debug():
     baseline had ratcheted for days with nothing recording which cache was holding it.
     Counts, never contents — this says how many entries a cache holds, not what is in
     them."""
+    import os as _os
     from app.services.memory_probe import rss_mb
     from app.services import bigquery_sync as _bq
+    from app.services import planning_service as _planning
+    from app.services import po_watch_service as _po_watch
+    from app.services.po_snapshot_service import get_po_snapshot_cache
     from app.services.price_intelligence import repository as _pi_repo
     return {
         "rss_mb": rss_mb(),
+        "worker_uptime_s": round(time.monotonic() - _WORKER_STARTED),
+        # Render only applies render.yaml env vars to Blueprint-managed services;
+        # this is what the live worker actually got.
+        "allocator_env": {
+            "MALLOC_ARENA_MAX": _os.environ.get("MALLOC_ARENA_MAX"),
+            "PYTHONMALLOC": _os.environ.get("PYTHONMALLOC"),
+        },
+        "slots_loaded": {
+            "special_orders": _special_orders_cache.get("data") is not None,
+            "reco_context": _reco_context_cache.get("data") is not None,
+            "po_snapshot_orders": len(get_po_snapshot_cache()._orders or []),
+        },
         "caches": {
             "item_stock": len(_bq._item_stock_cache),
             "order_cadence": len(_bq._order_cadence_cache),
@@ -246,6 +266,8 @@ def get_memory_debug():
             "price_intel": len(_pi_repo._caches),
             "shopify_timeline": len(_shopify_timeline_cache),
             "health": len(_health_cache),
+            "po_watch": len(_po_watch._watch_cache),
+            "planning_runs": len(_planning._RUNS),
         },
     }
 
