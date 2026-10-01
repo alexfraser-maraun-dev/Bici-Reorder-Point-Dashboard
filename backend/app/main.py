@@ -1459,7 +1459,8 @@ def _persist_special_order_sweep(result: Dict[str, Any]) -> None:
         from app.services import so_stage_log
         from app.services.planning_store import get_planning_store
         outcome = so_stage_log.persist_observations(
-            result.get("orders") or [], get_planning_store(), result.get("fetched_at") or ""
+            result.get("orders") or [], get_planning_store(), result.get("fetched_at") or "",
+            shopify_only=result.get("shopify_only") or [],
         )
         if outcome.get("skipped"):
             print(f"[so_sla] sweep skipped: {outcome['skipped']}")
@@ -2237,6 +2238,40 @@ def get_special_order_scoreboard(include_history: bool = True):
             print(f"[so_scoreboard] history unavailable: {e}")
             board["history"] = None
     return board
+
+
+# One small payload; the client slices it by store/source/archive itself, so filter changes
+# never come back here. Stage events only move when the 5-minute sweep runs.
+_stage_history_cache: Dict[str, Any] = {"key": None, "data": None, "built_at": 0.0}
+_STAGE_HISTORY_TTL_SECONDS = 600
+
+
+@app.get("/api/special-orders/stage-history")
+def get_special_order_stage_history(days: int = 60):
+    """Daily stage intervals behind the pipeline dwell sparklines (see so_stage_log)."""
+    from zoneinfo import ZoneInfo
+    from app.services import so_stage_log
+    from app.services.planning_store import get_planning_store
+
+    days = max(7, min(int(days), 180))
+    tz = ZoneInfo(os.getenv("SO_SWEEP_TIMEZONE", "America/Vancouver"))
+    today = datetime.now(tz).date()
+    key = (days, today.isoformat())
+    cached = _stage_history_cache
+    if cached["key"] == key and time.time() - cached["built_at"] < _STAGE_HISTORY_TTL_SECONDS:
+        return cached["data"]
+    # A day of slack on the SQL cut: last_seen_at is UTC, the window is local.
+    since = (today - timedelta(days=days + 1)).isoformat()
+    try:
+        events = get_planning_store().list_so_stage_events_since(since)
+    except Exception as e:
+        print(f"[so_stage_history] store unavailable: {e}")
+        return {"start": None, "end": today.isoformat(), "stages": list(so_stage_log.STAGE_HISTORY_STAGES),
+                "tracking_since": {}, "columns": list(so_stage_log.STAGE_HISTORY_COLUMNS), "rows": []}
+    data = so_stage_log.build_stage_history(events, today, days=days, tz=tz)
+    del events
+    _stage_history_cache.update({"key": key, "data": data, "built_at": time.time()})
+    return data
 
 
 def _refresh_special_orders_after_write() -> None:

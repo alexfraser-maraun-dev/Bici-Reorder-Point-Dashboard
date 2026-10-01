@@ -272,6 +272,25 @@ test('desktop Special Orders worklist is actionable, reconciled, paginated, and 
     contentType: 'application/json',
     body: JSON.stringify(worklist),
   }))
+  // Every stage tracked for the whole window, with a mix of open and exited intervals, so each
+  // pipeline tile has enough points to draw its dwell sparkline.
+  const stageHistoryStages = ['shopify', 'open_pool', 'unordered_po', 'ordered', 'received']
+  await page.route('**/backend/api/special-orders/stage-history**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      start: '2026-09-01',
+      end: '2026-10-01',
+      stages: stageHistoryStages,
+      tracking_since: Object.fromEntries(stageHistoryStages.map((stage) => [stage, '2026-08-20'])),
+      columns: ['stage', 'entered', 'left', 'shop_id', 'source', 'created'],
+      rows: stageHistoryStages.flatMap((_, stage) => [
+        [stage, -40, null, '1', 'neither', -40],
+        [stage, -25, -10, '1', 'workorder', -25],
+        [stage, -5, null, '1', 'shopify', -5],
+      ]),
+    }),
+  }))
   await page.route('**/backend/api/special-orders/*/activity', (route) => {
     activityCalls += 1
     const specialOrderId = new URL(route.request().url()).pathname.split('/').at(-2) ?? 'unknown'
@@ -333,6 +352,7 @@ test('desktop Special Orders worklist is actionable, reconciled, paginated, and 
     .map((text) => Number(text.match(/^\s*(\d+)/)?.[1] ?? Number.NaN))
   expect(pipelineCounts).toHaveLength(5)
   expect(pipelineCounts.reduce((total, count) => total + count, 0)).toBe(32)
+  await expect(pipeline.getByRole('img', { name: /median \d+d in stage now/ })).toHaveCount(5)
 
   await expect(page.getByText('Showing 1–25 of 32 orders')).toBeVisible()
   await expect(page.getByRole('button', { name: /^Review / })).toHaveCount(25)

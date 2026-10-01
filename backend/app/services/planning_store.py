@@ -418,6 +418,7 @@ class PlanningStore:
                 ON so_stage_events(special_order_id, stage, entered_at)
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_so_stage_events_open ON so_stage_events(left_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_so_stage_events_seen ON so_stage_events(last_seen_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_so_promises_so ON so_promises(special_order_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_so_activity_so ON so_activity_events(special_order_id, occurred_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_so_links_so ON so_shopify_links(special_order_id)")
@@ -773,6 +774,19 @@ class PlanningStore:
                 ), tuple(chunk)).fetchall()
                 out.extend(self._dict(r) for r in rows)
             return out
+
+    def list_so_stage_events_since(self, last_seen_on_or_after: str) -> List[Dict[str, Any]]:
+        """Stage events still being observed on or after an ISO timestamp/date.
+
+        The pipeline trend only needs intervals that overlap its window; everything that left
+        earlier is skipped in SQL rather than loaded and discarded.
+        """
+        with self._connection() as conn:
+            rows = conn.execute(self._sql(
+                "SELECT special_order_id, stage, entered_at, shop_id, source, first_seen_at, last_seen_at "
+                "FROM so_stage_events WHERE last_seen_at >= ?"
+            ), (str(last_seen_on_or_after),)).fetchall()
+            return [self._dict(r) for r in rows]
 
     def upsert_so_ack(self, special_order_id: str, *, acked_by: Optional[str], reason_code: str,
                       note: Optional[str], checkback_date: str, pinned_stage: Optional[str],

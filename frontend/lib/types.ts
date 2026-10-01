@@ -954,6 +954,19 @@ export interface SpecialOrderWorklistResponse {
   meta?: SpecialOrderMeta
 }
 
+/** `/api/special-orders/stage-history`: every stage interval overlapping the trend window.
+ *  Columnar to keep the payload small. Day offsets are relative to `end` (today = 0); an
+ *  interval covers days `entered <= d < left`, and `left` is null while still open. */
+export interface SpecialOrderStageHistory {
+  start: string | null
+  end: string
+  stages: TriageStage[]
+  /** First day each stage was observed at all; earlier points would be survivorship-biased. */
+  tracking_since: Partial<Record<TriageStage, string>>
+  columns: ['stage', 'entered', 'left', 'shop_id', 'source', 'created']
+  rows: [number, number, number | null, string | null, string | null, number][]
+}
+
 // Compatibility name for older imports while the base, non-SLA endpoint is retired.
 export type SpecialOrderDashboard = SpecialOrderWorklistResponse
 

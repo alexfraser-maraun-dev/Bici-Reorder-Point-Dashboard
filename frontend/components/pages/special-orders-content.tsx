@@ -5,6 +5,7 @@ import { usePathname, useSearchParams, type ReadonlyURLSearchParams } from 'next
 import { toast } from 'sonner'
 import {
   useSpecialOrders,
+  useSpecialOrderStageHistory,
   matchSpecialOrder,
   saveSpecialOrderMatchDecisions,
   unmatchSpecialOrder,
@@ -42,11 +43,13 @@ import { cn } from '@/lib/utils'
 import { SoLegend, type SoLegendCounts } from '@/components/dashboard/so-legend'
 import { SoScoreboard } from '@/components/dashboard/so-scoreboard'
 import { SpecialOrdersGrid } from '@/components/dashboard/special-orders-grid'
+import { DwellSparkline } from '@/components/dashboard/dwell-sparkline'
 import {
   DWELL_BANDS,
   dwellBand,
   emptyDwellCounts,
   stageDwellDays,
+  stageDwellSeries,
   type DwellCounts,
 } from '@/lib/special-order-triage'
 import {
@@ -438,40 +441,18 @@ function compareOperationalPriority(a: SpecialOrder, b: SpecialOrder): number {
 function SourceHealth({ sources }: { sources?: Record<string, SpecialOrderSourceStatus> }) {
   const entries = Object.entries(sources ?? {})
   if (entries.length === 0) return null
-  const degraded = entries.filter(([, health]) => health.status !== 'ok')
-  if (degraded.length === 0) {
-    return (
-      <span
-        className="ml-2 inline-flex items-center gap-1"
-        aria-label="All Special Orders data sources are healthy"
-        title={entries.map(([source]) => SOURCE_LABEL[source] ?? source).join(', ')}
-      >
-        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" aria-hidden="true" />
-        All systems healthy
-      </span>
-    )
-  }
+  // Degraded sources are spelled out by the amber banner below the header, so repeating them
+  // here as "Lightspeed stale · Shopify stale …" only doubled the noise. Healthy is the one
+  // state the banner can't express, so that is all this renders.
+  if (entries.some(([, health]) => health.status !== 'ok')) return null
   return (
-    <span className="ml-2 inline-flex flex-wrap items-center gap-2" aria-label="Data source health">
-      {degraded.map(([source, health]) => (
-        <span
-          key={source}
-          className="inline-flex items-center gap-1"
-          title={health.message ?? `${SOURCE_LABEL[source] ?? source}: ${health.status}`}
-        >
-          <span
-            className={cn(
-              'h-1.5 w-1.5 rounded-full',
-              health.status === 'ok' && 'bg-emerald-500',
-              health.status === 'stale' && 'bg-amber-500',
-              health.status === 'unavailable' && 'bg-red-500',
-            )}
-            aria-hidden="true"
-          />
-          {SOURCE_LABEL[source] ?? source}
-          <span> {health.status}</span>
-        </span>
-      ))}
+    <span
+      className="ml-2 inline-flex items-center gap-1"
+      aria-label="All Special Orders data sources are healthy"
+      title={entries.map(([source]) => SOURCE_LABEL[source] ?? source).join(', ')}
+    >
+      <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" aria-hidden="true" />
+      All systems healthy
     </span>
   )
 }
@@ -559,6 +540,7 @@ function SpecialOrdersContentInner() {
     sourceHealth,
     error,
   } = useSpecialOrders({ liveOnly })
+  const stageHistory = useSpecialOrderStageHistory()
 
   const updateFilters = (updates: Partial<FilterState>) => {
     setFilters((current) => ({ ...current, ...updates }))
@@ -722,6 +704,21 @@ function SpecialOrdersContentInner() {
   const { views: viewCounts, pipeline: pipelineCounts, dwell: dwellCounts } = counts
   const legendCounts = counts.legend
 
+  // The trend can only honour filters recorded on historical rows (see stageDwellSeries), so it
+  // deliberately depends on store/source/archive and nothing else.
+  const dwellSeries = useMemo(() => {
+    let shopIds: Set<string> | null = null
+    if (storeFilter !== 'all') {
+      shopIds = new Set(orders
+        .filter((order) => order.store === storeFilter && order.shop_id != null)
+        .map((order) => String(order.shop_id)))
+    }
+    return stageDwellSeries(stageHistory, { shopIds, source: sourceFilter, liveOnly })
+  }, [liveOnly, orders, sourceFilter, stageHistory, storeFilter])
+  const trendFilterNote = storeFilter !== 'all' || sourceFilter !== 'all'
+    ? 'Trend follows the Store and Source filters only.'
+    : 'Trend follows the Store and Source filters; Type, Action and Search do not apply to history.'
+
   const filtersActive = search !== '' || storeFilter !== 'all' || sourceFilter !== 'all' ||
     orderTypeFilter !== 'all' || actionFilter !== 'all' || !liveOnly
   const degradedSources = Object.entries(sourceHealth ?? {}).filter(([, health]) => health.status !== 'ok')
@@ -804,6 +801,15 @@ function SpecialOrdersContentInner() {
                       <span className="block text-xl font-semibold tabular-nums">{pipelineCounts[stage.key]}</span>
                       <span className="block text-xs text-muted-foreground">{stage.label}</span>
                     </span>
+                    {/* Median days in this stage over the trend window, in the row's spare
+                        width so the strip gains no height. */}
+                    <DwellSparkline
+                      className="ml-1 h-9 min-w-0 flex-1"
+                      series={dwellSeries[stage.key]}
+                      endDate={stageHistory?.end}
+                      stageLabel={stage.label}
+                      filterNote={trendFilterNote}
+                    />
                   </div>
                   {/* How long these have been in THIS step. The bar carries the shape at a
                       glance — a bucket going red is legible before you read a single number —

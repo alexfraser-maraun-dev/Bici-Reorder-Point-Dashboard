@@ -659,6 +659,23 @@ export function useSoScoreboard(enabled: boolean) {
   return { scoreboard: data, isLoading, error }
 }
 
+/** Stage intervals behind the pipeline dwell sparklines. One payload for every filter
+ *  combination: the page slices it client-side, so changing a filter never refetches. The
+ *  underlying table only moves with the 5-minute sweep, so a slow refresh is plenty. */
+export function useSpecialOrderStageHistory(days = 60) {
+  const { data } = useSWR<import('./types').SpecialOrderStageHistory>(
+    `/backend/api/special-orders/stage-history?days=${days}`,
+    fetcher,
+    {
+      ...adminDashboardSWRConfig,
+      refreshInterval: 1_800_000,
+      dedupingInterval: 600_000,
+      shouldRetryOnError: false,
+    },
+  )
+  return data
+}
+
 export function useSpecialOrders({ liveOnly = true }: { liveOnly?: boolean } = {}) {
   const baseUrl = '/backend'
   // The escalations endpoint is a strict superset of /api/special-orders: the same rows plus
