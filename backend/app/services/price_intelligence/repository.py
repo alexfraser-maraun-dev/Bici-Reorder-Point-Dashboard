@@ -98,6 +98,25 @@ SQL_TRACKED_DEDUPED = """(
         ORDER BY COALESCE(pinned, FALSE) DESC, updated_at DESC) = 1
 )"""
 
+# One store can hold several live diff_keys for an item (`link:`, `cat:{cid}:`,
+# `url:`), each refreshed on its own schedule. Picking the store's price across
+# all of them by in-stock-first let a weeks-old in-stock price beat tonight's
+# out-of-stock one (Steed GP5000 32mm: $133.95 shown against a live $142.95).
+# So a store's representative is chosen only among rows from its latest run —
+# within this many hours of the store's newest observation for the item.
+STORE_REP_FRESH_HOURS = 36
+SQL_STORE_KEY = "COALESCE(competitor_id, CONCAT('url:', url))"
+
+
+def sql_store_fresh(source: str = "latest") -> str:
+    """CTE body: `source`'s rows that belong to their store's latest run, per
+    (item, store). Every per-store pick reads from this, never `latest` directly."""
+    return f"""SELECT * FROM {source}
+            QUALIFY observed_at >= TIMESTAMP_SUB(
+                MAX(observed_at) OVER (PARTITION BY match_item_id, {SQL_STORE_KEY}),
+                INTERVAL {STORE_REP_FRESH_HOURS} HOUR)"""
+
+
 _tables_ensured = False
 _ensure_lock = threading.Lock()
 
@@ -905,8 +924,9 @@ def get_tracked_products_with_market(days: int = 7):
                        WHERE mt.item_id = o.match_item_id AND mt.item_matrix_id IS NOT NULL)))
             QUALIFY ROW_NUMBER() OVER (PARTITION BY diff_key ORDER BY observed_at DESC) = 1
         ),
+        fresh AS ({sql_store_fresh()}),
         store_rep AS (
-            SELECT * FROM latest
+            SELECT * FROM fresh
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY match_item_id, COALESCE(competitor_id, CONCAT('url:', url))
                 ORDER BY IF(COALESCE(in_stock, FALSE), 1, 0) DESC, observed_at DESC, price ASC
@@ -958,13 +978,14 @@ def get_item_competitor_prices(item_id: str, days: int = 45):
                        SELECT 1 FROM `{T_TRACKED}` mt
                        WHERE mt.item_id = o.match_item_id AND mt.item_matrix_id IS NOT NULL)))
             QUALIFY ROW_NUMBER() OVER (PARTITION BY o.diff_key ORDER BY o.observed_at DESC) = 1
-        )
+        ),
+        fresh AS ({sql_store_fresh()})
         SELECT l.competitor_id, c.name AS competitor_name, l.source, l.url,
                l.competitor_title, l.price, l.compare_at_price, l.in_stock,
                l.observed_at, l.match_method, l.match_confidence,
                l.price_scope, l.price_low, l.price_high, l.extraction_method,
                l.variant_id, l.variant_options_json
-        FROM latest l
+        FROM fresh l
         LEFT JOIN `{T_COMPETITORS}` c ON c.competitor_id = l.competitor_id
     """, params=[
         bigquery.ScalarQueryParameter("item_id", "STRING", str(item_id)),
@@ -1091,8 +1112,9 @@ def get_tracked_matrices_with_market(days: int = 7):
                        WHERE mt.item_id = o.match_item_id AND mt.item_matrix_id IS NOT NULL)))
             QUALIFY ROW_NUMBER() OVER (PARTITION BY diff_key ORDER BY observed_at DESC) = 1
         ),
+        fresh AS ({sql_store_fresh()}),
         store_rep AS (
-            SELECT * FROM latest
+            SELECT * FROM fresh
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY match_item_id, COALESCE(competitor_id, CONCAT('url:', url))
                 ORDER BY IF(COALESCE(in_stock, FALSE), 1, 0) DESC, observed_at DESC, price ASC
@@ -1166,9 +1188,10 @@ def get_matrix_coverage(matrix_id: str, days: int = 45):
                        WHERE mt.item_id = o.match_item_id AND mt.item_matrix_id IS NOT NULL)))
             QUALIFY ROW_NUMBER() OVER (PARTITION BY o.diff_key ORDER BY o.observed_at DESC) = 1
         ),
+        fresh AS ({sql_store_fresh()}),
         store_rep AS (
             SELECT l.*, t.current_retail
-            FROM latest l JOIN `{T_TRACKED}` t ON t.item_id = l.match_item_id
+            FROM fresh l JOIN `{T_TRACKED}` t ON t.item_id = l.match_item_id
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY l.match_item_id, COALESCE(l.competitor_id, CONCAT('url:', l.url))
                 ORDER BY IF(COALESCE(l.in_stock, FALSE), 1, 0) DESC, l.observed_at DESC, l.price ASC

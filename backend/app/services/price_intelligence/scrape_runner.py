@@ -115,6 +115,24 @@ def _needs_catalog_discovery(item_lookup: dict, confirmed_links: list, urls: lis
     return needy
 
 
+def _links_to_recheck(confirmed_links: list, item_lookup: dict, urls: list,
+                      crawl_refreshed: set) -> list:
+    """Confirmed links the URL re-check phase must fetch this run.
+
+    Skips links whose (item, competitor) pair the catalog crawl already priced
+    tonight, and links whose page is a tracked URL for the same item (scraped in
+    its own phase — no fetching the same page twice). Everything else is
+    re-checked, whatever the run mode."""
+    tracked_url_items = {(u["url"], str(u.get("item_id") or "")) for u in urls}
+    return [
+        l for l in confirmed_links
+        if l.get("competitor_url") and l.get("item_id")
+        and str(l["item_id"]) in item_lookup
+        and (l["competitor_url"], str(l["item_id"])) not in tracked_url_items
+        and (str(l["item_id"]), l.get("competitor_id")) not in crawl_refreshed
+    ]
+
+
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -665,9 +683,12 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
               f"days since last catalog crawl={stale})")
 
         # --- catalog scrape, one competitor at a time -----------------------
-        # Competitors whose catalog actually got crawled this run — the
-        # confirmed-link phase below re-checks links on everyone else.
-        crawled_competitor_ids = set()
+        # (item_id, competitor_id) pairs this run's catalog crawl actually priced.
+        # The confirmed-link phase below re-checks every other confirmed link —
+        # a crawled store is NOT enough: the crawl's head hunts only items with
+        # no link there, so a linked page is revisited only when the rotating
+        # tail reaches it (Primeau: a link sat on its 8/24 price for weeks).
+        crawl_refreshed = set()
         for competitor in competitors if full_scan else []:
             cid = competitor["competitor_id"]
             _set_status(phase=f"scraping {competitor['name']}")
@@ -698,7 +719,6 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                     counters["competitors_done"] += 1
                     _set_status(competitors_done=counters["competitors_done"])
                     continue
-                crawled_competitor_ids.add(cid)
                 # This store's slice of the diff map only — see the note at the
                 # top of the run about per-phase prev_map loading.
                 prev_map = repository.get_latest_observation_map(
@@ -770,6 +790,9 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                             and not index.has_brand(product.get("brand"))):
                         continue
                     obs_buffer.append(obs)
+                    if (item_id is not None and obs["price"] is not None
+                            and product.get("price_scope") != "range"):
+                        crawl_refreshed.add((str(item_id), cid))
                     if item_id is not None:
                         event_buffer.extend(
                             _build_events(prev_map, obs, competitor["name"], item_lookup)
@@ -844,23 +867,14 @@ def _run(run_id: str, trigger: str, force_full: bool = False):
                 print(f"pi: serp discovery failed: {e}")
 
         # --- re-check each confirmed link's URL ------------------------------
-        # Targeted mode re-checks every confirmed link. Full-scan mode still
-        # re-checks the links whose competitor's catalog was NOT crawled this
-        # run (connector-less SERP/manual matches, or no competitor at all) —
-        # otherwise those prices silently go stale on every full-scan night.
+        # Every confirmed link is re-checked unless tonight's catalog crawl
+        # already priced that exact (item, competitor) pair. Skipping whole
+        # crawled competitors instead left linked pages stale on every
+        # full-scan night the rotating tail didn't happen to reach them.
         scraper = PageScraper()
         competitor_names = {c["competitor_id"]: c["name"] for c in repository.get_competitors()}
-        # Tracked-URL rows are scraped in their own phase below; skip links
-        # that would fetch the same page twice.
-        tracked_url_items = {(u["url"], str(u.get("item_id") or "")) for u in urls}
-        link_targets = [
-            l for l in confirmed_links
-            if l.get("competitor_url") and l.get("item_id")
-            and str(l["item_id"]) in item_lookup
-            and (l["competitor_url"], str(l.get("item_id") or "")) not in tracked_url_items
-            and not (full_scan and l.get("competitor_id")
-                     and l["competitor_id"] in crawled_competitor_ids)
-        ]
+        link_targets = _links_to_recheck(confirmed_links, item_lookup, urls,
+                                         crawl_refreshed)
         _set_status(phase="scraping confirmed links", links_total=len(link_targets))
         prev_map = repository.get_latest_observation_map(diff_key_prefix="link:")
         obs_buffer, event_buffer = [], []
